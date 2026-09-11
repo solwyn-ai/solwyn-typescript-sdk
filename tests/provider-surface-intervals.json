@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "include": [
+    { "family": "anthropic", "interval": "floor", "packages": ["@anthropic-ai/sdk@0.30.0"] },
+    { "family": "anthropic", "interval": "latest", "packages": ["@anthropic-ai/sdk@0.123.0"] },
+    { "family": "bedrock", "interval": "floor", "packages": ["@aws-sdk/client-bedrock-runtime@3.422.0"] },
+    { "family": "bedrock", "interval": "latest", "packages": ["@aws-sdk/client-bedrock-runtime@3.1124.0"] },
+    { "family": "google-genai", "interval": "floor", "packages": ["@google/genai@0.3.1"] },
+    { "family": "google-genai", "interval": "latest", "packages": ["@google/genai@2.20.0"] },
+    { "family": "google-generativeai", "interval": "latest", "packages": ["@google/generative-ai@0.24.1"] },
+    { "family": "openai", "interval": "floor", "packages": ["openai@4.41.0"] },
+    { "family": "openai", "interval": "latest", "packages": ["openai@6.45.0"] },
+    { "family": "together", "interval": "floor", "packages": ["together-ai@0.16.0"] },
+    { "family": "together", "interval": "latest", "packages": ["together-ai@0.50.0"] }
+  ]
+}

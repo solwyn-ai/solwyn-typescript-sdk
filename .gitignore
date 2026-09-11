@@ -1,0 +1,12 @@
+node_modules/
+.worktrees/
+/dist/
+/build/
+coverage/
+.smoke-tmp/
+*.tgz
+*.log
+.DS_Store
+.env
+.env.*
+.worktrees

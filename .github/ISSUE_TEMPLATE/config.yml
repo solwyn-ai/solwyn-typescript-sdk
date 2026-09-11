@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/solwyn-ai/solwyn-typescript-sdk/security/policy
+    about: Report vulnerabilities privately by following the Security Policy.
+  - name: Solwyn documentation
+    url: https://docs.solwyn.ai/typescript-sdk
+    about: Read integration, provider, budget, privacy, and troubleshooting guidance.

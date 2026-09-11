@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "shape_key": "bedrock-v3",
+  "rows": [
+    ["ApplyGuardrailCommand",["command_class:command_class"]],
+    ["ConverseCommand",["command_class:command_class"]],
+    ["ConverseStreamCommand",["command_class:command_class"]],
+    ["CountTokensCommand",["command_class:command_class"]],
+    ["GetAsyncInvokeCommand",["command_class:command_class"]],
+    ["InvokeGuardrailChecksCommand",["command_class:command_class"]],
+    ["InvokeModelCommand",["command_class:command_class"]],
+    ["InvokeModelWithBidirectionalStreamCommand",["command_class:command_class"]],
+    ["InvokeModelWithResponseStreamCommand",["command_class:command_class"]],
+    ["ListAsyncInvokesCommand",["command_class:command_class"]],
+    ["StartAsyncInvokeCommand",["command_class:command_class"]],
+    ["config",["field:mapping"]],
+    ["destroy",["method:function"]],
+    ["handlers",["field:scalar"]],
+    ["initConfig",["field:mapping"]],
+    ["middlewareStack",["field:mapping"]],
+    ["send",["method:function"]]
+  ]
+}

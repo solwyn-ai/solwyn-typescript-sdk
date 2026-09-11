@@ -1,0 +1,15 @@
+{
+  "name": "@solwyn/verification-ai-types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@types/json-schema": "7.0.15",
+    "@types/node": "22.15.30",
+    "ai": "7.0.14",
+    "typescript-current": "npm:typescript@6.0.3",
+    "typescript-diagnostic": "npm:typescript@5.7.3",
+    "typescript-floor": "npm:typescript@5.8.3",
+    "zod": "4.4.3"
+  }
+}

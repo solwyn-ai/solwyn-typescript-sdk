@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "shape_key": "google-generativeai",
+  "rows": [
+    ["apiKey",["field:scalar"]],
+    ["getGenerativeModel",["method:function"]],
+    ["getGenerativeModelFromCachedContent",["method:function"]]
+  ]
+}

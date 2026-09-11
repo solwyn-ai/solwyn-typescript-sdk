@@ -1,0 +1,2657 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Solwyn API",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/budgets/check": {
+      "post": {
+        "tags": ["budgets"],
+        "summary": "Budget Check",
+        "description": "Pre-flight budget check. Creates a reservation if allowed.",
+        "operationId": "budget_check_api_v1_budgets_check_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BudgetCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BudgetCheckResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot perform budget enforcement writes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Budget Check Api V1 Budgets Check Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown model or request validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/UnknownModelError422Response"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  ],
+                  "title": "Response 422 Budget Check Api V1 Budgets Check Post"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Project admission rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until the next request is allowed.",
+                "required": true,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Budget state temporarily unreadable; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StringDetailErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/budgets/confirm": {
+      "post": {
+        "tags": ["budgets"],
+        "summary": "Budget Confirm",
+        "description": "Confirm actual cost for the authority that funded one served call.\n\nThe body names EXACTLY ONE funding source (wire-enforced): a\n``reservation_id`` from the legacy per-call check, or the ``lease_id`` the\ncall drew its tokens from. A lease-funded confirm has no reservation to look\nup \u2014 the lease itself is the ownership proof, bound to the caller's project\ninside the settlement \u2014 so it skips the reservation choreography entirely.\n\n``body.provider`` and ``body.is_provider_fallback`` are the *served*\nfailover attribution. They are accepted but **not persisted here** \u2014 the\ndurable served attribution is written via the metadata-ingest path onto\n``cost_events`` (see ``metadata_ingest._store_cost_event``). Confirm only\nsettles the Redis budget counter, so it has nothing to attribute them to.",
+        "operationId": "budget_confirm_api_v1_budgets_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BudgetConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "403": {
+            "description": "Read-only API key cannot confirm budget reservations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Budget Confirm Api V1 Budgets Confirm Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unknown served model or request validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/UnknownModelError422Response"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  ],
+                  "title": "Response 422 Budget Confirm Api V1 Budgets Confirm Post"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Budget backend (Redis) temporarily unavailable; retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StringDetailErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/metadata/ingest": {
+      "post": {
+        "tags": ["costs"],
+        "summary": "Metadata Ingest",
+        "description": "Batch ingest metadata events from SDK instances (D16).\n\nResolves the project from the authenticated API key, deduplicates,\nand stores events as CostEvent records. Max batch size: 1000 events.\n\nReturns 202 for every well-formed request with per-event dispositions:\nevents the API refuses (unknown model, unknown service tier) appear in\n``rejected`` while accepted events commit \u2014 a rejected event never\ncosts the rest of the batch.",
+        "operationId": "metadata_ingest_api_v1_metadata_ingest_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/IngestMetadataEvent"
+                },
+                "type": "array",
+                "title": "Events"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted",
+            "headers": {
+              "X-RateLimit-Limit-Minute": {
+                "description": "Maximum requests allowed in the current minute window.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Remaining-Minute": {
+                "description": "Requests remaining in the current minute window.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Limit-Hour": {
+                "description": "Maximum requests allowed in the current hour window.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-RateLimit-Remaining-Hour": {
+                "description": "Requests remaining in the current hour window.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until the next request is allowed.",
+                "required": true,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot ingest metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Metadata Ingest Api V1 Metadata Ingest Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/budgets/lease": {
+      "post": {
+        "tags": ["budgets"],
+        "summary": "Budget Lease Grant",
+        "description": "Grant a token lease for one (project, agent run, holder).\n\nThree populations share the 200: a GRANT, an INELIGIBLE answer (the run uses\nthe legacy per-call path), and a DENY verdict. Only the refusals below are\nnon-200, and each one is something the SDK recovers from without ever\nblocking a customer call.\n\nThe response serializes ``exclude_none`` so the lease block disappears\nentirely from the ineligible and deny shapes.",
+        "operationId": "budget_lease_grant_api_v1_budgets_lease_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseGrantResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot take or mutate a budget lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Budget Lease Grant Api V1 Budgets Lease Post"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease (or a key/holder binding mismatch), or unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/LeaseErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 404 Budget Lease Grant Api V1 Budgets Lease Post"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Active-holder cap exceeded, or the echoed generation is not fenceable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Project admission rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until the next request is allowed.",
+                "required": true,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Lease infrastructure unavailable; the run falls back to per-call checks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/budgets/lease/renew": {
+      "post": {
+        "tags": ["budgets"],
+        "summary": "Budget Lease Renew",
+        "description": "Acknowledge the current grant, report drawdown, and issue the successor.\n\nThe echoed ``generation`` is the idempotency key: a renewal whose response\nwas lost replays byte-identically, and anything unfenceable is a 409 the SDK\nanswers by dropping its lease and asking for a fresh grant.",
+        "operationId": "budget_lease_renew_api_v1_budgets_lease_renew_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseRenewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseGrantResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot take or mutate a budget lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Budget Lease Renew Api V1 Budgets Lease Renew Post"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease (or a key/holder binding mismatch), or unknown project",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/LeaseErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 404 Budget Lease Renew Api V1 Budgets Lease Renew Post"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Active-holder cap exceeded, or the echoed generation is not fenceable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Lease infrastructure unavailable; the run falls back to per-call checks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/budgets/lease/surrender": {
+      "post": {
+        "tags": ["budgets"],
+        "summary": "Budget Lease Surrender",
+        "description": "Release a lease's float on clean shutdown (DHCPRELEASE-style).\n\nIdempotent by design: surrendering an already-released lease returns\n``released_tokens: 0`` rather than 404, because a retried surrender from a\nprocess that is exiting must never look like an error.",
+        "operationId": "budget_lease_surrender_api_v1_budgets_lease_surrender_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseSurrenderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseSurrenderResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot take or mutate a budget lease",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Budget Lease Surrender Api V1 Budgets Lease Surrender Post"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown lease, or a key/holder binding mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Lease infrastructure unavailable; the run falls back to per-call checks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/untracked-surfaces": {
+      "post": {
+        "tags": ["health", "providers"],
+        "summary": "Ingest Untracked Surfaces For Api Key Project",
+        "description": "Persist content-free SDK observations for the API key's project.",
+        "operationId": "ingest_untracked_surfaces_for_api_key_project_api_v1_untracked_surfaces_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/UntrackedSurfaceReport"
+                },
+                "type": "array",
+                "maxItems": 100,
+                "title": "Reports"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UntrackedSurfaceAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Batch exceeds the limit or repeats an observation key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StringDetailErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the advisory report byte limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StringDetailErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Reports require a writable API key with valid project scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Ingest Untracked Surfaces For Api Key Project Api V1 Untracked Surfaces Post"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until the next request is allowed.",
+                "required": true,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/providers/breaker-reports": {
+      "post": {
+        "tags": ["health", "providers"],
+        "summary": "Ingest Breaker Report",
+        "description": "Accept one advisory SDK breaker snapshot for a project/provider instance.",
+        "operationId": "ingest_breaker_report_api_v1_projects__project_id__providers_breaker_reports_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BreakerStateReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BreakerReportAccepted"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Read-only API key cannot report breaker state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/StringDetailErrorResponse"
+                    }
+                  ],
+                  "title": "Response 403 Ingest Breaker Report Api V1 Projects  Project Id  Providers Breaker Reports Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BreakerReportAccepted": {
+        "properties": {
+          "accepted": {
+            "type": "boolean",
+            "title": "Accepted",
+            "default": true
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "BreakerReportAccepted"
+      },
+      "BreakerStateReport": {
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName",
+            "description": "Provider identifier"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CircuitState",
+            "description": "Current SDK circuit-breaker state"
+          },
+          "failure_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Failure Count",
+            "description": "Current breaker failure count"
+          },
+          "success_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Success Count",
+            "description": "Current breaker success count"
+          },
+          "reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Reported At",
+            "description": "Wall-clock time the SDK took the snapshot"
+          },
+          "sdk_instance_id": {
+            "type": "string",
+            "maxLength": 100,
+            "title": "Sdk Instance Id",
+            "description": "Bounded SDK instance identifier used to isolate Redis snapshots"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "provider",
+          "state",
+          "failure_count",
+          "success_count",
+          "reported_at",
+          "sdk_instance_id"
+        ],
+        "title": "BreakerStateReport",
+        "description": "One SDK instance's current provider circuit-breaker snapshot."
+      },
+      "BudgetCheckRequest": {
+        "properties": {
+          "estimated_input_tokens": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Estimated Input Tokens",
+            "description": "Estimated input token count for the pending call"
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 2048,
+            "title": "Model",
+            "description": "LLM model name"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName",
+            "description": "Target provider"
+          },
+          "modality": {
+            "type": "string",
+            "enum": ["text", "image", "audio", "video", "embedding"],
+            "title": "Modality",
+            "description": "Call modality of the pending request. Defaults to 'text' so pre-modality SDKs omit it safely (API-first). The pricing card's unit selects the billing basis; core bills text tokens only until per-modality cards land.",
+            "default": "text"
+          },
+          "estimated_media": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MediaUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Estimated non-text billing quantities for the pending call (image/video/audio/TTS). None for text-only calls; each quantity inside is None when unobservable pre-flight. The media analog of estimated_input_tokens \u2014 the server prices the reservation off it."
+          },
+          "fallback_providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderName"
+            },
+            "type": "array",
+            "title": "Fallback Providers",
+            "description": "Configured failover providers, in attempt order (chain hint)"
+          },
+          "fallback_models": {
+            "items": {
+              "type": "string",
+              "maxLength": 2048
+            },
+            "type": "array",
+            "maxItems": 8,
+            "title": "Fallback Models",
+            "description": "Failover models aligned element-for-element with fallback_providers"
+          },
+          "agent_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Run Id",
+            "description": "Optional caller-supplied agent run identifier for per-run budget enforcement. Omitted requests retain project-only behavior."
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "propertyNames": {
+                  "maxLength": 64,
+                  "minLength": 1
+                },
+                "type": "object",
+                "maxProperties": 10
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags",
+            "description": "Optional exact tags for tag-scoped budget enforcement. An omitted mapping cannot match or be denied by a tag-scoped rule."
+          },
+          "failover_directive_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failover Directive Version",
+            "description": "Explicit opt-in to the version 1 server failover directive. Omitted requests retain the legacy response shape."
+          },
+          "run_directive_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Directive Version",
+            "description": "Explicit opt-in to the version 1 run-control directive. Omitted requests retain the legacy response shape."
+          },
+          "price_hints_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Hints Version",
+            "description": "Explicit opt-in to server price hints on the response. Omitted requests keep price_hints null (no statement)."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["estimated_input_tokens", "model", "provider"],
+        "title": "BudgetCheckRequest",
+        "description": "Pre-flight budget check sent before an LLM call.\n\nThe SDK sends estimated token count; the API computes cost server-side\nvia PricingService rather than trusting SDK-computed USD values."
+      },
+      "BudgetCheckResponse": {
+        "properties": {
+          "allowed": {
+            "type": "boolean",
+            "title": "Allowed",
+            "description": "Whether the call is within budget"
+          },
+          "remaining_budget": {
+            "type": "number",
+            "title": "Remaining Budget",
+            "description": "Remaining budget in USD for current period"
+          },
+          "reservation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id",
+            "description": "Budget reservation ID (for cost reconciliation)"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/BudgetMode",
+            "description": "Current budget enforcement mode"
+          },
+          "budget_limit": {
+            "type": "number",
+            "title": "Budget Limit",
+            "description": "Total budget limit for current period in USD"
+          },
+          "current_usage": {
+            "type": "number",
+            "title": "Current Usage",
+            "description": "Current spend in USD for this period"
+          },
+          "denied_by_period": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Denied By Period",
+            "description": "Which budget period triggered denial (e.g. 'daily')"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "description": "Project identifier resolved from the API key"
+          },
+          "price_hints": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "propertyNames": {
+                  "$ref": "#/components/schemas/ProviderName"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price Hints",
+            "description": "Server-provided RELATIVE price signal per provider for cost routing; SDK never computes price. Populated only when the request opts in with price_hints_version. Values are normalized standard-tier token rates over the request's declared failover chain: cheapest positively-priced provider = 1.0, zero-cost local lanes = 0.0, unpriceable providers omitted. An empty mapping clears client-held hints; null makes no statement (client keeps last known)."
+          },
+          "failover_directive": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailoverDirective"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Versioned server policy for SDK-managed failover. Present only when the request opts in with failover_directive_version."
+          },
+          "run_control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunControlDirective"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Versioned instruction for a stopped run. Present only when the request opts in with run_directive_version."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "allowed",
+          "remaining_budget",
+          "mode",
+          "budget_limit",
+          "current_usage",
+          "project_id"
+        ],
+        "title": "BudgetCheckResponse",
+        "description": "API response to a budget check request."
+      },
+      "BudgetConfirmRequest": {
+        "properties": {
+          "reservation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reservation Id",
+            "description": "Budget reservation ID returned by BudgetCheckResponse. None when the call was funded by a lease (set lease_id instead)."
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Id",
+            "description": "Budget lease that funded the call, from LeaseGrantResponse. None when the call was funded by a per-call reservation."
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 2048,
+            "title": "Model",
+            "description": "LLM model name used for the call"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName",
+            "description": "Provider that actually served the call (required)"
+          },
+          "modality": {
+            "type": "string",
+            "enum": ["text", "image", "audio", "video", "embedding"],
+            "title": "Modality",
+            "description": "Call modality of the served call. Defaults to 'text' so pre-modality SDKs omit it safely (API-first). The pricing card's unit settles the budget counter on the right basis; core bills text tokens only until per-modality cards land.",
+            "default": "text"
+          },
+          "is_provider_fallback": {
+            "type": "boolean",
+            "title": "Is Provider Fallback",
+            "description": "served provider != requested provider",
+            "default": false
+          },
+          "call_id": {
+            "type": "string",
+            "maxLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Call Id",
+            "description": "uuid per intercepted call; dedups confirm vs metadata reconciliation. Canonical lowercase UUID enforced server-side (same identity contract as MetadataEvent.call_id)."
+          },
+          "token_details": {
+            "$ref": "#/components/schemas/TokenDetails",
+            "description": "Actual token breakdown from the provider adapter"
+          },
+          "media_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MediaUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Actual observable non-text billing quantities for the served call. None for text-only calls; each quantity inside is None when unobservable. The server settles the budget counter off the quantity its pricing-card unit selects."
+          },
+          "provider_region": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Region",
+            "description": "Cloud region of the serving endpoint, for per-region pricing (Bedrock). None for providers without regional pricing."
+          },
+          "service_tier": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["auto", "default", "flex", "scale", "priority", "standard", "optimized"]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Tier",
+            "description": "Service tier echoed by the provider response. Bedrock confirms settle the budget enforcement counter at the tier-repriced rate (flex 0.5x / priority 1.75x / optimized 1.25x) so hard-deny tracks real spend; None settles at Standard rates. Ignored for providers without per-tier pricing."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["model", "provider", "call_id", "token_details"],
+        "title": "BudgetConfirmRequest",
+        "description": "Post-call budget confirmation sent after an LLM call completes.\n\nTies one call's actual token usage to the authority that funded it so the\nAPI can compute the exact cost via PricingService and settle it.\n\nA call draws on EXACTLY ONE funding source, so exactly one of the two ids\nis set (PJ-2):\n\n* ``reservation_id`` \u2014 the legacy per-call path: the pre-flight check\n  reserved an estimate, and this confirm trues it up.\n* ``lease_id`` \u2014 the run held a budget LEASE and drew the call from the\n  granted tokens, so there is no per-call reservation to settle. The server\n  folds the actual cost into the lease's settled total and moves the\n  enforcement counters only for spend that overshoots the lease's claim.\n\nNaming both would settle the same call against one budget twice; naming\nneither leaves nothing to settle."
+      },
+      "BudgetMode": {
+        "type": "string",
+        "enum": ["alert_only", "hard_deny"],
+        "title": "BudgetMode",
+        "description": "How the SDK reacts when a budget limit is reached."
+      },
+      "CallStatus": {
+        "type": "string",
+        "enum": ["success", "error", "budget_denied"],
+        "title": "CallStatus",
+        "description": "Outcome status for LLM call metadata events."
+      },
+      "CircuitState": {
+        "type": "string",
+        "enum": ["closed", "open", "half_open"],
+        "title": "CircuitState",
+        "description": "Circuit breaker states for provider health tracking."
+      },
+      "FailoverDirective": {
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1",
+            "title": "Version"
+          },
+          "failover_tuning_allowed": {
+            "type": "boolean",
+            "title": "Failover Tuning Allowed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["version", "failover_tuning_allowed"],
+        "title": "FailoverDirective",
+        "description": "Versioned server policy for SDK-managed provider failover."
+      },
+      "FailoverReason": {
+        "type": "string",
+        "enum": ["circuit_open", "primary_error", "model_fallback", "cost_routed"],
+        "title": "FailoverReason",
+        "description": "Why the router advanced past the requested primary target (SDK v0.1.6)."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "IngestMetadataEvent": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "maxLength": 2048,
+            "title": "Model",
+            "description": "LLM model identifier, VERBATIM as the provider reports it. For Bedrock this may be a plain id (amazon.nova-pro-v1:0), a geo-prefixed cross-region inference profile (us.anthropic....), or a full ARN \u2014 the 2048 bound is the AWS Converse modelId contract."
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName",
+            "description": "LLM provider"
+          },
+          "modality": {
+            "type": "string",
+            "enum": ["text", "image", "audio", "video", "embedding"],
+            "title": "Modality",
+            "description": "Call modality. Defaults to 'text' so pre-modality SDKs omit it safely (API-first). The pricing card's unit \u2014 not this label alone \u2014 selects the billing basis; core bills text tokens only until per-modality cards land.",
+            "default": "text"
+          },
+          "input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "description": "Input token count"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "description": "Output token count"
+          },
+          "token_details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TokenDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Full token breakdown from provider adapter"
+          },
+          "media_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MediaUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Observable non-text billing quantities (image/video/audio/TTS). None for text-only calls; each quantity inside is None when unobservable. The server's pricing-card unit selects which quantity prices the call."
+          },
+          "latency_ms": {
+            "type": "number",
+            "title": "Latency Ms",
+            "description": "End-to-end call latency in ms"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CallStatus",
+            "description": "Call outcome"
+          },
+          "is_model_fallback": {
+            "type": "boolean",
+            "title": "Is Model Fallback",
+            "description": "Whether this call used fallback_model after the primary failed"
+          },
+          "is_provider_fallback": {
+            "type": "boolean",
+            "title": "Is Provider Fallback",
+            "description": "served provider != requested provider",
+            "default": false
+          },
+          "requested_provider": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProviderName"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Requested primary provider when failover occurred"
+          },
+          "requested_model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Model",
+            "description": "Requested primary model when failover occurred"
+          },
+          "failover_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailoverReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the router advanced past the requested target"
+          },
+          "failover_error_class": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^[A-Za-z][A-Za-z0-9_.]*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failover Error Class",
+            "description": "type(exc).__name__ ONLY \u2014 never str(exc). Pattern-validated server-side (D7): the privacy allowlist admits this column only because it cannot carry an exception message body."
+          },
+          "attempt_index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Attempt Index",
+            "description": "0=primary, 1=first fallback",
+            "default": 0
+          },
+          "call_id": {
+            "type": "string",
+            "maxLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Call Id",
+            "description": "uuid per intercepted call; join key for cache-hit spend reconciliation. Always present on the wire \u2014 it is NOT content. max_length=36 (D7) bounds the DB column and the Redis dedup key. Canonical lowercase UUID enforced server-side: the cost_event_ledger treats this as durable spend identity, so an empty or attacker-chosen string must never become a dedup key."
+          },
+          "possibly_succeeded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Possibly Succeeded",
+            "description": "post-send-ambiguous abort flag for reconciliation (wire-only; not persisted \u2014 D1)."
+          },
+          "service_tier": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service Tier",
+            "description": "Service tier echoed by the provider response, VERBATIM (bounded plain str, mirroring the SDK \u2014 any provider echo rides telemetry). None when providers omit it. Values outside the known ServiceTier set reject PER EVENT in the ingest service (unknown_service_tier), never the whole batch. Bedrock tiers reprice via multipliers; other providers store it for post-launch tier-based repricing."
+          },
+          "sdk_instance_id": {
+            "type": "string",
+            "title": "Sdk Instance Id",
+            "description": "Unique SDK instance identifier"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "When the LLM call completed (UTC)"
+          },
+          "agent_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Run Id",
+            "description": "Optional caller-supplied agent run identifier. When omitted the API falls back to an auto-id `_auto-{sdk_instance_id}-{date}` so calls from pre-P6 SDKs are still attributable to a run."
+          },
+          "parent_agent_run_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Agent Run Id",
+            "description": "Optional caller-supplied parent run identifier for orchestrator-to-sub-agent hierarchies. The API namespaces it with the same account-owner identity used for agent_run_id."
+          },
+          "agent_run_name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Run Name",
+            "description": "Optional human-readable name for the run. When the run is being created (no prior row with this id), defaults to ``agent_run_id``."
+          },
+          "provider_region": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Region",
+            "description": "Cloud region of the endpoint that served the call (e.g. 'us-east-1' for Bedrock, whose pricing is keyed per model AND region). None for providers without regional pricing."
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags",
+            "description": "Explicit customer-supplied metadata. Each event may contain at most 10 tags; keys are 1-64 characters and values are at most 256 characters. Across an account, at most 100 distinct tag keys and at most 1,000 distinct values per key are accepted. Tag policy failures are rejected individually in the 202 response, leaving well-formed siblings eligible for ingest; account-cardinality rejections use code `tag_cardinality_exceeded`."
+          },
+          "deny_source": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "server",
+                  "sticky_replay",
+                  "local_enforcement",
+                  "lease_exhausted",
+                  "local_velocity",
+                  "run_terminated",
+                  "aggregate_replay"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deny Source",
+            "description": "Authority that produced a denial receipt."
+          },
+          "deny_reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deny Reason",
+            "description": "Bounded machine-readable denial reason."
+          },
+          "denied_by_period": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Denied By Period",
+            "description": "Budget period that caused the denial when applicable."
+          },
+          "estimated_output_bound": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Output Bound",
+            "description": "Output-token upper bound used to price a denied call."
+          },
+          "velocity_flags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "enum": ["repeat_size", "monotonic_growth", "rate_acceleration"]
+                },
+                "type": "array",
+                "maxItems": 8
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Velocity Flags",
+            "description": "Bounded content-free velocity rules observed for this receipt."
+          },
+          "receipt_aggregate_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receipt Aggregate Count",
+            "description": "Number of already-summed denial observations represented by this receipt."
+          },
+          "receipt_pricing_input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receipt Pricing Input Tokens",
+            "description": "Original per-call input-token count used only to select the pricing card for a homogeneous aggregate receipt. Requires receipt_aggregate_count. Absent on a COARSE aggregate, whose folded receipts had differing per-call input sizes: the aggregate has no single pricing card and the server prices it unpriced rather than reading a card off the summed total. Denial evidence \u2014 count, run, reason, period, token totals \u2014 survives either way."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "model",
+          "provider",
+          "input_tokens",
+          "output_tokens",
+          "latency_ms",
+          "status",
+          "is_model_fallback",
+          "call_id",
+          "sdk_instance_id",
+          "timestamp"
+        ],
+        "title": "IngestMetadataEvent",
+        "description": "Ingest request item whose tag bounds produce per-event dispositions.\n\nEvery non-tag field inherits the strict shared/SDK contract. Tags retain a\nstrict plaintext mapping at the envelope while their 10/64/256 policy is\napplied by the ingest service, allowing one bad tag event to reject without\nfailing well-formed siblings."
+      },
+      "IngestRejection": {
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Index",
+            "description": "Position of the rejected event in the SUBMITTED batch \u2014 the SDK correlates without the server echoing events back. Dedup-skipped duplicates are neither ingested nor rejected and do not shift these indexes."
+          },
+          "code": {
+            "$ref": "#/components/schemas/IngestRejectionCode",
+            "description": "Why the event was rejected"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model",
+            "description": "Model identifier of the rejected event, truncated to 50 chars"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable guidance (file-an-issue / typical turnaround). The SDK logs this verbatim and never parses it."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["index", "code", "model", "message"],
+        "title": "IngestRejection",
+        "description": "Per-event rejection disposition returned in the 202 ingest body."
+      },
+      "IngestRejectionCode": {
+        "type": "string",
+        "enum": [
+          "unknown_model",
+          "unknown_service_tier",
+          "invalid_tags",
+          "tag_cardinality_exceeded",
+          "unsupported_modality"
+        ],
+        "title": "IngestRejectionCode",
+        "description": "Closed enum of per-event rejection codes.\n\nAlso the label set for ``solwyn_ingest_event_rejected_total{code}`` \u2014\nkeeping it closed keeps that metric's cardinality bounded."
+      },
+      "IngestResponse": {
+        "properties": {
+          "ingested": {
+            "type": "integer",
+            "title": "Ingested",
+            "description": "Count of rows inserted (dedup-skips excluded)"
+          },
+          "rejected": {
+            "items": {
+              "$ref": "#/components/schemas/IngestRejection"
+            },
+            "type": "array",
+            "title": "Rejected",
+            "description": "Per-event rejections, indexed by position in the submitted batch"
+          }
+        },
+        "type": "object",
+        "required": ["ingested", "rejected"],
+        "title": "IngestResponse",
+        "description": "202 body for metadata ingest: per-event dispositions.\n\nEvery well-formed request gets a 202 \u2014 even all-rejected batches.\nWhole-request errors remain only for a malformed envelope (422), batch\nsize (400), auth (403), and infrastructure faults (5xx)."
+      },
+      "LeaseErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "lease_holder_cap_exceeded",
+              "lease_not_found",
+              "lease_generation_conflict",
+              "lease_unavailable"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["code", "message"],
+        "title": "LeaseErrorDetail",
+        "description": "Body of a structured budget-lease refusal (409 / 404 / 503).\n\nThe SDK dispatches on ``code`` alone: ``lease_holder_cap_exceeded`` and\n``lease_unavailable`` mark the run lease-ineligible (legacy per-call path),\n``lease_not_found`` and ``lease_generation_conflict`` drop the local lease\nand ask for a fresh grant. None of them ever blocks a customer call."
+      },
+      "LeaseErrorResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/LeaseErrorDetail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["detail"],
+        "title": "LeaseErrorResponse",
+        "description": "OpenAPI envelope for every structured budget-lease refusal."
+      },
+      "LeaseGrantRequest": {
+        "properties": {
+          "agent_run_id": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Agent Run Id",
+            "description": "Caller-supplied agent run identifier the lease is scoped to"
+          },
+          "holder_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Holder Id",
+            "description": "SDK instance id \u2014 one holder per SDK process"
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 2048,
+            "title": "Model",
+            "description": "Primary model the run intends to call"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName",
+            "description": "Primary provider for the run"
+          },
+          "fallback_providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderName"
+            },
+            "type": "array",
+            "title": "Fallback Providers",
+            "description": "Configured failover providers, in attempt order (chain hint)"
+          },
+          "fallback_models": {
+            "items": {
+              "type": "string",
+              "maxLength": 2048
+            },
+            "type": "array",
+            "maxItems": 8,
+            "title": "Fallback Models",
+            "description": "Failover models aligned element-for-element with fallback_providers"
+          },
+          "fail_open": {
+            "type": "boolean",
+            "title": "Fail Open",
+            "description": "The client's configured unreachable posture, echoed back as posture.on_unreachable so the grant is the single self-describing artifact the outage ladder reads.",
+            "default": true
+          },
+          "estimated_input_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Estimated Input Tokens",
+            "description": "Token estimate of the call that triggered the grant (demand hint)",
+            "default": 0
+          },
+          "run_directive_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Directive Version",
+            "description": "Explicit opt-in to the version 1 run-control directive"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["agent_run_id", "holder_id", "model", "provider"],
+        "title": "LeaseGrantRequest",
+        "description": "Ask for a token lease covering one agent run, from one SDK process."
+      },
+      "LeaseGrantResponse": {
+        "properties": {
+          "eligible": {
+            "type": "boolean",
+            "title": "Eligible",
+            "description": "False \u2192 the run is lease-ineligible; use the legacy per-call path"
+          },
+          "ineligible_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ineligible Reason",
+            "description": "Why the run is lease-ineligible (e.g. 'unit_priced_model', 'zero_rate_model', 'scoped_rules_present'). Omitted when eligible."
+          },
+          "allowed": {
+            "type": "boolean",
+            "title": "Allowed",
+            "description": "False \u2192 authoritative HARD DENY verdict for this run"
+          },
+          "denied_by_period": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Denied By Period",
+            "description": "Which budget period denied \u2014 deny responses only, same literals as the check"
+          },
+          "run_control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunControlDirective"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Versioned instruction for a stopped run"
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Id"
+          },
+          "generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
+          "granted_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Tokens",
+            "description": "Tokens the holder may draw down; may be 0"
+          },
+          "refresh_interval_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Interval S",
+            "description": "Server-jittered renew-ahead cadence"
+          },
+          "lease_length_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Length S",
+            "description": "Client-side authority window for this grant"
+          },
+          "headroom_share_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headroom Share Tokens",
+            "description": "This holder's apportioned share of project headroom \u2014 the outage drawdown bound"
+          },
+          "posture": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LeasePosture"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "final_grant": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Grant",
+            "description": "True \u2192 wind-down; no further grants will be issued"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/BudgetMode"
+          },
+          "budget_limit": {
+            "type": "number",
+            "title": "Budget Limit"
+          },
+          "current_usage": {
+            "type": "number",
+            "title": "Current Usage"
+          },
+          "remaining_budget": {
+            "type": "number",
+            "title": "Remaining Budget"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "eligible",
+          "allowed",
+          "project_id",
+          "mode",
+          "budget_limit",
+          "current_usage",
+          "remaining_budget"
+        ],
+        "title": "LeaseGrantResponse",
+        "description": "Grant and renew response \u2014 one shape, three populations.\n\n* INELIGIBLE (``eligible=False``): the run takes the legacy per-call path;\n  no lease block.\n* DENY (``allowed=False``): an authoritative hard-deny verdict feeding the\n  SDK's existing sticky-deny machinery; no lease block.\n* GRANT: the lease block is present. ``granted_tokens`` may be 0 (an\n  alert_only project past its cap) \u2014 admission then falls to the legacy\n  per-call path for each call without the run becoming ineligible.\n\nThe display snapshot at the bottom is always present so the SDK can log a\nlast-known budget position on any of the three."
+      },
+      "LeasePosture": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/BudgetMode",
+            "description": "The CUSTOMER's configured project budget mode"
+          },
+          "on_unreachable": {
+            "type": "string",
+            "enum": ["fail_open", "local_enforce"],
+            "title": "On Unreachable",
+            "description": "What the holder does when Solwyn is unreachable and the share is exhausted \u2014 echoed from the client's configured fail_open until a server-side setting exists."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["mode", "on_unreachable"],
+        "title": "LeasePosture",
+        "description": "The two policy facts the SDK's outage ladder reads off a grant."
+      },
+      "LeaseRenewRequest": {
+        "properties": {
+          "lease_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Lease Id"
+          },
+          "holder_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Holder Id"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Generation",
+            "description": "Generation of the grant the holder operates under \u2014 echoing it acknowledges it"
+          },
+          "spent_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Spent Tokens",
+            "description": "Trued-up drawdown since the last successful report",
+            "default": 0
+          },
+          "reserved_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Reserved Tokens",
+            "description": "Currently in-flight reservations. Accepted but not read by the server today; reserved as a future sizing input (demand hint).",
+            "default": 0
+          },
+          "uncounted_calls": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Uncounted Calls",
+            "description": "Outage fail-open calls since the last successful report",
+            "default": 0
+          },
+          "uncounted_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Uncounted Tokens",
+            "description": "Tokens burned by those uncounted calls",
+            "default": 0
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model",
+            "description": "Optional model re-declaration; the server UNIONS it into the declared set"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProviderName"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider for `model`"
+          },
+          "fallback_providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderName"
+            },
+            "type": "array",
+            "title": "Fallback Providers"
+          },
+          "fallback_models": {
+            "items": {
+              "type": "string",
+              "maxLength": 2048
+            },
+            "type": "array",
+            "maxItems": 8,
+            "title": "Fallback Models"
+          },
+          "run_directive_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Directive Version",
+            "description": "Explicit opt-in to the version 1 run-control directive"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["lease_id", "holder_id", "generation"],
+        "title": "LeaseRenewRequest",
+        "description": "Renew a lease, acknowledge the current grant, and report drawdown.\n\nThe echoed ``generation`` IS the idempotency key: echoing the server's\ncurrent generation acknowledges it and asks for the successor; echoing the\npredecessor of an already-issued successor replays that stored response."
+      },
+      "LeaseSurrenderRequest": {
+        "properties": {
+          "lease_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Lease Id"
+          },
+          "holder_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Holder Id"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Generation"
+          },
+          "spent_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Spent Tokens",
+            "description": "Final true-up report",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["lease_id", "holder_id", "generation"],
+        "title": "LeaseSurrenderRequest",
+        "description": "Release a lease cleanly (enforcer close / interpreter exit)."
+      },
+      "LeaseSurrenderResponse": {
+        "properties": {
+          "released_tokens": {
+            "type": "integer",
+            "title": "Released Tokens",
+            "description": "Tokens of outstanding claim returned to the budget counters"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["released_tokens"],
+        "title": "LeaseSurrenderResponse",
+        "description": "What the surrender handed back to the project's headroom."
+      },
+      "MediaUsage": {
+        "properties": {
+          "image_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Image Count",
+            "description": "Number of images generated/edited on the call"
+          },
+          "generation_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation Count",
+            "description": "per_video / per_generation / per_song billing units"
+          },
+          "video_seconds": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Video Seconds",
+            "description": "Video duration billed per second"
+          },
+          "audio_seconds": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Seconds",
+            "description": "Audio duration: whole seconds from the provider's usage block (Whisper usage.seconds is an integer whole-second value); float to admit fractional sources"
+          },
+          "input_characters": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Characters",
+            "description": "TTS input length \u2014 measured length only, computed inside the firewall"
+          },
+          "resolution": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolution",
+            "description": "Image resolution variant selector (e.g. 1024x1024)"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 32
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality",
+            "description": "Image quality variant selector (e.g. standard/hd)"
+          },
+          "is_estimated": {
+            "type": "boolean",
+            "title": "Is Estimated",
+            "description": "True when these quantities are SDK-side estimates rather than provider-reported measurements (count-provenance marker).",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "MediaUsage",
+        "description": "Observable non-text billing quantities, measured inside the SDK firewall.\n\nBilling rule: the SDK sends EVERY observable billing basis it can measure\nfrom the request/response \u2014 WITHOUT ever reading prompt\nor media content \u2014 and the SERVER's pricing-card unit (matched against the\ndataset card's ``PriceVariant`` grid) selects WHICH single quantity prices\nthe call. A quantity is ``None`` when it is unobservable for that call \u2014\nnever zero-as-default \u2014 so an unpriceable call routes to the server's\n``is_unpriced`` lane instead of being billed as zero.\n\nWhy this model exists: OpenAI-compatible/Together image endpoints return\n``usage: null``, so token counts are absent; for those calls these\nrequest-derived quantities are the ONLY billing signal (verified against live\nresponses, 2026-07-10)."
+      },
+      "ProviderName": {
+        "type": "string",
+        "enum": [
+          "openai",
+          "anthropic",
+          "google",
+          "bedrock",
+          "xai",
+          "deepseek",
+          "mistral",
+          "qwen",
+          "groq",
+          "together",
+          "fireworks",
+          "perplexity",
+          "azure_openai",
+          "openrouter",
+          "zai",
+          "ollama",
+          "vllm",
+          "lmstudio",
+          "openai_compatible"
+        ],
+        "title": "ProviderName",
+        "description": "Supported LLM provider identifiers.\n\nThe first four are native API dialects (Bedrock's Converse API is its\nown dialect). The rest are OpenAI-compatible providers: they speak the\nChat Completions dialect but are distinct providers for attribution,\npricing, budget enforcement, and circuit breaking. ``OPENAI_COMPATIBLE``\nis the generic catch-all for any unrecognized OpenAI-compatible endpoint\n(custom proxies, new vendors).\n\nWire contract: these values ride MetadataEvent/BudgetCheckRequest/\nBudgetConfirmRequest. The Cloud API must accept every value here BEFORE\nan SDK carrying it is released (API deploys first) \u2014 keep lock-step with\nthe SDK's vendored ``solwyn._types.ProviderName``."
+      },
+      "RateLimitErrorResponse": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          },
+          "retry_after": {
+            "type": "integer",
+            "title": "Retry After"
+          }
+        },
+        "type": "object",
+        "required": ["detail", "retry_after"],
+        "title": "RateLimitErrorResponse",
+        "description": "429 body shared by ingest and budget-plane admission; the SDK parses it."
+      },
+      "ReadOnlyKeyErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "read_only_key",
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": ["code", "message"],
+        "title": "ReadOnlyKeyErrorDetail"
+      },
+      "ReadOnlyKeyErrorResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ReadOnlyKeyErrorDetail"
+          }
+        },
+        "type": "object",
+        "required": ["detail"],
+        "title": "ReadOnlyKeyErrorResponse"
+      },
+      "RunControlDirective": {
+        "properties": {
+          "version": {
+            "type": "string",
+            "const": "1",
+            "title": "Version"
+          },
+          "action": {
+            "type": "string",
+            "const": "terminate",
+            "title": "Action"
+          },
+          "agent_run_id": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Agent Run Id"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["version", "action", "agent_run_id", "reason"],
+        "title": "RunControlDirective",
+        "description": "Versioned server instruction to terminate one agent run."
+      },
+      "StringDetailErrorResponse": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": ["detail"],
+        "title": "StringDetailErrorResponse"
+      },
+      "TokenDetails": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "description": "Total input tokens (normalized)",
+            "default": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "description": "Total output tokens (normalized)",
+            "default": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Cached Input Tokens",
+            "description": "Input tokens served from prompt cache",
+            "default": 0
+          },
+          "cache_creation_5m_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Cache Creation 5M Tokens",
+            "description": "Anthropic ephemeral_5m_input_tokens \u2014 cache write with 5-minute TTL.",
+            "default": 0
+          },
+          "cache_creation_1h_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Cache Creation 1H Tokens",
+            "description": "Anthropic ephemeral_1h_input_tokens \u2014 cache write with 1-hour TTL.",
+            "default": 0
+          },
+          "reasoning_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Reasoning Tokens",
+            "description": "Tokens used for chain-of-thought / thinking",
+            "default": 0
+          },
+          "audio_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Audio Input Tokens",
+            "description": "Audio input tokens (OpenAI)",
+            "default": 0
+          },
+          "audio_output_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Audio Output Tokens",
+            "description": "Audio output tokens (OpenAI)",
+            "default": 0
+          },
+          "image_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Image Input Tokens",
+            "description": "Image input tokens \u2014 a SUBSET of input_tokens (mirrors reasoning \u2282 output). OpenAI Images/Responses report image_tokens inside input_tokens_details; documented, not validator-enforced.",
+            "default": 0
+          },
+          "image_output_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Image Output Tokens",
+            "description": "Image output tokens \u2014 a SUBSET of output_tokens (mirrors reasoning \u2282 output). Generated-image tokens reported in the output channel; documented, not validator-enforced.",
+            "default": 0
+          },
+          "accepted_prediction_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Accepted Prediction Tokens",
+            "description": "Predicted output tokens accepted (OpenAI)",
+            "default": 0
+          },
+          "rejected_prediction_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Rejected Prediction Tokens",
+            "description": "Predicted output tokens rejected (OpenAI)",
+            "default": 0
+          },
+          "tool_use_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Tool Use Input Tokens",
+            "description": "Tokens used for tool/function definitions (Google)",
+            "default": 0
+          },
+          "is_estimated": {
+            "type": "boolean",
+            "title": "Is Estimated",
+            "description": "True when the provider returned no usage data and these counts are SDK-side length-based estimates (explicit degradation marker \u2014 the API can surface estimated costs distinctly). False for provider-reported counts. Wire shape: the SDK OMITS the key when False, so key-absent means provider-reported.",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "TokenDetails",
+        "description": "Normalized token usage breakdown for one LLM call.\n\nProvider adapters populate whichever fields their API exposes; the rest\nstay at 0.  The API uses this struct to compute exact costs rather than\ntrusting SDK-side estimates.\n\nNormalization contract: ``input_tokens`` includes uncached input, cached\ninput reads, and cache-creation writes.  PricingService subtracts cached\nbuckets from ``input_tokens`` to derive uncached input, so provider adapters\nmust not send \"uncached only\" input totals.\n\nNesting contract: ``image_input_tokens`` is a SUBSET of ``input_tokens`` and\n``image_output_tokens`` a SUBSET of ``output_tokens`` (probed live 2026-07-10:\nan images.edit response reported input_tokens=222 with image_tokens=194 in\n``input_tokens_details``). These mirror the existing ``reasoning_tokens`` \u2282\n``output_tokens`` relationship \u2014 DOCUMENTED semantics, NOT validator-enforced\n(reasoning is likewise unenforced). The only enforced subset invariant is the\ncache-bucket one below; image tokens deliberately do not participate in it."
+      },
+      "UnknownModelError422Response": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/UnknownModelErrorDetail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["detail"],
+        "title": "UnknownModelError422Response",
+        "description": "OpenAPI envelope for the unknown-model 422 response."
+      },
+      "UnknownModelErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "unknown_model",
+            "title": "Code",
+            "default": "unknown_model"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["model", "provider", "message"],
+        "title": "UnknownModelErrorDetail",
+        "description": "Body of a 422 raised when Solwyn has no pricing for the served model."
+      },
+      "UntrackedSurfaceAccepted": {
+        "properties": {
+          "accepted": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Accepted",
+            "description": "Number of reports received and accepted for processing. An idempotent transport replay may already be durable and therefore not increment stored occurrences or observers. Persisted occurrence totals are advisory approximations and are never billing truth."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["accepted"],
+        "title": "UntrackedSurfaceAccepted",
+        "description": "Receipt for advisory signals whose stored occurrence totals are approximate."
+      },
+      "UntrackedSurfaceReport": {
+        "properties": {
+          "provider": {
+            "$ref": "#/components/schemas/ProviderName"
+          },
+          "client_shape": {
+            "type": "string",
+            "enum": [
+              "openai_sdk",
+              "native_together",
+              "anthropic_sdk",
+              "google_generativeai",
+              "google_genai",
+              "bedrock_boto3",
+              "bedrock_aioboto3"
+            ],
+            "title": "Client Shape"
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["sync", "async"],
+            "title": "Mode"
+          },
+          "surface": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,7}$",
+            "title": "Surface"
+          },
+          "rule_kind": {
+            "type": "string",
+            "enum": ["unmetered_spend", "unknown"],
+            "title": "Rule Kind"
+          },
+          "capability_scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["operation", "client", "resource", "raw_response", "arbitrary_endpoint"]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability Scope"
+          },
+          "posture": {
+            "type": "string",
+            "enum": ["warn", "allow"],
+            "title": "Posture"
+          },
+          "occurrences": {
+            "type": "integer",
+            "maximum": 1000000000.0,
+            "minimum": 1.0,
+            "title": "Occurrences"
+          },
+          "first_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "First Seen At"
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Last Seen At"
+          },
+          "sdk_instance_id": {
+            "type": "string",
+            "maxLength": 100,
+            "title": "Sdk Instance Id"
+          },
+          "report_id": {
+            "type": "string",
+            "maxLength": 36,
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "title": "Report Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "provider",
+          "client_shape",
+          "mode",
+          "surface",
+          "rule_kind",
+          "posture",
+          "occurrences",
+          "first_seen_at",
+          "last_seen_at",
+          "sdk_instance_id",
+          "report_id"
+        ],
+        "title": "UntrackedSurfaceReport",
+        "description": "Content-free SDK observation for a provider surface Solwyn does not meter."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

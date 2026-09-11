@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a reproducible problem with the Solwyn TypeScript SDK
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve `@solwyn/sdk`.
+
+        Do not include API keys, credentials, prompt or response content, sensitive tags,
+        customer/account identifiers, or private URLs. Replace them with synthetic values.
+
+        **Do not report a security vulnerability here.** Follow the repository's
+        [Security Policy](https://github.com/solwyn-ai/solwyn-typescript-sdk/security/policy).
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem in one sentence without including sensitive data.
+      placeholder: A wrapped streaming call settles usage twice after cancellation.
+    validations:
+      required: true
+
+  - type: input
+    id: sdk_version
+    attributes:
+      label: SDK version
+      description: Provide the exact installed `@solwyn/sdk` version, not a range or dist-tag.
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Sanitized environment
+      description: Include Node.js, package-manager, TypeScript, module format, OS/runtime, and relevant provider-SDK versions. Remove usernames and filesystem paths.
+      placeholder: |
+        Node.js: 22.x
+        Package manager: pnpm 10.x
+        TypeScript: 5.x
+        Module format: ESM
+        Runtime/OS: Linux
+        Provider package: openai 6.x
+    validations:
+      required: true
+
+  - type: input
+    id: surface
+    attributes:
+      label: Provider and SDK surface
+      description: Name the provider and method or entry point, but do not include request content.
+      placeholder: OpenAI-compatible chat.completions.create via @solwyn/sdk
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include only sanitized error types and messages.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal sanitized reproduction
+      description: Prefer an offline reproduction using `@solwyn/sdk/testing` and a provider-shaped fake. Replace all content and identifiers with synthetic placeholders.
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or additional context
+      description: Optional. Remove secrets, request/response content, sensitive tags, account data, private URLs, and personal paths before pasting.
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed secrets, prompt/response content, sensitive tags, customer/account data, private URLs, and personal paths.
+          required: true
+        - label: This report is not a security vulnerability.
+          required: true

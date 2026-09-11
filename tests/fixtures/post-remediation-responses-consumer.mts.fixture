@@ -1,0 +1,124 @@
+import { Solwyn } from "@solwyn/sdk";
+import OpenAI from "openai";
+import { zodTextFormat } from "openai/helpers/zod";
+import type {
+  ParsedResponse,
+  ResponseCreatedEvent,
+  ResponseStreamEvent,
+} from "openai/resources/responses/responses";
+import { z } from "zod";
+
+const raw = new OpenAI({ apiKey: "offline" });
+const client = new Solwyn(raw, {
+  apiKey: `sk_proj_${"a".repeat(64)}`,
+});
+const helper = client.responses.stream({
+  model: "gpt-test",
+  input: [],
+  text: { format: zodTextFormat(z.object({ count: z.number() }), "counter") },
+});
+const ended: boolean = helper.ended;
+const errored: boolean = helper.errored;
+const aborted: boolean = helper.aborted;
+const final: Promise<ParsedResponse<{ count: number }>> = helper.finalResponse();
+const events: AsyncIterable<ResponseStreamEvent> = helper;
+const listener = (event: { sequence_number: number }) => {
+  void event.sequence_number;
+};
+const fluent: typeof helper = helper
+  .on("response.created", listener)
+  .off("response.created", listener)
+  .once("end", () => {});
+helper.on("response.output_text.delta", (event) => {
+  const delta: string = event.delta;
+  void delta;
+});
+const received: Promise<ResponseStreamEvent> = helper.emitted("event");
+client.responses.stream({ response_id: "resp_test", starting_after: 1 }, { timeout: 100 });
+// @ts-expect-error Native events stay closed.
+helper.on("invented-event", () => {});
+// @ts-expect-error Parsed results retain the native schema relationship.
+const wrong: Promise<ParsedResponse<{ count: string }>> = helper.finalResponse();
+// @ts-expect-error Native request constraints remain enforced.
+client.responses.stream({ model: "gpt-test", stream: false });
+void [ended, errored, aborted, final, events, fluent, received, wrong];
+
+// @ts-expect-error Provider-internal emission is not part of the deferred helper.
+helper._emit("end");
+helper
+  .on("end", () => {})
+  .off("end", () => {})
+  .once("end", () => {})
+  // @ts-expect-error Fluent subscriptions cannot recover unsupported native internals.
+  ._emit("end");
+const fluentFinal: Promise<ParsedResponse<{ count: number }>> = helper
+  .on("end", () => {})
+  .finalResponse();
+void fluentFinal;
+
+const iterator: AsyncIterator<ResponseStreamEvent> = helper[Symbol.asyncIterator]();
+const typedCreated: Promise<ResponseCreatedEvent> = helper.emitted("response.created");
+helper.on("response.output_text.delta", (event) => {
+  const snapshot: string = event.snapshot;
+  void snapshot;
+});
+async function consume() {
+  for await (const event of helper) {
+    const native: ResponseStreamEvent = event;
+    void native;
+  }
+}
+void [iterator, typedCreated, consume];
+
+// Compare every installed-native event callback and emitted result, including
+// native delta snapshots and the distinct error/abort payload classes.
+import type { ResponseStream } from "openai/lib/responses/ResponseStream";
+
+declare const nativeHelper: ResponseStream<{ count: number }>;
+type Equal<Left, Right> =
+  (<T>() => T extends Left ? 1 : 2) extends <T>() => T extends Right ? 1 : 2 ? true : false;
+type EventNames = Parameters<typeof nativeHelper.on>[0];
+type NativeCallbacks = { [Event in EventNames]: Parameters<typeof nativeHelper.on<Event>>[1] };
+type WrappedCallbacks = { [Event in EventNames]: Parameters<typeof helper.on<Event>>[1] };
+type NativeEmitted = { [Event in EventNames]: ReturnType<typeof nativeHelper.emitted<Event>> };
+type WrappedEmitted = { [Event in EventNames]: ReturnType<typeof helper.emitted<Event>> };
+const sameCallbacks: Equal<NativeCallbacks, WrappedCallbacks> = true;
+const sameEmitted: Equal<NativeEmitted, WrappedEmitted> = true;
+const sameKeys: Equal<keyof typeof helper, Exclude<keyof typeof nativeHelper, "_emit">> = true;
+void [sameCallbacks, sameEmitted, sameKeys];
+
+declare const selected: "response.created" | "response.completed";
+const createdListener = (event: ResponseCreatedEvent) => {
+  void event.sequence_number;
+};
+nativeHelper.on(selected, createdListener);
+helper.on(selected, createdListener);
+function subscribe<Event extends EventNames>(event: Event, listener: NativeCallbacks[Event]) {
+  const chained: typeof helper = helper
+    .on(event, listener)
+    .off(event, listener)
+    .once(event, listener);
+  const emitted: ReturnType<typeof nativeHelper.emitted<Event>> = helper.emitted(event);
+  return { chained, emitted };
+}
+void subscribe;
+
+import type { ExtractParsedContentFromParams } from "openai/lib/ResponsesParser";
+import type { ResponseStreamParams } from "openai/lib/responses/ResponseStream";
+
+function generic<Params extends ResponseStreamParams>(body: Params) {
+  const native = raw.responses.stream(body).finalResponse();
+  const result = client.responses
+    .stream(body)
+    .on("end", () => {})
+    .finalResponse();
+  const nativeShape: typeof native = result;
+  const wrappedShape: typeof result = native;
+  const expected: Promise<ParsedResponse<ExtractParsedContentFromParams<Params>>> = result;
+  return [nativeShape, wrappedShape, expected];
+}
+const explicitParams = { model: "gpt-test", input: [] };
+const explicit: Promise<ParsedResponse<{ counter: number }>> = client.responses
+  .stream<typeof explicitParams, { counter: number }>(explicitParams)
+  .finalResponse();
+void [generic, explicit];

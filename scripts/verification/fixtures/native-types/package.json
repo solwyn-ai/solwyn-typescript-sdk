@@ -1,0 +1,13 @@
+{
+  "name": "@solwyn/verification-native-types",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.123.0",
+    "openai": "6.45.0",
+    "typescript-current": "npm:typescript@6.0.3",
+    "typescript-floor": "npm:typescript@5.8.3",
+    "zod": "4.4.3"
+  }
+}

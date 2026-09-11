@@ -1,0 +1,226 @@
+{
+  "fingerprints": [
+    {
+      "client_shape": "anthropic_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "@anthropic-ai/sdk",
+          "version": "0.30.0"
+        }
+      ],
+      "namespace_count": 54,
+      "observation_count": 57,
+      "provider": "anthropic",
+      "shape_key": "anthropic-native",
+      "structural_interval": "floor",
+      "structure_sha256": "5357a9435312e236bc3c0f14c31eaf841ec879d91ae030b45fa9d1c8d5cbfe29",
+      "variant": "native"
+    },
+    {
+      "client_shape": "anthropic_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "@anthropic-ai/sdk",
+          "version": "0.123.0"
+        }
+      ],
+      "namespace_count": 54,
+      "observation_count": 308,
+      "provider": "anthropic",
+      "shape_key": "anthropic-native",
+      "structural_interval": "latest",
+      "structure_sha256": "cf2e6e421c52671cda3dbd7a543c72b6decd09dddbbc4be31c989f95786d96ed",
+      "variant": "native"
+    },
+    {
+      "client_shape": "bedrock_v3",
+      "command_class_count": 2,
+      "distributions": [
+        {
+          "name": "@aws-sdk/client-bedrock-runtime",
+          "version": "3.422.0"
+        }
+      ],
+      "namespace_count": 0,
+      "observation_count": 4,
+      "provider": "bedrock",
+      "shape_key": "bedrock-v3",
+      "structural_interval": "floor",
+      "structure_sha256": "b356f03a5a4b67d013e0090b34a51b1136915e2b9ac9cf65ad24a80cce9ce355",
+      "variant": "native"
+    },
+    {
+      "client_shape": "bedrock_v3",
+      "command_class_count": 11,
+      "distributions": [
+        {
+          "name": "@aws-sdk/client-bedrock-runtime",
+          "version": "3.1124.0"
+        }
+      ],
+      "namespace_count": 0,
+      "observation_count": 6,
+      "provider": "bedrock",
+      "shape_key": "bedrock-v3",
+      "structural_interval": "latest",
+      "structure_sha256": "88e2bfa33896ec2940f2d5d088774c2793ef448791ea9354028d1a6d0b699d94",
+      "variant": "native"
+    },
+    {
+      "client_shape": "google_genai",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "@google/genai",
+          "version": "0.3.1"
+        }
+      ],
+      "namespace_count": 31,
+      "observation_count": 236,
+      "provider": "google",
+      "shape_key": "google-genai",
+      "structural_interval": "floor",
+      "structure_sha256": "5e123f2af1aeb0864970948c21839871b182654db7c3572732ede6db78651907",
+      "variant": "native"
+    },
+    {
+      "client_shape": "google_genai",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "@google/genai",
+          "version": "2.20.0"
+        }
+      ],
+      "namespace_count": 31,
+      "observation_count": 628,
+      "provider": "google",
+      "shape_key": "google-genai",
+      "structural_interval": "latest",
+      "structure_sha256": "afb41d4932c31d941afefc491cc5b61928ed63f01a37de70033b99d25fa47624",
+      "variant": "native"
+    },
+    {
+      "client_shape": "google_generativeai",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "@google/generative-ai",
+          "version": "0.24.1"
+        }
+      ],
+      "namespace_count": 0,
+      "observation_count": 3,
+      "provider": "google",
+      "shape_key": "google-generativeai",
+      "structural_interval": "latest",
+      "structure_sha256": "ecb860e109c876bb1d2b138ccf9161f02feffaaca1378dee434a7605f8ee09e0",
+      "variant": "native"
+    },
+    {
+      "client_shape": "openai_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "openai",
+          "version": "4.41.0"
+        }
+      ],
+      "namespace_count": 95,
+      "observation_count": 150,
+      "provider": "azure_openai",
+      "shape_key": "openai-azure",
+      "structural_interval": "floor",
+      "structure_sha256": "6e5c54983ee90daed89f2ebc936ea729e413185219053c90d2118b5e3dd8afe6",
+      "variant": "azure"
+    },
+    {
+      "client_shape": "openai_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "openai",
+          "version": "6.45.0"
+        }
+      ],
+      "namespace_count": 95,
+      "observation_count": 424,
+      "provider": "azure_openai",
+      "shape_key": "openai-azure",
+      "structural_interval": "latest",
+      "structure_sha256": "5352b8adfdfffc993026c5b55f7d451f97eb6a3a6fb38ffe572813afc84fd042",
+      "variant": "azure"
+    },
+    {
+      "client_shape": "openai_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "openai",
+          "version": "4.41.0"
+        }
+      ],
+      "namespace_count": 95,
+      "observation_count": 149,
+      "provider": "openai",
+      "shape_key": "openai-native",
+      "structural_interval": "floor",
+      "structure_sha256": "1e49f1f14ade581d45c725eecdc6b441bd8c7af1dd507e0dc9182594739996d2",
+      "variant": "native"
+    },
+    {
+      "client_shape": "openai_sdk",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "openai",
+          "version": "6.45.0"
+        }
+      ],
+      "namespace_count": 95,
+      "observation_count": 422,
+      "provider": "openai",
+      "shape_key": "openai-native",
+      "structural_interval": "latest",
+      "structure_sha256": "36e43a69d637111ecad9fd2bc7d61dcf6b5b9c465de702ce38c5bc3414dfa59b",
+      "variant": "native"
+    },
+    {
+      "client_shape": "native_together",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "together-ai",
+          "version": "0.16.0"
+        }
+      ],
+      "namespace_count": 46,
+      "observation_count": 79,
+      "provider": "together",
+      "shape_key": "together-native",
+      "structural_interval": "floor",
+      "structure_sha256": "04696583bc1b9d770971b349f9360350aa8f6dd739ab26b7e1e081e037099907",
+      "variant": "native"
+    },
+    {
+      "client_shape": "native_together",
+      "command_class_count": 0,
+      "distributions": [
+        {
+          "name": "together-ai",
+          "version": "0.50.0"
+        }
+      ],
+      "namespace_count": 47,
+      "observation_count": 236,
+      "provider": "together",
+      "shape_key": "together-native",
+      "structural_interval": "latest",
+      "structure_sha256": "c58b02f334b9b794c832df9132796412afa5440edbd8d7b0aecb39a057d1c672",
+      "variant": "native"
+    }
+  ],
+  "schema_version": 1
+}

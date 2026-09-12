@@ -147,7 +147,7 @@
     "@types/json-schema": "7.0.15",
     "@types/node": "^26.1.0",
     "ai": "7.0.14",
-    "esbuild": "0.27.7",
+    "esbuild": "0.28.1",
     "openai": "6.45.0",
     "together-ai": "0.50.0",
     "tsup": "^8.5.1",

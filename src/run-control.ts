@@ -4,6 +4,12 @@
  * The registered-symbol slot keeps ESM and CJS copies on one exact-ID registry.
  * Bounded registry entries may be forgotten, while active stream handles retain
  * their immutable first winner until explicit release.
+ *
+ * Active streams share termination authority through one epoch per clear
+ * generation rather than per-handle cells: every handle acquired since the
+ * run's last clear reads the same epoch, so acquire, release and stop are O(1)
+ * regardless of how many streams one run has open. A clear installs a fresh
+ * epoch and leaves the old one frozen for the streams that still hold it.
  */
 
 import type { RunStoppedSource } from "./errors";
@@ -50,17 +56,44 @@ export interface TerminationHandle {
   release(): void;
 }
 
-interface TerminationHandleCell {
-  readonly runId: string;
+/**
+ * Termination authority shared by every watcher of one clear generation.
+ *
+ * Only a group's current epoch is ever written: a stop latches the first winner
+ * while it has owners. A clear replaces the group's epoch instead of mutating
+ * it, so a superseded epoch is frozen by construction. When the last current
+ * owner releases a latched epoch, the group moves to a fresh epoch of the same
+ * generation, so a later stream re-seeds from the bounded registry rather than
+ * inheriting a winner that no live stream still owns.
+ */
+interface Epoch {
   readonly generation: number;
   termination: RunTermination | undefined;
-  released: boolean;
+  owners: number;
 }
 
+/**
+ * Live watcher ownership for one run ID. `members` counts every live handle
+ * across all generations so the group is dropped exactly when its last handle
+ * releases; `epoch.owners` alone bounds the current winner's lifetime.
+ */
 interface ActiveHandleGroup {
-  generation: number;
+  epoch: Epoch;
   observedAt: number | undefined;
-  readonly handles: Set<TerminationHandleCell>;
+  members: number;
+}
+
+/**
+ * One handle's ownership record and the finalizer's held value. It never
+ * references the handle shell, which stays the registration target. A released
+ * handle keeps the winner it held at release instead of following its epoch.
+ */
+interface HandleOwnership {
+  readonly runId: string;
+  readonly group: ActiveHandleGroup;
+  readonly epoch: Epoch;
+  released: boolean;
+  releasedTermination: RunTermination | undefined;
 }
 
 interface RunControlState {
@@ -72,11 +105,6 @@ interface RunControlState {
 
 interface GlobalWithRunControl {
   [RUN_CONTROL_KEY]?: RunControlState;
-}
-
-interface FinalizerHeldValue {
-  readonly runId: string;
-  readonly cell: TerminationHandleCell;
 }
 
 const defaultNow = (): number => performance.now();
@@ -101,29 +129,26 @@ function state(): RunControlState {
   return created;
 }
 
+function freshEpoch(generation: number): Epoch {
+  return { generation, termination: undefined, owners: 0 };
+}
+
+/** Return a winner only from the active group's current clear epoch. */
 function activeGroupTermination(
   group: ActiveHandleGroup | undefined,
   source?: RunStoppedSource,
 ): RunTermination | undefined {
-  if (group === undefined) {
-    return undefined;
-  }
-  for (const handle of group.handles) {
-    const termination = handle.termination;
-    if (
-      handle.generation === group.generation &&
-      termination !== undefined &&
-      (source === undefined || termination.source === source)
-    ) {
-      return termination;
-    }
+  const termination = group?.epoch.termination;
+  if (termination !== undefined && (source === undefined || termination.source === source)) {
+    return termination;
   }
   return undefined;
 }
 
+/** Fence obsolete sibling winners; the old epoch stays with the handles that hold it. */
 function advanceActiveGeneration(group: ActiveHandleGroup | undefined): void {
   if (group !== undefined) {
-    group.generation += 1;
+    group.epoch = freshEpoch(group.epoch.generation + 1);
     group.observedAt = undefined;
   }
 }
@@ -152,23 +177,32 @@ function trimRegistry(shared: RunControlState): void {
   }
 }
 
-function releaseCell(runId: string, cell: TerminationHandleCell): void {
-  if (cell.released) {
+function releaseOwnership(ownership: HandleOwnership): void {
+  if (ownership.released) {
     return;
   }
-  cell.released = true;
-  const group = state().activeHandles.get(runId);
-  if (group === undefined || !group.handles.delete(cell)) {
+  ownership.released = true;
+  ownership.releasedTermination = ownership.epoch.termination;
+  const shared = state();
+  const { runId, group, epoch } = ownership;
+  // Group identity is the fence: after a test reset, a late release or
+  // finalizer for a replaced group must never account against its successor.
+  if (shared.activeHandles.get(runId) !== group) {
     return;
   }
-  if (group.handles.size === 0) {
-    state().activeHandles.delete(runId);
+  group.members -= 1;
+  if (epoch === group.epoch) {
+    epoch.owners -= 1;
+    if (epoch.owners === 0 && epoch.termination !== undefined) {
+      group.epoch = freshEpoch(epoch.generation);
+    }
+  }
+  if (group.members === 0) {
+    shared.activeHandles.delete(runId);
   }
 }
 
-const handleFinalizer = new FinalizationRegistry<FinalizerHeldValue>(({ runId, cell }) => {
-  releaseCell(runId, cell);
-});
+const handleFinalizer = new FinalizationRegistry<HandleOwnership>(releaseOwnership);
 
 /**
  * Record a stop and return both its preserved first winner and this mark's stamp.
@@ -193,10 +227,11 @@ export function markTerminatedWithObservation(
   installExact(shared, runId, termination, observedAt);
   if (group !== undefined) {
     group.observedAt = observedAt;
-    for (const handle of group.handles) {
-      if (handle.generation === group.generation && handle.termination === undefined) {
-        handle.termination = termination;
-      }
+    // One write latches every current-generation watcher. An ownerless epoch
+    // never gains a winner that no live stream could hold.
+    const epoch = group.epoch;
+    if (epoch.owners > 0 && epoch.termination === undefined) {
+      epoch.termination = termination;
     }
   }
 
@@ -213,7 +248,7 @@ export function acquireTerminationHandle(runId: string): TerminationHandle {
   const shared = state();
   let group = shared.activeHandles.get(runId);
   if (group === undefined) {
-    group = { generation: 0, observedAt: undefined, handles: new Set() };
+    group = { epoch: freshEpoch(0), observedAt: undefined, members: 0 };
     shared.activeHandles.set(runId, group);
   }
 
@@ -221,31 +256,39 @@ export function acquireTerminationHandle(runId: string): TerminationHandle {
   if (termination !== undefined && group.observedAt === undefined) {
     group.observedAt = shared.observedAt.get(runId) ?? termination.atMonotonic;
   }
-  const cell: TerminationHandleCell = {
+  const epoch = group.epoch;
+  if (epoch.termination === undefined) {
+    epoch.termination = termination;
+  }
+  epoch.owners += 1;
+  group.members += 1;
+  const ownership: HandleOwnership = {
     runId,
-    generation: group.generation,
-    termination,
+    group,
+    epoch,
     released: false,
+    releasedTermination: undefined,
   };
-  group.handles.add(cell);
 
   let handle: TerminationHandle;
   handle = Object.freeze({
     runId,
-    generation: cell.generation,
+    generation: epoch.generation,
     get termination(): RunTermination | undefined {
-      return cell.termination;
+      return ownership.released ? ownership.releasedTermination : epoch.termination;
     },
     check(): RunTermination | undefined {
-      return cell.termination;
+      return ownership.released ? ownership.releasedTermination : epoch.termination;
     },
     release(): void {
       handleFinalizer.unregister(handle);
-      releaseCell(runId, cell);
+      releaseOwnership(ownership);
     },
   });
-  // The group retains only `cell`; the finalized target is the returned handle shell.
-  handleFinalizer.register(handle, { runId, cell }, handle);
+  // Neither the group nor the held value references the handle shell, which is
+  // the finalized target; the per-handle `released` flag makes an explicit
+  // release racing the finalizer idempotent.
+  handleFinalizer.register(handle, ownership, handle);
   return handle;
 }
 

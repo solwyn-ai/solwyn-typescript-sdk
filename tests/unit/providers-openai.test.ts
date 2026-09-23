@@ -911,10 +911,79 @@ describe("OpenAIResponsesStreamAccumulator", () => {
     expect(details.output_tokens).toBe(200);
   });
 
+  it("an all-zero usage event still wins over an earlier non-zero one", () => {
+    const acc = new OpenAIResponsesStreamAccumulator();
+    acc.observe({ response: { usage: { input_tokens: 5, output_tokens: 6 } } });
+    acc.observe({ response: { usage: { input_tokens: 0, output_tokens: 0 } } });
+    expect(acc.finalize()).toEqual(zeroTokenDetails());
+  });
+
   it("does not confuse a top-level chat-shaped usage for a Responses event (needs response.usage)", () => {
     const acc = new OpenAIResponsesStreamAccumulator();
     // A chat-shaped chunk (top-level usage, no nested response) is not a Responses event.
     acc.observe({ usage: { prompt_tokens: 5, completion_tokens: 7 } });
     expect(acc.finalize()).toEqual(buildTokenDetails({ is_estimated: true }));
   });
+});
+describe("OpenAI stream accumulators keep only the terminal usage projection", () => {
+  const overlong = "t".repeat(SERVICE_TIER_MAX_LENGTH + 20);
+  const cases = [
+    {
+      name: "chat",
+      create: (logger: Logger) => new OpenAIStreamAccumulator(logger),
+      carrier: (fields: Record<string, unknown>) => fields,
+      usage: (input: number) => ({ prompt_tokens: input, completion_tokens: 1 }),
+    },
+    {
+      name: "responses",
+      create: (logger: Logger) => new OpenAIResponsesStreamAccumulator(logger),
+      carrier: (fields: Record<string, unknown>) => ({ response: fields }),
+      usage: (input: number) => ({ input_tokens: input, output_tokens: 1 }),
+    },
+  ] as const;
+
+  for (const { name, create, carrier, usage } of cases) {
+    it(`${name}: the tier comes from the last usage-bearing carrier, not a later usage-less one`, () => {
+      const acc = create(fakeLogger());
+      acc.observe(carrier({ usage: usage(1), service_tier: "flex" }));
+      acc.observe(carrier({ usage: usage(2), service_tier: "priority" }));
+      acc.observe(carrier({ usage: null, service_tier: "default" }));
+      expect(acc.getServiceTier()).toBe("priority");
+      expect(acc.finalize().input_tokens).toBe(2);
+    });
+
+    it(`${name}: a later usage-bearing carrier without a tier clears the earlier tier`, () => {
+      const acc = create(fakeLogger());
+      acc.observe(carrier({ usage: usage(1), service_tier: "flex" }));
+      acc.observe(carrier({ usage: usage(2) }));
+      expect(acc.getServiceTier()).toBeNull();
+    });
+
+    it(`${name}: truncates an over-long tier and warns once per getServiceTier call`, () => {
+      const logger = fakeLogger();
+      const acc = create(logger);
+      acc.observe(carrier({ usage: usage(1), service_tier: overlong }));
+      acc.observe(carrier({ usage: usage(2), service_tier: overlong }));
+      expect(logger.warnings).toHaveLength(0);
+      expect(acc.getServiceTier()).toBe("t".repeat(SERVICE_TIER_MAX_LENGTH));
+      expect(logger.warnings).toHaveLength(1);
+      expect(acc.getServiceTier()).toBe("t".repeat(SERVICE_TIER_MAX_LENGTH));
+      expect(logger.warnings).toHaveLength(2);
+    });
+
+    it(`${name}: an unreadable tier degrades to null and an unreadable usage to estimated zeros`, () => {
+      const acc = create(fakeLogger());
+      const fields = {
+        get usage(): unknown {
+          throw new Error("unreadable");
+        },
+        get service_tier(): unknown {
+          throw new Error("unreadable");
+        },
+      };
+      acc.observe(name === "chat" ? fields : { response: fields });
+      expect(acc.finalize()).toEqual(buildTokenDetails({ is_estimated: true }));
+      expect(acc.getServiceTier()).toBeNull();
+    });
+  }
 });

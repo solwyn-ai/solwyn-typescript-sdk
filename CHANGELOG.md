@@ -79,6 +79,13 @@ corresponding release notes before users upgrade.
 - **Lower per-event CPU for Azure OpenAI Responses streams.** The OpenAI-compatible length
   estimator no longer throws and discards an internal `TypeError` for every Responses stream
   event, which has no `choices`. Settlement is unchanged.
+- **Wrapped streams no longer keep completed response payloads or request messages
+  reachable.** A held OpenAI stream now retains only the terminal usage block and service tier,
+  not the whole terminal chunk or Responses snapshot (with its generated output and echoed
+  instructions and tools). A held Google stream releases its buffered first chunk once it is
+  delivered or the stream is closed. An unfinished wrapped stream no longer keeps the request's
+  messages and options alive. Delivered events, settlement, and
+  `responses.stream().finalResponse()` are unchanged.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

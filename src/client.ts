@@ -3261,6 +3261,18 @@ export class SolwynCore {
         () => adapter.extractRegion(runtime.sdkClient),
         this.#logger,
       );
+      // The stream callbacks below outlive this frame for as long as the caller holds the
+      // stream, so they close over only what settlement reads — never `ctx`, whose caller
+      // kwargs, passthrough arguments and request defaults carry the request content.
+      const settlement: StreamSettlementContext = {
+        surface: ctx.surface,
+        callId: ctx.callId,
+        run: ctx.run,
+        estimatedInputTokens: ctx.estimatedInputTokens,
+        velocityFlags: ctx.velocityFlags,
+        funding: ctx.funding,
+        primaryDialect: ctx.primaryDialect,
+      };
       // Cross-dialect: translate each raw served chunk to the caller's dialect (the
       // accumulator still observes the RAW served chunk, so usage settles against what was
       // served). Same-dialect: null → strict passthrough (translator never invoked).
@@ -3270,7 +3282,7 @@ export class SolwynCore {
             try {
               return translation.translateStreamChunk({
                 served: adapter.dialect,
-                requested: ctx.primaryDialect,
+                requested: settlement.primaryDialect,
                 chunk: rawChunk,
               });
             } catch (error) {
@@ -3294,10 +3306,10 @@ export class SolwynCore {
           try {
             let settledTokenDetails = tokenDetails;
             let usageUnmeasured = tokenDetails.is_estimated;
-            if (ctx.surface === "responses") {
+            if (settlement.surface === "responses") {
               if (tokenDetails.input_tokens === 0 && tokenDetails.output_tokens === 0) {
                 settledTokenDetails = buildTokenDetails({
-                  input_tokens: ctx.estimatedInputTokens,
+                  input_tokens: settlement.estimatedInputTokens,
                   output_tokens: 0,
                   is_estimated: true,
                 });
@@ -3312,38 +3324,38 @@ export class SolwynCore {
               () => accumulator.getServiceTier(),
               this.#logger,
             );
-            const event = this.#buildSuccessEvent(ctx, hop, {
+            const event = this.#buildSuccessEvent(settlement, hop, {
               tokenDetails: settledTokenDetails,
               latencyMs: elapsedMs,
               serviceTier,
               region,
             });
-            if (hasSettlementFunding(ctx.funding)) {
+            if (hasSettlementFunding(settlement.funding)) {
               // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
               // reportSettlement — the same queue path used by buffered settlement (behavior 26).
               this.#settlePaidCall(event, {
-                reservationId: ctx.funding.reservationId,
-                leaseId: ctx.funding.leaseId,
-                leaseClaimToken: ctx.funding.leaseClaimToken,
+                reservationId: settlement.funding.reservationId,
+                leaseId: settlement.funding.leaseId,
+                leaseClaimToken: settlement.funding.leaseClaimToken,
                 model: hop.model,
                 tokenDetails: settledTokenDetails,
                 provider: hop.provider,
                 isProviderFallback: hop.isProviderFallback,
-                callId: ctx.callId,
+                callId: settlement.callId,
                 providerRegion: region,
                 serviceTier,
-                ...(ctx.surface === "responses" || usageUnmeasured
+                ...(settlement.surface === "responses" || usageUnmeasured
                   ? { floorAtReservation: usageUnmeasured }
                   : {}),
               });
             } else {
               this.#reporter.report(event);
             }
-            if (ctx.funding.leaseId === null) {
-              this.#releaseFunding(ctx.callId, ctx.funding);
+            if (settlement.funding.leaseId === null) {
+              this.#releaseFunding(settlement.callId, settlement.funding);
             }
           } catch (error) {
-            this.#releaseFunding(ctx.callId, ctx.funding);
+            this.#releaseFunding(settlement.callId, settlement.funding);
             throw error;
           }
         },
@@ -3356,14 +3368,14 @@ export class SolwynCore {
             const usage = extractUsageFailSoft({
               extract: () => accumulator.finalize(),
               estimate: () => null,
-              estimatedInputTokens: ctx.estimatedInputTokens,
+              estimatedInputTokens: settlement.estimatedInputTokens,
               logger: this.#logger,
             });
             const serviceTier = safeExtractServiceTier(
               () => accumulator.getServiceTier(),
               this.#logger,
             );
-            const event = this.#baseEvent(ctx, hop, {
+            const event = this.#baseEvent(settlement, hop, {
               status: "error",
               inputTokens: usage.tokenDetails.input_tokens,
               outputTokens: usage.tokenDetails.output_tokens,
@@ -3373,18 +3385,18 @@ export class SolwynCore {
               region,
               failoverErrorClass: safeErrorClassName(error),
               possiblySucceeded: null,
-              velocityFlags: ctx.velocityFlags,
+              velocityFlags: settlement.velocityFlags,
             });
-            if (hasSettlementFunding(ctx.funding)) {
+            if (hasSettlementFunding(settlement.funding)) {
               this.#settlePaidCall(event, {
-                reservationId: ctx.funding.reservationId,
-                leaseId: ctx.funding.leaseId,
-                leaseClaimToken: ctx.funding.leaseClaimToken,
+                reservationId: settlement.funding.reservationId,
+                leaseId: settlement.funding.leaseId,
+                leaseClaimToken: settlement.funding.leaseClaimToken,
                 model: hop.model,
                 tokenDetails: usage.tokenDetails,
                 provider: hop.provider,
                 isProviderFallback: hop.isProviderFallback,
-                callId: ctx.callId,
+                callId: settlement.callId,
                 providerRegion: region,
                 serviceTier,
                 floorAtReservation: usage.usageUnmeasured,
@@ -3392,7 +3404,8 @@ export class SolwynCore {
             } else {
               this.#reporter.report(event);
             }
-            if (ctx.funding.leaseId === null) this.#releaseFunding(ctx.callId, ctx.funding);
+            if (settlement.funding.leaseId === null)
+              this.#releaseFunding(settlement.callId, settlement.funding);
             return;
           }
           try {
@@ -3403,10 +3416,10 @@ export class SolwynCore {
               admission,
             );
             this.#reporter.report(
-              this.#buildStreamErrorEvent(ctx, hop, nowMs() - hopStarted, region),
+              this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
             );
           } finally {
-            this.#releaseFunding(ctx.callId, ctx.funding);
+            this.#releaseFunding(settlement.callId, settlement.funding);
           }
         },
         chunkTranslator,
@@ -3429,7 +3442,7 @@ export class SolwynCore {
                   );
                 this.#reporter.report(
                   this.#buildErrorEvent(
-                    ctx,
+                    settlement,
                     hop,
                     error,
                     nowMs() - hopStarted,
@@ -3438,7 +3451,7 @@ export class SolwynCore {
                   ),
                 );
               } finally {
-                this.#releaseFunding(ctx.callId, ctx.funding);
+                this.#releaseFunding(settlement.callId, settlement.funding);
               }
             })
           : wrapStream(streamOptions);
@@ -3543,7 +3556,7 @@ export class SolwynCore {
   }
 
   #buildSuccessEvent(
-    ctx: DispatchContext,
+    ctx: EventContext,
     hop: HopAttribution,
     result: {
       tokenDetails: TokenDetails;
@@ -3610,7 +3623,7 @@ export class SolwynCore {
    * `possiblySucceeded` is `true` ONLY on the not-failed-over post-send-ambiguous abort (#25).
    */
   #buildErrorEvent(
-    ctx: DispatchContext,
+    ctx: EventContext,
     hop: HopAttribution,
     error: unknown,
     latencyMs: number,
@@ -3639,7 +3652,7 @@ export class SolwynCore {
    * health-signal class name — matches Python's stream `on_error`, F9).
    */
   #buildStreamErrorEvent(
-    ctx: DispatchContext,
+    ctx: EventContext,
     hop: HopAttribution,
     latencyMs: number,
     region: string | null,
@@ -3658,7 +3671,7 @@ export class SolwynCore {
   }
 
   #baseEvent(
-    ctx: DispatchContext,
+    ctx: EventContext,
     hop: HopAttribution,
     fields: {
       status: MetadataEvent["status"];
@@ -3839,6 +3852,16 @@ interface DispatchContext {
   bufferedSettlementComplete?: boolean;
 }
 
+/** The fields event building reads from a {@link DispatchContext}. */
+type EventContext = Pick<DispatchContext, "callId" | "run" | "velocityFlags">;
+
+/**
+ * What a returned stream's settlement callbacks may retain from its {@link DispatchContext}:
+ * estimates, funding, call identity, surface and the primary dialect, but no request content.
+ */
+type StreamSettlementContext = EventContext &
+  Pick<DispatchContext, "surface" | "estimatedInputTokens" | "funding" | "primaryDialect">;
+
 interface AdmissionContext {
   readonly callId: string;
   readonly run: AttributionSnapshot | undefined;
@@ -3975,26 +3998,45 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
  * materialized stream still releases the real provider connection exactly once — the
  * {@link StreamWrapper}'s close-forwarding reaches THIS object's `aclose`. Ports
  * `client.py::_MaterializedAsyncStream`.
+ *
+ * The buffered first chunk is owned only until it is handed out: the generator yields it
+ * through {@link MaterializedAsyncStream.#takeFirst} (never via a local, which the
+ * suspended generator frame would keep alive mid-stream), and `aclose()` drops it when
+ * the stream is closed before its first iteration, so a held handle never keeps the
+ * delivered or undelivered chunk reachable.
  */
 class MaterializedAsyncStream implements AsyncIterable<unknown> {
-  readonly #first: unknown;
+  #first: unknown;
+  #firstPending: boolean;
   readonly #original: unknown;
   readonly #iterator: AsyncIterator<unknown>;
-  readonly #empty: boolean;
   #closed = false;
 
   constructor(first: unknown, original: unknown, iterator: AsyncIterator<unknown>, empty: boolean) {
     this.#first = first;
+    this.#firstPending = !empty;
     this.#original = original;
     this.#iterator = iterator;
-    this.#empty = empty;
+  }
+
+  /** Hand out the buffered first chunk exactly once and release this object's reference. */
+  #takeFirst(): unknown {
+    const first = this.#first;
+    this.#first = undefined;
+    this.#firstPending = false;
+    return first;
+  }
+
+  #dropFirst(): void {
+    this.#first = undefined;
+    this.#firstPending = false;
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<unknown> {
-    if (this.#empty) {
+    if (!this.#firstPending) {
       return;
     }
-    yield this.#first;
+    yield this.#takeFirst();
     // Drain the REMAINING items from the iterator already advanced by one in
     // `materializeStream` — never re-iterate the source (that would re-establish / double-emit).
     while (true) {
@@ -4008,6 +4050,7 @@ class MaterializedAsyncStream implements AsyncIterable<unknown> {
 
   /** Close the already-open native iterator once; legacy adapters fall back to source close. */
   async aclose(): Promise<void> {
+    this.#dropFirst();
     if (this.#closed) return;
     this.#closed = true;
     if (typeof this.#iterator.return === "function") {

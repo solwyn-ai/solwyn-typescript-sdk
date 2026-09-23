@@ -133,7 +133,11 @@ function extractResponsesApi(usage: unknown): TokenDetails {
  *   4. else → estimated zeros.
  */
 export function extractOpenAIUsage(response: unknown): TokenDetails {
-  const usage = getProp(response, "usage");
+  return extractUsageBlock(getProp(response, "usage"));
+}
+
+/** Shape-detect and extract one already-read `usage` block (see {@link extractOpenAIUsage}). */
+function extractUsageBlock(usage: unknown): TokenDetails {
   if (usage === undefined || usage === null) {
     return buildReportedTokenDetails({});
   }
@@ -157,15 +161,31 @@ export function extractServiceTier(
   response: unknown,
   logger: Logger = consoleLogger,
 ): string | null {
-  const tier = getProp(response, "service_tier");
+  const tier = boundServiceTier(getProp(response, "service_tier"));
+  if (tier.truncated) warnServiceTierTruncated(logger);
+  return tier.value;
+}
+
+/** A bounded tier label plus whether bounding truncated it (the warning is the caller's). */
+interface BoundedServiceTier {
+  readonly value: string | null;
+  readonly truncated: boolean;
+}
+
+const NO_SERVICE_TIER: BoundedServiceTier = { value: null, truncated: false };
+
+function boundServiceTier(tier: unknown): BoundedServiceTier {
   if (typeof tier !== "string") {
-    return null;
+    return NO_SERVICE_TIER;
   }
   if (tier.length > SERVICE_TIER_MAX_LENGTH) {
-    logger.warn(`openai: service_tier exceeds ${SERVICE_TIER_MAX_LENGTH} characters; truncating`);
-    return tier.slice(0, SERVICE_TIER_MAX_LENGTH);
+    return { value: tier.slice(0, SERVICE_TIER_MAX_LENGTH), truncated: true };
   }
-  return tier;
+  return { value: tier, truncated: false };
+}
+
+function warnServiceTierTruncated(logger: Logger): void {
+  logger.warn(`openai: service_tier exceeds ${SERVICE_TIER_MAX_LENGTH} characters; truncating`);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,16 +195,20 @@ export function extractServiceTier(
 /**
  * Accumulates OpenAI streaming usage. Constructed fresh per streaming call.
  *
- * State is a single "last usage-bearing chunk observed" reference. Non-usage chunks
- * are skipped without clearing it (last-usage-wins). `finalize`/`getServiceTier`
- * delegate to the same extractors the non-streaming path uses.
+ * State is the `usage` block and the bounded `service_tier` label of the last
+ * usage-bearing chunk observed, never the chunk itself, so a caller holding a completed
+ * stream does not keep its payload reachable. Non-usage chunks are skipped without
+ * clearing it (last-usage-wins). `finalize`/`getServiceTier` apply the same extraction
+ * the non-streaming path uses, and a truncated tier warns once per `getServiceTier` call.
  *
  * CONCURRENCY: one instance must never be shared across two concurrent stream reads
  * (a single async consumer of one stream's chunks is the only supported driver).
  */
 export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
-  /** Last chunk that carried a non-null `usage`; `null` means none seen yet. */
-  #lastUsageChunk: unknown = null;
+  /** `usage` of the last usage-bearing chunk; `null` until one is observed. */
+  #usage: unknown = null;
+  /** Bounded `service_tier` read off that same chunk. */
+  #serviceTier: BoundedServiceTier = NO_SERVICE_TIER;
   readonly #logger: Logger;
 
   constructor(logger: Logger = consoleLogger) {
@@ -192,25 +216,27 @@ export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
   }
 
   observe(chunk: unknown): void {
+    // Presence (not truthiness) of a non-null usage block selects the chunk, so an
+    // all-zero usage still wins.
     const usage = getProp(chunk, "usage");
-    if (usage !== undefined && usage !== null) {
-      this.#lastUsageChunk = chunk;
-    }
+    if (usage === undefined || usage === null) return;
+    this.#usage = usage;
+    this.#serviceTier = boundServiceTier(getProp(chunk, "service_tier"));
   }
 
   finalize(): TokenDetails {
-    if (this.#lastUsageChunk === null) {
-      return buildReportedTokenDetails({});
-    }
-    return extractOpenAIUsage(this.#lastUsageChunk);
+    return extractUsageBlock(this.#usage);
   }
 
   getServiceTier(): string | null {
-    if (this.#lastUsageChunk === null) {
-      return null;
-    }
-    return extractServiceTier(this.#lastUsageChunk, this.#logger);
+    return settledServiceTier(this.#serviceTier, this.#logger);
   }
+}
+
+/** The retained tier label, warning (once per call) when bounding truncated it. */
+function settledServiceTier(tier: BoundedServiceTier, logger: Logger): string | null {
+  if (tier.truncated) warnServiceTierTruncated(logger);
+  return tier.value;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,17 +257,19 @@ export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
  * `response.usage` wins, mirroring {@link OpenAIStreamAccumulator}'s last-usage-wins rule
  * one level down.
  *
- * Both usage and service-tier extraction delegate to the shared extractors by handing
- * them the captured `response` object (which exposes `.usage` and `.service_tier` exactly
- * like a non-streaming Responses-API response), so the Responses-API branch of
- * {@link extractOpenAIUsage} settles the terminal chunk with no duplicated field mapping.
+ * The nested `response` exposes `.usage` and `.service_tier` exactly like a non-streaming
+ * Responses-API response, so the same projection as {@link OpenAIStreamAccumulator} applies
+ * one level down and the Responses-API branch of {@link extractOpenAIUsage} settles
+ * it with no duplicated field mapping. The snapshot itself is never retained.
  *
  * CONCURRENCY: one instance must never be shared across two concurrent stream reads (a
  * single async consumer of one stream's events is the only supported driver).
  */
 export class OpenAIResponsesStreamAccumulator implements StreamUsageAccumulator {
-  /** The `response` object off the last event that carried a non-null `usage`; `null` if none. */
-  #lastResponse: unknown = null;
+  /** `response.usage` of the last usage-bearing event; `null` until one is observed. */
+  #usage: unknown = null;
+  /** Bounded `response.service_tier` read off that same event. */
+  #serviceTier: BoundedServiceTier = NO_SERVICE_TIER;
   readonly #logger: Logger;
 
   constructor(logger: Logger = consoleLogger) {
@@ -252,24 +280,20 @@ export class OpenAIResponsesStreamAccumulator implements StreamUsageAccumulator 
     // A Responses stream event nests the response snapshot under `response`; only the
     // terminal events populate its `usage`. Presence (not truthiness) of a non-null usage
     // block selects the usage-bearing event, so a `usage` present but all-zero still wins.
+    // Only that usage block and tier label are kept: the snapshot also carries generated
+    // output and echoed instructions and tools.
     const response = getProp(chunk, "response");
     const usage = getProp(response, "usage");
-    if (usage !== undefined && usage !== null) {
-      this.#lastResponse = response;
-    }
+    if (usage === undefined || usage === null) return;
+    this.#usage = usage;
+    this.#serviceTier = boundServiceTier(getProp(response, "service_tier"));
   }
 
   finalize(): TokenDetails {
-    if (this.#lastResponse === null) {
-      return buildReportedTokenDetails({});
-    }
-    return extractOpenAIUsage(this.#lastResponse);
+    return extractUsageBlock(this.#usage);
   }
 
   getServiceTier(): string | null {
-    if (this.#lastResponse === null) {
-      return null;
-    }
-    return extractServiceTier(this.#lastResponse, this.#logger);
+    return settledServiceTier(this.#serviceTier, this.#logger);
   }
 }

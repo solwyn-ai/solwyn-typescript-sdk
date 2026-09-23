@@ -18,6 +18,12 @@ corresponding release notes before users upgrade.
   starts on the following timer turn instead of after the flush interval.
 - `close()` no longer evicts ready metadata events from a full queue while a delivery round that
   was already in flight finishes.
+- Clients dropped without `close()` no longer keep their provider, timers and heartbeats alive.
+  Once such a client's queued confirmations and events are delivered, its wrapped provider, lease
+  state and background reporter can be garbage-collected, its flush timer and provider-breaker
+  heartbeats stop, and it leaves the Node exit registry. A client constructed inside `run()` no
+  longer keeps that run alive. Reuse one client and `close()` it at shutdown: that remains the
+  supported lifecycle.
 
 ### Changed
 

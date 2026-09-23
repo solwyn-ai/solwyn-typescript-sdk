@@ -37,6 +37,7 @@ import {
   ORDINARY_TOKEN_COUNT_MAX,
   ReceiptFoldState,
 } from "./receipt-fold";
+import { runOutsideRun } from "./run-context";
 import {
   BUDGET_CONFIRM_PATH,
   type FetchLike,
@@ -82,6 +83,35 @@ const BREAKER_REPORT_TIMEOUT_MS = 5000;
 const NODE_REPORTER_REGISTRATION = Symbol.for("@solwyn/sdk/node-reporter-registration");
 
 type BreakerSnapshot = readonly [provider: string, state: CircuitBreakerState];
+
+/**
+ * Reporters that currently own queued, in-flight or retry work, unlogged drops or an
+ * active breaker cycle. This set is the only strong root the flush cadence needs: an
+ * idle reporter's pending tick holds it through a WeakRef, so a client dropped
+ * without close() is collected (and its cadence stops) once its work is delivered.
+ */
+const reportersWithWork = new Set<MetadataReporter>();
+
+/** The flush tick's reference to its reporter: weak where WeakRef exists, else strong. */
+type TickTarget =
+  | { readonly weak: WeakRef<MetadataReporter> }
+  | { readonly strong: MetadataReporter };
+
+/**
+ * Arm one unref'd flush tick. Built at module level so the timer callback closes over
+ * nothing but `target`; a closure created inside the reporter would root it.
+ */
+function armFlushTick(target: TickTarget, ms: number): ReturnType<typeof setTimeout> {
+  const timer = setTimeout(() => {
+    const reporter = "weak" in target ? target.weak.deref() : target.strong;
+    reporter?._tick();
+  }, ms);
+  // The flush cadence must never keep the Node event loop alive on its own: a process
+  // that never calls close() must still be able to exit. `unref` is Node-only; web/edge
+  // timers lack it, so the optional call is a no-op there.
+  (timer as { unref?: () => void })?.unref?.();
+  return timer;
+}
 
 export type SendOutcome = "sent" | "held" | "retry" | "dropped";
 export type IngestRejectionKind = "clean" | "exact" | "legacy" | "malformed";
@@ -379,8 +409,10 @@ export class MetadataReporter {
   private deliveryClosed = false;
   private readonly deliveryAbortController = new AbortController();
   private closeDeadline: number | null = null;
-  private loopPromise: Promise<void> | null = null;
-  private wakeLoop: (() => void) | null = null;
+  private loopStarted = false;
+  private tickTarget: TickTarget | null = null;
+  private tickTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeRound: Promise<void> | null = null;
   private breakerProjectId: string | null = null;
   private activeBreakerCycle: Promise<void> | null = null;
   private activeBreakerAbortController: AbortController | null = null;
@@ -518,6 +550,7 @@ export class MetadataReporter {
     try {
       this.start();
       this._enqueue(event);
+      reportersWithWork.add(this);
     } catch {
       // Enqueue is deliberately nonthrowing. A start/scheduling failure is
       // contained by start() and does not prevent the item from being retained.
@@ -533,6 +566,7 @@ export class MetadataReporter {
     try {
       this.start();
       const evicted = this.confirmQueue.push(this._pendingConfirm(request));
+      reportersWithWork.add(this);
       if (evicted !== undefined) this._countDrop("confirm", "overflow");
     } catch (error) {
       this.logger.warn(`reporter.confirm_enqueue_failed: exc_type=${exceptionName(error)}`);
@@ -550,6 +584,7 @@ export class MetadataReporter {
     try {
       this.start();
       const evicted = this.settlementQueue.push({ confirm: this._pendingConfirm(request), event });
+      reportersWithWork.add(this);
       if (evicted !== undefined) {
         this._recordDrop("settlement_confirm", "overflow");
         this._moveEventToQueue(evicted.event, false);
@@ -1608,15 +1643,20 @@ export class MetadataReporter {
   // Lifecycle.
   // -------------------------------------------------------------------------
 
-  /** Begin the periodic flush loop. Idempotent while live; typed failure after close. */
+  /**
+   * Begin the periodic flush cadence. Idempotent while live; typed failure after close.
+   * The first tick is armed outside any active run, so the cadence never inherits and
+   * pins the run that happened to construct or first use this reporter.
+   */
   start(): void {
     if (this.shuttingDown) {
       throw new SolwynError("cannot start a closed MetadataReporter");
     }
-    if (this.loopPromise !== null) return;
-    this.loopPromise = this._runLoop().catch((error) => {
-      this._warnFlushScheduleFailure(error);
-    });
+    if (this.loopStarted) return;
+    this.loopStarted = true;
+    this.tickTarget =
+      typeof WeakRef === "function" ? { weak: new WeakRef(this) } : { strong: this };
+    runOutsideRun(() => this._armTick(false));
   }
 
   private _warnFlushScheduleFailure(error: unknown): void {
@@ -1625,51 +1665,70 @@ export class MetadataReporter {
     this.logger.warn("reporter.flush_schedule_failed: exc_type=%s", exceptionName(error));
   }
 
-  private async _runLoop(): Promise<void> {
-    let more = false;
-    while (!this.shuttingDown) {
-      // A quota-exhausted round continues on a zero-delay timer turn (never a
-      // microtask), so producers, close() and other timers still run between rounds.
-      await this._sleep(more ? 0 : this.flushInterval);
-      if (this.shuttingDown) {
-        break;
-      }
-      more = false;
-      try {
-        const round: FlushRound = { more: false };
-        await this._flushRemaining(undefined, false, round);
-        more = round.more;
-        if (this.shuttingDown) break;
-        if (this._breakerReportsDue()) void this._startBreakerCycle();
-      } catch (error) {
-        // A single flush failure is not a scheduler failure and must not kill
-        // cadence. The next tick gets an independent chance to make progress.
-        this.logger.warn("reporter.flush_cycle_failed: exc_type=%s", exceptionName(error));
-      }
+  /**
+   * Whether anything still needs this reporter to run: queued, in-hand or retrying
+   * items (retries stay queued with a future due time), counted drops not yet logged,
+   * retained receipt aggregates, or an active breaker cycle.
+   */
+  private _hasWork(): boolean {
+    return (
+      this.confirmQueue.length > 0 ||
+      this.settlementQueue.length > 0 ||
+      this.metadataQueue.length > 0 ||
+      this.inHandConfirms.size > 0 ||
+      this.inHandSettlements.size > 0 ||
+      this.inHandEventBatches.size > 0 ||
+      this.activeBreakerCycle !== null ||
+      !this.receiptFoldState.isEmpty ||
+      this._dropTotal() !== this.lastLoggedDropTotal
+    );
+  }
+
+  /**
+   * Arm the next tick. A quota-exhausted round continues on a zero-delay timer turn
+   * (never a microtask), so producers, close() and other timers still run between
+   * rounds. The reporter stays strongly held only while it has work; otherwise the
+   * tick holds it weakly and a reachable reporter keeps its cadence and heartbeat.
+   */
+  private _armTick(more: boolean): void {
+    const target = this.tickTarget;
+    if (this.shuttingDown || target === null) return;
+    if (more || this._hasWork()) reportersWithWork.add(this);
+    else reportersWithWork.delete(this);
+    try {
+      this.tickTimer = armFlushTick(target, more ? 0 : this.flushInterval);
+    } catch (error) {
+      // Queued items stay owned (and rooted) until close() delivers or counts them.
+      this._warnFlushScheduleFailure(error);
     }
   }
 
-  private _sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => {
-      try {
-        const timer = setTimeout(() => {
-          this.wakeLoop = null;
-          resolve();
-        }, ms);
-        // The flush loop must never keep the Node event loop alive on its own: a
-        // process that never calls close() must still be able to exit. `unref` is
-        // Node-only — web/edge timers lack it, so guard the optional call (no-op there).
-        (timer as { unref?: () => void })?.unref?.();
-        this.wakeLoop = () => {
-          clearTimeout(timer);
-          this.wakeLoop = null;
-          resolve();
-        };
-      } catch (error) {
-        this._warnFlushScheduleFailure(error);
-        throw error;
-      }
+  /** Timer entry point for one ordinary round. Internal: called only by the flush tick. */
+  _tick(): void {
+    this.tickTimer = null;
+    if (this.shuttingDown || this.activeRound !== null) return;
+    reportersWithWork.add(this);
+    const round = this._runRound().then((more) => {
+      this.activeRound = null;
+      // Once close() has begun it owns delivery and releases the root when it resolves.
+      if (!this.shuttingDown) this._armTick(more);
     });
+    this.activeRound = round;
+  }
+
+  private async _runRound(): Promise<boolean> {
+    try {
+      const round: FlushRound = { more: false };
+      await this._flushRemaining(undefined, false, round);
+      if (this.shuttingDown) return false;
+      if (this._breakerReportsDue()) void this._startBreakerCycle();
+      return round.more;
+    } catch (error) {
+      // A single flush failure is not a scheduler failure and must not kill
+      // cadence. The next tick gets an independent chance to make progress.
+      this.logger.warn("reporter.flush_cycle_failed: exc_type=%s", exceptionName(error));
+      return false;
+    }
   }
 
   private _effectiveDeadline(deadline?: number): number | null {
@@ -1784,21 +1843,30 @@ export class MetadataReporter {
     this.closePromise = shared;
     this.finalDeliveryStarted = true;
     this.shuttingDown = true;
+    // Close owns delivery from here: root the reporter until it resolves, then release.
+    reportersWithWork.add(this);
+    const release = (): void => {
+      reportersWithWork.delete(this);
+      resolveClose();
+    };
 
     let deadline: number;
     try {
       const budget = Number.isFinite(timeout) && timeout >= 0 ? timeout : 0;
       deadline = this.monotonicClock() + budget;
       this.closeDeadline = deadline;
-      this.wakeLoop?.();
-      void this._finishClose(deadline).then(resolveClose, () => {
+      if (this.tickTimer !== null) {
+        clearTimeout(this.tickTimer);
+        this.tickTimer = null;
+      }
+      void this._finishClose(deadline).then(release, () => {
         this._sealDelivery();
-        resolveClose();
+        release();
       });
     } catch {
       this.closeDeadline = Number.NEGATIVE_INFINITY;
       this._sealDelivery();
-      resolveClose();
+      release();
     }
     return shared;
   }
@@ -1806,8 +1874,8 @@ export class MetadataReporter {
   private async _finishClose(deadline: number): Promise<void> {
     // Stop cadence before final spend delivery. A stuck active send is advisory
     // here: the outer deadline wins and the in-hand token is sealed below.
-    const loop = this.loopPromise;
-    if (loop !== null) await this._awaitWithin(loop, deadline);
+    const round = this.activeRound;
+    if (round !== null) await this._awaitWithin(round, deadline);
     this.#takeFoldsFinal();
     if (!this._deadlineExpired(deadline)) {
       const finalFlush = this._flushRemaining(deadline, true);

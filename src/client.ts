@@ -348,6 +348,27 @@ function applyEventReceiptFields(event: MetadataEvent, fields: EventReceiptField
 
 type InspectValue = (value: unknown, options?: unknown) => string;
 
+// The two callbacks a core hands out are built here, outside the constructor. V8 gives
+// every closure created in one function a shared context, so a constructor-created
+// closure that used `this` would keep the core, its provider and its lease holder
+// reachable from any other callback created there (such as one the reporter's timer
+// can reach). Each factory closes over exactly the one value it needs.
+
+/** Node `util.inspect` hook that renders only the wrapped client. */
+function inspectHook(
+  client: unknown,
+): (depth: number, inspectOptions: unknown, inspectValue: InspectValue) => string {
+  return (_depth, inspectOptions, inspectValue) =>
+    `Solwyn(${inspectValue(client, inspectOptions)})`;
+}
+
+/** Breaker-snapshot supplier for the reporter; references the breaker registry only. */
+function breakerSnapshotSupplier(
+  breakers: CircuitBreakerManager,
+): () => ReturnType<CircuitBreakerManager["snapshots"]> {
+  return () => breakers.snapshots();
+}
+
 /**
  * A single fallback chain entry: `[client, model]`, `[client, model, defaultParams]`,
  * or `[client, model, defaultParams, providerOverride]`. Positional/arity-driven,
@@ -1052,13 +1073,12 @@ export class SolwynCore {
 
     this.#client = client;
     // Node's util.inspect may bypass a Proxy get trap and invoke the target hook with the
-    // proxy as `this`. An own arrow closes over this real core instance, keeping #client
-    // private-field access valid while using only the edge-safe global symbol key.
+    // proxy as `this`. An own hook bound to the wrapped client (not to `this`) stays
+    // valid for any receiver while using only the edge-safe global symbol key.
     Object.defineProperty(this, CUSTOM_INSPECT, {
       configurable: true,
       enumerable: false,
-      value: (_depth: number, inspectOptions: unknown, inspectValue: InspectValue): string =>
-        `Solwyn(${inspectValue(this.#client, inspectOptions)})`,
+      value: inspectHook(client),
       writable: false,
     });
     // Resolves defaults + env fallback and validates the api_key format. Throws
@@ -1106,6 +1126,18 @@ export class SolwynCore {
       logger: this.#logger,
     });
 
+    // Per-provider-NAME breaker registry (invariant 5). Thresholds/jitter flow from the
+    // resolved config; the config default jitter is 0.2 (breakers run jittered by
+    // default — see circuit-breaker.ts flag). One breaker is eagerly created per runtime
+    // in #buildInit; #getCircuitBreaker lazily returns the same instance thereafter.
+    // Built before the reporter, whose snapshot supplier references only this registry.
+    this.#breakers = new CircuitBreakerManager({
+      failureThreshold: this.#config.circuit_breaker_failure_threshold,
+      recoveryTimeout: this.#config.circuit_breaker_recovery_timeout,
+      successThreshold: this.#config.circuit_breaker_success_threshold,
+      recoveryTimeoutJitter: this.#config.circuit_breaker_recovery_timeout_jitter,
+    });
+
     this.#reporter = new MetadataReporter(this.#config.api_url, this.#config.api_key, {
       batchSize: this.#config.reporter_batch_size,
       flushInterval: this.#config.reporter_flush_interval * 1000,
@@ -1119,22 +1151,11 @@ export class SolwynCore {
       fetch: options.fetch,
       logger: this.#logger,
       controlPlaneBreaker: this.#controlPlaneBreaker,
-      breakerSnapshots: () => this.#breakers.snapshots(),
+      breakerSnapshots: breakerSnapshotSupplier(this.#breakers),
       sdkInstanceId: this.#sdkInstanceId,
       breakerReportingEnabled: this.#config.breaker_reporting_enabled,
     });
     this.#reporter.start();
-
-    // Per-provider-NAME breaker registry (invariant 5). Thresholds/jitter flow from the
-    // resolved config; the config default jitter is 0.2 (breakers run jittered by
-    // default — see circuit-breaker.ts flag). One breaker is eagerly created per runtime
-    // in #buildInit; #getCircuitBreaker lazily returns the same instance thereafter.
-    this.#breakers = new CircuitBreakerManager({
-      failureThreshold: this.#config.circuit_breaker_failure_threshold,
-      recoveryTimeout: this.#config.circuit_breaker_recovery_timeout,
-      successThreshold: this.#config.circuit_breaker_success_threshold,
-      recoveryTimeoutJitter: this.#config.circuit_breaker_recovery_timeout_jitter,
-    });
 
     // The pre-flight budget enforcer. Budget knobs (budget_mode, fail_open, cache TTL)
     // flow from SolwynOptions through the resolved config — validated once at

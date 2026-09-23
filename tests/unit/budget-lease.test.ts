@@ -2487,7 +2487,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
     expect(warnings.filter(({ message }) => message.startsWith("lease.uncounted_"))).toEqual([
       {
         message:
-          "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied for the next successful renewal to report (reason=%s)",
+          "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied; a successful renewal reports the tallies, otherwise they are aggregated into a local warning when the run ends (reason=%s)",
         args: ["grant_unreachable"],
       },
       {

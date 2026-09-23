@@ -9,6 +9,27 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
+  at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
+  by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
+  5xx answer), overflows the queue, or passes its deadline is dropped and counted, and the drops
+  are reported in aggregated `lease.surrenders_dropped` warnings, instead of being retried on
+  every call. The control plane settles spend from lease-tagged confirmations, so a dropped
+  surrender only delays the return of unspent reserved tokens until the lease expires.
+- **Surrender timeout retry.** Outside `close()`, a surrender that times out is now retried once,
+  immediately, within two seconds of being queued. Surrender answers with an HTTP status (4xx or
+  503) still count as control-plane reachability for the circuit breaker.
+- **Close drains through four workers.** `close()` now drains lease surrenders through four
+  workers within its existing one-second deadline, one attempt each, and logs how many were left
+  in a single `lease.close_release_summary` warning.
+- **Uncounted tallies of finished runs.** Uncounted fail-open tallies can be reported only on a
+  lease renewal, which a finished run never sends. They are now aggregated and logged in
+  `lease.uncounted_discarded` warnings (at most one every 30 seconds, repeated in the close
+  summary) instead of being retained indefinitely. The `lease.uncounted_entry` warning now says
+  so.
+
 ## [0.1.0-rc.1] — 2026-09-11
 
 Bootstrap release candidate for the initial public preview of a drop-in wrapper for an existing

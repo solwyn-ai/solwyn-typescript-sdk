@@ -230,6 +230,8 @@ export class LeaseLedger {
   readonly #callIndex = new Map<string, string>();
   readonly #callClaims = new Map<string, CallClaim>();
   readonly #callExpiries: Expiry[] = [];
+  /** Runs whose aged reservations a sweep released since the owner last took them. */
+  readonly #sweptRuns = new Set<string>();
   #nextClaimToken = 0;
   #nextLeaseIncarnation = 0;
   readonly #rng: LeaseLedgerOptions["rng"];
@@ -266,6 +268,30 @@ export class LeaseLedger {
   ): boolean {
     const state = this.#states.get(runId);
     return state?.leaseId === leaseId && state.generation === generation;
+  }
+  /** The run holding a live reservation for this call, if any. */
+  runIdForCall(callId: string): string | null {
+    return this.#callIndex.get(callId) ?? null;
+  }
+  /** Hand over (and forget) the runs whose reservations a sweep released. */
+  takeSweptRuns(): string[] {
+    if (this.#sweptRuns.size === 0) return [];
+    const runs = [...this.#sweptRuns];
+    this.#sweptRuns.clear();
+    return runs;
+  }
+  /** Uncounted fail-open tallies held by every state, e.g. before close drains them. */
+  uncountedTallies(): { runs: number; calls: number; tokens: number } {
+    let runs = 0;
+    let calls = 0;
+    let tokens = 0;
+    for (const state of this.#states.values()) {
+      if (state.uncountedCalls <= 0 && state.uncountedTokens <= 0) continue;
+      runs += 1;
+      calls += Math.max(0, state.uncountedCalls);
+      tokens += Math.max(0, state.uncountedTokens);
+    }
+    return { runs, calls, tokens };
   }
   activeRunIds(): string[] {
     return [...this.#states].flatMap(([runId, state]) => (state.hasLease ? [runId] : []));
@@ -460,6 +486,7 @@ export class LeaseLedger {
     this.#callIndex.clear();
     this.#callClaims.clear();
     this.#callExpiries.length = 0;
+    this.#sweptRuns.clear();
     return requests;
   }
   pendingRenewalSpendDeltas(): readonly PendingRenewalSpendDelta[] {
@@ -482,6 +509,7 @@ export class LeaseLedger {
     return Object.freeze(deltas);
   }
   onForkReset(): void {
+    this.#sweptRuns.clear();
     this.#states.clear();
     this.#callIndex.clear();
     this.#callClaims.clear();
@@ -527,8 +555,10 @@ export class LeaseLedger {
       const claim = this.#callClaims.get(expiry.callId);
       if (!claim || claim.token !== expiry.token || claim.createdAt + RESERVATION_MAX_AGE_S > now)
         continue;
-      if (this.#callIndex.has(expiry.callId)) {
+      const runId = this.#callIndex.get(expiry.callId);
+      if (runId !== undefined) {
         this.release(expiry.callId, { claimToken: expiry.token });
+        this.#sweptRuns.add(runId);
         swept++;
       }
       this.#callClaims.delete(expiry.callId);

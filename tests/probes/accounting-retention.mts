@@ -6,6 +6,7 @@ import { BudgetEnforcer } from "../../src/budget";
 import { BudgetExceededError } from "../../src/errors";
 import { LeaseLedger, type LeaseState } from "../../src/lease";
 import { createRun, currentRun, noopLogger, run, Solwyn } from "../../src/node";
+import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import type { FetchLike } from "../../src/transport";
 import type { LeaseGrantResponse } from "../../src/types";
 
@@ -16,6 +17,14 @@ async function collect(): Promise<void> {
     await setImmediate();
     forceGc?.();
   }
+  await setImmediate();
+}
+/** The enforcer's bounded surrender dispatcher (diagnostic counters only). */
+function releasesOf(budget: BudgetEnforcer): ReleaseDispatcher {
+  return (budget as unknown as { releases: ReleaseDispatcher }).releases;
+}
+async function releasesIdle(budget: BudgetEnforcer): Promise<void> {
+  await releasesOf(budget).whenIdle();
   await setImmediate();
 }
 const apiKey = `sk_proj_${"a".repeat(64)}`;
@@ -445,15 +454,20 @@ for (const ineligible of [false, true]) {
     await collect();
     assert.equal(
       f.refs.filter((ref) => ref.deref() !== undefined).length,
-      1,
-      "failed surrender must retain unreported spend",
+      0,
+      "a refused surrender is dropped with its advisory spend, not retained",
     );
+    await releasesIdle(f.budget);
+    assert.equal(f.counters.surrenders, 1);
+    assert.equal(releasesOf(f.budget).counts().dropped.refused, 1);
     f.setSurrenderFailure(false);
-    await f.call();
-    await collect();
-    assert.equal(f.refs.filter((ref) => ref.deref() !== undefined).length, 0);
-    assert.equal(f.counters.surrenderedSpend, 2);
-    results["failed_surrender_retains_spend"] = true;
+    for (let index = 0; index < 3; index++) await f.call();
+    await releasesIdle(f.budget);
+    assert.equal(f.counters.surrenders, 1, "a refused surrender is never relaunched");
+    assert.equal(f.counters.surrenderedSpend, 0, "no retry carries the dropped spend");
+    const counts = releasesOf(f.budget).counts();
+    assert.equal(counts.enqueued, counts.sent + counts.dropped.refused);
+    results["refused_surrender_dropped_and_counted"] = true;
   } finally {
     await f.close();
   }
@@ -593,6 +607,48 @@ for (const ineligible of [false, true]) {
     finishSurrender();
     await f.close();
   }
+}
+
+{
+  // An idle release dispatcher starts no timers and holds no pending work, so it cannot
+  // keep an unclosed enforcer reachable.
+  async function exercise(): Promise<WeakRef<BudgetEnforcer>> {
+    const enforcer = new BudgetEnforcer({
+      apiKey,
+      apiUrl: "https://accounting-retention.invalid",
+      fetch: async () => new Response(null, { status: 204 }),
+    });
+    const internal = enforcer as unknown as {
+      surrenderLateSuccessor(response: LeaseGrantResponse, spentTokens: number): void;
+    };
+    internal.surrenderLateSuccessor(
+      {
+        eligible: true,
+        allowed: true,
+        lease_id: "idle-late",
+        generation: 2,
+        granted_tokens: 2000,
+        refresh_interval_s: 300,
+        lease_length_s: 600,
+        headroom_share_tokens: 0,
+        posture: { mode: "hard_deny", on_unreachable: "local_enforce" },
+        final_grant: false,
+        project_id: projectId,
+        mode: "hard_deny",
+        budget_limit: 100,
+        current_usage: 0,
+        remaining_budget: 100,
+      },
+      3,
+    );
+    await releasesIdle(enforcer);
+    assert.equal(releasesOf(enforcer).counts().sent, 1);
+    return new WeakRef(enforcer);
+  }
+  const reference = await run("idle-dispatcher", () => exercise());
+  await collect();
+  assert.equal(reference.deref(), undefined, "an idle release dispatcher roots nothing");
+  results["idle_release_dispatcher"] = true;
 }
 
 process.stdout.write(`${JSON.stringify({ ok: true, results })}\n`);

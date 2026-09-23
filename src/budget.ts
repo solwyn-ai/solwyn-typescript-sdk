@@ -466,6 +466,8 @@ interface RenewalOperation {
   readonly originGeneration: number;
   readonly closeEpoch: number;
   readonly declaredModels: readonly string[];
+  /** Models a widening renewal adds to the lease; empty for an ordinary renewal. */
+  readonly wideningModels: readonly string[];
   readonly wire: Readonly<Record<string, unknown>>;
 }
 
@@ -1027,10 +1029,13 @@ export class BudgetEnforcer {
     let leaseCallId: string | null = null;
     let leaseClaimToken: number | null = null;
 
+    let widenAfterAllow = false;
+
     if (this.leaseEntryEligible(captured)) {
       leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
       let leaseAdmission = this.admitLease(captured, leaseCallId, null);
       leaseClaimToken = leaseAdmission.claimToken;
+      widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
 
       const immediate = this.localLeaseResult(captured, leaseAdmission);
       if (immediate !== null) {
@@ -1146,10 +1151,12 @@ export class BudgetEnforcer {
         }
 
         this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        return this.withLeaseClaim(
-          this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch),
-          leaseClaimToken,
-        );
+        const result = this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch);
+        // Only a live allow for this run widens; denied, unreadable and outage paths never do.
+        if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
+          this.scheduleWidening(captured);
+        }
+        return this.withLeaseClaim(result, leaseClaimToken);
       } finally {
         this.unregisterPendingOrderedRequest(requestDispatch);
       }
@@ -1273,7 +1280,41 @@ export class BudgetEnforcer {
       fallbackModels: captured.fallbackModels,
     });
     if (claimed === null) return;
+    this.launchRenewal(runId, captured, claimed, []);
+  }
 
+  /**
+   * After an allowed per-call check for a chain the lease does not declare, claim one background
+   * renewal that re-declares the call's full chain. The call keeps its per-call result; the lease
+   * covers the chain only once the renewal is applied. A skipped claim (worker cap, backoff, a
+   * renewal in flight) is retried by the next such call.
+   */
+  private scheduleWidening(captured: CapturedCheck): void {
+    const runId = captured.agentRunId;
+    if (runId === undefined || !this.leaseEntryEligible(captured)) return;
+    if (this.renewalOperations.size >= MAX_RENEWAL_OPERATIONS) {
+      this.logger.debug("lease.renew_worker_limit");
+      return;
+    }
+    const claimed = this.leaseLedger.claimWideningRequest(runId, {
+      now: this.monotonicNow() / 1000,
+      model: captured.model,
+      provider: captured.provider,
+      fallbackProviders: captured.fallbackProviders,
+      fallbackModels: captured.fallbackModels,
+    });
+    if (claimed === null) return;
+    this.logger.debug("lease.widen: added_models=%d", claimed.addedModels.length);
+    this.launchRenewal(runId, captured, claimed.request, claimed.addedModels);
+  }
+
+  /** Validate and launch one claimed renewal without awaiting it on the admission path. */
+  private launchRenewal(
+    runId: string,
+    captured: CapturedCheck,
+    claimed: LeaseRenewRequest,
+    wideningModels: readonly string[],
+  ): void {
     const originLeaseId = claimed.lease_id;
     const originGeneration = claimed.generation;
     const parsed = LeaseRenewRequestSchema.safeParse(claimed);
@@ -1297,6 +1338,7 @@ export class BudgetEnforcer {
       originGeneration,
       closeEpoch: this.closeEpoch,
       declaredModels: Object.freeze([captured.model, ...captured.fallbackModels]),
+      wideningModels,
       wire: Object.freeze(serializeLeaseRenewRequest(request)),
     });
 
@@ -1425,6 +1467,7 @@ export class BudgetEnforcer {
         declaredModels: operation.declaredModels,
         expectedLeaseId: operation.originLeaseId,
         expectedGeneration: operation.originGeneration,
+        wideningModels: operation.wideningModels,
       });
       if (outcome === GrantOutcome.Applied) {
         this.foldRunStateForAllow(projected, operation.runId, authorityDispatch.runDispatchedAt);
@@ -1452,6 +1495,9 @@ export class BudgetEnforcer {
         );
       } else if (outcome === GrantOutcome.Ineligible) {
         this.logger.debug("lease.renew_ineligible: reason=%s", ineligibleReason(effective));
+        if (operation.wideningModels.length > 0) {
+          this.logger.debug("lease.widen_refused: models=%d", operation.wideningModels.length);
+        }
         this.releaseRefusedLease(operation.runId);
       } else if (outcome === GrantOutcome.Stale) {
         this.failRenewal(operation.runId, operation.originLeaseId, operation.originGeneration);

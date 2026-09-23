@@ -37,6 +37,17 @@ corresponding release notes before users upgrade.
   still keeps the run on per-call checks. The `FakeControlPlane` test double in
   `@solwyn/sdk/testing` now accepts that release, at the generation held before an ineligible or
   denied renewal, as the control plane does, instead of answering 409.
+- **Run leases widen to newly used model chains.** A run lease used to cover only the model chain
+  of the run's first call, so every call on another model or fallback chain took a blocking
+  per-call budget check for the rest of the run. Now, after a per-call check allows a call whose
+  chain the lease does not cover, the SDK renews the lease in the background and re-declares that
+  call's full chain (model, provider and fallbacks); once the renewal is applied, later calls on
+  that chain use the lease. A denied, unreadable or unreachable check never widens the lease, and
+  tagged and media calls never do. If the control plane answers the widening renewal as
+  ineligible, the models it added are recorded for the run and never declared again: calls whose
+  chain names one of them keep per-call checks, and the rest of the run returns to the lease after
+  the SDK releases and re-acquires it. Widening to a more expensive model re-prices the lease for
+  every model in the run, so each model's token grant shrinks.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

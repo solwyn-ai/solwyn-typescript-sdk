@@ -154,6 +154,11 @@ export class LeaseState {
   onUnreachable: OnUnreachable = "fail_open";
   finalGrant = false;
   declaredModels = new Set<string>();
+  /**
+   * Models a widening renewal added and the control plane answered eligible:false. They belong to
+   * the run, outlive any lease, and are never declared again in a renewal or a grant.
+   */
+  readonly refusedModels = new Set<string>();
   readonly reservations = new Map<string, Reservation>();
   renewalInFlight = false;
   consecutiveFailures = 0;
@@ -195,6 +200,14 @@ export class LeaseState {
       fallbackModels.every((item) => this.declaredModels.has(item))
     );
   }
+
+  /** Whether the chain names a model a refused widening recorded for this run. */
+  refuses(model: string, fallbackModels: readonly string[]): boolean {
+    if (this.refusedModels.size === 0) return false;
+    return (
+      this.refusedModels.has(model) || fallbackModels.some((item) => this.refusedModels.has(item))
+    );
+  }
 }
 
 export interface LeaseLedgerOptions {
@@ -221,12 +234,26 @@ export interface ApplyGrantResponseOptions {
   declaredModels?: readonly string[];
   expectedLeaseId?: string | null;
   expectedGeneration?: number | null;
+  /** The models a widening renewal added; an eligible:false answer records them as refused. */
+  wideningModels?: readonly string[];
 }
 export interface RenewalOptions {
   model?: string | null;
   provider?: ProviderName | null;
   fallbackProviders?: readonly ProviderName[];
   fallbackModels?: readonly string[];
+}
+export interface WideningOptions {
+  now: number;
+  model: string;
+  provider: ProviderName;
+  fallbackProviders: readonly ProviderName[];
+  fallbackModels: readonly string[];
+}
+/** A claimed renewal that re-declares a call's chain, and the models it adds to the lease. */
+export interface WideningClaim {
+  readonly request: LeaseRenewRequest;
+  readonly addedModels: readonly string[];
 }
 export interface RenewalFailedOptions {
   now: number;
@@ -348,6 +375,13 @@ export class LeaseLedger {
       state.ineligibleRetryAt = 0;
       state.releasePending = null;
     }
+    if (state?.refuses(model, fallbackModels)) {
+      // Never declared again: no widening and no grant for a chain with a refused model.
+      return this.#admission(LeaseDecision.LegacyCheck, {
+        reason: "model_refused_for_lease",
+        claimToken: ownedClaimToken,
+      });
+    }
     if (state?.hasLease && !state.covers(model, fallbackModels)) {
       return this.#admission(LeaseDecision.LegacyCheck, {
         reason: "model_outside_declared_set",
@@ -372,7 +406,13 @@ export class LeaseLedger {
     response: LeaseGrantResponse,
     options: ApplyGrantResponseOptions,
   ): GrantOutcome {
-    const { now, declaredModels = [], expectedLeaseId, expectedGeneration } = options;
+    const {
+      now,
+      declaredModels = [],
+      expectedLeaseId,
+      expectedGeneration,
+      wideningModels = [],
+    } = options;
     let state = this.#states.get(runId);
     if (this.#originFenceRejects(state, expectedLeaseId, expectedGeneration)) {
       return GrantOutcome.Stale;
@@ -386,6 +426,7 @@ export class LeaseLedger {
         expectedGeneration !== null &&
         expectedGeneration !== undefined;
       const release = renewal ? this.#releaseRefusedLease(state) : null;
+      if (renewal) for (const model of wideningModels) state.refusedModels.add(model);
       this.#dropLease(state);
       this.#storeSnapshot(state, response);
       state.runIneligible = true;
@@ -658,6 +699,35 @@ export class LeaseLedger {
     const request = this.buildRenewalRequest(runId, options);
     if (request) state.renewalInFlight = true;
     return request;
+  }
+  /**
+   * Claim one out-of-cycle renewal that re-declares a call's full chain, after that call's
+   * per-call check allowed it. Applies the gates renewalDue applies to an ordinary renewal (a live
+   * lease with a positive grant, no renewal in flight, past any backoff, not a final grant), and
+   * never claims for a chain that is already covered or names a refused model.
+   */
+  claimWideningRequest(runId: string, options: WideningOptions): WideningClaim | null {
+    const { now, model, fallbackModels } = options;
+    const state = this.#states.get(runId);
+    if (
+      !state?.hasLease ||
+      state.runIneligible ||
+      state.renewalInFlight ||
+      state.finalGrant ||
+      state.grantedTokens <= 0 ||
+      now >= state.leaseDeadline ||
+      now < state.nextAttemptAt ||
+      state.refuses(model, fallbackModels)
+    )
+      return null;
+    const addedModels = [...new Set([model, ...fallbackModels])].filter(
+      (item) => !state.declaredModels.has(item),
+    );
+    if (addedModels.length === 0) return null;
+    const request = this.claimRenewalRequest(runId, options);
+    return request === null
+      ? null
+      : Object.freeze({ request, addedModels: Object.freeze(addedModels) });
   }
   buildSurrenderRequest(runId: string): LeaseSurrenderRequest | null {
     const state = this.#states.get(runId);

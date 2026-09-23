@@ -187,6 +187,12 @@ from a local run lease. That removes a control-plane round trip from most calls 
 live. Grants and renewals are generation-fenced; renewal is detached from the call path, and
 `close()` surrenders remaining authority best-effort after queued telemetry is flushed. Tagged
 calls, media calls, ineligible models, and calls outside a run keep the ordinary per-call check.
+A lease first covers the model chain of the call that acquired it. When a per-call check allows a
+call on a chain the lease does not cover, the SDK renews the lease in the background with that
+call's full chain (model, provider and fallbacks), and later calls on the chain use the lease.
+The control plane prices the widened lease at its most expensive model, so widening to a pricier
+model shrinks every model's grant. If it answers the widening as ineligible, the models it added
+stay on per-call checks for the rest of the run and are never declared again.
 If a grant is refused with 409, or a renewal comes back ineligible, the run uses per-call checks
 for at most 150 seconds; after an ineligible renewal the SDK releases its lease and acquires a
 new one as soon as the release is confirmed. An ineligible initial grant keeps the run on

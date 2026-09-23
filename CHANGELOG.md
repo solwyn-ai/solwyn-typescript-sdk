@@ -71,7 +71,14 @@ corresponding release notes before users upgrade.
   heartbeats stop, and it leaves the Node exit registry. A client constructed inside `run()` no
   longer keeps that run alive. Reuse one client and `close()` it at shutdown: that remains the
   supported lifecycle.
-
+- **Faster image translation for cross-dialect failover.** Byte-backed Bedrock images are now
+  Base64-encoded in bounded chunks (or with the runtime's native `Uint8Array.prototype.toBase64`
+  where available) instead of one string concatenation per byte. A 3 MiB image no longer blocks
+  the event loop for over 100 ms before the fallback request is dispatched. The encoded output
+  is unchanged.
+- **Lower per-event CPU for Azure OpenAI Responses streams.** The OpenAI-compatible length
+  estimator no longer throws and discards an internal `TypeError` for every Responses stream
+  event, which has no `choices`. Settlement is unchanged.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

@@ -423,6 +423,15 @@ export function measureOpenAIVideoMedia(kwargs: Record<string, unknown>): Comple
 }
 
 /**
+ * Whether `value` exposes an iterator method. Callers invoke it inside their own
+ * try/catch, so a hostile `Symbol.iterator` getter still lands in the never-raise path.
+ */
+function isIterable(value: unknown): value is Iterable<unknown> {
+  if (value === null || value === undefined) return false;
+  return typeof (value as { [Symbol.iterator]?: unknown })[Symbol.iterator] === "function";
+}
+
+/**
  * Length-only measurement of one OpenAI-dialect streaming delta chunk (the
  * missing-usage fallback accumulator for compat providers that never emit usage
  * mid-stream). Walks `chunk.choices`, summing `partTextLength(choice.delta)`.
@@ -437,7 +446,10 @@ export function estimateStreamChunkContentLength(chunk: unknown): number {
   let total = 0;
   try {
     const choices = getProp(chunk, "choices");
-    for (const choice of choices as Iterable<unknown>) {
+    // Responses events carry no `choices`: return without iterating, so the common
+    // shape never constructs (and discards) a not-iterable TypeError per event.
+    if (!isIterable(choices)) return total;
+    for (const choice of choices) {
       total += partTextLength(getProp(choice, "delta"));
     }
     return total;
@@ -456,7 +468,8 @@ export function estimateResponseContentLength(response: unknown): number {
   let total = 0;
   try {
     const choices = getProp(response, "choices");
-    for (const choice of choices as Iterable<unknown>) {
+    if (!isIterable(choices)) return total;
+    for (const choice of choices) {
       total += partTextLength(getProp(choice, "message"));
     }
     return total;

@@ -156,11 +156,32 @@ export function denormalizeFinishReason(
 // Base64 <-> bytes (edge-safe; atob/btoa are web-standard globals).
 // ---------------------------------------------------------------------------
 
+/**
+ * Fallback chunk length for {@link bytesToBase64}. A multiple of 3, so every non-final
+ * chunk encodes to unpadded Base64 and the joined chunks equal a single whole-buffer encode.
+ * Well under engine argument-count limits for `Function.prototype.apply`.
+ */
+const BASE64_CHUNK_BYTES = 24_576;
+
+/** `Uint8Array.prototype.toBase64` (ES2026), detected structurally on the instance. */
+interface NativeBase64Bytes extends Uint8Array {
+  toBase64(): string;
+}
+
+function hasNativeToBase64(bytes: Uint8Array): bytes is NativeBase64Bytes {
+  return typeof (bytes as { toBase64?: unknown }).toBase64 === "function";
+}
+
 export function bytesToBase64(bytes: Uint8Array | string): string {
   if (typeof bytes === "string") return btoa(bytes);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin);
+  if (hasNativeToBase64(bytes)) return bytes.toBase64();
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += BASE64_CHUNK_BYTES) {
+    const chunk = bytes.subarray(i, i + BASE64_CHUNK_BYTES);
+    // One binary-string build per chunk instead of one string concatenation per byte.
+    parts.push(btoa(String.fromCharCode.apply(null, chunk as unknown as number[])));
+  }
+  return parts.join("");
 }
 
 export function base64ToBytes(b64: string): Uint8Array {

@@ -9,6 +9,21 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Metadata ingestion no longer starves under sustained confirmation traffic. The background
+  reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
+  standalone confirmations and of settlements, then sends the metadata batches that were queued
+  when the round reached them. When a round stops at its quota with work still due, the next round
+  starts on the following timer turn instead of after the flush interval.
+- `close()` no longer evicts ready metadata events from a full queue while a delivery round that
+  was already in flight finishes.
+
+### Changed
+
+- `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
+  at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
+
 ## [0.1.0-rc.1] — 2026-09-11
 
 Bootstrap release candidate for the initial public preview of a drop-in wrapper for an existing

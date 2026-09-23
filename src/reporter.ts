@@ -66,7 +66,7 @@ const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 const DEFAULT_MAX_QUEUE_SIZE = 10_000;
 const DEFAULT_MAX_IN_FLIGHT = 3;
-/** Confirm and settlement queues are each bounded at this (not configurable). */
+/** Confirm and settlement queues are each bounded at this (not user-configurable). */
 const CONFIRM_SETTLEMENT_QUEUE_MAX = 1000;
 /** Consecutive confirm-POST failures before ERROR-level escalation. */
 const CONFIRM_FAILURE_THRESHOLD = 10;
@@ -238,6 +238,17 @@ interface ConfirmCycle {
     | null;
 }
 
+/** Out-parameter for one ordinary delivery round. */
+export interface FlushRound {
+  /** True only when a stage exhausted its turn with due work still queued. */
+  more: boolean;
+}
+
+interface EventStageResult {
+  readonly clean: boolean;
+  readonly more: boolean;
+}
+
 interface EventDispositionOptions {
   readonly emit?: boolean;
   readonly forceTerminal?: boolean;
@@ -259,7 +270,10 @@ export interface MetadataReporterOptions {
   flushInterval?: number;
   /** Metadata queue cap; drop-oldest on overflow (default 10_000). */
   maxQueueSize?: number;
-  /** Max concurrent in-flight batch sends (default 3). */
+  /**
+   * Accepted and retained, but currently has no effect: confirms and ingest
+   * batches are sent serially, one request at a time (default 3).
+   */
   maxInFlight?: number;
   /** Total send attempts before a retryable item is disposed (default 5). */
   maxSendAttempts?: number;
@@ -287,6 +301,8 @@ export interface MetadataReporterOptions {
   wallClock?: () => Date;
   /** Injectable monotonic millisecond clock for retry/lifecycle tests. */
   monotonicClock?: () => number;
+  /** Internal test seam for the confirm and settlement queue bound (default 1000). */
+  controlQueueMaxSize?: number;
 }
 
 /**
@@ -391,6 +407,7 @@ export class MetadataReporter {
     this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
     this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL_MS;
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
+    // Retained for configuration compatibility; delivery is serial and never reads it.
     this.maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
     this.maxSendAttempts = options.maxSendAttempts ?? 5;
     this.retryBackoffBase = options.retryBackoffBase ?? 1000;
@@ -401,6 +418,12 @@ export class MetadataReporter {
 
     const invalidPositiveInteger = (value: number): boolean =>
       !Number.isInteger(value) || !Number.isFinite(value) || value < 1;
+    const controlQueueMaxSize = options.controlQueueMaxSize ?? CONFIRM_SETTLEMENT_QUEUE_MAX;
+    if (invalidPositiveInteger(controlQueueMaxSize)) {
+      throw new ConfigurationError("controlQueueMaxSize must be an integer >= 1", {
+        field: "controlQueueMaxSize",
+      });
+    }
     if (invalidPositiveInteger(this.maxQueueSize)) {
       throw new ConfigurationError("maxQueueSize must be an integer >= 1", {
         field: "maxQueueSize",
@@ -431,8 +454,8 @@ export class MetadataReporter {
     }
 
     this.metadataQueue = new BoundedQueue(this.maxQueueSize);
-    this.confirmQueue = new BoundedQueue(CONFIRM_SETTLEMENT_QUEUE_MAX);
-    this.settlementQueue = new BoundedQueue(CONFIRM_SETTLEMENT_QUEUE_MAX);
+    this.confirmQueue = new BoundedQueue(controlQueueMaxSize);
+    this.settlementQueue = new BoundedQueue(controlQueueMaxSize);
 
     // The core never imports Node. When `@solwyn/sdk/node` is the selected entry,
     // that module installs a weak registration callback behind this global symbol.
@@ -1138,22 +1161,37 @@ export class MetadataReporter {
     return !this.deliveryClosed && claims.has(token) && !this._deadlineExpired(deadline);
   }
 
+  /** Whether a queued head could be sent now (ordinary rounds honour backoff). */
+  private _headDue(head: Pending<unknown> | undefined): boolean {
+    return head !== undefined && head.nextAttemptAt <= this.monotonicClock();
+  }
+
+  /**
+   * Send due confirms FIFO. An ordinary round resolves at most `limit` items and
+   * returns true only when that quota ran out with a due head still queued.
+   */
   private async _drainConfirms(
     cycle: ConfirmCycle,
     deadline?: number,
     final = false,
-  ): Promise<void> {
+    limit?: number,
+  ): Promise<boolean> {
+    let resolved = 0;
     while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
+      if (limit !== undefined && resolved >= limit) {
+        return this._headDue(this.confirmQueue.peek());
+      }
       const head = this.confirmQueue.peek();
-      if (head === undefined) return;
-      if (!final && head.nextAttemptAt > this.monotonicClock()) return;
+      if (head === undefined) return false;
+      if (!final && head.nextAttemptAt > this.monotonicClock()) return false;
       const claimed = this._claimConfirm();
-      if (claimed === null) return;
+      if (claimed === null) return false;
+      resolved += 1;
       const [token, pending] = claimed;
       const result = await this.#sendConfirmAttempt(pending, deadline, () =>
         this._claimIsCurrent(this.inHandConfirms, token, deadline),
       );
-      if (this._deadlineExpired(deadline) || !this.inHandConfirms.delete(token)) return;
+      if (this._deadlineExpired(deadline) || !this.inHandConfirms.delete(token)) return false;
 
       if (result.outcome === "sent") {
         if (!result.counterNeutral) this._recordCycleSuccess(cycle);
@@ -1162,11 +1200,11 @@ export class MetadataReporter {
       if (result.outcome === "held") {
         if (!final) {
           this._restoreConfirmPrefix([pending]);
-          return;
+          return false;
         }
         this._countDrop("confirm", "exit_breaker_open");
         this._countDrop("confirm", "exit_breaker_open", this.confirmQueue.drainAll().length);
-        return;
+        return false;
       }
 
       this._recordCycleFailure(cycle, result.error, result.diagnosticRecorded);
@@ -1182,26 +1220,34 @@ export class MetadataReporter {
       pending.nextAttemptAt = this.monotonicClock() + this._backoffDelay(pending.attempts);
       this._restoreConfirmPrefix([pending]);
       // FIFO: nothing behind a backing-off head may jump it.
-      return;
+      return false;
     }
+    return false;
   }
 
+  /** Settlement twin of {@link _drainConfirms}; each event follows its own confirm. */
   private async _drainSettlements(
     cycle: ConfirmCycle,
     deadline?: number,
     final = false,
-  ): Promise<void> {
+    limit?: number,
+  ): Promise<boolean> {
+    let resolved = 0;
     while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
+      if (limit !== undefined && resolved >= limit) {
+        return this._headDue(this.settlementQueue.peek()?.confirm);
+      }
       const head = this.settlementQueue.peek();
-      if (head === undefined) return;
-      if (!final && head.confirm.nextAttemptAt > this.monotonicClock()) return;
+      if (head === undefined) return false;
+      if (!final && head.confirm.nextAttemptAt > this.monotonicClock()) return false;
       const claimed = this._claimSettlement();
-      if (claimed === null) return;
+      if (claimed === null) return false;
+      resolved += 1;
       const [token, settlement] = claimed;
       const result = await this.#sendConfirmAttempt(settlement.confirm, deadline, () =>
         this._claimIsCurrent(this.inHandSettlements, token, deadline),
       );
-      if (this._deadlineExpired(deadline) || !this.inHandSettlements.delete(token)) return;
+      if (this._deadlineExpired(deadline) || !this.inHandSettlements.delete(token)) return false;
 
       if (result.outcome === "sent") {
         if (!result.counterNeutral) this._recordCycleSuccess(cycle);
@@ -1211,7 +1257,7 @@ export class MetadataReporter {
       if (result.outcome === "held") {
         if (!final) {
           this._restoreSettlementPrefix([settlement]);
-          return;
+          return false;
         }
         const stranded = [settlement, ...this.settlementQueue.drainAll()];
         this._recordDrop("settlement_confirm", "exit_breaker_open", stranded.length);
@@ -1219,7 +1265,7 @@ export class MetadataReporter {
           this._moveEventToQueue(remainder.event, false);
         }
         this._maybeLogDrops(false);
-        return;
+        return false;
       }
 
       this._recordCycleFailure(cycle, result.error, result.diagnosticRecorded);
@@ -1239,8 +1285,9 @@ export class MetadataReporter {
       settlement.confirm.nextAttemptAt =
         this.monotonicClock() + this._backoffDelay(settlement.confirm.attempts);
       this._restoreSettlementPrefix([settlement]);
-      return;
+      return false;
     }
+    return false;
   }
 
   /** Select exact/full/partial-legacy dispositions; partial legacy is stable-heaviest. */
@@ -1277,12 +1324,25 @@ export class MetadataReporter {
     this._disposeEvents(disposed, "ingest_rejected", { forceTerminal });
   }
 
-  async _drainEventBatches(deadline?: number, final = false): Promise<boolean> {
+  /**
+   * Send due metadata in batches. An ordinary round sends at most the batches
+   * queued when the stage starts, so arrivals during its sends wait for the next
+   * round and can never extend this one.
+   */
+  async _drainEventBatches(deadline?: number, final = false): Promise<EventStageResult> {
     let sentCleanBatch = false;
     let cycleClean = true;
+    const cleanNow = (): boolean =>
+      sentCleanBatch && cycleClean && !this.deliveryClosed && !this._deadlineExpired(deadline);
+    let batchesLeft =
+      this.batchSize >= 1 ? Math.ceil(this.metadataQueue.length / this.batchSize) : 0;
     while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
+      if (!final && batchesLeft <= 0) {
+        return { clean: cleanNow(), more: this._headDue(this.metadataQueue.peek()) };
+      }
       const claimed = this._claimEventBatch(final);
       if (claimed === null) break;
+      batchesLeft -= 1;
       const [token, pendingBatch] = claimed;
       const valid: PendingEvent[] = [];
       const projected: ProjectedEvent[] = [];
@@ -1318,7 +1378,7 @@ export class MetadataReporter {
         this._claimIsCurrent(this.inHandEventBatches, token, deadline),
       );
       if (this._deadlineExpired(deadline) || !this.inHandEventBatches.delete(token)) {
-        return false;
+        return { clean: false, more: false };
       }
       if (result.outcome === "sent") {
         this._publishIngestDispositions(events, result.rejections, final);
@@ -1354,11 +1414,9 @@ export class MetadataReporter {
         forceTerminal: final,
       });
       this._maybeLogDrops(false);
-      return (
-        sentCleanBatch && cycleClean && !this.deliveryClosed && !this._deadlineExpired(deadline)
-      );
+      return { clean: cleanNow(), more: false };
     }
-    return sentCleanBatch && cycleClean && !this.deliveryClosed && !this._deadlineExpired(deadline);
+    return { clean: cleanNow(), more: false };
   }
 
   /** Transfer recovery-eligible aggregates synchronously to the event-queue tail. */
@@ -1374,13 +1432,22 @@ export class MetadataReporter {
     this._maybeLogDrops(false);
   }
 
-  /** Flush confirms → settlements → events; one confirm failure increment per cycle. */
-  async _flushRemaining(deadline?: number, final = false): Promise<boolean> {
+  /**
+   * One delivery round: confirms → settlements → events, with one confirm
+   * failure increment per round. An ordinary round gives each control stage a
+   * turn of at most `max(1, min(batchSize, maxQueueSize))` items and the event
+   * stage the batches queued at its start; `round.more` reports whether any
+   * stage stopped at its quota with due work left. The final flush is unbounded.
+   * Returns whether the round's metadata delivery was clean.
+   */
+  async _flushRemaining(deadline?: number, final = false, round?: FlushRound): Promise<boolean> {
     this._drainReceiptFoldsToQueue();
     const cycle: ConfirmCycle = { lastVerdict: null };
-    await this._drainConfirms(cycle, deadline, final);
-    await this._drainSettlements(cycle, deadline, final);
-    const clean = await this._drainEventBatches(deadline, final);
+    const limit = final ? undefined : Math.max(1, Math.min(this.batchSize, this.maxQueueSize));
+    const moreConfirms = await this._drainConfirms(cycle, deadline, final, limit);
+    const moreSettlements = await this._drainSettlements(cycle, deadline, final, limit);
+    const { clean, more: moreEvents } = await this._drainEventBatches(deadline, final);
+    if (round !== undefined) round.more = moreConfirms || moreSettlements || moreEvents;
     if (cycle.lastVerdict?.outcome === "sent") {
       this._recordConfirmSuccess();
     } else if (cycle.lastVerdict?.outcome === "failed") {
@@ -1559,13 +1626,19 @@ export class MetadataReporter {
   }
 
   private async _runLoop(): Promise<void> {
+    let more = false;
     while (!this.shuttingDown) {
-      await this._sleep(this.flushInterval);
+      // A quota-exhausted round continues on a zero-delay timer turn (never a
+      // microtask), so producers, close() and other timers still run between rounds.
+      await this._sleep(more ? 0 : this.flushInterval);
       if (this.shuttingDown) {
         break;
       }
+      more = false;
       try {
-        await this._flushRemaining();
+        const round: FlushRound = { more: false };
+        await this._flushRemaining(undefined, false, round);
+        more = round.more;
         if (this.shuttingDown) break;
         if (this._breakerReportsDue()) void this._startBreakerCycle();
       } catch (error) {
@@ -1706,7 +1779,10 @@ export class MetadataReporter {
       resolveClose = resolve;
     });
     // Publish identity and the enqueue fence before consulting any injected clock.
+    // An ordinary round may still own a confirm while close joins it; from here on
+    // its event transfer must not evict ready metadata to make room.
     this.closePromise = shared;
+    this.finalDeliveryStarted = true;
     this.shuttingDown = true;
 
     let deadline: number;

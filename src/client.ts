@@ -432,7 +432,10 @@ export interface SolwynOptions {
   reporterFlushInterval?: number;
   /** Reporter queue cap (drop-oldest on overflow). */
   reporterMaxQueueSize?: number;
-  /** Reporter max concurrent in-flight batch sends. */
+  /**
+   * Accepted for compatibility but currently has no effect: reporter sends are serial,
+   * one request at a time.
+   */
   reporterMaxInFlight?: number;
   /** Reporter attempts before disposing retryable telemetry (default 5). */
   reporterMaxSendAttempts?: number;

@@ -14,6 +14,11 @@ import type {
 export const DEFAULT_OUTPUT_BOUND = 4096;
 export const RESERVATION_MAX_AGE_S = 900;
 export const INELIGIBLE_RETRY_AFTER_S = 30;
+/**
+ * How long a run stays on per-call checks after a grant 409, or after an ineligible renewal whose
+ * release was not confirmed. It outlasts the lease an unseen grant may have left behind.
+ */
+export const LEASE_REFUSAL_LATCH_S = 150;
 export const RENEWAL_DEPLETION_NUM = 3;
 export const RENEWAL_DEPLETION_DEN = 4;
 export const REFRESH_JITTER_MIN = 0.85;
@@ -125,6 +130,15 @@ interface Expiry {
   readonly token: number;
   readonly callId: string;
 }
+/** The release owed after an ineligible renewal, pending until its outcome arrives. */
+export interface RefusalRelease {
+  /** Monotonic seconds when the ineligible renewal was applied. */
+  readonly refusedAt: number;
+  /** Identifies this refusal; a later refusal or a lapsed latch replaces or clears it. */
+  readonly token: number;
+  /** Surrender of the lease held when the renewal was refused, at its held generation. */
+  readonly request: LeaseSurrenderRequest;
+}
 
 export class LeaseState {
   readonly runId: string;
@@ -150,6 +164,8 @@ export class LeaseState {
   uncountedTokens = 0;
   runIneligible = false;
   ineligibleRetryAt = 0;
+  /** Not a retirement item: it never blocks retirement or keeps the state alive. */
+  releasePending: RefusalRelease | null = null;
   snapshot: LeaseSnapshot | null = null;
 
   constructor(runId: string) {
@@ -234,6 +250,7 @@ export class LeaseLedger {
   readonly #sweptRuns = new Set<string>();
   #nextClaimToken = 0;
   #nextLeaseIncarnation = 0;
+  #nextRefusalToken = 0;
   readonly #rng: LeaseLedgerOptions["rng"];
 
   constructor({
@@ -322,12 +339,14 @@ export class LeaseLedger {
     if (state?.runIneligible) {
       if (now < state.ineligibleRetryAt) {
         return this.#admission(LeaseDecision.LegacyCheck, {
-          reason: "run_lease_ineligible",
+          reason: state.releasePending ? "lease_release_pending" : "run_lease_ineligible",
           claimToken: ownedClaimToken,
         });
       }
+      // A release outcome that never arrived cannot hold the run beyond the latch.
       state.runIneligible = false;
       state.ineligibleRetryAt = 0;
+      state.releasePending = null;
     }
     if (state?.hasLease && !state.covers(model, fallbackModels)) {
       return this.#admission(LeaseDecision.LegacyCheck, {
@@ -360,10 +379,28 @@ export class LeaseLedger {
     }
     state ??= this.#state(runId);
     if (!response.eligible) {
+      // Only a renewal names its origin; the fence above proved this state still holds it.
+      const renewal =
+        expectedLeaseId !== null &&
+        expectedLeaseId !== undefined &&
+        expectedGeneration !== null &&
+        expectedGeneration !== undefined;
+      const release = renewal ? this.#releaseRefusedLease(state) : null;
       this.#dropLease(state);
       this.#storeSnapshot(state, response);
       state.runIneligible = true;
-      state.ineligibleRetryAt = Infinity;
+      if (release === null) {
+        // An ineligible initial grant keeps the run on per-call checks for its lifetime.
+        state.ineligibleRetryAt = Infinity;
+        state.releasePending = null;
+      } else {
+        state.ineligibleRetryAt = now + LEASE_REFUSAL_LATCH_S;
+        state.releasePending = Object.freeze({
+          refusedAt: now,
+          token: ++this.#nextRefusalToken,
+          request: release,
+        });
+      }
       return GrantOutcome.Ineligible;
     }
     if (!response.allowed) {
@@ -409,6 +446,7 @@ export class LeaseLedger {
     state.nextAttemptAt = 0;
     state.runIneligible = false;
     state.ineligibleRetryAt = 0;
+    state.releasePending = null;
     this.#storeSnapshot(state, response);
     this.#settlePendingReport(state);
     return GrantOutcome.Applied;
@@ -423,6 +461,22 @@ export class LeaseLedger {
     state.runIneligible = true;
     state.ineligibleRetryAt =
       retryAfter === null || retryAfter === undefined ? Infinity : now + retryAfter;
+    state.releasePending = null;
+  }
+  /**
+   * Record the outcome of the release owed by one ineligible renewal. A sent release lets the
+   * next eligible call grant again; any other outcome leaves the latch counted from the refusal.
+   * Never creates state, and ignores an outcome for a refusal that is no longer pending.
+   */
+  resolveRefusalRelease(runId: string, token: number, sent: boolean): boolean {
+    const state = this.#states.get(runId);
+    if (state?.releasePending?.token !== token) return false;
+    state.releasePending = null;
+    if (sent) {
+      state.runIneligible = false;
+      state.ineligibleRetryAt = 0;
+    }
+    return true;
   }
   recordUncounted(
     runId: string,
@@ -836,6 +890,23 @@ export class LeaseLedger {
     state.finalGrant = false;
     state.renewalInFlight = false;
     state.pendingReport = null;
+  }
+  /**
+   * Settle the refused renewal's report (the control plane applied its tallies and its spend is
+   * advisory), then build the surrender for the held generation and clear its spend now: a
+   * surrender is never retried, and a later outcome must not touch a successor lease's spend.
+   */
+  #releaseRefusedLease(state: LeaseState): LeaseSurrenderRequest | null {
+    if (state.leaseId === null) return null;
+    this.#settlePendingReport(state);
+    const request = Object.freeze({
+      lease_id: state.leaseId,
+      holder_id: this.holderId,
+      generation: state.generation,
+      spent_tokens: state.spentTokensSinceReport,
+    });
+    state.spentTokensSinceReport = Math.max(0, state.spentTokensSinceReport - request.spent_tokens);
+    return request;
   }
   #storeSnapshot(state: LeaseState, response: LeaseGrantResponse): void {
     state.snapshot = Object.freeze({

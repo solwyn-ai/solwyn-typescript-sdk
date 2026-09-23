@@ -7,6 +7,7 @@ import {
   DEFAULT_OUTPUT_BOUND,
   GrantOutcome,
   INELIGIBLE_RETRY_AFTER_S,
+  LEASE_REFUSAL_LATCH_S,
   LeaseDecision,
   LeaseLedger,
   RESERVATION_MAX_AGE_S,
@@ -652,6 +653,112 @@ describe("LeaseLedger grants and accounting", () => {
     expect(value.stateFor(RUN)).toMatchObject({ uncountedCalls: 1, uncountedTokens: 25 });
     value.discard(RUN);
     expect(value.stateFor(RUN)).toBeNull();
+  });
+});
+
+describe("LeaseLedger recovery after an ineligible renewal", () => {
+  const INELIGIBLE = grant({
+    eligible: false,
+    lease_id: null,
+    generation: null,
+    granted_tokens: null,
+    refresh_interval_s: null,
+    lease_length_s: null,
+    headroom_share_tokens: null,
+    posture: null,
+    ineligible_reason: "zero_rate_model",
+  });
+
+  it("settles the refused report and owes one held-generation release with the later spend", () => {
+    const value = installed();
+    const first = admit(value, { callId: "before" });
+    value.trueUp("before", 200, { claimToken: first.claimToken });
+    value.recordUncounted(RUN, 50);
+    expect(value.claimRenewalRequest(RUN)).toMatchObject({
+      spent_tokens: 200,
+      uncounted_calls: 1,
+      uncounted_tokens: 50,
+    });
+    const second = admit(value, { callId: "after", now: 1_002 });
+    value.trueUp("after", 300, { claimToken: second.claimToken });
+
+    expect(
+      value.applyGrantResponse(RUN, INELIGIBLE, {
+        now: 1_010,
+        expectedLeaseId: "lse-1",
+        expectedGeneration: 1,
+      }),
+    ).toBe(GrantOutcome.Ineligible);
+    const state = value.stateFor(RUN);
+    expect(state).toMatchObject({
+      leaseId: null,
+      generation: 0,
+      pendingReport: null,
+      spentTokensSinceReport: 0,
+      uncountedCalls: 0,
+      uncountedTokens: 0,
+      runIneligible: true,
+      ineligibleRetryAt: 1_010 + LEASE_REFUSAL_LATCH_S,
+      releasePending: {
+        refusedAt: 1_010,
+        token: expect.any(Number),
+        request: { lease_id: "lse-1", holder_id: HOLDER, generation: 1, spent_tokens: 300 },
+      },
+    });
+    expect(admit(value, { callId: "pending", now: 1_011 })).toMatchObject({
+      decision: LeaseDecision.LegacyCheck,
+      reason: "lease_release_pending",
+    });
+  });
+
+  it("re-grants after a sent release, latches from the refusal otherwise, and never creates state", () => {
+    const refused = (value: LeaseLedger) => {
+      value.applyGrantResponse(RUN, INELIGIBLE, {
+        now: 1_010,
+        expectedLeaseId: "lse-1",
+        expectedGeneration: 1,
+      });
+      return value.stateFor(RUN)?.releasePending?.token ?? -1;
+    };
+
+    const sent = installed();
+    const sentToken = refused(sent);
+    expect(sent.resolveRefusalRelease(RUN, sentToken + 1, true)).toBe(false);
+    expect(sent.resolveRefusalRelease(RUN, sentToken, true)).toBe(true);
+    expect(sent.resolveRefusalRelease(RUN, sentToken, true)).toBe(false);
+    expect(admit(sent, { callId: "sent", now: 1_011 }).decision).toBe(LeaseDecision.NeedGrant);
+
+    const dropped = installed();
+    const droppedToken = refused(dropped);
+    expect(dropped.resolveRefusalRelease(RUN, droppedToken, false)).toBe(true);
+    expect(admit(dropped, { callId: "latched", now: 1_159 })).toMatchObject({
+      decision: LeaseDecision.LegacyCheck,
+      reason: "run_lease_ineligible",
+    });
+    expect(admit(dropped, { callId: "lapsed", now: 1_160 }).decision).toBe(LeaseDecision.NeedGrant);
+
+    const missing = installed();
+    const missingToken = refused(missing);
+    expect(admit(missing, { callId: "cap", now: 1_160 }).decision).toBe(LeaseDecision.NeedGrant);
+    expect(missing.stateFor(RUN)?.releasePending).toBeNull();
+    expect(missing.resolveRefusalRelease(RUN, missingToken, false)).toBe(false);
+    expect(missing.stateFor(RUN)?.runIneligible).toBe(false);
+
+    const retired = installed();
+    const retiredToken = refused(retired);
+    retired.discard(RUN);
+    expect(retired.resolveRefusalRelease(RUN, retiredToken, true)).toBe(false);
+    expect(retired.stateFor(RUN)).toBeNull();
+  });
+
+  it("keeps an ineligible initial grant permanent with no release owed", () => {
+    const value = ledger();
+    expect(value.applyGrantResponse(RUN, INELIGIBLE, { now: 1_000 })).toBe(GrantOutcome.Ineligible);
+    expect(value.stateFor(RUN)).toMatchObject({
+      runIneligible: true,
+      ineligibleRetryAt: Number.POSITIVE_INFINITY,
+      releasePending: null,
+    });
   });
 });
 

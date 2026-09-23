@@ -48,6 +48,7 @@ import {
   GrantOutcome,
   INELIGIBLE_RETRY_AFTER_S,
   isInstallableLeaseGrantResponse,
+  LEASE_REFUSAL_LATCH_S,
   type LeaseAdmission,
   LeaseDecision,
   LeaseLedger,
@@ -248,6 +249,12 @@ function copyPriceHints(
   priceHints: Record<string, number> | null | undefined,
 ): Record<string, number> | null {
   return priceHints === null || priceHints === undefined ? null : { ...priceHints };
+}
+
+/** Diagnostic only: the SDK never branches on the reason. */
+function ineligibleReason(response: LeaseGrantResponse): string {
+  const reason = response.ineligible_reason;
+  return typeof reason === "string" ? escapeControlChars(reason) : "none";
 }
 
 /** Attribute a replayed directive only when it belongs to the run being checked. */
@@ -1443,6 +1450,9 @@ export class BudgetEnforcer {
           responseObservation.runObservedAt,
           authorityOrder,
         );
+      } else if (outcome === GrantOutcome.Ineligible) {
+        this.logger.debug("lease.renew_ineligible: reason=%s", ineligibleReason(effective));
+        this.releaseRefusedLease(operation.runId);
       } else if (outcome === GrantOutcome.Stale) {
         this.failRenewal(operation.runId, operation.originLeaseId, operation.originGeneration);
       }
@@ -1526,7 +1536,7 @@ export class BudgetEnforcer {
           if (closeDispatchEpoch === this.closeEpoch) {
             this.leaseLedger.markIneligible(runId, {
               now: this.monotonicNow() / 1000,
-              retryAfter: status === 409 ? null : INELIGIBLE_RETRY_AFTER_S,
+              retryAfter: status === 409 ? LEASE_REFUSAL_LATCH_S : INELIGIBLE_RETRY_AFTER_S,
             });
           }
           this.logger.debug("lease.grant_refused: status=%s", status);
@@ -1622,6 +1632,9 @@ export class BudgetEnforcer {
           kind: "denied",
           result: this.projectCloudResponse(winningResponse ?? projected, runId),
         };
+      }
+      if (outcome === GrantOutcome.Ineligible) {
+        this.logger.debug("lease.grant_ineligible: reason=%s", ineligibleReason(effective));
       }
       if (outcome !== GrantOutcome.Applied) return { kind: "legacy" };
 
@@ -2629,6 +2642,25 @@ export class BudgetEnforcer {
       return;
     }
     this.discardRetiredRun(runId, state);
+  }
+
+  /**
+   * Send the release owed by an ineligible renewal. Until its outcome arrives the run takes
+   * per-call checks; a sent release lets the next eligible call grant again, and any other
+   * outcome leaves the 150 s latch counted from the refusal. The pending release never blocks
+   * retirement.
+   */
+  private releaseRefusedLease(runId: string): void {
+    const pending = this.leaseLedger.stateFor(runId)?.releasePending ?? null;
+    if (pending === null) return;
+    const { request, token } = pending;
+    this.releases.submit(request, {
+      onOutcome: (outcome) => {
+        // Never creates state: a retired run, a newer refusal or a closing client ignores it.
+        if (this.closed) return;
+        this.leaseLedger.resolveRefusalRelease(runId, token, outcome.kind === "sent");
+      },
+    });
   }
 
   /** Discard a finished run as an ordinary orphan, folding any uncounted tallies first. */

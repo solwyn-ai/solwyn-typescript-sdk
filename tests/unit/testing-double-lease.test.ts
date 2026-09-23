@@ -124,21 +124,31 @@ describe("FakeControlPlane lease surrender", () => {
     "solwyn-test/deny",
     "solwyn-test/deny-tag",
     "solwyn-test/lease-ineligible",
-  ])("requires the terminal successor generation to surrender after %s", (model) => {
+  ])("accepts the held generation's surrender after a terminal %s renewal", (model) => {
     const plane = new FakeControlPlane({ grantedTokens: 40 });
     plane.handle("POST", GRANT_PATH, grant());
     const terminal = plane.handle("POST", RENEW_PATH, renew({ model, provider: "openai" }));
     expect(terminal.status).toBe(200);
     expect(terminal.body).not.toHaveProperty("lease_id");
-    expect(plane.handle("POST", SURRENDER_PATH, surrender())).toMatchObject({
-      status: 409,
-      body: { detail: { code: "lease_generation_conflict" } },
-    });
-    expect(plane.handle("POST", SURRENDER_PATH, surrender({ generation: 2 }))).toMatchObject({
+    // The successor carries no lease block, so the generation the SDK still holds is released.
+    expect(plane.handle("POST", SURRENDER_PATH, surrender({ spent_tokens: 7 }))).toMatchObject({
       status: 200,
       body: { released_tokens: 40 },
     });
+    expect(plane.handle("POST", SURRENDER_PATH, surrender({ generation: 2 }))).toMatchObject({
+      status: 200,
+      body: { released_tokens: 0 },
+    });
+    expect(plane.handle("POST", SURRENDER_PATH, surrender({ generation: 3 }))).toMatchObject({
+      status: 409,
+      body: { detail: { code: "lease_generation_conflict" } },
+    });
     expect(plane.handle("POST", RENEW_PATH, renew())).toMatchObject({ status: 404 });
+    // After that release, a grant for the same holder is a new lease, not a conflict.
+    expect(plane.handle("POST", GRANT_PATH, grant())).toMatchObject({
+      status: 200,
+      body: { lease_id: "lse_fake2", generation: 1 },
+    });
   });
 
   it("rejects invalid surrender atomically without echoing or recording private fields", () => {

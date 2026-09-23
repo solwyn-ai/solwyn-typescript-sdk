@@ -1166,7 +1166,7 @@ export class FakeControlPlane {
       return this.leaseError(404, "lease_not_found", "Budget lease not found");
     }
     // Approved Python/core simulator parity; OpenAPI omits surrender's 409 response.
-    if (request.generation !== record.generation) {
+    if (!this.surrenderGenerationAccepted(record, request.generation)) {
       return this.leaseError(409, "lease_generation_conflict", "Budget lease generation conflict");
     }
     if (this.expiredLeaseIds.has(record.leaseId) || this.releasedLeaseIds.has(record.leaseId)) {
@@ -1176,6 +1176,19 @@ export class FakeControlPlane {
     return validatedResponse(200, LeaseSurrenderResponseSchema, {
       released_tokens: record.grantedTokens,
     });
+  }
+
+  /**
+   * The current generation, or the predecessor of a stored successor that carries no lease
+   * block (an ineligible or denied renewal). A predecessor whose successor is live stays 409.
+   */
+  private surrenderGenerationAccepted(record: LeaseRecord, generation: number): boolean {
+    if (generation === record.generation) return true;
+    if (record.lastRenewedFromGeneration !== generation || record.frozenResponse === "") {
+      return false;
+    }
+    const successor = JSON.parse(record.frozenResponse) as LeaseGrantResponse;
+    return successor.lease_id === null || successor.lease_id === undefined;
   }
 
   private leaseVerdict(

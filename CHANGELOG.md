@@ -29,6 +29,14 @@ corresponding release notes before users upgrade.
   `lease.uncounted_discarded` warnings (at most one every 30 seconds, repeated in the close
   summary) instead of being retained indefinitely. The `lease.uncounted_entry` warning now says
   so.
+- **Lease recovery after a refusal.** After a lease grant is refused with 409, or a renewal comes
+  back ineligible, a run now falls back to per-call budget checks for at most 150 seconds,
+  instead of for the rest of the run. After an ineligible renewal, the SDK releases the lease it
+  holds and acquires a new one as soon as the release is confirmed; the new lease's renewals no
+  longer repeat the refused renewal's spend or uncounted tallies. An ineligible initial grant
+  still keeps the run on per-call checks. The `FakeControlPlane` test double in
+  `@solwyn/sdk/testing` now accepts that release, at the generation held before an ineligible or
+  denied renewal, as the control plane does, instead of answering 409.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

@@ -187,6 +187,10 @@ from a local run lease. That removes a control-plane round trip from most calls 
 live. Grants and renewals are generation-fenced; renewal is detached from the call path, and
 `close()` surrenders remaining authority best-effort after queued telemetry is flushed. Tagged
 calls, media calls, ineligible models, and calls outside a run keep the ordinary per-call check.
+If a grant is refused with 409, or a renewal comes back ineligible, the run uses per-call checks
+for at most 150 seconds; after an ineligible renewal the SDK releases its lease and acquires a
+new one as soon as the release is confirmed. An ineligible initial grant keeps the run on
+per-call checks.
 Set `leaseOutputBoundDefault` (default `4096`) to change the fallback reservation when a request
 does not expose a usable structural output cap.
 

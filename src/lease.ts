@@ -153,6 +153,12 @@ export interface RenewalDeclaration {
   readonly fallbackModels: readonly string[];
   /** The declaration's models the lease did not yet declare; empty for an ordinary renewal. */
   readonly addedModels: readonly string[];
+  /**
+   * Whether any attempt may have reached the control plane. Set once an attempt is dispatched,
+   * or reports an unknown outcome; never cleared while the declaration is owed. A skipped attempt
+   * (an open breaker, an invalid request) drops the declaration only while this is false.
+   */
+  readonly dispatched: boolean;
 }
 
 export class LeaseState {
@@ -274,19 +280,22 @@ export interface WideningOptions {
 export interface RenewalClaim {
   readonly request: LeaseRenewRequest;
   readonly addedModels: readonly string[];
+  /** Whether the claim re-sends a declaration an earlier attempt owed, not a fresh one. */
+  readonly retry: boolean;
 }
-/** A claimed renewal that re-declares a call's chain, and the models it adds to the lease. */
-export interface WideningClaim {
-  readonly request: LeaseRenewRequest;
-  readonly addedModels: readonly string[];
-}
+/**
+ * A claimed renewal that re-declares a call's chain, and the models it adds to the lease; or,
+ * while a retry is owed, that retry (`retry: true`), which never carries the call's chain.
+ */
+export type WideningClaim = RenewalClaim;
 export interface RenewalFailedOptions {
   now: number;
   expectedLeaseId?: string | null;
   expectedGeneration?: number | null;
   /**
-   * Whether the request may have reached the control plane. A renewal that was never sent owes
-   * no retry its declaration, so the next claim at the same origin declares afresh.
+   * Whether this attempt may have reached the control plane. `false` only when it provably never
+   * left. The declaration is dropped only if no earlier attempt may have reached the control
+   * plane either; otherwise the next claim at the same origin still re-sends it.
    */
   sent?: boolean;
 }
@@ -413,6 +422,15 @@ export class LeaseLedger {
       });
     }
     if (state?.hasLease && !state.covers(model, fallbackModels)) {
+      if (now >= state.leaseDeadline && !breakerOpen) {
+        // An expired lease cannot widen, and only this call's chain can drive its re-grant:
+        // drop it and re-grant for that chain, as a covered chain's call does at expiry.
+        this.#dropLease(state);
+        return this.#admission(LeaseDecision.NeedGrant, {
+          reason: "lease_expired",
+          claimToken: ownedClaimToken,
+        });
+      }
       return this.#admission(LeaseDecision.LegacyCheck, {
         reason: "model_outside_declared_set",
         claimToken: ownedClaimToken,
@@ -735,8 +753,8 @@ export class LeaseLedger {
   claimRenewal(runId: string, options: RenewalOptions = {}): RenewalClaim | null {
     const state = this.#states.get(runId);
     if (!state || state.leaseId === null || state.renewalInFlight) return null;
-    const declaration =
-      this.#owedDeclaration(state) ?? this.#newDeclaration(state, state.leaseId, options);
+    const owed = this.#owedDeclaration(state);
+    const declaration = owed ?? this.#newDeclaration(state, state.leaseId, options);
     const request = this.buildRenewalRequest(runId, {
       model: declaration.model,
       provider: declaration.provider,
@@ -746,7 +764,7 @@ export class LeaseLedger {
     if (request === null) return null;
     state.renewalInFlight = true;
     state.renewalDeclaration = declaration;
-    return Object.freeze({ request, addedModels: declaration.addedModels });
+    return Object.freeze({ request, addedModels: declaration.addedModels, retry: owed !== null });
   }
   /** The declaration a retry at the state's current lease and generation must re-send. */
   owedRenewalDeclaration(runId: string): RenewalDeclaration | null {
@@ -754,12 +772,29 @@ export class LeaseLedger {
     return state ? this.#owedDeclaration(state) : null;
   }
   /**
+   * Record that the claimed renewal at this origin was handed to the transport, so its declaration
+   * may have reached the control plane. From then on only a superseding generation drops it.
+   */
+  renewalDispatched(
+    runId: string,
+    { expectedLeaseId, expectedGeneration }: Omit<RenewalFailedOptions, "now" | "sent">,
+  ): boolean {
+    const state = this.#states.get(runId);
+    if (!state || this.#originFenceRejects(state, expectedLeaseId, expectedGeneration))
+      return false;
+    const owed = this.#owedDeclaration(state);
+    if (owed === null) return false;
+    this.#markDispatched(state, owed);
+    return true;
+  }
+  /**
    * Claim one out-of-cycle renewal that re-declares a call's full chain, after that call's
    * per-call check allowed it. Applies the gates renewalDue applies to an ordinary renewal (a live
    * lease with a positive grant, no renewal in flight, past any backoff, not a final grant), and
    * never claims for a chain that is already covered or names a refused model. While a retry of
-   * another declaration is owed at this lease and generation, it claims nothing: the chain's models
-   * never ride on that retry, and the next undeclared allowed call re-triggers once it resolves.
+   * another declaration is owed at this lease and generation, the call claims that retry instead,
+   * unchanged: its own chain never rides on it and stays on per-call checks, and the next
+   * undeclared allowed call widens for that chain once the retry resolves.
    */
   claimWideningRequest(runId: string, options: WideningOptions): WideningClaim | null {
     const { now, model, fallbackModels } = options;
@@ -779,8 +814,6 @@ export class LeaseLedger {
       (item) => !state.declaredModels.has(item),
     );
     if (addedModels.length === 0) return null;
-    const owed = this.#owedDeclaration(state);
-    if (owed !== null && !sameDeclaration(owed, options)) return null;
     return this.claimRenewal(runId, options);
   }
   buildSurrenderRequest(runId: string): LeaseSurrenderRequest | null {
@@ -804,7 +837,12 @@ export class LeaseLedger {
     const state = this.#states.get(runId);
     if (!state || this.#originFenceRejects(state, expectedLeaseId, expectedGeneration))
       return false;
-    if (!sent) state.renewalDeclaration = null;
+    const owed = this.#owedDeclaration(state);
+    if (owed !== null) {
+      // Only a declaration no attempt may have delivered is dropped by a skipped attempt.
+      if (sent) this.#markDispatched(state, owed);
+      else if (!owed.dispatched) state.renewalDeclaration = null;
+    }
     state.renewalInFlight = false;
     state.pendingReport = null;
     state.consecutiveFailures++;
@@ -978,7 +1016,12 @@ export class LeaseLedger {
       addedModels: Object.freeze(
         [...new Set(chain)].filter((item) => !state.declaredModels.has(item)),
       ),
+      dispatched: false,
     });
+  }
+  #markDispatched(state: LeaseState, declaration: RenewalDeclaration): void {
+    if (declaration.dispatched) return;
+    state.renewalDeclaration = Object.freeze({ ...declaration, dispatched: true });
   }
   #outputBound(value: number | undefined): number {
     return positiveOutputBound(value) ?? this.outputBoundDefault;
@@ -1139,19 +1182,6 @@ export class LeaseLedger {
     heap[index] = last;
     return first;
   }
-}
-
-function sameDeclaration(declaration: RenewalDeclaration, options: RenewalOptions): boolean {
-  return (
-    declaration.model === (options.model ?? null) &&
-    declaration.provider === (options.provider ?? null) &&
-    sameItems(declaration.fallbackProviders, options.fallbackProviders ?? []) &&
-    sameItems(declaration.fallbackModels, options.fallbackModels ?? [])
-  );
-}
-
-function sameItems<T>(first: readonly T[], second: readonly T[]): boolean {
-  return first.length === second.length && first.every((item, index) => item === second[index]);
 }
 
 export function backoffCeiling(consecutiveFailures: number): number {

@@ -1305,7 +1305,10 @@ export class BudgetEnforcer {
       fallbackModels: captured.fallbackModels,
     });
     if (claimed === null) return;
-    this.logger.debug("lease.widen: added_models=%d", claimed.addedModels.length);
+    // While a retry is owed, the call sends that retry unchanged; its own chain widens later.
+    if (claimed.retry)
+      this.logger.debug("lease.renew_retry: added_models=%d", claimed.addedModels.length);
+    else this.logger.debug("lease.widen: added_models=%d", claimed.addedModels.length);
     this.launchRenewal(runId, claimed.request, claimed.addedModels);
   }
 
@@ -1379,6 +1382,14 @@ export class BudgetEnforcer {
       }
 
       const authorityDispatch = this.captureAuthorityDispatch();
+      // From here the declaration may reach the control plane: only a superseding generation
+      // may drop it, whatever a later attempt reports.
+      if (operation.closeEpoch === this.closeEpoch) {
+        this.leaseLedger.renewalDispatched(operation.runId, {
+          expectedLeaseId: operation.originLeaseId,
+          expectedGeneration: operation.originGeneration,
+        });
+      }
       let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
       try {
         raw = await this.transport.postJsonAndReadJson(LEASE_RENEW_PATH, operation.wire, {
@@ -1520,7 +1531,10 @@ export class BudgetEnforcer {
     }
   }
 
-  /** `sent: false` only when the request provably never reached the control plane. */
+  /**
+   * `sent: false` only when this attempt provably never reached the control plane; the ledger
+   * still keeps the declaration if an earlier attempt at the same origin may have.
+   */
   private failRenewal(runId: string, leaseId: string, generation: number, sent = true): void {
     this.leaseLedger.renewalFailed(runId, {
       now: this.monotonicNow() / 1000,

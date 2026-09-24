@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer, type BudgetEnforcerOptions } from "../../src/budget";
+import { CircuitBreaker } from "../../src/circuit-breaker";
 import type { LeaseLedger, LeaseState } from "../../src/lease";
 import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import { FakeControlPlane } from "../../src/testing/index";
@@ -553,9 +554,9 @@ describe("a lease renewal retried after an unknown outcome", () => {
   };
   /** A retry of generation 1 gets the answer the plane stored for the first request. */
   const replayApplied = (body: Body) =>
-    json(grant({ lease_id: "lease-1", generation: Number(body["generation"]) + 1 }));
+    json(grant({ lease_id: String(body["lease_id"]), generation: Number(body["generation"]) + 1 }));
 
-  it("never covers a chain the plane was not sent, and the retry re-declares the first chain", async () => {
+  it("is sent by the next allowed call on another undeclared chain, which stays on per-call checks until its own widening is applied", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const h = harness({ renew: lostThenAnswer(replayApplied) });
     await grantFirstModel(h);
@@ -566,24 +567,13 @@ describe("a lease renewal retried after an unknown outcome", () => {
     expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
     expect(h.state()).toMatchObject({ generation: 1, renewalInFlight: false });
 
-    // Past the backoff, a call on another undeclared chain is allowed per call.
+    // Only chain-C traffic follows. Past the backoff, the first allowed C call sends the owed
+    // retry, unchanged: it re-declares the first chain, never C, and C is not covered by the
+    // answer the plane stored for that request.
     h.clock.now = 2_000;
     await expect(check(h, 3, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
     await settleRenewals(h);
-    // That chain is not on the lease: the next call on it still takes a per-call check.
-    await expect(check(h, 4, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
-    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
-    // Its models never ride on the owed retry: it claims nothing.
-    expect(h.renewals.map((body) => [body["generation"], declaredChain(body)])).toEqual([
-      [1, ["gpt-4o-mini"]],
-    ]);
-    expect(h.since()).toEqual([CHECK_URL, CHECK_URL]);
-
-    // The next renewal at the same generation, claimed by a gpt-4o call, re-sends the first chain.
-    h.clock.now = 601_000;
-    await expect(check(h, 5)).resolves.toMatchObject({ leaseId: "lease-1" });
-    await settleRenewals(h);
-    expect(h.since()).toEqual([RENEW_URL]);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
     expect(h.renewals[1]).toMatchObject({
       lease_id: "lease-1",
       generation: 1,
@@ -594,11 +584,13 @@ describe("a lease renewal retried after an unknown outcome", () => {
     });
     expect(h.state()?.generation).toBe(2);
     expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
-    await expect(check(h, 6, MINI)).resolves.toMatchObject({ leaseId: "lease-1" });
+    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
+    await expect(check(h, 4, MINI)).resolves.toMatchObject({ leaseId: "lease-1" });
     expect(h.since()).toEqual([]);
 
-    // The other chain now widens on its own, at the new generation.
-    await check(h, 7, OTHER);
+    // The second C call still takes a per-call check and widens for its own chain, at the new
+    // generation; the third is on the lease.
+    await expect(check(h, 5, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
     await settleRenewals(h);
     expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
     expect(h.renewals[2]).toMatchObject({
@@ -606,7 +598,121 @@ describe("a lease renewal retried after an unknown outcome", () => {
       model: "claude-sonnet-4-5",
       provider: "anthropic",
     });
-    await expect(check(h, 8, OTHER)).resolves.toMatchObject({ leaseId: "lease-1" });
+    await expect(check(h, 6, OTHER)).resolves.toMatchObject({ leaseId: "lease-1" });
+    expect(h.since()).toEqual([]);
+    expect(h.checks.map((body) => body["model"])).toEqual([
+      "gpt-4o-mini",
+      "claude-sonnet-4-5",
+      "claude-sonnet-4-5",
+    ]);
+    expect(h.renewals.map((body) => [body["generation"], declaredChain(body)])).toEqual([
+      [1, ["gpt-4o-mini"]],
+      [1, ["gpt-4o-mini"]],
+      [2, ["claude-sonnet-4-5"]],
+    ]);
+  });
+
+  it("survives a retry skipped while the control-plane breaker is open: another chain re-sends it and never receives its replay", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const clock = { now: 0 };
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      recoveryTimeout: 60,
+      now: () => clock.now,
+    });
+    const h = harness(
+      { grant: () => json(grant({ refresh_interval_s: 1 })), renew: lostThenAnswer(replayApplied) },
+      { controlPlaneBreaker: breaker, monotonicNow: () => clock.now },
+    );
+    await grantFirstModel(h);
+
+    // The widening for gpt-4o-mini reaches the plane, which applies it; the lost answer opens
+    // the control-plane breaker.
+    clock.now = 1_000;
+    await check(h, 2, MINI);
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(breaker.getState().state).toBe("open");
+    expect(internal(h.budget).leaseLedger.owedRenewalDeclaration(RUN)).toMatchObject({
+      generation: 1,
+      model: "gpt-4o-mini",
+    });
+
+    // Inside the recovery window, a due renewal claims the retry, which the open breaker skips
+    // before it is sent. The declaration the first attempt delivered is still owed.
+    clock.now = 2_000;
+    await expect(check(h, 3)).resolves.toMatchObject({ leaseId: "lease-1" });
+    await settleRenewals(h);
+    expect(h.since()).toEqual([]);
+    expect(h.state()).toMatchObject({
+      generation: 1,
+      renewalInFlight: false,
+      consecutiveFailures: 2,
+    });
+    expect(internal(h.budget).leaseLedger.owedRenewalDeclaration(RUN)).toMatchObject({
+      generation: 1,
+      model: "gpt-4o-mini",
+    });
+
+    // After the window, a chain-C call's check is the recovery probe. Its widening trigger
+    // re-sends gpt-4o-mini at generation 1; the plane replays the answer it stored for that
+    // request, which covers gpt-4o-mini and never C.
+    clock.now = 70_000;
+    await expect(check(h, 4, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(h.renewals.map((body) => [body["generation"], declaredChain(body)])).toEqual([
+      [1, ["gpt-4o-mini"]],
+      [1, ["gpt-4o-mini"]],
+    ]);
+    expect(h.state()?.generation).toBe(2);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
+    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
+    await expect(check(h, 5, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(h.renewals[2]).toMatchObject({ generation: 2, model: "claude-sonnet-4-5" });
+    await expect(check(h, 6, OTHER)).resolves.toMatchObject({ leaseId: "lease-1" });
+    expect(breaker.getState().state).toBe("closed");
+  });
+
+  it("re-grants for an undeclared chain once the lease has expired, instead of leaving the run on per-call checks", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const h = harness({ renew: lostThenAnswer(replayApplied) });
+    await grantFirstModel(h);
+
+    h.clock.now = 1_000;
+    await check(h, 2, MINI);
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+
+    // The 1,200 s lease expires with the retry still owed; only chain-C traffic follows. An
+    // expired lease cannot widen, so the first C call re-grants for its own chain, as an
+    // expired-lease call on a covered chain does, and is on the new lease at once.
+    h.clock.now = 1_300_000;
+    await expect(check(h, 3, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: "lease-2" });
+    expect(h.since()).toEqual([LEASE_URL]);
+    expect(h.grants[1]).toMatchObject({
+      agent_run_id: RUN,
+      model: "claude-sonnet-4-5",
+      provider: "anthropic",
+    });
+    expect(h.state()).toMatchObject({ leaseId: "lease-2", generation: 1 });
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["claude-sonnet-4-5"]);
+    expect(internal(h.budget).leaseLedger.owedRenewalDeclaration(RUN)).toBeNull();
+    await expect(check(h, 4, OTHER)).resolves.toMatchObject({ leaseId: "lease-2" });
+    expect(h.since()).toEqual([]);
+
+    // The first chain widens the new lease like any newly seen chain.
+    await expect(check(h, 5)).resolves.toMatchObject({ allowed: true, leaseId: null });
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(h.renewals[1]).toMatchObject({ lease_id: "lease-2", generation: 1, model: "gpt-4o" });
+    await expect(check(h, 6)).resolves.toMatchObject({ leaseId: "lease-2" });
+    expect(h.renewals.map((body) => [body["lease_id"], body["generation"]])).toEqual([
+      ["lease-1", 1],
+      ["lease-2", 1],
+    ]);
   });
 
   it("records the retried widening's added models when the retry is refused", async () => {

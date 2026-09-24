@@ -109,6 +109,33 @@ describe("LeaseLedger admission ladder", () => {
     );
   });
 
+  it("re-grants an expired lease for an uncovered chain while the control plane is reachable", () => {
+    // Before expiry, an uncovered chain stays on per-call checks and the lease is kept.
+    const live = installed(grant({ lease_length_s: 1 }));
+    expect(admit(live, { callId: "outside-live", model: "other", now: 1_000.5 })).toMatchObject({
+      decision: LeaseDecision.LegacyCheck,
+      reason: "model_outside_declared_set",
+      claimToken: 1,
+    });
+    expect(live.leaseIdFor(RUN)).toBe("lse-1");
+    // Once expired, the call drops the lease and re-grants for its own chain, as a covered
+    // chain's call does: an expired lease cannot widen.
+    const up = installed(grant({ lease_length_s: 1 }));
+    expect(admit(up, { callId: "outside-up", model: "other", now: 1_001 })).toMatchObject({
+      decision: LeaseDecision.NeedGrant,
+      reason: "lease_expired",
+      claimToken: 1,
+    });
+    expect(up.leaseIdFor(RUN)).toBeNull();
+    // With the control plane unreachable, no grant is possible: the chain keeps its per-call
+    // path and the expired lease is kept for the covered chains' outage ladder.
+    const down = installed(grant({ lease_length_s: 1 }));
+    expect(
+      admit(down, { callId: "outside-down", model: "other", now: 1_001, breakerOpen: true }),
+    ).toMatchObject({ decision: LeaseDecision.LegacyCheck, reason: "model_outside_declared_set" });
+    expect(down.leaseIdFor(RUN)).toBe("lse-1");
+  });
+
   it("uses the live and expired outage ladders without treating expiry as exhaustion", () => {
     const live = installed(grant({ granted_tokens: 1_000, headroom_share_tokens: 2_000 }));
     expect(
@@ -924,13 +951,29 @@ describe("LeaseLedger widening claims and refused models", () => {
       fallbackModels: ["claude-sonnet-4-5", "gpt-5-mini"],
     });
 
-    // Another undeclared chain never rides on the owed retry.
+    // Another undeclared chain claims the owed retry, which re-sends the first declaration; its
+    // own chain never rides on it and is not among the added models.
     const other = { now: 1_003, model: "gpt-5-nano", fallbackProviders: [], fallbackModels: [] };
-    expect(value.claimWideningRequest(RUN, chain(other))).toBeNull();
-    expect(value.stateFor(RUN)?.renewalInFlight).toBe(false);
+    const byOther = value.claimWideningRequest(RUN, chain(other));
+    expect(byOther).toMatchObject({
+      retry: true,
+      addedModels: ["claude-sonnet-4-5", "gpt-5-mini"],
+      request: {
+        lease_id: "lse-1",
+        generation: 1,
+        model: "gpt-5",
+        provider: "openai",
+        fallback_providers: ["anthropic", "openai"],
+        fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
+      },
+    });
+    expect(JSON.stringify(byOther)).not.toContain("gpt-5-nano");
+    expect(value.stateFor(RUN)?.renewalInFlight).toBe(true);
+    value.renewalFailed(RUN, { now: 1_003, expectedLeaseId: "lse-1", expectedGeneration: 1 });
 
     // Any retry at the origin, whoever claims it, re-sends the first declaration and added models.
     const retry = value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" });
+    expect(retry?.retry).toBe(true);
     expect(retry?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
     expect(retry?.request).toMatchObject({
       lease_id: "lse-1",
@@ -941,8 +984,8 @@ describe("LeaseLedger widening claims and refused models", () => {
       fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
     });
     value.renewalFailed(RUN, { now: 1_003, expectedLeaseId: "lse-1", expectedGeneration: 1 });
-    // The same chain may drive the retry itself.
-    expect(value.claimWideningRequest(RUN, chain({ now: 1_005 }))?.request).toMatchObject({
+    // The same chain may drive the retry itself (past the 4 s backoff of a third failure).
+    expect(value.claimWideningRequest(RUN, chain({ now: 1_007 }))?.request).toMatchObject({
       generation: 1,
       fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
     });
@@ -959,6 +1002,73 @@ describe("LeaseLedger widening claims and refused models", () => {
       addedModels: ["gpt-5-nano"],
       request: { generation: 2, model: "gpt-5-nano", fallback_models: [] },
     });
+  });
+
+  it("keeps a declaration an earlier attempt may have delivered when a later attempt is skipped", () => {
+    const value = installed();
+    value.claimWideningRequest(RUN, chain());
+    // The first attempt was sent and its outcome is unknown: the plane may hold its answer.
+    value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 });
+    // A retry is claimed and skipped before it is sent (an open breaker). That skip must not
+    // clear what the first attempt may have delivered.
+    expect(value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" })).not.toBeNull();
+    value.renewalFailed(RUN, {
+      now: 1_002,
+      expectedLeaseId: "lse-1",
+      expectedGeneration: 1,
+      sent: false,
+    });
+    expect(value.owedRenewalDeclaration(RUN)).toMatchObject({
+      leaseId: "lse-1",
+      generation: 1,
+      model: "gpt-5",
+      fallbackModels: ["claude-sonnet-4-5", "gpt-5-mini"],
+    });
+    // The next claim, from any chain, still re-sends it.
+    expect(
+      value.claimWideningRequest(
+        RUN,
+        chain({ now: 1_005, model: "gpt-5-nano", fallbackProviders: [], fallbackModels: [] }),
+      )?.request,
+    ).toMatchObject({
+      generation: 1,
+      model: "gpt-5",
+      fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
+    });
+  });
+
+  it("records that a claimed declaration was dispatched, whatever the attempt reports later", () => {
+    const value = installed();
+    value.claimWideningRequest(RUN, chain());
+    expect(value.owedRenewalDeclaration(RUN)?.dispatched).toBe(false);
+    // A dispatch report for another origin changes nothing.
+    expect(value.renewalDispatched(RUN, { expectedLeaseId: "lse-1", expectedGeneration: 2 })).toBe(
+      false,
+    );
+    expect(
+      value.renewalDispatched("other-run", { expectedLeaseId: "lse-1", expectedGeneration: 1 }),
+    ).toBe(false);
+    expect(value.owedRenewalDeclaration(RUN)?.dispatched).toBe(false);
+    expect(value.renewalDispatched(RUN, { expectedLeaseId: "lse-1", expectedGeneration: 1 })).toBe(
+      true,
+    );
+    expect(value.owedRenewalDeclaration(RUN)?.dispatched).toBe(true);
+    // Once dispatched, even an attempt reported as never sent leaves the declaration owed.
+    value.renewalFailed(RUN, {
+      now: 1_001,
+      expectedLeaseId: "lse-1",
+      expectedGeneration: 1,
+      sent: false,
+    });
+    expect(value.owedRenewalDeclaration(RUN)).toMatchObject({ model: "gpt-5", dispatched: true });
+    // A superseding generation clears it, as always.
+    value.applyGrantResponse(RUN, grant({ generation: 2 }), {
+      now: 1_002,
+      declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+      expectedLeaseId: "lse-1",
+      expectedGeneration: 1,
+    });
+    expect(value.owedRenewalDeclaration(RUN)).toBeNull();
   });
 
   it("owes nothing for a renewal that never reached the control plane", () => {

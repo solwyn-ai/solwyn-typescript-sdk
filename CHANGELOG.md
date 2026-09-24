@@ -29,6 +29,11 @@ corresponding release notes before users upgrade.
 
 - `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
   at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
+- A failed provider-breaker report now backs off before the reporter retries it. The first retry
+  waits at least one flush interval, and later retries follow the reporter's retry backoff
+  (`reporterRetryBackoffBase` to `reporterRetryBackoffCap`, 1 to 60 seconds by default). While a
+  retry is pending, no breaker report is sent, including a changed breaker state. A successful
+  report clears the backoff. Reports sent by `close()` are not delayed.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

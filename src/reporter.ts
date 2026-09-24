@@ -418,6 +418,10 @@ export class MetadataReporter {
   private activeBreakerAbortController: AbortController | null = null;
   private readonly breakerLastSent = new Map<string, string>();
   private breakerHeartbeatAt = 0;
+  /** Consecutive breaker cycles with a failed report; drives the retry backoff. */
+  private breakerFailedCycles = 0;
+  /** Monotonic time before which cadence rounds launch no breaker cycle. */
+  private breakerRetryAt: number | null = null;
   private pendingBreakerSnapshots: readonly BreakerSnapshot[] | null = null;
   private closePromise: Promise<void> | null = null;
   private flushScheduleFailureLogged = false;
@@ -1598,6 +1602,31 @@ export class MetadataReporter {
 
     const reportedAt = this.wallClock().toISOString();
     const path = `/api/v1/projects/${encodeURIComponent(projectId)}/providers/breaker-reports`;
+    const outcome = { delivered: false, failed: false };
+    try {
+      await this._postBreakerReports(
+        path,
+        due,
+        reportedAt,
+        sdkInstanceId,
+        outcome,
+        deadline,
+        signal,
+      );
+    } finally {
+      this._noteBreakerCycleOutcome(outcome.delivered, outcome.failed);
+    }
+  }
+
+  private async _postBreakerReports(
+    path: string,
+    due: readonly BreakerSnapshot[],
+    reportedAt: string,
+    sdkInstanceId: string,
+    outcome: { delivered: boolean; failed: boolean },
+    deadline?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     for (const [provider, snapshot] of due) {
       if (this._deadlineExpired(deadline)) return;
       const parsed = BreakerStateReportSchema.safeParse({
@@ -1624,8 +1653,10 @@ export class MetadataReporter {
         });
         if (this._deadlineExpired(deadline)) return;
         this.breakerLastSent.set(provider, this._breakerSnapshotKey(snapshot));
+        outcome.delivered = true;
       } catch (error) {
         if (this._deadlineExpired(deadline)) return;
+        outcome.failed = true;
         if (isReadOnlyKeyError(error)) {
           handleReadOnlyKeyError(error, this.logger);
           return;
@@ -1637,6 +1668,29 @@ export class MetadataReporter {
         );
       }
     }
+  }
+
+  /**
+   * A cycle with any failed report arms an independent retry deadline: never sooner
+   * than one flush interval, then the reporter's no-jitter retry backoff. A cycle
+   * whose reports all succeed clears it. Cadence rounds, including zero-delay
+   * continuation rounds, respect the deadline; the forced close-time cycle does not.
+   */
+  private _noteBreakerCycleOutcome(delivered: boolean, failed: boolean): void {
+    if (failed) {
+      this.breakerFailedCycles += 1;
+      this.breakerRetryAt =
+        this.monotonicClock() +
+        Math.max(this.flushInterval, this._backoffDelay(this.breakerFailedCycles));
+    } else if (delivered) {
+      this.breakerFailedCycles = 0;
+      this.breakerRetryAt = null;
+    }
+  }
+
+  /** Whether a failed breaker report's retry deadline still gates cadence cycles. */
+  private _breakerRetryPending(): boolean {
+    return this.breakerRetryAt !== null && this.monotonicClock() < this.breakerRetryAt;
   }
 
   // -------------------------------------------------------------------------
@@ -1721,7 +1775,9 @@ export class MetadataReporter {
       const round: FlushRound = { more: false };
       await this._flushRemaining(undefined, false, round);
       if (this.shuttingDown) return false;
-      if (this._breakerReportsDue()) void this._startBreakerCycle();
+      if (!this._breakerRetryPending() && this._breakerReportsDue()) {
+        void this._startBreakerCycle();
+      }
       return round.more;
     } catch (error) {
       // A single flush failure is not a scheduler failure and must not kill

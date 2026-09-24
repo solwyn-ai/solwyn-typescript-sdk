@@ -3,9 +3,10 @@ import type { CircuitBreakerState } from "../../src/circuit-breaker";
 import type { Logger } from "../../src/logging";
 import { resetReadOnlyKeyDiagnosticForTest } from "../../src/read-only-key";
 import { MetadataReporter } from "../../src/reporter";
+import { zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
-import type { MetadataEvent } from "../../src/types";
-import { MetadataEventSchema } from "../../src/validation";
+import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
+import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -64,6 +65,24 @@ function metadataEvent(): MetadataEvent {
     sdk_instance_id: SDK_INSTANCE_ID,
     timestamp: "2026-08-14T00:00:00Z",
   });
+}
+
+function syntheticCallId(index: number): string {
+  return `00000000-0000-0000-0001-${(index + 1).toString(16).padStart(12, "0")}`;
+}
+
+function settlementPair(index: number): [BudgetConfirmRequest, MetadataEvent] {
+  const callId = syntheticCallId(index);
+  return [
+    BudgetConfirmRequestSchema.parse({
+      reservation_id: "synthetic",
+      model: "gpt-4o",
+      provider: "openai",
+      call_id: callId,
+      token_details: zeroTokenDetails(),
+    }),
+    MetadataEventSchema.parse({ ...metadataEvent(), call_id: callId }),
+  ];
 }
 
 describe("provider breaker report cycles", () => {
@@ -536,6 +555,108 @@ describe("provider breaker report cycles", () => {
       releaseIngest?.();
       releaseSecondCycle?.();
       vi.useRealTimers();
+    }
+  });
+
+  it("backs off failed breaker reports across zero-delay continuation rounds", async () => {
+    let now = 0;
+    let rounds = 0;
+    let generated = 0;
+    let producing = true;
+    let breakerStatus = 503;
+    let failureCount = 0;
+    let breakerPosts = 0;
+    const logger = loggerSpies();
+    let instance!: MetadataReporter;
+    const produce = (): void => {
+      instance.reportSettlement(...settlementPair(generated));
+      generated += 1;
+    };
+    instance = reporter({
+      batchSize: 1,
+      flushInterval: 1000,
+      logger,
+      monotonicClock: () => now,
+      sdkInstanceId: SDK_INSTANCE_ID,
+      breakerSnapshots: () => [["openai", state({ failureCount })]],
+      // Every confirm yields one new settlement, so each quota-exhausted round sets
+      // more and the next round runs on a zero-delay timer turn.
+      fetch: async (url, init) => {
+        if (url === BREAKER_URL) {
+          breakerPosts += 1;
+          return new Response(null, { status: breakerStatus });
+        }
+        if (url.endsWith("/budgets/confirm")) {
+          if (producing) produce();
+          return new Response(null, { status: 204 });
+        }
+        const events = JSON.parse(String(init?.body)) as unknown[];
+        return new Response(JSON.stringify({ ingested: events.length, rejected: [] }), {
+          status: 202,
+        });
+      },
+    });
+    instance.observeProjectId(PROJECT_ID);
+    const flush = instance._flushRemaining.bind(instance);
+    vi.spyOn(instance, "_flushRemaining").mockImplementation(async (...args) => {
+      const clean = await flush(...args);
+      rounds += 1;
+      return clean;
+    });
+    const afterRounds = async (count: number): Promise<void> => {
+      const target = rounds + count;
+      while (rounds < target) await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    const sendFailures = (): number =>
+      vi
+        .mocked(logger.warn)
+        .mock.calls.filter(
+          (call) => call[0] === "reporter.breaker_send_failed: provider=%s exc_type=%s",
+        ).length;
+
+    produce(); // starts the cadence
+    try {
+      // The clock is frozen, so only zero-delay continuation rounds run.
+      await afterRounds(30);
+      expect(instance.settlementQueueSize).toBeGreaterThan(0); // more is still set
+      expect(breakerPosts).toBe(1);
+
+      // First retry: one flush interval (>= the 1 s backoff base) after the failure.
+      now = 999;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(1);
+      now = 1000;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(2);
+
+      // Second retry backs off to 2 s.
+      now = 2999;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(2);
+      now = 3000;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(3);
+      expect(sendFailures()).toBe(3);
+
+      // A changed snapshot waits for the pending deadline too (4 s backoff).
+      failureCount = 1;
+      breakerStatus = 204;
+      now = 6999;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(3);
+      now = 7000;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(4);
+
+      // Success clears the backoff: the next changed snapshot reports at once, once.
+      failureCount = 2;
+      await afterRounds(30);
+      expect(breakerPosts).toBe(5);
+      expect(sendFailures()).toBe(3);
+      expect(generated).toBeGreaterThan(200);
+    } finally {
+      producing = false;
+      await instance.close(5000);
     }
   });
 });

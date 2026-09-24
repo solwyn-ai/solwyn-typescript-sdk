@@ -290,10 +290,12 @@ const TRANSCRIPTION_FORMAT_HINT =
 
 /**
  * An identity-stable getter plus the narrow invalidation seam used by proxy mutation
- * traps. Ordinary methods are bound to `target` once and memoized per property key, so
- * `proxy.foo === proxy.foo` across unchanged reads (F23). Non-function values are re-read
- * live. A successful mutation invalidates only its own key, preventing a replaced method
- * from being shadowed by its old bound function without disturbing any other identity.
+ * traps. Ordinary methods are bound to `target` and memoized per property key together
+ * with the raw function they bind, so `proxy.foo === proxy.foo` across unchanged reads
+ * (F23). Non-function values are re-read live. A cached binding is reused only while the
+ * live raw value is the same function; a method replaced directly on the raw object or
+ * patched on its prototype is rebound instead of being shadowed by its old binding. A
+ * successful proxy mutation also invalidates only its own key.
  * Separate presentation lets public reads validate raw values before binding; classes
  * remain unbound so their shape and identity are not disguised as ordinary functions.
  */
@@ -304,7 +306,13 @@ interface BoundGetter {
 }
 
 function makeBoundGetter(target: object): BoundGetter {
-  const boundMethods = new Map<string | symbol, (...args: unknown[]) => unknown>();
+  const boundMethods = new Map<
+    string | symbol,
+    {
+      readonly raw: (...args: unknown[]) => unknown;
+      readonly bound: (...args: unknown[]) => unknown;
+    }
+  >();
   const present = (prop: string | symbol, value: unknown): unknown => {
     if (
       prop === "constructor" ||
@@ -313,12 +321,13 @@ function makeBoundGetter(target: object): BoundGetter {
     ) {
       return value;
     }
+    const raw = value as (...args: unknown[]) => unknown;
     const cached = boundMethods.get(prop);
-    if (cached !== undefined) {
-      return cached;
+    if (cached?.raw === raw) {
+      return cached.bound;
     }
-    const bound = (value as (...args: unknown[]) => unknown).bind(target);
-    boundMethods.set(prop, bound);
+    const bound = raw.bind(target);
+    boundMethods.set(prop, { raw, bound });
     return bound;
   };
   const get = ((prop: string | symbol): unknown =>

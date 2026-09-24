@@ -87,6 +87,46 @@ export function validateMeteredGoogleOptions(params: Record<string, unknown>): v
   }
 }
 
+/** The caller's cancellation value in its own dialect's native carrier, unvalidated. */
+function callerSignalValue(
+  args: readonly unknown[],
+  sourceParams: Record<string, unknown>,
+  sourceDialect: Dialect,
+): unknown {
+  const original = args[0];
+  const config = sourceParams["config"];
+  const fetchOptions = record(original) ? original["fetchOptions"] : undefined;
+  return sourceDialect === "google" && record(config)
+    ? config["abortSignal"]
+    : record(original)
+      ? (original["signal"] ??
+        original["abortSignal"] ??
+        (record(fetchOptions) ? fetchOptions["signal"] : undefined))
+      : undefined;
+}
+
+/**
+ * The caller's `AbortSignal`, when its native carrier holds a signal-shaped value. Duck-typed
+ * (no `instanceof`) so polyfilled and cross-realm signals are honoured.
+ */
+export function callerAbortSignal(
+  args: readonly unknown[],
+  sourceParams: Record<string, unknown>,
+  sourceDialect: Dialect,
+): AbortSignal | undefined {
+  const value = callerSignalValue(args, sourceParams, sourceDialect);
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    typeof Reflect.get(value, "aborted") === "boolean" &&
+    typeof Reflect.get(value, "addEventListener") === "function" &&
+    typeof Reflect.get(value, "removeEventListener") === "function"
+  ) {
+    return value as AbortSignal;
+  }
+  return undefined;
+}
+
 /** Only endpoint-independent transport controls may move to another provider. */
 export function crossProviderRequestOptions(
   args: readonly unknown[],
@@ -101,16 +141,7 @@ export function crossProviderRequestOptions(
       if (Object.hasOwn(original, key)) copied[key] = original[key];
     }
   }
-  const config = sourceParams["config"];
-  const fetchOptions = record(original) ? original["fetchOptions"] : undefined;
-  const signal =
-    sourceDialect === "google" && record(config)
-      ? config["abortSignal"]
-      : record(original)
-        ? (original["signal"] ??
-          original["abortSignal"] ??
-          (record(fetchOptions) ? fetchOptions["signal"] : undefined))
-        : undefined;
+  const signal = callerSignalValue(args, sourceParams, sourceDialect);
   if (signal !== undefined)
     copied[targetDialect === "google" || targetDialect === "bedrock" ? "abortSignal" : "signal"] =
       signal;

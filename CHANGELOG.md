@@ -94,6 +94,26 @@ corresponding release notes before users upgrade.
   or failing body is cancelled within the lesser of the remaining request deadline and one
   second. Outcomes are still decided when headers arrive and never wait for this cleanup; body
   bytes are never retained or logged.
+- **Merged-tag clamping warns once per client.** When configured, run, and per-call tags merge
+  to more than 10 keys, the first clamped call on a client still logs a warning; later clamped
+  calls on that client log at debug level with a running count instead of warning on every
+  call. Which tags are kept is unchanged.
+- **Wrapped methods follow raw method replacement.** A wrapped surface method (for example
+  `chat.completions.list`) that is replaced directly on the raw client object, or patched on its
+  prototype, after it was first read through the wrapper now calls the new function instead of
+  the stale bound original. Reads of an unchanged method still return the same function.
+- **Caller aborts end same-provider `Retry-After` waits.** With `sameProviderRetries` above zero,
+  aborting the request's `AbortSignal` during a `Retry-After` sleep now rejects immediately with
+  the signal's reason (or an `AbortError`), clears the timer, and neither re-dispatches to the
+  same provider nor fails over to a fallback, even when the provider SDK ignores the signal.
+  Previously the SDK slept for the whole `Retry-After` interval and then dispatched again.
+- **Documented what `failoverHopReadTimeout` bounds.** The README no longer says it bounds the
+  whole provider request. For the OpenAI, OpenAI-compatible, and Anthropic SDKs it covers
+  connecting and receiving headers only, so a stream that stalls after its first bytes is not
+  interrupted; Google keeps the bound until the response or stream finishes (through Solwyn's
+  own `AbortSignal` timer on a verified `@google/genai` version, otherwise the native
+  `config.httpOptions.timeout`). Use an `AbortSignal` or an idle timeout to bound stalled
+  streams.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

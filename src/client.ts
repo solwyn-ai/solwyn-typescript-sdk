@@ -101,6 +101,7 @@ import {
 } from "./registry";
 import { MetadataReporter } from "./reporter";
 import {
+  callerAbortSignal,
   captureMeteredRequestOptions,
   crossProviderRequestOptions,
   snapshotRequestOptions,
@@ -242,6 +243,32 @@ function snapshotCurrentRun(budget?: BudgetEnforcer): RunSnapshot | undefined {
     tags,
     parentAgentRunId: current.parentAgentRunId ?? null,
   });
+}
+
+/**
+ * The logger handed to tag capture: one warn-once latch per client. `captureTags` warns on
+ * every clamped capture; through this latch the first clamp on a client reaches `warn` and
+ * every later one is logged at debug level with its running count, so a hot path with an
+ * oversized tag layer does not emit one warning per call. Other levels pass through.
+ */
+function tagCaptureLogger(logger: Logger): Logger {
+  let clampWarnings = 0;
+  return {
+    debug: (message, ...args) => logger.debug(message, ...args),
+    info: (message, ...args) => logger.info(message, ...args),
+    error: (message, ...args) => logger.error(message, ...args),
+    warn(message, ...args): void {
+      clampWarnings += 1;
+      if (clampWarnings === 1) {
+        logger.warn(
+          `${message} (further occurrences on this client are logged at debug level)`,
+          ...args,
+        );
+        return;
+      }
+      logger.debug(`${message} (occurrence ${clampWarnings} on this client)`, ...args);
+    },
+  };
 }
 
 /** Capture complete intercepted-call attribution once, before asynchronous admission work. */
@@ -643,10 +670,38 @@ function nowMs(): number {
   return performance.now();
 }
 
-/** Resolve after `ms` (web-standard `setTimeout`; used only for same-provider 429 retries). */
-function delayMs(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+/** The rejection for a caller abort: its reason when that is an Error, else an `AbortError`. */
+function callerAbortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  if (typeof DOMException === "function") {
+    return new DOMException("The operation was aborted.", "AbortError");
+  }
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * Resolve after `ms` (web-standard `setTimeout`; used only for same-provider 429 retries), or
+ * reject with {@link callerAbortError} as soon as the caller's signal aborts. The timer and
+ * the abort listener are both released on whichever outcome comes first.
+ */
+function abortableDelayMs(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(callerAbortError(signal));
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(callerAbortError(signal as AbortSignal));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -1030,6 +1085,8 @@ export class SolwynCore {
   readonly #controlPlaneBreaker: CircuitBreaker;
   readonly #sdkInstanceId: string;
   readonly #logger: Logger;
+  /** {@link tagCaptureLogger}: the client's warn-once latch for merged-tag clamping. */
+  readonly #tagLogger: Logger;
   /** Injectable candidate-ordering policy (default health-based). */
   readonly #selectionPolicy: SelectionPolicy;
   /** Per-provider rolling latency window feeding {@link LatencyPolicy}. */
@@ -1095,6 +1152,7 @@ export class SolwynCore {
     this.#sdkInstanceId = crypto.randomUUID();
     // D6: resolve one logger for every core and advisory subsystem.
     this.#logger = options.logger ?? consoleLogger;
+    this.#tagLogger = tagCaptureLogger(this.#logger);
     this.#surfaceRuntimes = buildSurfaceRuntimeDescriptors(
       this.#client,
       this.#primaryModel,
@@ -1974,7 +2032,12 @@ export class SolwynCore {
     const { callerKwargs, perCallTags } = copyKwargsAndExtractTags(kwargs);
     // Capture exactly once at issuance so deferred streams retain the scope that created them,
     // while unscoped configured/per-call tags remain real attribution.
-    const run = captureCallAttribution(perCallTags, this.#config.tags, this.#logger, this.#budget);
+    const run = captureCallAttribution(
+      perCallTags,
+      this.#config.tags,
+      this.#tagLogger,
+      this.#budget,
+    );
     const callId = crypto.randomUUID();
     return this.#executeInterceptedCall(
       surface,
@@ -1992,7 +2055,12 @@ export class SolwynCore {
     passthroughArgs: readonly unknown[] = [],
   ): DeferredResponseStream {
     const { callerKwargs, perCallTags } = copyKwargsAndExtractTags(kwargs);
-    const run = captureCallAttribution(perCallTags, this.#config.tags, this.#logger, this.#budget);
+    const run = captureCallAttribution(
+      perCallTags,
+      this.#config.tags,
+      this.#tagLogger,
+      this.#budget,
+    );
     const callId = crypto.randomUUID();
     const effective = this.#mergeResponsesKwargs(
       { model: this.#primaryModel ?? "", default_params: {} },
@@ -2226,7 +2294,7 @@ export class SolwynCore {
     const attribution = captureCallAttribution(
       perCallTags,
       this.#config.tags,
-      this.#logger,
+      this.#tagLogger,
       this.#budget,
     );
     const { primary } = await this.#ensureInit();
@@ -2252,7 +2320,7 @@ export class SolwynCore {
       captureCallAttribution(
         directRequest?.perCallTags,
         this.#config.tags,
-        this.#logger,
+        this.#tagLogger,
         this.#budget,
       );
     const callId = crypto.randomUUID();
@@ -2591,6 +2659,8 @@ export class SolwynCore {
 
       // Same-provider 429 retries reset to the snapshotted budget for EACH chain entry.
       let retriesRemaining = ctx.responsesLeaf === "stream" ? 0 : ctx.tuning.sameProviderRetries;
+      // A caller abort observed during (or at the end of) a Retry-After sleep ends the call.
+      let retryAbort: Error | undefined;
 
       while (true) {
         // The provider read bound is immutable for the whole logical call. The total deadline
@@ -2641,12 +2711,26 @@ export class SolwynCore {
           // verdict and NO error event for the unresolved 429 (#20). After the sleep, RE-CHECK the
           // deadline: a sleep that spent the whole chain budget falls through to normal failover
           // handling; a retry that still fits keeps the call's constant snapshotted read bound.
+          // The sleep honours the caller's AbortSignal even when the provider SDK would ignore
+          // it, and signal.aborted is re-checked before re-dispatch. An abort is the caller
+          // ending the call: the 429 hop is accounted below as an un-retried failure, then the
+          // abort is raised in place of advancing, so it can never become a failover.
           if (disposition === Disposition.FAILOVER && retriesRemaining > 0) {
             const delaySeconds = retryAfterSeconds(error);
             if (delaySeconds !== null && retryFitsWithinDeadline(delaySeconds, deadline)) {
               retriesRemaining -= 1;
-              await delayMs(delaySeconds * 1000);
-              if (!deadline.expired()) {
+              const signal = callerAbortSignal(
+                ctx.passthroughArgs,
+                ctx.callerKwargs,
+                ctx.primaryDialect,
+              );
+              try {
+                await abortableDelayMs(delaySeconds * 1000, signal);
+                if (signal?.aborted) retryAbort = callerAbortError(signal);
+              } catch (abortError) {
+                retryAbort = abortError as Error;
+              }
+              if (retryAbort === undefined && !deadline.expired()) {
                 continue;
               }
             }
@@ -2691,6 +2775,10 @@ export class SolwynCore {
             ),
           );
 
+          if (retryAbort !== undefined) {
+            // The caller aborted during the Retry-After sleep: end the call, never advance.
+            throw retryAbort;
+          }
           if (disposition === Disposition.FAIL_FAST) {
             // #26: stop the whole chain, re-raise the IDENTICAL original exception.
             throw error;

@@ -841,6 +841,67 @@ describe("proxies — transparent top-level mutation + reflection", () => {
     await solwyn.close();
   });
 
+  it("rebinds a surface method replaced on the raw object or its prototype after the first read", async () => {
+    class Completions {
+      create(): object {
+        return {};
+      }
+      list(): string {
+        return this === completions ? "original list" : "wrong receiver";
+      }
+      update(): string {
+        return this === completions ? "original update" : "wrong receiver";
+      }
+      retrieve(): string {
+        return this === completions ? "stable" : "wrong receiver";
+      }
+    }
+    const completions = new Completions() as Completions & { list: () => string };
+    const client = { chat: { completions } };
+    const { fetchMock } = makeFetch();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch: fetchMock });
+    const wrapped = (
+      solwyn as unknown as {
+        chat: { completions: { list(): string; update(): string; retrieve(): string } };
+      }
+    ).chat.completions;
+
+    const stable = wrapped.retrieve;
+    const firstList = wrapped.list;
+    const firstUpdate = wrapped.update;
+    expect(wrapped.list).toBe(firstList);
+    expect(wrapped.update).toBe(firstUpdate);
+    expect(firstList()).toBe("original list");
+
+    // Raw-side own replacement, bypassing the proxy's mutation traps.
+    completions.list = function (this: unknown): string {
+      return this === completions ? "replaced list" : "wrong receiver";
+    };
+    const replacedList = wrapped.list;
+    expect(replacedList).not.toBe(firstList);
+    expect(replacedList()).toBe("replaced list");
+    expect(wrapped.list).toBe(replacedList);
+
+    // Prototype patch after the first wrapped read.
+    const originalUpdate = Completions.prototype.update;
+    Completions.prototype.update = function (this: unknown): string {
+      return this === completions ? "patched update" : "wrong receiver";
+    };
+    try {
+      const patchedUpdate = wrapped.update;
+      expect(patchedUpdate).not.toBe(firstUpdate);
+      expect(patchedUpdate()).toBe("patched update");
+      expect(wrapped.update).toBe(patchedUpdate);
+    } finally {
+      Completions.prototype.update = originalUpdate;
+    }
+    expect(wrapped.update()).toBe("original update");
+
+    // Nothing changed for this key: identity is unchanged across every read above.
+    expect(wrapped.retrieve).toBe(stable);
+    await solwyn.close();
+  });
+
   it("keeps the same binding when a mutation fails and the method is unchanged", async () => {
     const client = {
       chat: { completions: { create: () => ({}) } },
@@ -1035,8 +1096,8 @@ describe("proxies — specialized namespace mutation", () => {
         get: () => method,
         set(value: typeof method) {
           setterReceiver = this;
-          method = value;
           if (value === failedMethod) throw failure;
+          method = value;
           return result;
         },
       });

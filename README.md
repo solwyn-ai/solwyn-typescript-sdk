@@ -609,9 +609,9 @@ const client = new Solwyn(new OpenAI(), {
 });
 ```
 
-On a failover-eligible error the router walks `[primary, ...fallbacks]` in health order. `failoverTotalTimeout` is the failover window: it starts at call entry and gates budget preflight, `Retry-After` sleeps, and whether another hop may start. It does not interrupt a provider request that has already been dispatched. Every attempt instead receives the same `failoverHopReadTimeout` SDK request bound, so worst-case wall time is approximately the failover window plus one provider read bound.
+On a failover-eligible error the router walks `[primary, ...fallbacks]` in health order. `failoverTotalTimeout` is the failover window: it starts at call entry and gates budget preflight, `Retry-After` sleeps, and whether another hop may start. It does not interrupt a provider request that has already been dispatched. Every attempt instead receives the same `failoverHopReadTimeout` SDK request bound, so worst-case wall time until a response starts is approximately the failover window plus one provider read bound. That bound does not cover reading a response body or stream on every provider (see the timeout notes under Configuration): for OpenAI, OpenAI-compatible, and Anthropic clients, a body or stream that stalls after its first bytes can outlast it. Pass an `AbortSignal` in the request options, or apply your own idle timeout while consuming a stream, to bound that phase.
 
-JavaScript provider SDKs expose one per-request timeout rather than separate connect/read controls. OpenAI, compatible clients, and Anthropic receive it in their request options; Google applies it to the whole request through `config.httpOptions.timeout`. Bedrock receives AWS SDK v3 `requestTimeout`, but that carrier is not a universal hard abort for every Converse stream handler. When Solwyn can read no finite-positive socket timeout from a Bedrock client's `requestHandler`, it warns so the handler can be bounded explicitly.
+JavaScript provider SDKs expose one per-request timeout rather than separate connect/read controls. OpenAI, compatible clients, and Anthropic receive it in their request options. Google receives it as `config.httpOptions.timeout` with native retries disabled; on a `@google/genai` version whose request-signal support Solwyn has verified, Solwyn disables that native timeout and arms its own `AbortSignal` timer instead, which stays armed until the buffered response or the stream finishes. Bedrock receives AWS SDK v3 `requestTimeout`, but that carrier is not a universal hard abort for every Converse stream handler. When Solwyn can read no finite-positive socket timeout from a Bedrock client's `requestHandler`, it warns so the handler can be bounded explicitly.
 
 Circuit breakers, latency signals, and failover labeling key off the provider **name** — so give distinct endpoints distinct identities (via `provider` or the 4th fallback element) when you want them tracked separately.
 
@@ -1024,9 +1024,14 @@ Env fallback is a **presence check**: an env var is consulted only when the corr
 Both failover timeout values must be finite, non-boolean numbers;
 `failoverHopReadTimeout` must also be positive. A zero `failoverTotalTimeout` is valid and prevents
 new work from starting after call entry. JavaScript provider SDKs expose a single per-request
-timeout carrier, so `failoverHopReadTimeout` bounds the whole provider request rather than a
-separate read phase. In particular, Bedrock's `requestTimeout` is not a universal hard abort for
-every Converse stream handler; configure a finite socket timeout on the AWS request handler too.
+timeout carrier rather than separate connect and read phases, and what it covers differs by SDK.
+For the OpenAI, OpenAI-compatible, and Anthropic SDKs, `failoverHopReadTimeout` covers only
+connecting and receiving response headers: a response body or stream that stalls after its first
+bytes is not interrupted. For Google, Solwyn keeps the bound armed until the buffered response or
+the stream finishes, so it also limits the total duration of a healthy stream. To bound a stalled
+stream on the other SDKs, pass an `AbortSignal` in the request options or apply your own idle
+timeout while iterating. Bedrock's `requestTimeout` is not a universal hard abort for every
+Converse stream handler; configure a finite socket timeout on the AWS request handler too.
 
 </details>
 

@@ -330,6 +330,76 @@ describe("SolwynCore — native primary request bags", () => {
     expect(ingested[0]?.tags).toEqual({ customer: "acme" });
   });
 
+  it("warns about merged-tag clamping once per client and logs later clamps at debug level", async () => {
+    const tags = Object.fromEntries(
+      Array.from({ length: 10 }, (_, index) => [`default-${index}`, `value-${index}`]),
+    );
+    const makeClient = () => ({
+      chat: {
+        completions: {
+          create: vi.fn((_kwargs: Record<string, unknown>) => ({
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+          })),
+        },
+      },
+    });
+    const makeLogger = () => ({
+      debug: vi.fn<(message: string) => void>(),
+      info: vi.fn<(message: string) => void>(),
+      warn: vi.fn<(message: string) => void>(),
+      error: vi.fn<(message: string) => void>(),
+    });
+    const clampMessages = (mock: ReturnType<typeof makeLogger>["warn"]) =>
+      mock.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message.startsWith("merged tags exceed 10 keys"));
+    const { fetchMock, ingested } = makeFetch();
+    const firstLogger = makeLogger();
+    const secondLogger = makeLogger();
+    const first = new Solwyn(makeClient(), {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: firstLogger,
+      tags,
+    });
+    const second = new Solwyn(makeClient(), {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: secondLogger,
+      tags,
+    });
+    const request = () => ({
+      model: "gpt-4o",
+      messages: [],
+      solwyn_tags: { caller: "overflow" },
+    });
+
+    for (let index = 0; index < 200; index += 1) {
+      await first.chat.completions.create(request());
+    }
+    await second.chat.completions.create(request());
+    await first.close();
+    await second.close();
+
+    expect(clampMessages(firstLogger.warn)).toEqual([
+      "merged tags exceed 10 keys; lower-priority tags were dropped (further occurrences on this client are logged at debug level)",
+    ]);
+    const firstDebug = clampMessages(firstLogger.debug);
+    expect(firstDebug).toHaveLength(199);
+    expect(firstDebug.at(-1)).toBe(
+      "merged tags exceed 10 keys; lower-priority tags were dropped (occurrence 200 on this client)",
+    );
+    // The latch is per client: another client's first clamp still warns.
+    expect(clampMessages(secondLogger.warn)).toHaveLength(1);
+    expect(clampMessages(secondLogger.debug)).toHaveLength(0);
+    // Clamping itself is unchanged on every call: the per-call tag wins and one default drops.
+    expect(ingested).toHaveLength(201);
+    for (const event of ingested) {
+      expect(Object.keys(event.tags ?? {})).toHaveLength(10);
+      expect(event.tags?.["caller"]).toBe("overflow");
+    }
+  });
+
   it("dispatches a no-default native primary without enumerating empty default records", async () => {
     const create = vi.fn((_kwargs: Record<string, unknown>) => ({
       usage: { prompt_tokens: 1, completion_tokens: 1 },

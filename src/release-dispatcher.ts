@@ -11,6 +11,12 @@
  * when a worker dequeues. Workers exist only while there is work, so an idle dispatcher holds no
  * pending promise. A request that ignores abort keeps its worker slot until it settles.
  *
+ * Every queue operation is amortized O(1) per item, so close() can drain an uncapped population
+ * within its deadline. Ordinary and close-time items wait in separate FIFOs. Within each FIFO
+ * deadlines are non-decreasing (ordinary items share one item budget from a monotonic clock, and
+ * close fencing clamps every queued item to one close deadline), so expiry only inspects the
+ * head. An item whose deadline has passed is still classified when a worker takes it.
+ *
  * Edge-safe: no `node:*` imports, and no prompt or response content is ever seen here.
  */
 
@@ -99,6 +105,47 @@ interface ReleaseItem {
   readonly callbacks: Array<(outcome: ReleaseOutcome) => void>;
 }
 
+/** A FIFO with O(1) amortized push and shift: a head index over an array, compacted lazily. */
+class Fifo<T> {
+  #items: T[] = [];
+  #head = 0;
+
+  get length(): number {
+    return this.#items.length - this.#head;
+  }
+
+  peek(): T | undefined {
+    return this.#items[this.#head];
+  }
+
+  push(item: T): void {
+    this.#items.push(item);
+  }
+
+  shift(): T | undefined {
+    if (this.#head >= this.#items.length) return undefined;
+    const item = this.#items[this.#head] as T;
+    (this.#items as Array<T | undefined>)[this.#head] = undefined;
+    this.#head += 1;
+    if (this.#head === this.#items.length) {
+      this.#items = [];
+      this.#head = 0;
+    } else if (this.#head >= 1_024 && this.#head * 2 >= this.#items.length) {
+      this.#items = this.#items.slice(this.#head);
+      this.#head = 0;
+    }
+    return item;
+  }
+
+  /** Removes and returns every item, oldest first. */
+  takeAll(): T[] {
+    const items = this.#head === 0 ? this.#items : this.#items.slice(this.#head);
+    this.#items = [];
+    this.#head = 0;
+    return items;
+  }
+}
+
 const SENT: ReleaseOutcome = Object.freeze({ kind: "sent" });
 
 function dropped(reason: ReleaseDropReason): ReleaseOutcome {
@@ -124,7 +171,10 @@ export class ReleaseDispatcher {
   readonly #options: ReleaseDispatcherOptions;
   /** Queued and active items by merge key; only identical payloads merge. */
   readonly #items = new Map<string, ReleaseItem>();
-  #queue: ReleaseItem[] = [];
+  /** Ordinary items, oldest first. */
+  readonly #queue = new Fifo<ReleaseItem>();
+  /** Close-time items, oldest first; each has one attempt and is served before ordinary items. */
+  readonly #closeQueue = new Fifo<ReleaseItem>();
   #active = 0;
   #peakActive = 0;
   #idleWaiters: Array<() => void> = [];
@@ -144,12 +194,12 @@ export class ReleaseDispatcher {
 
   /** Items waiting for a worker. */
   get pending(): number {
-    return this.#queue.length;
+    return this.#queue.length + this.#closeQueue.length;
   }
 
   /** Whether a submission now would start immediately instead of waiting. */
   get hasFreeWorker(): boolean {
-    return this.#queue.length === 0 && this.#active < RELEASE_WORKERS;
+    return this.pending === 0 && this.#active < RELEASE_WORKERS;
   }
 
   /** Highest observed number of simultaneously active requests. */
@@ -167,7 +217,7 @@ export class ReleaseDispatcher {
     });
   }
 
-  /** Queue one surrender. Never waits and never scans anything larger than the pending queue. */
+  /** Queue one surrender. Never waits and never scans the queue. */
   submit(request: LeaseSurrenderRequest, options: ReleaseSubmitOptions = {}): void {
     const now = this.#options.now();
     this.#expireQueued(now);
@@ -191,43 +241,37 @@ export class ReleaseDispatcher {
       this.#finish(item, dropped(closeTime ? "shutdown_deadline" : "expired"));
       return;
     }
-    if (!closeTime && this.#queue.length >= RELEASE_MAX_PENDING) {
+    if (!closeTime && this.pending >= RELEASE_MAX_PENDING) {
       this.#finish(item, dropped("queue_full"));
       return;
     }
     this.#items.set(key, item);
-    this.#queue.push(item);
+    (closeTime ? this.#closeQueue : this.#queue).push(item);
     this.#pump();
   }
 
   /** Close fencing: queued items get one attempt within the close deadline. */
   clampForClose(deadline: number): void {
-    for (const item of this.#queue) {
-      item.deadline = Math.min(item.deadline, deadline);
-      item.closeTime = true;
-    }
+    for (const item of this.#closeQueue.takeAll()) this.#clampInto(item, deadline);
+    for (const item of this.#queue.takeAll()) this.#clampInto(item, deadline);
+  }
+
+  #clampInto(item: ReleaseItem, deadline: number): void {
+    item.deadline = Math.min(item.deadline, deadline);
+    item.closeTime = true;
+    this.#closeQueue.push(item);
   }
 
   /** Drop close-time items still waiting; returns how many were left. */
   dropCloseTimeQueued(): number {
-    let left = 0;
-    const kept: ReleaseItem[] = [];
-    const queue = this.#queue;
-    this.#queue = kept;
-    for (const item of queue) {
-      if (item.closeTime) {
-        left += 1;
-        this.#finish(item, dropped("shutdown_deadline"));
-      } else {
-        kept.push(item);
-      }
-    }
-    return left;
+    const left = this.#closeQueue.takeAll();
+    for (const item of left) this.#finish(item, dropped("shutdown_deadline"));
+    return left.length;
   }
 
   /** Resolves when no item is queued or active. */
   whenIdle(): Promise<void> {
-    if (this.#active === 0 && this.#queue.length === 0) return Promise.resolve();
+    if (this.#active === 0 && this.pending === 0) return Promise.resolve();
     return new Promise((resolve) => {
       this.#idleWaiters.push(resolve);
     });
@@ -250,16 +294,19 @@ export class ReleaseDispatcher {
 
   #next(): ReleaseItem | null {
     this.#expireQueued(this.#options.now());
-    return this.#queue.shift() ?? null;
+    return this.#closeQueue.shift() ?? this.#queue.shift() ?? null;
   }
 
+  /** Drops expired items from each FIFO's head; deadlines are non-decreasing within a FIFO. */
   #expireQueued(now: number): void {
-    if (this.#queue.length === 0 || this.#queue.every((item) => item.deadline > now)) return;
-    const queue = this.#queue;
-    this.#queue = [];
-    for (const item of queue) {
-      if (item.deadline > now) this.#queue.push(item);
-      else this.#finish(item, dropped(item.closeTime ? "shutdown_deadline" : "expired"));
+    this.#expireHead(this.#closeQueue, now);
+    this.#expireHead(this.#queue, now);
+  }
+
+  #expireHead(queue: Fifo<ReleaseItem>, now: number): void {
+    for (let head = queue.peek(); head !== undefined && head.deadline <= now; head = queue.peek()) {
+      queue.shift();
+      this.#finish(head, dropped(head.closeTime ? "shutdown_deadline" : "expired"));
     }
   }
 
@@ -283,7 +330,7 @@ export class ReleaseDispatcher {
       }
     } finally {
       this.#active -= 1;
-      if (this.#active === 0 && this.#queue.length === 0) {
+      if (this.#active === 0 && this.pending === 0) {
         const waiters = this.#idleWaiters;
         this.#idleWaiters = [];
         for (const resolve of waiters) resolve();

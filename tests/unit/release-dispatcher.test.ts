@@ -142,6 +142,117 @@ describe("ReleaseDispatcher", () => {
     expect(releases.counts().dropped).toMatchObject({ timeout: 4, shutdown_deadline: 96 });
   });
 
+  it("drains 20,000 close-time releases within the close deadline with O(N) queue visits", async () => {
+    // Structural cost model: every time the dispatcher examines an item's deadline counts as one
+    // visit and advances the fake clock by one tick. Linear queue work finishes long before the
+    // close deadline; a full-queue scan per enqueue or dequeue would consume it.
+    const closeCount = 20_000;
+    const ordinaryCount = 60;
+    const total = closeCount + ordinaryCount;
+    let clock = 0;
+    let visits = 0;
+    const closeDeadlineAt = 10 * total;
+    const closeDeadline = {
+      valueOf() {
+        visits += 1;
+        clock += 1;
+        return closeDeadlineAt;
+      },
+    } as unknown as number;
+    let calls = 0;
+    const releases = dispatcher(
+      async () => {
+        calls += 1;
+        return { result: "sent", settled: null };
+      },
+      { now: () => clock, itemBudgetMs: Number.MAX_SAFE_INTEGER },
+    );
+    // Ordinary releases waiting behind busy workers are fenced into the close drain first.
+    for (let index = 0; index < ordinaryCount; index++) releases.submit(request(`queued-${index}`));
+    expect(releases.pending).toBe(ordinaryCount - 4);
+    releases.clampForClose(closeDeadline);
+    for (let index = 0; index < closeCount; index++) {
+      releases.submit(request(`close-${index}`), { deadline: closeDeadline, closeTime: true });
+    }
+    await releases.whenIdle();
+
+    expect(clock).toBeLessThan(closeDeadlineAt);
+    expect(visits).toBeLessThanOrEqual(8 * total);
+    expect(releases.dropCloseTimeQueued()).toBe(0);
+    const counts = releases.counts();
+    expect(calls).toBe(total);
+    expect(counts.enqueued).toBe(total);
+    expect(counts.sent).toBe(total);
+    expect(Object.values(counts.dropped).every((count) => count === 0)).toBe(true);
+    expect(releases.peakActive).toBe(4);
+  });
+
+  it("serves close-time items FIFO before ordinary ones and expires each queue from its head", async () => {
+    let now = 0;
+    const gate = deferred<void>();
+    const sent: string[] = [];
+    const releases = dispatcher(
+      async (item) => {
+        sent.push(item.lease_id);
+        await gate.promise;
+        return { result: "sent", settled: null };
+      },
+      { now: () => now },
+    );
+    for (let index = 0; index < 4; index++) releases.submit(request(`busy-${index}`));
+    releases.submit(request("early"));
+    now = 100;
+    releases.submit(request("fenced"));
+    releases.clampForClose(1_000);
+    releases.submit(request("close-a"), { deadline: 1_000, closeTime: true });
+    releases.submit(request("close-b"), { deadline: 1_000, closeTime: true });
+    // Submitted after close fencing: ordinary, and served after every close-time item.
+    releases.submit(request("late"));
+    expect(releases.pending).toBe(5);
+    gate.resolve();
+    await releases.whenIdle();
+    expect(sent).toEqual([
+      "busy-0",
+      "busy-1",
+      "busy-2",
+      "busy-3",
+      "early",
+      "fenced",
+      "close-a",
+      "close-b",
+      "late",
+    ]);
+
+    // Expiry at the head of the ordinary queue, lazily at enqueue.
+    const blocked = deferred<void>();
+    const outcomes: Array<[string, ReleaseOutcome]> = [];
+    const expiring = dispatcher(
+      async () => {
+        await blocked.promise;
+        return { result: "sent", settled: null };
+      },
+      { now: () => now },
+    );
+    now = 0;
+    for (let index = 0; index < 4; index++) expiring.submit(request(`hold-${index}`));
+    expiring.submit(request("stale-1"), { onOutcome: (o) => outcomes.push(["stale-1", o]) });
+    now = 1;
+    expiring.submit(request("stale-2"), { onOutcome: (o) => outcomes.push(["stale-2", o]) });
+    now = 2_000;
+    expiring.submit(request("fresh"), { onOutcome: (o) => outcomes.push(["fresh", o]) });
+    expect(outcomes).toEqual([["stale-1", { kind: "dropped", reason: "expired" }]]);
+    expect(expiring.pending).toBe(2);
+    // Lazily at dequeue: the new head has passed its deadline by the time a worker is free.
+    now = 2_001;
+    blocked.resolve();
+    await expiring.whenIdle();
+    expect(outcomes).toEqual([
+      ["stale-1", { kind: "dropped", reason: "expired" }],
+      ["stale-2", { kind: "dropped", reason: "expired" }],
+      ["fresh", { kind: "sent" }],
+    ]);
+  });
+
   it("holds nothing once idle", async () => {
     const releases = dispatcher(async () => ({ result: "sent", settled: null }));
     releases.submit(request("one"));

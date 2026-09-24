@@ -86,6 +86,14 @@ corresponding release notes before users upgrade.
   delivered or the stream is closed. An unfinished wrapped stream no longer keeps the request's
   messages and options alive. Delivered events, settlement, and
   `responses.stream().finalResponse()` are unchanged.
+- **Unread control-plane response bodies are released within the request deadline.** Error
+  bodies and the success bodies of lease surrender, settlement confirmation, breaker reports and
+  untracked-surface reports are no longer left open until garbage collection, which could hold
+  connections and, with a connection-capped HTTP pool, make later control-plane requests time
+  out. A small complete body is read to the end so its connection is reused; a larger, stalled
+  or failing body is cancelled within the lesser of the remaining request deadline and one
+  second. Outcomes are still decided when headers arrive and never wait for this cleanup; body
+  bytes are never retained or logged.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

@@ -101,24 +101,25 @@ describe("Transport — URL + headers + body", () => {
     expect(calls[0]?.init.body).toBe(JSON.stringify(events));
   });
 
-  it("returns the Response on a 2xx (caller decides whether to parse)", async () => {
+  it("resolves without a value on a 2xx; the unused body is not handed to callers", async () => {
     const transport = new Transport("https://api.solwyn.ai", API_KEY, {
       fetch: recordingFetch(
         [],
         () => new Response('{"ingested":1,"rejected":[]}', { status: 202 }),
       ),
     });
-    const response = await transport.postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 });
-    expect(response.status).toBe(202);
-    await expect(response.json()).resolves.toEqual({ ingested: 1, rejected: [] });
+    await expect(
+      transport.postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 }),
+    ).resolves.toBeUndefined();
   });
 
   it("treats a 204 as success and does not require a body", async () => {
     const transport = new Transport("https://api.solwyn.ai", API_KEY, {
       fetch: recordingFetch([], () => new Response(null, { status: 204 })),
     });
-    const response = await transport.postJson(BUDGET_CONFIRM_PATH, {}, { timeoutMs: 5000 });
-    expect(response.status).toBe(204);
+    await expect(
+      transport.postJson(BUDGET_CONFIRM_PATH, {}, { timeoutMs: 5000 }),
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -334,9 +335,8 @@ describe("Transport — bounded retry policy", () => {
 
     const promise = transport.postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 });
     await vi.advanceTimersByTimeAsync(100);
-    const response = await promise;
 
-    expect(response.status).toBe(200);
+    await expect(promise).resolves.toBeUndefined();
     expect(attempts).toBe(2);
   });
 });

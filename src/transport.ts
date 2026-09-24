@@ -19,6 +19,12 @@
  *   explicitly enabled, apply only to transient conditions (network error,
  *   timeout, 429, 5xx) and are capped.
  *
+ * - Dispose of every response body the SDK does not use, off the result path:
+ *   the outcome is decided at headers, and a detached, bounded drain then reads
+ *   and discards a small body (keeping the connection reusable) or cancels the
+ *   body and aborts the request (releasing the connection). Body bytes are never
+ *   decoded, retained, or logged.
+ *
  * The `fetch` implementation is injectable so unit tests stay fully offline.
  */
 
@@ -152,7 +158,20 @@ type JsonBodyReadResult =
   | { readonly parsed: true; readonly value: unknown }
   | { readonly parsed: false; readonly error: unknown };
 
-type ResponseConsumer<T> = (response: Response) => T | Promise<T>;
+/**
+ * Reads a successful response. `discard` hands the body to the detached drain;
+ * a consumer that does not call it owns the body and must read it fully.
+ */
+type ResponseConsumer<T> = (response: Response, discard: () => void) => T | Promise<T>;
+
+/** Bytes an unused body may deliver before it is cancelled instead of drained. */
+const DISCARD_DRAIN_MAX_BYTES = 16 * 1024;
+/** Upper bound on a detached drain; it is further capped by the attempt deadline. */
+const DISCARD_DRAIN_MAX_MS = 1000;
+
+function monotonicNow(): number {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
 
 /** Reporter-visible retry classification shared by normal and bounded-final sends. */
 export function isRetryableTransportError(error: unknown): boolean {
@@ -178,6 +197,85 @@ async function sanitizedHttpMarker(response: Response): Promise<"read_only_key" 
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Release a response body the SDK will not use, without ever blocking the caller.
+ *
+ * A null body (for example a 204) needs nothing. Otherwise the body is read and
+ * discarded, chunk by chunk and without decoding, so a small complete body ends
+ * normally and its connection stays reusable. A body that exceeds the byte cap,
+ * outlives `boundMs`, or fails to read is cancelled (the cancel is never awaited
+ * and its rejection is handled) and the request is aborted. The drain is
+ * detached: callers never await it and it never rejects.
+ */
+function discardResponseBody(
+  response: Response,
+  controller: AbortController,
+  boundMs: number,
+): void {
+  let body: ReadableStream<Uint8Array> | null | undefined;
+  try {
+    body = response.body;
+  } catch {
+    controller.abort();
+    return;
+  }
+  if (body === null || body === undefined) {
+    return;
+  }
+  drainBody(body, controller, Math.min(Math.max(0, boundMs), DISCARD_DRAIN_MAX_MS)).catch(() => {});
+}
+
+async function drainBody(
+  body: ReadableStream<Uint8Array>,
+  controller: AbortController,
+  boundMs: number,
+): Promise<void> {
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = body.getReader();
+  } catch {
+    // Already locked or disturbed by someone else: only the request can be released.
+    controller.abort();
+    return;
+  }
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      // Cancelling settles any pending read; the cancel itself is never awaited.
+      reader.cancel().catch(() => {});
+    } catch {
+      // A synchronously throwing cancel still ends in the abort below.
+    }
+    controller.abort();
+  };
+  const timer = setTimeout(release, boundMs);
+  // A drain must never keep the process alive. `unref` is Node-only, so guard the
+  // optional call (no-op on web/edge timers).
+  (timer as { unref?: () => void })?.unref?.();
+  try {
+    let bytes = 0;
+    while (!released) {
+      const result = await reader.read();
+      if (result.done) {
+        // A body that ended on its own leaves its connection reusable.
+        released = true;
+        break;
+      }
+      // Only the size is observed; the chunk itself is dropped immediately.
+      const size = (result.value as { byteLength?: unknown } | undefined)?.byteLength;
+      bytes += typeof size === "number" && size > 0 ? size : 1;
+      if (bytes > DISCARD_DRAIN_MAX_BYTES) release();
+    }
+  } catch {
+    // A read error releases the body and the request.
+    release();
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -225,13 +323,15 @@ export class Transport {
   }
 
   /**
-   * POST `body` (JSON-serialized) to `path`. Returns the `Response` on any 2xx;
-   * the caller decides whether to parse a body (ingest parses the 202 body;
-   * confirm ignores the 204). Throws a {@link TransportError} subclass on non-2xx,
-   * timeout, or network failure — always privacy-safe (class name + status only).
+   * POST `body` (JSON-serialized) to `path`. Resolves on any 2xx without reading
+   * the body, which is released by a detached, bounded drain. Throws a
+   * {@link TransportError} subclass on non-2xx, timeout, or network failure —
+   * always privacy-safe (class name + status only).
    */
-  async postJson(path: string, body: unknown, options: RequestOptions): Promise<Response> {
-    return this.postJsonWith(path, body, options, (response) => response);
+  async postJson(path: string, body: unknown, options: RequestOptions): Promise<void> {
+    return this.postJsonWith(path, body, options, (_response, discard) => {
+      discard();
+    });
   }
 
   /**
@@ -290,12 +390,19 @@ export class Transport {
     consume: ResponseConsumer<T>,
   ): Promise<T> {
     const controller = new AbortController();
+    const deadline = monotonicNow() + options.timeoutMs;
+    const discard = (response: Response) =>
+      discardResponseBody(response, controller, deadline - monotonicNow());
+    // Set once the attempt has settled, timed out, or been aborted; a Response
+    // that an abort-ignoring fetch delivers afterwards is released immediately.
+    let abandoned = false;
     let timedOut = false;
     let httpFailure: TransportHttpError | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
         timedOut = true;
+        abandoned = true;
         controller.abort();
         // AbortController is advisory to caller-supplied fetch implementations. A
         // Promise race also bounds slow-drip/body consumers that ignore abort.
@@ -309,6 +416,7 @@ export class Transport {
       rejectExternalAbort = reject;
     });
     const onExternalAbort = () => {
+      abandoned = true;
       controller.abort();
       // Injected fetch/body implementations may ignore AbortSignal. The explicit
       // race makes ownership cancellation authoritative and leaves the detached
@@ -331,14 +439,23 @@ export class Transport {
           body: payload,
           signal: controller.signal,
         });
+        if (abandoned) {
+          // An abort-ignoring fetch resolved after the attempt already failed.
+          discardResponseBody(response, controller, 0);
+          throw new TransportNetworkError("response arrived after the attempt ended");
+        }
         if (!response.ok) {
-          httpFailure = new TransportHttpError(
+          const failure = new TransportHttpError(
             response.status,
             await sanitizedHttpMarker(response),
           );
-          throw httpFailure;
+          httpFailure = failure;
+          // The outcome is decided at headers; disposal never delays or changes it.
+          // A 403 body was consumed by the marker read; anything else is drained.
+          if (response.status !== 403) discard(response);
+          throw failure;
         }
-        return consume(response);
+        return consume(response, () => discard(response));
       })();
       return await Promise.race([operation, timeout, externalAbort]);
     } catch (error) {
@@ -356,6 +473,7 @@ export class Transport {
       }
       throw new TransportNetworkError("network request failed", { cause: error });
     } finally {
+      abandoned = true;
       if (timer !== undefined) clearTimeout(timer);
       external?.removeEventListener("abort", onExternalAbort);
     }

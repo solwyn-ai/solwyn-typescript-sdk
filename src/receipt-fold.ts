@@ -293,6 +293,11 @@ export class ReceiptFoldState {
     return "folded";
   }
 
+  /** Whether no aggregate is retained (nothing awaits replay). */
+  get isEmpty(): boolean {
+    return this.#folds.size === 0;
+  }
+
   snapshot(): ReceiptFoldEntry[] {
     return [...this.#folds.values()].map(({ key, fold }) => ({
       key: cloneKey(key),

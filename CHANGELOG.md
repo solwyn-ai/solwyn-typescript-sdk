@@ -9,6 +9,32 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Metadata ingestion no longer starves under sustained confirmation traffic. The background
+  reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
+  standalone confirmations and of settlements, then sends the metadata batches that were queued
+  when the round reached them. When a round stops at its quota with work still due, the next round
+  starts on the following timer turn instead of after the flush interval.
+- `close()` no longer evicts ready metadata events from a full queue while a delivery round that
+  was already in flight finishes.
+- Clients dropped without `close()` no longer keep their provider, timers and heartbeats alive.
+  Once such a client's queued confirmations and events are delivered, its wrapped provider, lease
+  state and background reporter can be garbage-collected, its flush timer and provider-breaker
+  heartbeats stop, and it leaves the Node exit registry. A client constructed inside `run()` no
+  longer keeps that run alive. Reuse one client and `close()` it at shutdown: that remains the
+  supported lifecycle.
+
+### Changed
+
+- `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
+  at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
+- A failed provider-breaker report now backs off before the reporter retries it. The first retry
+  waits at least one flush interval, and later retries follow the reporter's retry backoff
+  (`reporterRetryBackoffBase` to `reporterRetryBackoffCap`, 1 to 60 seconds by default). While a
+  retry is pending, no breaker report is sent, including a changed breaker state. A successful
+  report clears the backoff. Reports sent by `close()` are not delayed.
+
 ## [0.1.0-rc.1] — 2026-09-11
 
 Bootstrap release candidate for the initial public preview of a drop-in wrapper for an existing

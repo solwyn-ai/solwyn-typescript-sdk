@@ -34,7 +34,7 @@
 import { type AsyncHook, AsyncLocalStorage, createHook } from "node:async_hooks";
 import { SolwynError } from "./errors";
 import type { MetadataReporter } from "./reporter";
-import { type CurrentRun, setCurrentRunReader } from "./run-context";
+import { type CurrentRun, setCurrentRunReader, setOutsideRunRunner } from "./run-context";
 import { copyTags, type Tags } from "./tags";
 
 const NODE_REPORTER_REGISTRATION = Symbol.for("@solwyn/sdk/node-reporter-registration");
@@ -72,6 +72,20 @@ function exitRegistry(): ExitRegistry {
   return created;
 }
 
+// Collected participants leave their set through these finalizers, so registration
+// never rescans the population. Closed participants that are still reachable are swept
+// when a set has doubled since its last sweep, which keeps total registration work
+// linear in the number of registrations.
+const MIN_SWEEP_SIZE = 64;
+const collectedReporters = new FinalizationRegistry<WeakRef<ExitDrainableReporter>>((ref) => {
+  exitRegistry().reporters.delete(ref);
+});
+const collectedLeaseHolders = new FinalizationRegistry<WeakRef<ExitDrainableLeaseHolder>>((ref) => {
+  exitRegistry().leaseHolders.delete(ref);
+});
+let reporterSweepAt = MIN_SWEEP_SIZE;
+let leaseHolderSweepAt = MIN_SWEEP_SIZE;
+
 function liveExitReporters(): ExitDrainableReporter[] {
   const registry = exitRegistry();
   const live: ExitDrainableReporter[] = [];
@@ -79,6 +93,7 @@ function liveExitReporters(): ExitDrainableReporter[] {
     const reporter = reference.deref();
     if (reporter === undefined || reporter.isShutdown) {
       registry.reporters.delete(reference);
+      collectedReporters.unregister(reference);
     } else {
       live.push(reporter);
     }
@@ -93,6 +108,7 @@ function liveExitLeaseHolders(): ExitDrainableLeaseHolder[] {
     const holder = reference.deref();
     if (holder === undefined || holder.isClosed) {
       registry.leaseHolders.delete(reference);
+      collectedLeaseHolders.unregister(reference);
     } else {
       live.push(holder);
     }
@@ -136,15 +152,25 @@ function installExitListener(registry: ExitRegistry): void {
 
 function registerReporterForExit(reporter: ExitDrainableReporter): void {
   const registry = exitRegistry();
-  liveExitReporters();
-  registry.reporters.add(new WeakRef(reporter));
+  if (registry.reporters.size >= reporterSweepAt) {
+    liveExitReporters();
+    reporterSweepAt = Math.max(MIN_SWEEP_SIZE, 2 * registry.reporters.size);
+  }
+  const reference = new WeakRef(reporter);
+  registry.reporters.add(reference);
+  collectedReporters.register(reporter, reference, reference);
   installExitListener(registry);
 }
 
 function registerLeaseHolderForExit(holder: ExitDrainableLeaseHolder): void {
   const registry = exitRegistry();
-  liveExitLeaseHolders();
-  registry.leaseHolders.add(new WeakRef(holder));
+  if (registry.leaseHolders.size >= leaseHolderSweepAt) {
+    liveExitLeaseHolders();
+    leaseHolderSweepAt = Math.max(MIN_SWEEP_SIZE, 2 * registry.leaseHolders.size);
+  }
+  const reference = new WeakRef(holder);
+  registry.leaseHolders.add(reference);
+  collectedLeaseHolders.register(holder, reference, reference);
   installExitListener(registry);
 }
 
@@ -367,6 +393,10 @@ setCurrentRunReader(() => {
     { value: frame.lifetimeRef.deref() },
   );
 });
+
+// Long-lived SDK loops (the reporter's flush timer) start outside any run, so a client
+// constructed inside `run(...)` never makes that run's lifetime token outlive the run.
+setOutsideRunRunner((fn) => runStore.exit(fn));
 
 /**
  * Rejects any character in the Unicode general categories Cc (control), Cf (format),

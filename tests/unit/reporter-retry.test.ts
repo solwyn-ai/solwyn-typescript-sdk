@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CircuitBreaker } from "../../src/circuit-breaker";
 import type { Logger } from "../../src/logging";
-import { MetadataReporter } from "../../src/reporter";
+import { type FlushRound, MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
@@ -57,6 +57,19 @@ function invalidConfirm(index = 1): BudgetConfirmRequest {
     ...confirm(index),
     call_id: `bad-${"x".repeat(40)}`,
   } as BudgetConfirmRequest;
+}
+
+/** Ordinary rounds are bounded; run consecutive rounds while one reports more due work. */
+async function flushRounds(reporter: MetadataReporter, maxRounds = 25): Promise<number> {
+  const round: FlushRound = { more: true };
+  let rounds = 0;
+  while (round.more) {
+    if (rounds >= maxRounds) throw new Error("ordinary flush rounds did not settle");
+    round.more = false;
+    await reporter._flushRemaining(undefined, false, round);
+    rounds += 1;
+  }
+  return rounds;
 }
 
 function response202(body: unknown): Response {
@@ -477,7 +490,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     expect(reporter.metadataQueueSize).toBe(0);
     expect(reporter.droppedCounts).toEqual({ "settlement_confirm.overflow": 1 });
     now = 1000;
-    await reporter._flushRemaining();
+    await flushRounds(reporter);
     expect(confirmPayloads.slice(0, 3)).toEqual([callId(1), callId(1), callId(2)]);
     expect(confirmPayloads.at(-1)).toBe(callId(1000));
     expect(confirmPayloads).not.toContain(callId(1001));
@@ -555,7 +568,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     expect(reporter.confirmQueueSize).toBe(1000);
     expect(reporter.droppedCounts).toEqual({ "confirm.overflow": 1 });
     now = 1000;
-    await reporter._flushRemaining();
+    await flushRounds(reporter);
     expect(sent.slice(0, 3)).toEqual([callId(1), callId(1), callId(2)]);
     expect(sent.at(-1)).toBe(callId(1000));
     expect(sent).not.toContain(callId(1001));
@@ -594,7 +607,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     expect(reporter.confirmQueueSize).toBe(1000);
     expect(reporter.droppedCounts).toEqual({ "confirm.overflow": 1 });
     breakerNow = 1000;
-    await reporter._flushRemaining();
+    await flushRounds(reporter);
     expect(sent.slice(0, 2)).toEqual([callId(1), callId(2)]);
     expect(sent.at(-1)).toBe(callId(1000));
     expect(sent).not.toContain(callId(1001));
@@ -1024,7 +1037,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     expect(reporter.metadataQueueSize).toBe(0);
     expect(reporter.droppedCounts).toEqual({ "settlement_confirm.overflow": 1 });
     breakerNow = 1000;
-    await reporter._flushRemaining();
+    await flushRounds(reporter);
     expect(confirmPayloads.slice(0, 2)).toEqual([callId(1), callId(2)]);
     expect(confirmPayloads.at(-1)).toBe(callId(1000));
     expect(confirmPayloads).not.toContain(callId(1001));

@@ -65,3 +65,32 @@ export function setCurrentRunReader(reader: CurrentRunReader): void {
 export function resetCurrentRunReader(): void {
   delete (globalThis as GlobalWithReader)[READER_KEY];
 }
+
+/**
+ * Runs a callback so that async resources it creates belong to no run. Long-lived
+ * SDK loops start through this seam; otherwise a loop started inside `run(...)`
+ * would inherit and pin that run for the life of the client.
+ */
+export type OutsideRunRunner = <T>(fn: () => T) => T;
+
+/** Global-registry key for the installed runner (shared across duplicate module copies). */
+const OUTSIDE_RUN_KEY = Symbol.for("@solwyn/sdk.outsideRunRunner");
+
+interface GlobalWithOutsideRun {
+  [OUTSIDE_RUN_KEY]?: OutsideRunRunner;
+}
+
+/**
+ * Call `fn` outside any active run scope. The Node entry installs an
+ * `AsyncLocalStorage.exit` runner; elsewhere there is no run context to leave and
+ * `fn` is called directly.
+ */
+export function runOutsideRun<T>(fn: () => T): T {
+  const runner = (globalThis as GlobalWithOutsideRun)[OUTSIDE_RUN_KEY];
+  return runner ? runner(fn) : fn();
+}
+
+/** Install the outside-run runner (called once by the Node entry point). */
+export function setOutsideRunRunner(runner: OutsideRunRunner): void {
+  (globalThis as GlobalWithOutsideRun)[OUTSIDE_RUN_KEY] = runner;
+}

@@ -1273,14 +1273,15 @@ export class BudgetEnforcer {
     }
     const runId = captured.agentRunId;
     if (runId === undefined) return;
-    const claimed = this.leaseLedger.claimRenewalRequest(runId, {
+    // A retry at the same lease and generation re-sends the first claim's declaration.
+    const claimed = this.leaseLedger.claimRenewal(runId, {
       model: captured.model,
       provider: captured.provider,
       fallbackProviders: captured.fallbackProviders,
       fallbackModels: captured.fallbackModels,
     });
     if (claimed === null) return;
-    this.launchRenewal(runId, captured, claimed, []);
+    this.launchRenewal(runId, claimed.request, claimed.addedModels);
   }
 
   /**
@@ -1305,13 +1306,12 @@ export class BudgetEnforcer {
     });
     if (claimed === null) return;
     this.logger.debug("lease.widen: added_models=%d", claimed.addedModels.length);
-    this.launchRenewal(runId, captured, claimed.request, claimed.addedModels);
+    this.launchRenewal(runId, claimed.request, claimed.addedModels);
   }
 
   /** Validate and launch one claimed renewal without awaiting it on the admission path. */
   private launchRenewal(
     runId: string,
-    captured: CapturedCheck,
     claimed: LeaseRenewRequest,
     wideningModels: readonly string[],
   ): void {
@@ -1319,7 +1319,7 @@ export class BudgetEnforcer {
     const originGeneration = claimed.generation;
     const parsed = LeaseRenewRequestSchema.safeParse(claimed);
     if (!parsed.success) {
-      this.failRenewal(runId, originLeaseId, originGeneration);
+      this.failRenewal(runId, originLeaseId, originGeneration, false);
       this.logger.warn("lease.renew_request_invalid");
       return;
     }
@@ -1337,7 +1337,11 @@ export class BudgetEnforcer {
       originLeaseId,
       originGeneration,
       closeEpoch: this.closeEpoch,
-      declaredModels: Object.freeze([captured.model, ...captured.fallbackModels]),
+      // An applied renewal covers exactly what the request declared, never the caller's chain.
+      declaredModels: Object.freeze([
+        ...(request.model === null || request.model === undefined ? [] : [request.model]),
+        ...fallbackModels,
+      ]),
       wideningModels,
       wire: Object.freeze(serializeLeaseRenewRequest(request)),
     });
@@ -1363,7 +1367,12 @@ export class BudgetEnforcer {
     try {
       if (admission !== null && !admission.allowed) {
         if (operation.closeEpoch === this.closeEpoch) {
-          this.failRenewal(operation.runId, operation.originLeaseId, operation.originGeneration);
+          this.failRenewal(
+            operation.runId,
+            operation.originLeaseId,
+            operation.originGeneration,
+            false,
+          );
         }
         this.logger.debug("lease.renew_skipped_breaker_open");
         return;
@@ -1511,11 +1520,13 @@ export class BudgetEnforcer {
     }
   }
 
-  private failRenewal(runId: string, leaseId: string, generation: number): void {
+  /** `sent: false` only when the request provably never reached the control plane. */
+  private failRenewal(runId: string, leaseId: string, generation: number, sent = true): void {
     this.leaseLedger.renewalFailed(runId, {
       now: this.monotonicNow() / 1000,
       expectedLeaseId: leaseId,
       expectedGeneration: generation,
+      sent,
     });
   }
 

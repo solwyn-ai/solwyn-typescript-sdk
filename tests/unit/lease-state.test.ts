@@ -908,6 +908,96 @@ describe("LeaseLedger widening claims and refused models", () => {
     initial.applyGrantResponse(RUN, INELIGIBLE, { now: 1_000, wideningModels: ["gpt-5"] });
     expect(initial.stateFor(RUN)?.refusedModels.size).toBe(0);
   });
+
+  it("re-sends the first declaration on every retry at the same lease and generation", () => {
+    const value = installed();
+    const first = value.claimWideningRequest(RUN, chain());
+    expect(first?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    // The outcome is unknown: the control plane may have applied it and stored its answer.
+    expect(
+      value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 }),
+    ).toBe(true);
+    expect(value.owedRenewalDeclaration(RUN)).toMatchObject({
+      leaseId: "lse-1",
+      generation: 1,
+      model: "gpt-5",
+      fallbackModels: ["claude-sonnet-4-5", "gpt-5-mini"],
+    });
+
+    // Another undeclared chain never rides on the owed retry.
+    const other = { now: 1_003, model: "gpt-5-nano", fallbackProviders: [], fallbackModels: [] };
+    expect(value.claimWideningRequest(RUN, chain(other))).toBeNull();
+    expect(value.stateFor(RUN)?.renewalInFlight).toBe(false);
+
+    // Any retry at the origin, whoever claims it, re-sends the first declaration and added models.
+    const retry = value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" });
+    expect(retry?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    expect(retry?.request).toMatchObject({
+      lease_id: "lse-1",
+      generation: 1,
+      model: "gpt-5",
+      provider: "openai",
+      fallback_providers: ["anthropic", "openai"],
+      fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
+    });
+    value.renewalFailed(RUN, { now: 1_003, expectedLeaseId: "lse-1", expectedGeneration: 1 });
+    // The same chain may drive the retry itself.
+    expect(value.claimWideningRequest(RUN, chain({ now: 1_005 }))?.request).toMatchObject({
+      generation: 1,
+      fallback_models: ["claude-sonnet-4-5", "gpt-5-mini"],
+    });
+
+    // Once the generation is superseded, nothing is owed and the next claim declares afresh.
+    value.applyGrantResponse(RUN, grant({ generation: 2 }), {
+      now: 1_006,
+      declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+      expectedLeaseId: "lse-1",
+      expectedGeneration: 1,
+    });
+    expect(value.owedRenewalDeclaration(RUN)).toBeNull();
+    expect(value.claimWideningRequest(RUN, chain(other))).toMatchObject({
+      addedModels: ["gpt-5-nano"],
+      request: { generation: 2, model: "gpt-5-nano", fallback_models: [] },
+    });
+  });
+
+  it("owes nothing for a renewal that never reached the control plane", () => {
+    const value = installed();
+    value.claimWideningRequest(RUN, chain());
+    value.renewalFailed(RUN, {
+      now: 1_001,
+      expectedLeaseId: "lse-1",
+      expectedGeneration: 1,
+      sent: false,
+    });
+    expect(value.owedRenewalDeclaration(RUN)).toBeNull();
+    expect(
+      value.claimWideningRequest(
+        RUN,
+        chain({ now: 1_003, model: "gpt-5-nano", fallbackProviders: [], fallbackModels: [] }),
+      ),
+    ).toMatchObject({ addedModels: ["gpt-5-nano"], request: { model: "gpt-5-nano" } });
+  });
+
+  it("records a retried widening's added models when the retry is refused", () => {
+    const value = installed();
+    value.claimWideningRequest(RUN, chain());
+    value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 });
+    const retry = value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" });
+    expect(
+      value.applyGrantResponse(RUN, INELIGIBLE, {
+        now: 1_003,
+        expectedLeaseId: "lse-1",
+        expectedGeneration: 1,
+        wideningModels: retry?.addedModels ?? [],
+      }),
+    ).toBe(GrantOutcome.Ineligible);
+    expect([...(value.stateFor(RUN)?.refusedModels ?? [])]).toEqual([
+      "claude-sonnet-4-5",
+      "gpt-5-mini",
+    ]);
+    expect(value.owedRenewalDeclaration(RUN)).toBeNull();
+  });
 });
 
 describe("LeaseLedger bounded claims, renewal, and shutdown", () => {

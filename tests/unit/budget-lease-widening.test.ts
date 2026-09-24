@@ -544,6 +544,94 @@ describe("a refused widening", () => {
   });
 });
 
+describe("a lease renewal retried after an unknown outcome", () => {
+  const OTHER = { model: "claude-sonnet-4-5", provider: "anthropic" } as const;
+  /** The first renewal reaches the plane, which applies it; its answer is lost. */
+  const lostThenAnswer = (answer: (body: Body) => Response) => (body: Body, index: number) => {
+    if (index === 1) throw new TypeError("fetch failed");
+    return answer(body);
+  };
+  /** A retry of generation 1 gets the answer the plane stored for the first request. */
+  const replayApplied = (body: Body) =>
+    json(grant({ lease_id: "lease-1", generation: Number(body["generation"]) + 1 }));
+
+  it("never covers a chain the plane was not sent, and the retry re-declares the first chain", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const h = harness({ renew: lostThenAnswer(replayApplied) });
+    await grantFirstModel(h);
+
+    h.clock.now = 1_000;
+    await check(h, 2, MINI);
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(h.state()).toMatchObject({ generation: 1, renewalInFlight: false });
+
+    // Past the backoff, a call on another undeclared chain is allowed per call.
+    h.clock.now = 2_000;
+    await expect(check(h, 3, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
+    await settleRenewals(h);
+    // That chain is not on the lease: the next call on it still takes a per-call check.
+    await expect(check(h, 4, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
+    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
+    // Its models never ride on the owed retry: it claims nothing.
+    expect(h.renewals.map((body) => [body["generation"], declaredChain(body)])).toEqual([
+      [1, ["gpt-4o-mini"]],
+    ]);
+    expect(h.since()).toEqual([CHECK_URL, CHECK_URL]);
+
+    // The next renewal at the same generation, claimed by a gpt-4o call, re-sends the first chain.
+    h.clock.now = 601_000;
+    await expect(check(h, 5)).resolves.toMatchObject({ leaseId: "lease-1" });
+    await settleRenewals(h);
+    expect(h.since()).toEqual([RENEW_URL]);
+    expect(h.renewals[1]).toMatchObject({
+      lease_id: "lease-1",
+      generation: 1,
+      model: "gpt-4o-mini",
+      provider: "openai",
+      fallback_providers: [],
+      fallback_models: [],
+    });
+    expect(h.state()?.generation).toBe(2);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
+    await expect(check(h, 6, MINI)).resolves.toMatchObject({ leaseId: "lease-1" });
+    expect(h.since()).toEqual([]);
+
+    // The other chain now widens on its own, at the new generation.
+    await check(h, 7, OTHER);
+    await settleRenewals(h);
+    expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
+    expect(h.renewals[2]).toMatchObject({
+      generation: 2,
+      model: "claude-sonnet-4-5",
+      provider: "anthropic",
+    });
+    await expect(check(h, 8, OTHER)).resolves.toMatchObject({ leaseId: "lease-1" });
+  });
+
+  it("records the retried widening's added models when the retry is refused", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const h = harness({ renew: lostThenAnswer(() => json(INELIGIBLE)) });
+    await grantFirstModel(h);
+
+    h.clock.now = 1_000;
+    await check(h, 2, MINI);
+    await settleRenewals(h);
+
+    // An ordinary renewal claimed by a gpt-4o call retries the widening, and is refused.
+    h.clock.now = 601_000;
+    await check(h, 3);
+    await settleRenewals(h);
+    await internal(h.budget).releases.whenIdle();
+    expect(h.renewals.map((body) => [body["generation"], declaredChain(body)])).toEqual([
+      [1, ["gpt-4o-mini"]],
+      [1, ["gpt-4o-mini"]],
+    ]);
+    expect([...(h.state()?.refusedModels ?? [])]).toEqual(["gpt-4o-mini"]);
+    expect(h.surrenders).toEqual([expect.objectContaining({ lease_id: "lease-1", generation: 1 })]);
+  });
+});
+
 function declaredChain(body: Body): string[] {
   return [
     ...(typeof body["model"] === "string" ? [body["model"]] : []),

@@ -1,29 +1,14 @@
 /**
- * Edge-safe, process-wide agent-run termination state.
- *
- * The registered-symbol slot keeps ESM and CJS copies on one exact-ID registry.
- * Bounded registry entries may be forgotten, while active stream handles retain
- * their immutable first winner until explicit release.
- *
- * Active streams share termination authority through one epoch per clear
- * generation rather than per-handle cells: every handle acquired since the
- * run's last clear reads the same epoch, so acquire, release and stop are O(1)
- * regardless of how many streams one run has open. A clear installs a fresh
- * epoch and leaves the old one frozen for the streams that still hold it.
- *
- * The slot is shared with every other copy of the package in the process,
- * including releases whose active groups hold one cell per handle
- * ({generation, observedAt, handles: Set<{runId, generation, termination,
- * released}>}). Groups therefore keep that outer shape: `generation` is the
- * run's current clear generation, and `handles` holds each live epoch as one
- * such cell, next to any per-handle cells another copy added. A per-handle
- * copy's stop latches a live epoch like any other cell, and its clear advances
- * `generation`, which this copy reads as a clear. The only Set walks are for
- * cells another copy added, so a single-version process never iterates.
+ * Test-only reproduction of the run-control algorithm published in
+ * @solwyn/sdk 0.1.0-rc.1 (src/run-control.ts at 4f1e702), which keeps one
+ * termination cell per stream handle. It shares the same registered-symbol
+ * slot as the current module, so tests can interleave an older copy of the
+ * package with this one in a single process. Kept verbatim except for this
+ * header, the import path, and the removal of the ambient-run helper, which
+ * does not touch the shared slot. Never shipped.
  */
 
-import type { RunStoppedSource } from "./errors";
-import { getCurrentRun } from "./run-context";
+import type { RunStoppedSource } from "../../src/errors";
 
 const MAX_TERMINATED_RUNS = 256;
 const RUN_CONTROL_KEY = Symbol.for("@solwyn/sdk.runControl");
@@ -66,80 +51,33 @@ export interface TerminationHandle {
   release(): void;
 }
 
-/**
- * Termination authority shared by every watcher of one clear generation.
- *
- * Only a group's current epoch is ever written: a stop latches the first winner
- * while it has owners. A clear replaces the group's epoch instead of mutating
- * it, so a superseded epoch is frozen by construction. When the last current
- * owner releases a latched epoch, the group moves to a fresh epoch of the same
- * generation, so a later stream re-seeds from the bounded registry rather than
- * inheriting a winner that no live stream still owns.
- */
-interface Epoch extends SharedCell {
-  owners: number;
-}
-
-/**
- * The per-handle cell shape shared with other copies. Other copies read
- * `generation` and `termination` and latch `termination` on a stop; nothing
- * else in a foreign cell is read here.
- */
-interface SharedCell {
+interface TerminationHandleCell {
   readonly runId: string;
   readonly generation: number;
   termination: RunTermination | undefined;
   released: boolean;
 }
 
-/**
- * Live watcher ownership for one run ID, as another copy of the package may
- * have created it: only the shared outer shape is guaranteed.
- */
-interface SharedHandleGroup {
+interface ActiveHandleGroup {
   generation: number;
   observedAt: number | undefined;
-  readonly handles: Set<SharedCell>;
-  epoch?: Epoch;
-  members?: number;
-  epochCells?: number;
-}
-
-/**
- * Live watcher ownership for one run ID. `members` counts this copy's live
- * handles across all generations; `epoch.owners` alone bounds the current
- * winner's lifetime. `handles` holds every epoch that still has owners plus any
- * other copy's cells, and `epochCells` counts the epochs among them, so the
- * group is dropped exactly when the last handle of any copy releases.
- */
-interface ActiveHandleGroup extends SharedHandleGroup {
-  epoch: Epoch;
-  members: number;
-  epochCells: number;
-}
-
-/**
- * One handle's ownership record and the finalizer's held value. It never
- * references the handle shell, which stays the registration target. A released
- * handle keeps the winner it held at release instead of following its epoch.
- */
-interface HandleOwnership {
-  readonly runId: string;
-  readonly group: ActiveHandleGroup;
-  readonly epoch: Epoch;
-  released: boolean;
-  releasedTermination: RunTermination | undefined;
+  readonly handles: Set<TerminationHandleCell>;
 }
 
 interface RunControlState {
   readonly terminations: Map<string, RunTermination>;
   readonly observedAt: Map<string, number>;
-  readonly activeHandles: Map<string, SharedHandleGroup>;
+  readonly activeHandles: Map<string, ActiveHandleGroup>;
   now: () => number;
 }
 
 interface GlobalWithRunControl {
   [RUN_CONTROL_KEY]?: RunControlState;
+}
+
+interface FinalizerHeldValue {
+  readonly runId: string;
+  readonly cell: TerminationHandleCell;
 }
 
 const defaultNow = (): number => performance.now();
@@ -164,42 +102,6 @@ function state(): RunControlState {
   return created;
 }
 
-function freshEpoch(runId: string, generation: number): Epoch {
-  return { runId, generation, termination: undefined, released: false, owners: 0 };
-}
-
-/**
- * Adopt a group another copy created and follow a clear another copy made by
- * advancing `generation`. O(1); the superseded epoch stays with its holders.
- */
-function currentGroup(runId: string, group: SharedHandleGroup): ActiveHandleGroup {
-  if (group.epoch === undefined) {
-    group.epoch = freshEpoch(runId, group.generation);
-    group.members = 0;
-    group.epochCells = 0;
-  } else if (group.epoch.generation !== group.generation) {
-    group.epoch = freshEpoch(runId, group.generation);
-  }
-  return group as ActiveHandleGroup;
-}
-
-function activeGroup(shared: RunControlState, runId: string): ActiveHandleGroup | undefined {
-  const group = shared.activeHandles.get(runId);
-  return group === undefined ? undefined : currentGroup(runId, group);
-}
-
-function hasForeignCells(group: ActiveHandleGroup): boolean {
-  return group.handles.size > group.epochCells;
-}
-
-function matchesSource(
-  termination: RunTermination | undefined,
-  source: RunStoppedSource | undefined,
-): termination is RunTermination {
-  return termination !== undefined && (source === undefined || termination.source === source);
-}
-
-/** Return a winner only from the active group's current clear generation. */
 function activeGroupTermination(
   group: ActiveHandleGroup | undefined,
   source?: RunStoppedSource,
@@ -207,25 +109,22 @@ function activeGroupTermination(
   if (group === undefined) {
     return undefined;
   }
-  const termination = group.epoch.termination;
-  if (matchesSource(termination, source)) {
-    return termination;
-  }
-  if (hasForeignCells(group)) {
-    for (const cell of group.handles) {
-      if (cell.generation === group.generation && matchesSource(cell.termination, source)) {
-        return cell.termination;
-      }
+  for (const handle of group.handles) {
+    const termination = handle.termination;
+    if (
+      handle.generation === group.generation &&
+      termination !== undefined &&
+      (source === undefined || termination.source === source)
+    ) {
+      return termination;
     }
   }
   return undefined;
 }
 
-/** Fence obsolete sibling winners; the old epoch stays with the handles that hold it. */
 function advanceActiveGeneration(group: ActiveHandleGroup | undefined): void {
   if (group !== undefined) {
     group.generation += 1;
-    group.epoch = freshEpoch(group.epoch.runId, group.generation);
     group.observedAt = undefined;
   }
 }
@@ -254,35 +153,23 @@ function trimRegistry(shared: RunControlState): void {
   }
 }
 
-function releaseOwnership(ownership: HandleOwnership): void {
-  if (ownership.released) {
+function releaseCell(runId: string, cell: TerminationHandleCell): void {
+  if (cell.released) {
     return;
   }
-  ownership.released = true;
-  ownership.releasedTermination = ownership.epoch.termination;
-  const shared = state();
-  const { runId, group, epoch } = ownership;
-  // Group identity is the fence: after a test reset, a late release or
-  // finalizer for a replaced group must never account against its successor.
-  if (shared.activeHandles.get(runId) !== group) {
+  cell.released = true;
+  const group = state().activeHandles.get(runId);
+  if (group === undefined || !group.handles.delete(cell)) {
     return;
-  }
-  currentGroup(runId, group);
-  group.members -= 1;
-  epoch.owners -= 1;
-  if (epoch.owners === 0) {
-    group.handles.delete(epoch);
-    group.epochCells -= 1;
-    if (epoch === group.epoch && epoch.termination !== undefined) {
-      group.epoch = freshEpoch(runId, epoch.generation);
-    }
   }
   if (group.handles.size === 0) {
-    shared.activeHandles.delete(runId);
+    state().activeHandles.delete(runId);
   }
 }
 
-const handleFinalizer = new FinalizationRegistry<HandleOwnership>(releaseOwnership);
+const handleFinalizer = new FinalizationRegistry<FinalizerHeldValue>(({ runId, cell }) => {
+  releaseCell(runId, cell);
+});
 
 /**
  * Record a stop and return both its preserved first winner and this mark's stamp.
@@ -295,7 +182,7 @@ export function markTerminatedWithObservation(
 ): ObservedRunTermination {
   const shared = state();
   const observedAt = shared.now();
-  const group = activeGroup(shared, runId);
+  const group = shared.activeHandles.get(runId);
   let termination = shared.terminations.get(runId);
   if (termination === undefined) {
     termination = activeGroupTermination(group);
@@ -307,18 +194,9 @@ export function markTerminatedWithObservation(
   installExact(shared, runId, termination, observedAt);
   if (group !== undefined) {
     group.observedAt = observedAt;
-    // One write latches every current-generation watcher. An ownerless epoch
-    // never gains a winner that no live stream could hold.
-    const epoch = group.epoch;
-    if (epoch.owners > 0 && epoch.termination === undefined) {
-      epoch.termination = termination;
-    }
-    // Per-handle cells another copy added latch as that copy would latch them.
-    if (hasForeignCells(group)) {
-      for (const cell of group.handles) {
-        if (cell.generation === group.generation && cell.termination === undefined) {
-          cell.termination = termination;
-        }
+    for (const handle of group.handles) {
+      if (handle.generation === group.generation && handle.termination === undefined) {
+        handle.termination = termination;
       }
     }
   }
@@ -334,16 +212,9 @@ export function markTerminated(runId: string, options: MarkTerminatedOptions): R
 /** Register one active stream and seed it from the exact or current sibling winner. */
 export function acquireTerminationHandle(runId: string): TerminationHandle {
   const shared = state();
-  let group = activeGroup(shared, runId);
+  let group = shared.activeHandles.get(runId);
   if (group === undefined) {
-    group = {
-      generation: 0,
-      observedAt: undefined,
-      handles: new Set(),
-      epoch: freshEpoch(runId, 0),
-      members: 0,
-      epochCells: 0,
-    };
+    group = { generation: 0, observedAt: undefined, handles: new Set() };
     shared.activeHandles.set(runId, group);
   }
 
@@ -351,43 +222,31 @@ export function acquireTerminationHandle(runId: string): TerminationHandle {
   if (termination !== undefined && group.observedAt === undefined) {
     group.observedAt = shared.observedAt.get(runId) ?? termination.atMonotonic;
   }
-  const epoch = group.epoch;
-  if (epoch.termination === undefined) {
-    epoch.termination = termination;
-  }
-  if (epoch.owners === 0) {
-    group.handles.add(epoch);
-    group.epochCells += 1;
-  }
-  epoch.owners += 1;
-  group.members += 1;
-  const ownership: HandleOwnership = {
+  const cell: TerminationHandleCell = {
     runId,
-    group,
-    epoch,
+    generation: group.generation,
+    termination,
     released: false,
-    releasedTermination: undefined,
   };
+  group.handles.add(cell);
 
   let handle: TerminationHandle;
   handle = Object.freeze({
     runId,
-    generation: epoch.generation,
+    generation: cell.generation,
     get termination(): RunTermination | undefined {
-      return ownership.released ? ownership.releasedTermination : epoch.termination;
+      return cell.termination;
     },
     check(): RunTermination | undefined {
-      return ownership.released ? ownership.releasedTermination : epoch.termination;
+      return cell.termination;
     },
     release(): void {
       handleFinalizer.unregister(handle);
-      releaseOwnership(ownership);
+      releaseCell(runId, cell);
     },
   });
-  // Neither the group nor the held value references the handle shell, which is
-  // the finalized target; the per-handle `released` flag makes an explicit
-  // release racing the finalizer idempotent.
-  handleFinalizer.register(handle, ownership, handle);
+  // The group retains only `cell`; the finalized target is the returned handle shell.
+  handleFinalizer.register(handle, { runId, cell }, handle);
   return handle;
 }
 
@@ -412,7 +271,7 @@ export function runObservedAt(runId: string): number | undefined {
 /** Return an exact termination or a current-generation active sibling winner. */
 export function outageTermination(runId: string): RunTermination | undefined {
   const shared = state();
-  return shared.terminations.get(runId) ?? activeGroupTermination(activeGroup(shared, runId));
+  return shared.terminations.get(runId) ?? activeGroupTermination(shared.activeHandles.get(runId));
 }
 
 /** Return a stop that is authoritative after a live budget check. */
@@ -429,7 +288,7 @@ export function clearServerTerminationBeforeRequest(
   requestEpoch: number,
 ): RunTermination | undefined {
   const shared = state();
-  const group = activeGroup(shared, runId);
+  const group = shared.activeHandles.get(runId);
   const activeServer = activeGroupTermination(group, "server");
   const termination = shared.terminations.get(runId) ?? activeServer;
   if (termination === undefined || termination.source !== "server") {
@@ -458,7 +317,7 @@ export function clearServerTerminationBeforeRequest(
 /** Clear only when the exact or current sibling first-writer source matches. */
 export function clearTerminationIf(runId: string, source: RunStoppedSource): void {
   const shared = state();
-  const group = activeGroup(shared, runId);
+  const group = shared.activeHandles.get(runId);
   const exact = shared.terminations.get(runId);
   const matchingSibling = activeGroupTermination(group, source);
   const clearsCurrent =
@@ -480,16 +339,10 @@ export function clearTerminationIf(runId: string, source: RunStoppedSource): voi
  */
 export function clearRunTermination(runId: string): void {
   const shared = state();
-  const group = activeGroup(shared, runId);
+  const group = shared.activeHandles.get(runId);
   shared.terminations.delete(runId);
   shared.observedAt.delete(runId);
   advanceActiveGeneration(group);
-}
-
-/** Return whether the exact ambient agent-run scope has a registry termination. */
-export function currentRunTerminated(): boolean {
-  const currentRun = getCurrentRun();
-  return currentRun !== undefined && runTermination(currentRun.agentRunId) !== undefined;
 }
 
 /** Install a deterministic monotonic clock for focused tests. */

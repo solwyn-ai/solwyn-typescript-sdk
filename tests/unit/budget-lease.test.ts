@@ -404,7 +404,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
     expect(urls).toEqual([LEASE_URL, CHECK_URL, CHECK_URL, LEASE_URL, CHECK_URL]);
   });
 
-  it("makes a 409 holder-cap refusal permanently ineligible", async () => {
+  it("latches a 409 holder-cap refusal for 150 seconds instead of permanently", async () => {
     let now = 0;
     const urls: string[] = [];
     const budget = enforcer(
@@ -418,9 +418,12 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
     );
 
     await budget.checkBudget(leaseCheck(1));
-    now = Number.MAX_SAFE_INTEGER;
+    now = 149_999;
     await budget.checkBudget(leaseCheck(2));
     expect(urls).toEqual([LEASE_URL, CHECK_URL, CHECK_URL]);
+    now = 150_000;
+    await budget.checkBudget(leaseCheck(3));
+    expect(urls).toEqual([LEASE_URL, CHECK_URL, CHECK_URL, LEASE_URL, CHECK_URL]);
   });
 
   it.each([
@@ -2487,7 +2490,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
     expect(warnings.filter(({ message }) => message.startsWith("lease.uncounted_"))).toEqual([
       {
         message:
-          "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied for the next successful renewal to report (reason=%s)",
+          "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied; a successful renewal reports the tallies, otherwise they are aggregated into a local warning when the run ends (reason=%s)",
         args: ["grant_unreachable"],
       },
       {

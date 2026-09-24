@@ -48,6 +48,7 @@ import {
   GrantOutcome,
   INELIGIBLE_RETRY_AFTER_S,
   isInstallableLeaseGrantResponse,
+  LEASE_REFUSAL_LATCH_S,
   type LeaseAdmission,
   LeaseDecision,
   LeaseLedger,
@@ -58,6 +59,13 @@ import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
 import { positiveOutputBound } from "./output-bound";
 import { handleReadOnlyKeyError, isReadOnlyKeyError } from "./read-only-key";
+import {
+  RELEASE_DROP_REASONS,
+  type ReleaseAttempt,
+  ReleaseDispatcher,
+  type ReleaseDropReason,
+  type ReleaseOutcome,
+} from "./release-dispatcher";
 import type { CurrentRun } from "./run-context";
 import {
   clearServerTerminationBeforeRequest,
@@ -75,6 +83,8 @@ import {
   requireFetchLike,
   Transport,
   TransportHttpError,
+  TransportTimeoutError,
+  transportErrorLabel,
 } from "./transport";
 import type {
   BudgetCheckRequest,
@@ -131,7 +141,10 @@ const MAX_STICKY_RUN_DENIALS = 128;
 /** Maximum run-scoped uncounted diagnostic episodes retained by one enforcer. */
 const MAX_UNCOUNTED_EPISODES = 128;
 
-/** Minimum interval between continuing diagnostics for one uncounted episode. */
+/**
+ * Minimum interval between continuing diagnostics for one uncounted episode, and between
+ * aggregate release diagnostics (dropped surrenders, discarded uncounted tallies).
+ */
 const UNCOUNTED_WARN_INTERVAL_MS = 30_000;
 
 /** Renewal I/O is always detached from admission and independently bounded. */
@@ -142,6 +155,12 @@ const MAX_RENEWAL_OPERATIONS = 4;
 
 /** Explicit close shares this deadline across renewal joins and surrender fan-out. */
 const DEFAULT_SURRENDER_TIMEOUT_MS = 1_000;
+
+/** A surrender that times out outside close() is retried once, immediately. */
+const SURRENDER_ATTEMPTS = 2;
+
+/** Ordinary surrender deadline from enqueue: the per-attempt bound times the attempts. */
+const RELEASE_BUDGET_MS = DEFAULT_SURRENDER_TIMEOUT_MS * SURRENDER_ATTEMPTS;
 
 /** Private edge-safe handshake installed only by the dedicated `./node` entry. */
 const NODE_LEASE_REGISTRATION = Symbol.for("@solwyn/sdk/node-lease-registration");
@@ -230,6 +249,12 @@ function copyPriceHints(
   priceHints: Record<string, number> | null | undefined,
 ): Record<string, number> | null {
   return priceHints === null || priceHints === undefined ? null : { ...priceHints };
+}
+
+/** Diagnostic only: the SDK never branches on the reason. */
+function ineligibleReason(response: LeaseGrantResponse): string {
+  const reason = response.ineligible_reason;
+  return typeof reason === "string" ? escapeControlChars(reason) : "none";
 }
 
 /** Attribute a replayed directive only when it belongs to the run being checked. */
@@ -441,12 +466,20 @@ interface RenewalOperation {
   readonly originGeneration: number;
   readonly closeEpoch: number;
   readonly declaredModels: readonly string[];
+  /** Models a widening renewal adds to the lease; empty for an ordinary renewal. */
+  readonly wideningModels: readonly string[];
   readonly wire: Readonly<Record<string, unknown>>;
 }
 
-interface QueuedSurrender {
-  readonly request: LeaseSurrenderRequest;
-  readonly late: boolean;
+/** Bounded aggregate of uncounted fail-open tallies discarded with finished runs. */
+interface UncountedAggregate {
+  runs: number;
+  calls: number;
+  tokens: number;
+}
+
+function saturatingAdd(total: number, value: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, total + Math.max(0, value));
 }
 
 interface AuthorityDispatch {
@@ -537,19 +570,15 @@ export class BudgetEnforcer {
   private readonly orphanedRuns = new Set<string>();
   private readonly unmanagedStates = new WeakSet<LeaseState>();
   private readonly pendingUnmanagedRuns = new Map<string, number>();
-  private readonly retiringRuns = new Map<string, Promise<void>>();
+  /** Runs whose retirement surrender is queued or active; they take per-call checks. */
+  private readonly retiringRuns = new Map<string, object>();
+  /**
+   * Retirable runs waiting for a free release worker, FIFO. Retirement never overflows the
+   * dispatcher queue; each entry is re-evaluated when a worker takes it.
+   */
+  private readonly retirementBacklog = new Set<string>();
   private readonly runOwnerFinalizer = new FinalizationRegistry<string>((runId) => {
-    if (this.closed) return;
-    const remaining = (this.runOwnerCounts.get(runId) ?? 1) - 1;
-    if (remaining > 0) {
-      this.runOwnerCounts.set(runId, remaining);
-      return;
-    }
-    this.runOwnerCounts.delete(runId);
-    const state = this.leaseLedger.stateFor(runId);
-    if (state !== null && this.unmanagedStates.has(state)) return;
-    this.orphanedRuns.add(runId);
-    this.retireOrphanedRun(runId);
+    this.onRunOwnerCollected(runId);
   });
 
   readonly budgetMode: BudgetMode;
@@ -616,22 +645,66 @@ export class BudgetEnforcer {
   private readonly uncountedEpisodes = new Map<string, { lastWarnAt: number }>();
   /** Strong ownership keeps detached renewal promises observed until they settle. */
   private readonly renewalOperations = new Set<Promise<void>>();
-  /** Detached late-surrender work remains observed even after explicit close returns. */
-  private readonly detachedSurrenders = new Set<Promise<void>>();
   /** Generation-fenced post-snapshot spend captured synchronously at close. */
   private readonly lateRenewalSpend = new Map<string, number>();
+  /** Every surrender (retirement, late successor, close) goes through this bounded queue. */
+  private readonly releases: ReleaseDispatcher;
+  /** Set only while a surrender attempt synchronously starts its request. */
+  private rawFetchCapture: { raw: Promise<unknown> | null } | null = null;
+  /** Drops not yet reported in an aggregate WARN line. */
+  private readonly unreportedDrops = new Map<ReleaseDropReason, number>();
+  private lastDropWarnAt: number | null = null;
+  private dropWarnScheduled = false;
+  /** Uncounted tallies of discarded runs: since the last WARN, and for the client's life. */
+  private readonly unreportedUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
+  private readonly totalUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
+  private lastUncountedWarnAt: number | null = null;
+  private uncountedWarnScheduled = false;
   private closeEpoch = 0;
   private closePromise: Promise<void> | null = null;
-  private closeSurrenderQueue: QueuedSurrender[] | null = null;
+  /** Between close() and its single summary WARN, drops are reported only by that WARN. */
+  private closeDraining = false;
   private closed = false;
 
   constructor(options: BudgetEnforcerOptions) {
     requireFetchLike(options.fetch);
+    // A surrender attempt observes its underlying request so a request that ignores abort
+    // keeps its dispatcher slot until it settles. Every other request is passed through; the
+    // default fetch honours abort, so it needs no observation.
+    const injected = options.fetch;
+    const fetch: FetchLike | undefined =
+      injected === undefined
+        ? undefined
+        : (input, init) => {
+            const capture = this.rawFetchCapture;
+            if (capture === null) return injected(input, init);
+            this.rawFetchCapture = null;
+            let raw: Promise<Response>;
+            try {
+              raw = Promise.resolve(injected(input, init));
+            } catch (error) {
+              raw = Promise.reject(error);
+            }
+            capture.raw = raw.then(
+              () => {},
+              () => {},
+            );
+            return raw;
+          };
     // Transport normalizes the URL (strips ALL trailing slashes) and owns auth headers.
-    this.transport = new Transport(options.apiUrl, options.apiKey, { fetch: options.fetch });
+    this.transport = new Transport(options.apiUrl, options.apiKey, { fetch });
     this.logger = bestEffortLogger(options.logger ?? noopLogger);
     this.now = options.now ?? Date.now;
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
+    this.releases = new ReleaseDispatcher({
+      send: (request, timeoutMs) => this.attemptSurrender(request, timeoutMs),
+      now: () => this.monotonicNow(),
+      attemptTimeoutMs: DEFAULT_SURRENDER_TIMEOUT_MS,
+      maxAttempts: SURRENDER_ATTEMPTS,
+      itemBudgetMs: RELEASE_BUDGET_MS,
+      onDrop: (reason) => this.noteReleaseDrop(reason),
+      onWorkerReady: () => this.feedRetirements(),
+    });
     this.controlPlaneBreaker = options.controlPlaneBreaker ?? null;
     this.leaseLedger = new LeaseLedger({
       holderId: options.holderId ?? crypto.randomUUID(),
@@ -786,19 +859,21 @@ export class BudgetEnforcer {
           field: "lease_claim_token",
         });
       }
+      const runId = this.leaseLedger.runIdForCall(validated.data.call_id);
       this.leaseLedger.trueUp(validated.data.call_id, totalTokens(validated.data.token_details), {
         claimToken,
         floorAtReservation: options.floorAtReservation ?? false,
       });
-      this.retryOrphanRetirement();
+      if (runId !== null) this.retireOrphanedRun(runId);
     }
     return validated.data;
   }
 
   /** Consume unknown paid work at its reservation floor without performing wire I/O. */
   consumeUnknownUsage(callId: string, claimToken: number | null): void {
+    const runId = this.leaseLedger.runIdForCall(callId);
     this.leaseLedger.trueUp(callId, 0, { claimToken, floorAtReservation: true });
-    this.retryOrphanRetirement();
+    if (runId !== null) this.retireOrphanedRun(runId);
   }
 
   /** Return one still-current local lease reservation without performing wire I/O. */
@@ -807,8 +882,9 @@ export class BudgetEnforcer {
     if (!BudgetConfirmRequestObjectSchema.shape.call_id.safeParse(callId).success) {
       throw new ConfigurationError("invalid call_id", { field: "call_id" });
     }
+    const runId = this.leaseLedger.runIdForCall(callId);
     this.leaseLedger.release(callId, { claimToken });
-    this.retryOrphanRetirement();
+    if (runId !== null) this.retireOrphanedRun(runId);
   }
 
   /**
@@ -883,7 +959,6 @@ export class BudgetEnforcer {
   }
 
   private async checkBudgetWithOwnership(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
-    this.retryOrphanRetirement();
     // Invariant 7 / D5: `provider` is required AT RUNTIME, even from untyped JS callers.
     if (!options.provider) {
       throw new ConfigurationError("provider is required for budget check", { field: "provider" });
@@ -954,10 +1029,13 @@ export class BudgetEnforcer {
     let leaseCallId: string | null = null;
     let leaseClaimToken: number | null = null;
 
+    let widenAfterAllow = false;
+
     if (this.leaseEntryEligible(captured)) {
       leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
       let leaseAdmission = this.admitLease(captured, leaseCallId, null);
       leaseClaimToken = leaseAdmission.claimToken;
+      widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
 
       const immediate = this.localLeaseResult(captured, leaseAdmission);
       if (immediate !== null) {
@@ -1073,10 +1151,12 @@ export class BudgetEnforcer {
         }
 
         this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        return this.withLeaseClaim(
-          this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch),
-          leaseClaimToken,
-        );
+        const result = this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch);
+        // Only a live allow for this run widens; denied, unreadable and outage paths never do.
+        if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
+          this.scheduleWidening(captured);
+        }
+        return this.withLeaseClaim(result, leaseClaimToken);
       } finally {
         this.unregisterPendingOrderedRequest(requestDispatch);
       }
@@ -1132,7 +1212,7 @@ export class BudgetEnforcer {
         field: "agent_run_id",
       });
     }
-    return this.leaseLedger.admit({
+    const admission = this.leaseLedger.admit({
       runId,
       callId,
       estimatedInputTokens: captured.estimatedInputTokens,
@@ -1145,6 +1225,9 @@ export class BudgetEnforcer {
       breakerOpen,
       claimToken,
     });
+    // Aged reservations released by the admission sweep may make their runs retirable.
+    for (const swept of this.leaseLedger.takeSweptRuns()) this.retireOrphanedRun(swept);
+    return admission;
   }
 
   /** Map ledger authority and its immutable display snapshot into the local result shape. */
@@ -1190,19 +1273,56 @@ export class BudgetEnforcer {
     }
     const runId = captured.agentRunId;
     if (runId === undefined) return;
-    const claimed = this.leaseLedger.claimRenewalRequest(runId, {
+    // A retry at the same lease and generation re-sends the first claim's declaration.
+    const claimed = this.leaseLedger.claimRenewal(runId, {
       model: captured.model,
       provider: captured.provider,
       fallbackProviders: captured.fallbackProviders,
       fallbackModels: captured.fallbackModels,
     });
     if (claimed === null) return;
+    this.launchRenewal(runId, claimed.request, claimed.addedModels);
+  }
 
+  /**
+   * After an allowed per-call check for a chain the lease does not declare, claim one background
+   * renewal that re-declares the call's full chain. The call keeps its per-call result; the lease
+   * covers the chain only once the renewal is applied. A skipped claim (worker cap, backoff, a
+   * renewal in flight) is retried by the next such call.
+   */
+  private scheduleWidening(captured: CapturedCheck): void {
+    const runId = captured.agentRunId;
+    if (runId === undefined || !this.leaseEntryEligible(captured)) return;
+    if (this.renewalOperations.size >= MAX_RENEWAL_OPERATIONS) {
+      this.logger.debug("lease.renew_worker_limit");
+      return;
+    }
+    const claimed = this.leaseLedger.claimWideningRequest(runId, {
+      now: this.monotonicNow() / 1000,
+      model: captured.model,
+      provider: captured.provider,
+      fallbackProviders: captured.fallbackProviders,
+      fallbackModels: captured.fallbackModels,
+    });
+    if (claimed === null) return;
+    // While a retry is owed, the call sends that retry unchanged; its own chain widens later.
+    if (claimed.retry)
+      this.logger.debug("lease.renew_retry: added_models=%d", claimed.addedModels.length);
+    else this.logger.debug("lease.widen: added_models=%d", claimed.addedModels.length);
+    this.launchRenewal(runId, claimed.request, claimed.addedModels);
+  }
+
+  /** Validate and launch one claimed renewal without awaiting it on the admission path. */
+  private launchRenewal(
+    runId: string,
+    claimed: LeaseRenewRequest,
+    wideningModels: readonly string[],
+  ): void {
     const originLeaseId = claimed.lease_id;
     const originGeneration = claimed.generation;
     const parsed = LeaseRenewRequestSchema.safeParse(claimed);
     if (!parsed.success) {
-      this.failRenewal(runId, originLeaseId, originGeneration);
+      this.failRenewal(runId, originLeaseId, originGeneration, false);
       this.logger.warn("lease.renew_request_invalid");
       return;
     }
@@ -1220,7 +1340,12 @@ export class BudgetEnforcer {
       originLeaseId,
       originGeneration,
       closeEpoch: this.closeEpoch,
-      declaredModels: Object.freeze([captured.model, ...captured.fallbackModels]),
+      // An applied renewal covers exactly what the request declared, never the caller's chain.
+      declaredModels: Object.freeze([
+        ...(request.model === null || request.model === undefined ? [] : [request.model]),
+        ...fallbackModels,
+      ]),
+      wideningModels,
       wire: Object.freeze(serializeLeaseRenewRequest(request)),
     });
 
@@ -1245,13 +1370,26 @@ export class BudgetEnforcer {
     try {
       if (admission !== null && !admission.allowed) {
         if (operation.closeEpoch === this.closeEpoch) {
-          this.failRenewal(operation.runId, operation.originLeaseId, operation.originGeneration);
+          this.failRenewal(
+            operation.runId,
+            operation.originLeaseId,
+            operation.originGeneration,
+            false,
+          );
         }
         this.logger.debug("lease.renew_skipped_breaker_open");
         return;
       }
 
       const authorityDispatch = this.captureAuthorityDispatch();
+      // From here the declaration may reach the control plane: only a superseding generation
+      // may drop it, whatever a later attempt reports.
+      if (operation.closeEpoch === this.closeEpoch) {
+        this.leaseLedger.renewalDispatched(operation.runId, {
+          expectedLeaseId: operation.originLeaseId,
+          expectedGeneration: operation.originGeneration,
+        });
+      }
       let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
       try {
         raw = await this.transport.postJsonAndReadJson(LEASE_RENEW_PATH, operation.wire, {
@@ -1349,6 +1487,7 @@ export class BudgetEnforcer {
         declaredModels: operation.declaredModels,
         expectedLeaseId: operation.originLeaseId,
         expectedGeneration: operation.originGeneration,
+        wideningModels: operation.wideningModels,
       });
       if (outcome === GrantOutcome.Applied) {
         this.foldRunStateForAllow(projected, operation.runId, authorityDispatch.runDispatchedAt);
@@ -1374,6 +1513,12 @@ export class BudgetEnforcer {
           responseObservation.runObservedAt,
           authorityOrder,
         );
+      } else if (outcome === GrantOutcome.Ineligible) {
+        this.logger.debug("lease.renew_ineligible: reason=%s", ineligibleReason(effective));
+        if (operation.wideningModels.length > 0) {
+          this.logger.debug("lease.widen_refused: models=%d", operation.wideningModels.length);
+        }
+        this.releaseRefusedLease(operation.runId);
       } else if (outcome === GrantOutcome.Stale) {
         this.failRenewal(operation.runId, operation.originLeaseId, operation.originGeneration);
       }
@@ -1386,11 +1531,16 @@ export class BudgetEnforcer {
     }
   }
 
-  private failRenewal(runId: string, leaseId: string, generation: number): void {
+  /**
+   * `sent: false` only when this attempt provably never reached the control plane; the ledger
+   * still keeps the declaration if an earlier attempt at the same origin may have.
+   */
+  private failRenewal(runId: string, leaseId: string, generation: number, sent = true): void {
     this.leaseLedger.renewalFailed(runId, {
       now: this.monotonicNow() / 1000,
       expectedLeaseId: leaseId,
       expectedGeneration: generation,
+      sent,
     });
   }
 
@@ -1457,7 +1607,7 @@ export class BudgetEnforcer {
           if (closeDispatchEpoch === this.closeEpoch) {
             this.leaseLedger.markIneligible(runId, {
               now: this.monotonicNow() / 1000,
-              retryAfter: status === 409 ? null : INELIGIBLE_RETRY_AFTER_S,
+              retryAfter: status === 409 ? LEASE_REFUSAL_LATCH_S : INELIGIBLE_RETRY_AFTER_S,
             });
           }
           this.logger.debug("lease.grant_refused: status=%s", status);
@@ -1554,6 +1704,9 @@ export class BudgetEnforcer {
           result: this.projectCloudResponse(winningResponse ?? projected, runId),
         };
       }
+      if (outcome === GrantOutcome.Ineligible) {
+        this.logger.debug("lease.grant_ineligible: reason=%s", ineligibleReason(effective));
+      }
       if (outcome !== GrantOutcome.Applied) return { kind: "legacy" };
 
       this.foldRunStateForAllow(projected, runId, authorityDispatch.runDispatchedAt);
@@ -1647,7 +1800,7 @@ export class BudgetEnforcer {
     const episode = this.uncountedEpisodes.get(runId);
     if (episode === undefined) {
       this.logger.warn(
-        "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied for the next successful renewal to report (reason=%s)",
+        "lease.uncounted_entry: Solwyn is unreachable and this run holds no live lease; calls proceed UNCOUNTED under fail_open and are tallied; a successful renewal reports the tallies, otherwise they are aggregated into a local warning when the run ends (reason=%s)",
         reason,
       );
       this.uncountedEpisodes.set(runId, { lastWarnAt: now });
@@ -2466,11 +2619,27 @@ export class BudgetEnforcer {
   // Lifecycle.
   // -------------------------------------------------------------------------
 
-  private retryOrphanRetirement(): void {
-    for (const runId of this.orphanedRuns) this.retireOrphanedRun(runId);
+  /** A run owner became unreachable: the run can retire once nothing else owns its state. */
+  private onRunOwnerCollected(runId: string): void {
+    if (this.closed) return;
+    const remaining = (this.runOwnerCounts.get(runId) ?? 1) - 1;
+    if (remaining > 0) {
+      this.runOwnerCounts.set(runId, remaining);
+      return;
+    }
+    this.runOwnerCounts.delete(runId);
+    const state = this.leaseLedger.stateFor(runId);
+    if (state !== null && this.unmanagedStates.has(state)) return;
+    this.orphanedRuns.add(runId);
+    this.retireOrphanedRun(runId);
   }
 
-  private retireOrphanedRun(runId: string): void {
+  /**
+   * Evaluate ONE run. Called only when that run's state mutates (owner loss, reservation
+   * settlement or release, renewal or grant completion, a finished surrender); admission and
+   * settlement never walk the orphan set.
+   */
+  private retireOrphanedRun(runId: string, fromBacklog = false): void {
     if (
       this.closed ||
       !this.orphanedRuns.has(runId) ||
@@ -2483,50 +2652,154 @@ export class BudgetEnforcer {
     const state = this.leaseLedger.stateFor(runId);
     if (state === null) {
       this.orphanedRuns.delete(runId);
+      this.uncountedEpisodes.delete(runId);
       return;
     }
     if (this.unmanagedStates.has(state)) return;
     // Reservation/renewal owners are independent of frame reachability. In particular,
     // a detached renewal may outlive the final provider call's captured run snapshot.
+    // Their completion re-evaluates this run.
     if (state.reservations.size > 0 || state.renewalInFlight || state.pendingReport !== null)
       return;
-    // These diagnostics cannot be represented by the surrender wire contract.
-    if (state.uncountedCalls > 0 || state.uncountedTokens > 0) return;
-    const request = this.leaseLedger.buildSurrenderRequest(runId);
-    if (request === null) {
-      if (state.spentTokensSinceReport !== 0) return;
-      this.leaseLedger.discard(runId);
-      this.orphanedRuns.delete(runId);
-      this.uncountedEpisodes.delete(runId);
+    if (state.leaseId === null) {
+      // Without a lease nothing can be surrendered; spent_tokens is advisory (confirms settle).
+      this.discardRetiredRun(runId, state);
       return;
     }
-    const spent = state.spentTokensSinceReport;
-    const operation = this.sendSurrender(request, DEFAULT_SURRENDER_TIMEOUT_MS)
-      .then((sent) => {
-        // A failed send retains unreported spend for retry/explicit close. Zero-spend
-        // orphan authority can expire remotely without pinning local history.
-        if (!sent && spent !== 0) return;
-        if (sent && this.unmanagedStates.has(state)) {
-          this.leaseLedger.acknowledgeSurrender(runId, request);
-          return;
-        }
-        if (
-          this.unmanagedStates.has(state) ||
-          this.leaseLedger.stateFor(runId) !== state ||
-          state.reservations.size > 0 ||
-          state.renewalInFlight ||
-          state.spentTokensSinceReport !== spent
-        )
-          return;
-        this.leaseLedger.discard(runId);
-        this.orphanedRuns.delete(runId);
-        this.uncountedEpisodes.delete(runId);
-      })
-      .catch(() => {})
-      .finally(() => {
-        this.retiringRuns.delete(runId);
-      });
-    this.retiringRuns.set(runId, operation);
+    if (!fromBacklog && (this.retirementBacklog.size > 0 || !this.releases.hasFreeWorker)) {
+      this.retirementBacklog.add(runId);
+      return;
+    }
+    const request = this.leaseLedger.buildSurrenderRequest(runId);
+    if (request === null) return;
+    this.retirementBacklog.delete(runId);
+    const marker = {};
+    this.retiringRuns.set(runId, marker);
+    this.releases.submit(request, {
+      onOutcome: (outcome) => this.finishRetirement(runId, state, request, marker, outcome),
+    });
+  }
+
+  /** A worker is free: hand it the oldest retirable run (or several, if more are free). */
+  private feedRetirements(): void {
+    for (const runId of this.retirementBacklog) {
+      if (this.closed || this.releases.pending > 0) return;
+      this.retirementBacklog.delete(runId);
+      this.retireOrphanedRun(runId, true);
+    }
+  }
+
+  /** Every outcome ends the retirement: a dropped surrender is never relaunched. */
+  private finishRetirement(
+    runId: string,
+    state: LeaseState,
+    request: LeaseSurrenderRequest,
+    marker: object,
+    outcome: ReleaseOutcome,
+  ): void {
+    if (this.retiringRuns.get(runId) === marker) this.retiringRuns.delete(runId);
+    if (this.closed) return;
+    const sent = outcome.kind === "sent";
+    if (
+      this.unmanagedStates.has(state) ||
+      this.leaseLedger.stateFor(runId) !== state ||
+      state.reservations.size > 0 ||
+      state.renewalInFlight ||
+      state.spentTokensSinceReport !== request.spent_tokens
+    ) {
+      // A revived identity keeps its state; a released lease is never reused locally.
+      if (sent) this.leaseLedger.acknowledgeSurrender(runId, request);
+      this.retireOrphanedRun(runId);
+      return;
+    }
+    this.discardRetiredRun(runId, state);
+  }
+
+  /**
+   * Send the release owed by an ineligible renewal. Until its outcome arrives the run takes
+   * per-call checks; a sent release lets the next eligible call grant again, and any other
+   * outcome leaves the 150 s latch counted from the refusal. The pending release never blocks
+   * retirement.
+   */
+  private releaseRefusedLease(runId: string): void {
+    const pending = this.leaseLedger.stateFor(runId)?.releasePending ?? null;
+    if (pending === null) return;
+    const { request, token } = pending;
+    this.releases.submit(request, {
+      onOutcome: (outcome) => {
+        // Never creates state: a retired run, a newer refusal or a closing client ignores it.
+        if (this.closed) return;
+        this.leaseLedger.resolveRefusalRelease(runId, token, outcome.kind === "sent");
+      },
+    });
+  }
+
+  /** Discard a finished run as an ordinary orphan, folding any uncounted tallies first. */
+  private discardRetiredRun(runId: string, state: LeaseState): void {
+    if (state.uncountedCalls > 0 || state.uncountedTokens > 0) {
+      this.noteDiscardedUncounted(1, state.uncountedCalls, state.uncountedTokens);
+    }
+    this.leaseLedger.discard(runId);
+    this.orphanedRuns.delete(runId);
+    this.retirementBacklog.delete(runId);
+    this.uncountedEpisodes.delete(runId);
+  }
+
+  /** Uncounted tallies travel only on renewals; a finished run's are aggregated and logged. */
+  private noteDiscardedUncounted(runs: number, calls: number, tokens: number): void {
+    for (const aggregate of [this.unreportedUncounted, this.totalUncounted]) {
+      aggregate.runs = saturatingAdd(aggregate.runs, runs);
+      aggregate.calls = saturatingAdd(aggregate.calls, calls);
+      aggregate.tokens = saturatingAdd(aggregate.tokens, tokens);
+    }
+    if (this.uncountedWarnScheduled || this.closed) return;
+    const last = this.lastUncountedWarnAt;
+    if (last !== null && this.monotonicNow() - last < UNCOUNTED_WARN_INTERVAL_MS) return;
+    // One microtask aggregates a synchronous burst; no timer is ever started.
+    this.uncountedWarnScheduled = true;
+    queueMicrotask(() => {
+      this.uncountedWarnScheduled = false;
+      const pending = this.unreportedUncounted;
+      if (pending.runs === 0 || this.closed) return;
+      this.lastUncountedWarnAt = this.monotonicNow();
+      this.logger.warn(
+        "lease.uncounted_discarded: %d finished runs held %d UNCOUNTED fail-open calls (%d estimated tokens) that no renewal can report",
+        pending.runs,
+        pending.calls,
+        pending.tokens,
+      );
+      pending.runs = 0;
+      pending.calls = 0;
+      pending.tokens = 0;
+    });
+  }
+
+  /** Count a dropped surrender and emit at most one aggregate WARN per interval. */
+  private noteReleaseDrop(reason: ReleaseDropReason): void {
+    this.unreportedDrops.set(reason, saturatingAdd(this.unreportedDrops.get(reason) ?? 0, 1));
+    if (this.dropWarnScheduled || this.closeDraining) return;
+    const last = this.lastDropWarnAt;
+    if (last !== null && this.monotonicNow() - last < UNCOUNTED_WARN_INTERVAL_MS) return;
+    this.dropWarnScheduled = true;
+    queueMicrotask(() => {
+      this.dropWarnScheduled = false;
+      if (this.unreportedDrops.size === 0 || this.closeDraining) return;
+      this.lastDropWarnAt = this.monotonicNow();
+      this.logger.warn(
+        "lease.surrenders_dropped: %s; unspent reserved tokens return when the leases expire",
+        this.formatDrops(this.unreportedDrops),
+      );
+      this.unreportedDrops.clear();
+    });
+  }
+
+  private formatDrops(drops: ReadonlyMap<ReleaseDropReason, number>): string {
+    const parts: string[] = [];
+    for (const reason of RELEASE_DROP_REASONS) {
+      const count = drops.get(reason) ?? 0;
+      if (count > 0) parts.push(`${reason}=${count}`);
+    }
+    return parts.length === 0 ? "none" : parts.join(" ");
   }
 
   private renewalKey(operation: RenewalOperation): string {
@@ -2556,47 +2829,56 @@ export class BudgetEnforcer {
       spent_tokens: Math.max(0, spentTokens),
     });
     if (!parsed.success) return;
-    this.queueSurrender(parsed.data, true);
+    this.queueSurrender(parsed.data);
   }
 
-  private queueSurrender(request: LeaseSurrenderRequest, late: boolean): void {
-    const queue = this.closeSurrenderQueue;
-    if (queue !== null) {
-      queue.push(Object.freeze({ request, late }));
-      return;
+  /** Late successors use the same bounded dispatcher, before, during and after close. */
+  private queueSurrender(request: LeaseSurrenderRequest): void {
+    this.releases.submit(request);
+  }
+
+  /**
+   * One surrender attempt for the dispatcher. Payload setup failures skip the breaker; HTTP
+   * answers (4xx, 503, read-only key) record breaker success, while transport failures and
+   * other 5xx record failure. Only a timeout is retried, by the dispatcher.
+   */
+  private async attemptSurrender(
+    request: LeaseSurrenderRequest,
+    timeoutMs: number,
+  ): Promise<ReleaseAttempt> {
+    let body: Record<string, unknown>;
+    try {
+      const parsed = LeaseSurrenderRequestSchema.safeParse(request);
+      if (!parsed.success || timeoutMs <= 0) return { result: "setup_failed", settled: null };
+      body = serializeLeaseSurrenderRequest(parsed.data);
+    } catch {
+      return { result: "setup_failed", settled: null };
     }
-    if (late) this.launchDetachedSurrender(request);
-  }
-
-  private launchDetachedSurrender(request: LeaseSurrenderRequest): void {
-    let tracked!: Promise<void>;
-    tracked = this.sendSurrender(request, DEFAULT_SURRENDER_TIMEOUT_MS)
-      .then(() => {})
-      .catch(() => {})
-      .finally(() => {
-        this.detachedSurrenders.delete(tracked);
-      });
-    this.detachedSurrenders.add(tracked);
-  }
-
-  private async sendSurrender(request: LeaseSurrenderRequest, timeoutMs: number): Promise<boolean> {
-    const parsed = LeaseSurrenderRequestSchema.safeParse(request);
-    if (!parsed.success || timeoutMs <= 0) return false;
     const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
+    let settled: Promise<unknown> | null = null;
     try {
       if (admission !== null && !admission.allowed) {
         this.logger.debug("lease.surrender_skipped_breaker_open");
-        return false;
+        return { result: "breaker_open", settled: null };
       }
+      const capture: { raw: Promise<unknown> | null } = { raw: null };
+      let posting: Promise<Response>;
+      this.rawFetchCapture = capture;
       try {
-        await this.transport.postJson(
-          LEASE_SURRENDER_PATH,
-          serializeLeaseSurrenderRequest(parsed.data),
-          { timeoutMs },
-        );
+        posting = this.transport.postJson(LEASE_SURRENDER_PATH, body, { timeoutMs });
+      } finally {
+        this.rawFetchCapture = null;
+      }
+      settled = capture.raw;
+      try {
+        await posting;
         this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        return true;
+        return { result: "sent", settled };
       } catch (error) {
+        if (transportErrorLabel(error) === null) {
+          this.logger.debug("lease.surrender_failed: local_error");
+          return { result: "local_error", settled };
+        }
         const status = error instanceof TransportHttpError ? error.status : null;
         const responded =
           isReadOnlyKeyError(error) ||
@@ -2605,8 +2887,10 @@ export class BudgetEnforcer {
         if (responded) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         else this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
         if (isReadOnlyKeyError(error)) handleReadOnlyKeyError(error, this.logger);
-        this.logger.debug("lease.surrender_failed");
-        return false;
+        this.logger.debug("lease.surrender_failed: status=%s", status);
+        if (status !== null) return { result: "refused", settled };
+        if (error instanceof TransportTimeoutError) return { result: "timeout", settled };
+        return { result: "unreachable", settled };
       }
     } finally {
       this.controlPlaneBreaker?.releaseProbe(admission);
@@ -2637,36 +2921,32 @@ export class BudgetEnforcer {
     }
   }
 
-  private async finishClose(deadline: number): Promise<void> {
-    const queue = this.closeSurrenderQueue;
-    if (queue === null) return;
-    let cursor = 0;
-
-    const drainQueued = (): Promise<boolean> | null => {
-      const remaining = this.remainingBefore(deadline);
-      if (remaining <= 0 || cursor >= queue.length) return null;
-      const batch = queue.slice(cursor);
-      cursor = queue.length;
-      return this.awaitBefore(
-        Promise.allSettled(batch.map(({ request }) => this.sendSurrender(request, remaining))),
-        deadline,
-      );
-    };
-
-    const originSurrenders = drainQueued();
+  private async finishClose(deadline: number, drainedUncounted: UncountedAggregate): Promise<void> {
     await this.awaitBefore(Promise.allSettled([...this.renewalOperations]), deadline);
-    await this.awaitBefore(Promise.allSettled([...this.retiringRuns.values()]), deadline);
-    for (let drain = drainQueued(); drain !== null; drain = drainQueued()) {
-      await drain;
-    }
-    if (originSurrenders !== null) await originSurrenders;
-    for (let drain = drainQueued(); drain !== null; drain = drainQueued()) {
-      await drain;
-    }
-
-    const unsentLate = queue.slice(cursor).filter(({ late }) => late);
-    this.closeSurrenderQueue = null;
-    for (const { request } of unsentLate) this.launchDetachedSurrender(request);
+    await this.awaitBefore(this.releases.whenIdle(), deadline);
+    const left = this.releases.dropCloseTimeQueued();
+    this.closeDraining = false;
+    const inFlight = this.releases.active;
+    const uncounted = this.totalUncounted;
+    const drops = new Map<ReleaseDropReason, number>();
+    const dropped = this.releases.counts().dropped;
+    for (const reason of RELEASE_DROP_REASONS) drops.set(reason, dropped[reason]);
+    this.unreportedDrops.clear();
+    this.unreportedUncounted.runs = 0;
+    this.unreportedUncounted.calls = 0;
+    this.unreportedUncounted.tokens = 0;
+    const anyDrop = [...drops.values()].some((count) => count > 0);
+    if (left === 0 && inFlight === 0 && !anyDrop && uncounted.runs === 0) return;
+    this.logger.warn(
+      "lease.close_release_summary: shutdown_deadline=%d in_flight=%d dropped=[%s] uncounted_runs=%d uncounted_calls=%d uncounted_tokens=%d (closed with %d runs holding uncounted tallies)",
+      left,
+      inFlight,
+      this.formatDrops(drops),
+      uncounted.runs,
+      uncounted.calls,
+      uncounted.tokens,
+      drainedUncounted.runs,
+    );
   }
 
   /** Drain all lease authority and surrender it under one absolute monotonic deadline. */
@@ -2675,6 +2955,7 @@ export class BudgetEnforcer {
 
     // One synchronous lifecycle section: close fencing precedes every async boundary.
     this.closed = true;
+    this.closeDraining = true;
     this.closeEpoch += 1;
     for (const delta of this.leaseLedger.pendingRenewalSpendDeltas()) {
       this.lateRenewalSpend.set(
@@ -2682,16 +2963,25 @@ export class BudgetEnforcer {
         delta.spentTokens,
       );
     }
-    this.closeSurrenderQueue = this.leaseLedger
-      .drainSurrenderRequests(new Set(this.retiringRuns.keys()))
-      .map((request) => Object.freeze({ request, late: false }));
+    const drainedUncounted = this.leaseLedger.uncountedTallies();
+    this.noteDiscardedUncounted(
+      drainedUncounted.runs,
+      drainedUncounted.calls,
+      drainedUncounted.tokens,
+    );
+    // Runs already retiring have their surrender queued or active; merging dedupes the rest.
+    const requests = this.leaseLedger.drainSurrenderRequests(new Set(this.retiringRuns.keys()));
     this.uncountedEpisodes.clear();
     this.runOwnerCounts.clear();
     this.orphanedRuns.clear();
+    this.retirementBacklog.clear();
     this.pendingUnmanagedRuns.clear();
 
     const deadline = this.monotonicNow() + Math.max(0, timeoutMs);
-    this.closePromise = this.finishClose(deadline);
+    // FIFO and uncapped in count; one attempt each within the close deadline.
+    this.releases.clampForClose(deadline);
+    for (const request of requests) this.releases.submit(request, { deadline, closeTime: true });
+    this.closePromise = this.finishClose(deadline, drainedUncounted);
     return this.closePromise;
   }
 

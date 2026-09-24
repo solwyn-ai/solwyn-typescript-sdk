@@ -14,6 +14,11 @@ import type {
 export const DEFAULT_OUTPUT_BOUND = 4096;
 export const RESERVATION_MAX_AGE_S = 900;
 export const INELIGIBLE_RETRY_AFTER_S = 30;
+/**
+ * How long a run stays on per-call checks after a grant 409, or after an ineligible renewal whose
+ * release was not confirmed. It outlasts the lease an unseen grant may have left behind.
+ */
+export const LEASE_REFUSAL_LATCH_S = 150;
 export const RENEWAL_DEPLETION_NUM = 3;
 export const RENEWAL_DEPLETION_DEN = 4;
 export const REFRESH_JITTER_MIN = 0.85;
@@ -125,6 +130,36 @@ interface Expiry {
   readonly token: number;
   readonly callId: string;
 }
+/** The release owed after an ineligible renewal, pending until its outcome arrives. */
+export interface RefusalRelease {
+  /** Monotonic seconds when the ineligible renewal was applied. */
+  readonly refusedAt: number;
+  /** Identifies this refusal; a later refusal or a lapsed latch replaces or clears it. */
+  readonly token: number;
+  /** Surrender of the lease held when the renewal was refused, at its held generation. */
+  readonly request: LeaseSurrenderRequest;
+}
+/**
+ * The declaration a renewal first claimed at one lease and generation. Until that generation is
+ * superseded, every retry at the same origin re-sends it: the control plane may answer a retry
+ * with its stored result for the first request, so a retry must never declare anything else.
+ */
+export interface RenewalDeclaration {
+  readonly leaseId: string;
+  readonly generation: number;
+  readonly model: string | null;
+  readonly provider: ProviderName | null;
+  readonly fallbackProviders: readonly ProviderName[];
+  readonly fallbackModels: readonly string[];
+  /** The declaration's models the lease did not yet declare; empty for an ordinary renewal. */
+  readonly addedModels: readonly string[];
+  /**
+   * Whether any attempt may have reached the control plane. Set once an attempt is dispatched,
+   * or reports an unknown outcome; never cleared while the declaration is owed. A skipped attempt
+   * (an open breaker, an invalid request) drops the declaration only while this is false.
+   */
+  readonly dispatched: boolean;
+}
 
 export class LeaseState {
   readonly runId: string;
@@ -140,8 +175,15 @@ export class LeaseState {
   onUnreachable: OnUnreachable = "fail_open";
   finalGrant = false;
   declaredModels = new Set<string>();
+  /**
+   * Models a widening renewal added and the control plane answered eligible:false. They belong to
+   * the run, outlive any lease, and are never declared again in a renewal or a grant.
+   */
+  readonly refusedModels = new Set<string>();
   readonly reservations = new Map<string, Reservation>();
   renewalInFlight = false;
+  /** Owed by every retry at its lease and generation; see {@link RenewalDeclaration}. */
+  renewalDeclaration: RenewalDeclaration | null = null;
   consecutiveFailures = 0;
   nextAttemptAt = 0;
   pendingReport: PendingReport | null = null;
@@ -150,6 +192,8 @@ export class LeaseState {
   uncountedTokens = 0;
   runIneligible = false;
   ineligibleRetryAt = 0;
+  /** Not a retirement item: it never blocks retirement or keeps the state alive. */
+  releasePending: RefusalRelease | null = null;
   snapshot: LeaseSnapshot | null = null;
 
   constructor(runId: string) {
@@ -179,6 +223,14 @@ export class LeaseState {
       fallbackModels.every((item) => this.declaredModels.has(item))
     );
   }
+
+  /** Whether the chain names a model a refused widening recorded for this run. */
+  refuses(model: string, fallbackModels: readonly string[]): boolean {
+    if (this.refusedModels.size === 0) return false;
+    return (
+      this.refusedModels.has(model) || fallbackModels.some((item) => this.refusedModels.has(item))
+    );
+  }
 }
 
 export interface LeaseLedgerOptions {
@@ -205,6 +257,8 @@ export interface ApplyGrantResponseOptions {
   declaredModels?: readonly string[];
   expectedLeaseId?: string | null;
   expectedGeneration?: number | null;
+  /** The models a widening renewal added; an eligible:false answer records them as refused. */
+  wideningModels?: readonly string[];
 }
 export interface RenewalOptions {
   model?: string | null;
@@ -212,10 +266,38 @@ export interface RenewalOptions {
   fallbackProviders?: readonly ProviderName[];
   fallbackModels?: readonly string[];
 }
+export interface WideningOptions {
+  now: number;
+  model: string;
+  provider: ProviderName;
+  fallbackProviders: readonly ProviderName[];
+  fallbackModels: readonly string[];
+}
+/**
+ * A claimed renewal and the models its declaration adds to the lease. A retry at the same lease
+ * and generation carries the first claim's declaration and added models, not the caller's chain.
+ */
+export interface RenewalClaim {
+  readonly request: LeaseRenewRequest;
+  readonly addedModels: readonly string[];
+  /** Whether the claim re-sends a declaration an earlier attempt owed, not a fresh one. */
+  readonly retry: boolean;
+}
+/**
+ * A claimed renewal that re-declares a call's chain, and the models it adds to the lease; or,
+ * while a retry is owed, that retry (`retry: true`), which never carries the call's chain.
+ */
+export type WideningClaim = RenewalClaim;
 export interface RenewalFailedOptions {
   now: number;
   expectedLeaseId?: string | null;
   expectedGeneration?: number | null;
+  /**
+   * Whether this attempt may have reached the control plane. `false` only when it provably never
+   * left. The declaration is dropped only if no earlier attempt may have reached the control
+   * plane either; otherwise the next claim at the same origin still re-sends it.
+   */
+  sent?: boolean;
 }
 export interface ClaimSettlementOptions {
   claimToken: number | null;
@@ -230,8 +312,11 @@ export class LeaseLedger {
   readonly #callIndex = new Map<string, string>();
   readonly #callClaims = new Map<string, CallClaim>();
   readonly #callExpiries: Expiry[] = [];
+  /** Runs whose aged reservations a sweep released since the owner last took them. */
+  readonly #sweptRuns = new Set<string>();
   #nextClaimToken = 0;
   #nextLeaseIncarnation = 0;
+  #nextRefusalToken = 0;
   readonly #rng: LeaseLedgerOptions["rng"];
 
   constructor({
@@ -267,6 +352,30 @@ export class LeaseLedger {
     const state = this.#states.get(runId);
     return state?.leaseId === leaseId && state.generation === generation;
   }
+  /** The run holding a live reservation for this call, if any. */
+  runIdForCall(callId: string): string | null {
+    return this.#callIndex.get(callId) ?? null;
+  }
+  /** Hand over (and forget) the runs whose reservations a sweep released. */
+  takeSweptRuns(): string[] {
+    if (this.#sweptRuns.size === 0) return [];
+    const runs = [...this.#sweptRuns];
+    this.#sweptRuns.clear();
+    return runs;
+  }
+  /** Uncounted fail-open tallies held by every state, e.g. before close drains them. */
+  uncountedTallies(): { runs: number; calls: number; tokens: number } {
+    let runs = 0;
+    let calls = 0;
+    let tokens = 0;
+    for (const state of this.#states.values()) {
+      if (state.uncountedCalls <= 0 && state.uncountedTokens <= 0) continue;
+      runs += 1;
+      calls += Math.max(0, state.uncountedCalls);
+      tokens += Math.max(0, state.uncountedTokens);
+    }
+    return { runs, calls, tokens };
+  }
   activeRunIds(): string[] {
     return [...this.#states].flatMap(([runId, state]) => (state.hasLease ? [runId] : []));
   }
@@ -296,14 +405,32 @@ export class LeaseLedger {
     if (state?.runIneligible) {
       if (now < state.ineligibleRetryAt) {
         return this.#admission(LeaseDecision.LegacyCheck, {
-          reason: "run_lease_ineligible",
+          reason: state.releasePending ? "lease_release_pending" : "run_lease_ineligible",
           claimToken: ownedClaimToken,
         });
       }
+      // A release outcome that never arrived cannot hold the run beyond the latch.
       state.runIneligible = false;
       state.ineligibleRetryAt = 0;
+      state.releasePending = null;
+    }
+    if (state?.refuses(model, fallbackModels)) {
+      // Never declared again: no widening and no grant for a chain with a refused model.
+      return this.#admission(LeaseDecision.LegacyCheck, {
+        reason: "model_refused_for_lease",
+        claimToken: ownedClaimToken,
+      });
     }
     if (state?.hasLease && !state.covers(model, fallbackModels)) {
+      if (now >= state.leaseDeadline && !breakerOpen) {
+        // An expired lease cannot widen, and only this call's chain can drive its re-grant:
+        // drop it and re-grant for that chain, as a covered chain's call does at expiry.
+        this.#dropLease(state);
+        return this.#admission(LeaseDecision.NeedGrant, {
+          reason: "lease_expired",
+          claimToken: ownedClaimToken,
+        });
+      }
       return this.#admission(LeaseDecision.LegacyCheck, {
         reason: "model_outside_declared_set",
         claimToken: ownedClaimToken,
@@ -327,17 +454,42 @@ export class LeaseLedger {
     response: LeaseGrantResponse,
     options: ApplyGrantResponseOptions,
   ): GrantOutcome {
-    const { now, declaredModels = [], expectedLeaseId, expectedGeneration } = options;
+    const {
+      now,
+      declaredModels = [],
+      expectedLeaseId,
+      expectedGeneration,
+      wideningModels = [],
+    } = options;
     let state = this.#states.get(runId);
     if (this.#originFenceRejects(state, expectedLeaseId, expectedGeneration)) {
       return GrantOutcome.Stale;
     }
     state ??= this.#state(runId);
     if (!response.eligible) {
+      // Only a renewal names its origin; the fence above proved this state still holds it.
+      const renewal =
+        expectedLeaseId !== null &&
+        expectedLeaseId !== undefined &&
+        expectedGeneration !== null &&
+        expectedGeneration !== undefined;
+      const release = renewal ? this.#releaseRefusedLease(state) : null;
+      if (renewal) for (const model of wideningModels) state.refusedModels.add(model);
       this.#dropLease(state);
       this.#storeSnapshot(state, response);
       state.runIneligible = true;
-      state.ineligibleRetryAt = Infinity;
+      if (release === null) {
+        // An ineligible initial grant keeps the run on per-call checks for its lifetime.
+        state.ineligibleRetryAt = Infinity;
+        state.releasePending = null;
+      } else {
+        state.ineligibleRetryAt = now + LEASE_REFUSAL_LATCH_S;
+        state.releasePending = Object.freeze({
+          refusedAt: now,
+          token: ++this.#nextRefusalToken,
+          request: release,
+        });
+      }
       return GrantOutcome.Ineligible;
     }
     if (!response.allowed) {
@@ -379,10 +531,12 @@ export class LeaseLedger {
     if (sameLease) for (const model of declaredModels) state.declaredModels.add(model);
     else state.declaredModels = new Set(declaredModels);
     state.renewalInFlight = false;
+    state.renewalDeclaration = null;
     state.consecutiveFailures = 0;
     state.nextAttemptAt = 0;
     state.runIneligible = false;
     state.ineligibleRetryAt = 0;
+    state.releasePending = null;
     this.#storeSnapshot(state, response);
     this.#settlePendingReport(state);
     return GrantOutcome.Applied;
@@ -397,6 +551,22 @@ export class LeaseLedger {
     state.runIneligible = true;
     state.ineligibleRetryAt =
       retryAfter === null || retryAfter === undefined ? Infinity : now + retryAfter;
+    state.releasePending = null;
+  }
+  /**
+   * Record the outcome of the release owed by one ineligible renewal. A sent release lets the
+   * next eligible call grant again; any other outcome leaves the latch counted from the refusal.
+   * Never creates state, and ignores an outcome for a refusal that is no longer pending.
+   */
+  resolveRefusalRelease(runId: string, token: number, sent: boolean): boolean {
+    const state = this.#states.get(runId);
+    if (state?.releasePending?.token !== token) return false;
+    state.releasePending = null;
+    if (sent) {
+      state.runIneligible = false;
+      state.ineligibleRetryAt = 0;
+    }
+    return true;
   }
   recordUncounted(
     runId: string,
@@ -460,6 +630,7 @@ export class LeaseLedger {
     this.#callIndex.clear();
     this.#callClaims.clear();
     this.#callExpiries.length = 0;
+    this.#sweptRuns.clear();
     return requests;
   }
   pendingRenewalSpendDeltas(): readonly PendingRenewalSpendDelta[] {
@@ -482,6 +653,7 @@ export class LeaseLedger {
     return Object.freeze(deltas);
   }
   onForkReset(): void {
+    this.#sweptRuns.clear();
     this.#states.clear();
     this.#callIndex.clear();
     this.#callClaims.clear();
@@ -527,8 +699,10 @@ export class LeaseLedger {
       const claim = this.#callClaims.get(expiry.callId);
       if (!claim || claim.token !== expiry.token || claim.createdAt + RESERVATION_MAX_AGE_S > now)
         continue;
-      if (this.#callIndex.has(expiry.callId)) {
+      const runId = this.#callIndex.get(expiry.callId);
+      if (runId !== undefined) {
         this.release(expiry.callId, { claimToken: expiry.token });
+        this.#sweptRuns.add(runId);
         swept++;
       }
       this.#callClaims.delete(expiry.callId);
@@ -569,11 +743,78 @@ export class LeaseLedger {
     };
   }
   claimRenewalRequest(runId: string, options: RenewalOptions = {}): LeaseRenewRequest | null {
+    return this.claimRenewal(runId, options)?.request ?? null;
+  }
+  /**
+   * Claim one renewal. The first claim at a lease and generation records its declaration; a retry
+   * at the same origin re-sends that declaration and reports its added models, whatever chain the
+   * retrying call uses. Spend, reservations and uncounted tallies are always current.
+   */
+  claimRenewal(runId: string, options: RenewalOptions = {}): RenewalClaim | null {
     const state = this.#states.get(runId);
     if (!state || state.leaseId === null || state.renewalInFlight) return null;
-    const request = this.buildRenewalRequest(runId, options);
-    if (request) state.renewalInFlight = true;
-    return request;
+    const owed = this.#owedDeclaration(state);
+    const declaration = owed ?? this.#newDeclaration(state, state.leaseId, options);
+    const request = this.buildRenewalRequest(runId, {
+      model: declaration.model,
+      provider: declaration.provider,
+      fallbackProviders: declaration.fallbackProviders,
+      fallbackModels: declaration.fallbackModels,
+    });
+    if (request === null) return null;
+    state.renewalInFlight = true;
+    state.renewalDeclaration = declaration;
+    return Object.freeze({ request, addedModels: declaration.addedModels, retry: owed !== null });
+  }
+  /** The declaration a retry at the state's current lease and generation must re-send. */
+  owedRenewalDeclaration(runId: string): RenewalDeclaration | null {
+    const state = this.#states.get(runId);
+    return state ? this.#owedDeclaration(state) : null;
+  }
+  /**
+   * Record that the claimed renewal at this origin was handed to the transport, so its declaration
+   * may have reached the control plane. From then on only a superseding generation drops it.
+   */
+  renewalDispatched(
+    runId: string,
+    { expectedLeaseId, expectedGeneration }: Omit<RenewalFailedOptions, "now" | "sent">,
+  ): boolean {
+    const state = this.#states.get(runId);
+    if (!state || this.#originFenceRejects(state, expectedLeaseId, expectedGeneration))
+      return false;
+    const owed = this.#owedDeclaration(state);
+    if (owed === null) return false;
+    this.#markDispatched(state, owed);
+    return true;
+  }
+  /**
+   * Claim one out-of-cycle renewal that re-declares a call's full chain, after that call's
+   * per-call check allowed it. Applies the gates renewalDue applies to an ordinary renewal (a live
+   * lease with a positive grant, no renewal in flight, past any backoff, not a final grant), and
+   * never claims for a chain that is already covered or names a refused model. While a retry of
+   * another declaration is owed at this lease and generation, the call claims that retry instead,
+   * unchanged: its own chain never rides on it and stays on per-call checks, and the next
+   * undeclared allowed call widens for that chain once the retry resolves.
+   */
+  claimWideningRequest(runId: string, options: WideningOptions): WideningClaim | null {
+    const { now, model, fallbackModels } = options;
+    const state = this.#states.get(runId);
+    if (
+      !state?.hasLease ||
+      state.runIneligible ||
+      state.renewalInFlight ||
+      state.finalGrant ||
+      state.grantedTokens <= 0 ||
+      now >= state.leaseDeadline ||
+      now < state.nextAttemptAt ||
+      state.refuses(model, fallbackModels)
+    )
+      return null;
+    const addedModels = [...new Set([model, ...fallbackModels])].filter(
+      (item) => !state.declaredModels.has(item),
+    );
+    if (addedModels.length === 0) return null;
+    return this.claimRenewal(runId, options);
   }
   buildSurrenderRequest(runId: string): LeaseSurrenderRequest | null {
     const state = this.#states.get(runId);
@@ -591,11 +832,17 @@ export class LeaseLedger {
   }
   renewalFailed(
     runId: string,
-    { now, expectedLeaseId, expectedGeneration }: RenewalFailedOptions,
+    { now, expectedLeaseId, expectedGeneration, sent = true }: RenewalFailedOptions,
   ): boolean {
     const state = this.#states.get(runId);
     if (!state || this.#originFenceRejects(state, expectedLeaseId, expectedGeneration))
       return false;
+    const owed = this.#owedDeclaration(state);
+    if (owed !== null) {
+      // Only a declaration no attempt may have delivered is dropped by a skipped attempt.
+      if (sent) this.#markDispatched(state, owed);
+      else if (!owed.dispatched) state.renewalDeclaration = null;
+    }
     state.renewalInFlight = false;
     state.pendingReport = null;
     state.consecutiveFailures++;
@@ -747,6 +994,35 @@ export class LeaseLedger {
       state.generation !== expectedGeneration
     );
   }
+  #owedDeclaration(state: LeaseState): RenewalDeclaration | null {
+    const declaration = state.renewalDeclaration;
+    return declaration !== null &&
+      declaration.leaseId === state.leaseId &&
+      declaration.generation === state.generation
+      ? declaration
+      : null;
+  }
+  #newDeclaration(state: LeaseState, leaseId: string, options: RenewalOptions): RenewalDeclaration {
+    const model = options.model ?? null;
+    const fallbackModels = Object.freeze([...(options.fallbackModels ?? [])]);
+    const chain = model === null ? fallbackModels : [model, ...fallbackModels];
+    return Object.freeze({
+      leaseId,
+      generation: state.generation,
+      model,
+      provider: options.provider ?? null,
+      fallbackProviders: Object.freeze([...(options.fallbackProviders ?? [])]),
+      fallbackModels,
+      addedModels: Object.freeze(
+        [...new Set(chain)].filter((item) => !state.declaredModels.has(item)),
+      ),
+      dispatched: false,
+    });
+  }
+  #markDispatched(state: LeaseState, declaration: RenewalDeclaration): void {
+    if (declaration.dispatched) return;
+    state.renewalDeclaration = Object.freeze({ ...declaration, dispatched: true });
+  }
   #outputBound(value: number | undefined): number {
     return positiveOutputBound(value) ?? this.outputBoundDefault;
   }
@@ -805,7 +1081,25 @@ export class LeaseLedger {
     state.leaseDeadline = 0;
     state.finalGrant = false;
     state.renewalInFlight = false;
+    state.renewalDeclaration = null;
     state.pendingReport = null;
+  }
+  /**
+   * Settle the refused renewal's report (the control plane applied its tallies and its spend is
+   * advisory), then build the surrender for the held generation and clear its spend now: a
+   * surrender is never retried, and a later outcome must not touch a successor lease's spend.
+   */
+  #releaseRefusedLease(state: LeaseState): LeaseSurrenderRequest | null {
+    if (state.leaseId === null) return null;
+    this.#settlePendingReport(state);
+    const request = Object.freeze({
+      lease_id: state.leaseId,
+      holder_id: this.holderId,
+      generation: state.generation,
+      spent_tokens: state.spentTokensSinceReport,
+    });
+    state.spentTokensSinceReport = Math.max(0, state.spentTokensSinceReport - request.spent_tokens);
+    return request;
   }
   #storeSnapshot(state: LeaseState, response: LeaseGrantResponse): void {
     state.snapshot = Object.freeze({

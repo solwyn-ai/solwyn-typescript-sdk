@@ -9,6 +9,53 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Changed
+
+- **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
+  at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
+  by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
+  5xx answer), overflows the queue, or passes its deadline is dropped and counted, and the drops
+  are reported in aggregated `lease.surrenders_dropped` warnings, instead of being retried on
+  every call. The control plane settles spend from lease-tagged confirmations, so a dropped
+  surrender only delays the return of unspent reserved tokens until the lease expires.
+- **Surrender timeout retry.** Outside `close()`, a surrender that times out is now retried once,
+  immediately, within two seconds of being queued. Surrender answers with an HTTP status (4xx or
+  503) still count as control-plane reachability for the circuit breaker.
+- **Close drains through four workers.** `close()` now drains lease surrenders through four
+  workers within its existing one-second deadline, one attempt each, and logs how many were left
+  in a single `lease.close_release_summary` warning.
+- **Uncounted tallies of finished runs.** Uncounted fail-open tallies can be reported only on a
+  lease renewal, which a finished run never sends. They are now aggregated and logged in
+  `lease.uncounted_discarded` warnings (at most one every 30 seconds, repeated in the close
+  summary) instead of being retained indefinitely. The `lease.uncounted_entry` warning now says
+  so.
+- **Lease recovery after a refusal.** After a lease grant is refused with 409, or a renewal comes
+  back ineligible, a run now falls back to per-call budget checks for at most 150 seconds,
+  instead of for the rest of the run. After an ineligible renewal, the SDK releases the lease it
+  holds and acquires a new one as soon as the release is confirmed; the new lease's renewals no
+  longer repeat the refused renewal's spend or uncounted tallies. An ineligible initial grant
+  still keeps the run on per-call checks. The `FakeControlPlane` test double in
+  `@solwyn/sdk/testing` now accepts that release, at the generation held before an ineligible or
+  denied renewal, as the control plane does, instead of answering 409.
+- **Run leases widen to newly used model chains.** A run lease used to cover only the model chain
+  of the run's first call, so every call on another model or fallback chain took a blocking
+  per-call budget check for the rest of the run. Now, after a per-call check allows a call whose
+  chain the lease does not cover, the SDK renews the lease in the background and re-declares that
+  call's full chain (model, provider and fallbacks); once the renewal is applied, later calls on
+  that chain use the lease. A denied, unreadable or unreachable check never widens the lease, and
+  tagged and media calls never do. If the control plane answers the widening renewal as
+  ineligible, the models it added are recorded for the run and never declared again: calls whose
+  chain names one of them keep per-call checks, and the rest of the run returns to the lease after
+  the SDK releases and re-acquires it. Widening to a more expensive model re-prices the lease for
+  every model in the run, so each model's token grant shrinks.
+- `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
+  at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
+- A failed provider-breaker report now backs off before the reporter retries it. The first retry
+  waits at least one flush interval, and later retries follow the reporter's retry backoff
+  (`reporterRetryBackoffBase` to `reporterRetryBackoffCap`, 1 to 60 seconds by default). While a
+  retry is pending, no breaker report is sent, including a changed breaker state. A successful
+  report clears the backoff. Reports sent by `close()` are not delayed.
+
 ### Fixed
 
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
@@ -25,15 +72,6 @@ corresponding release notes before users upgrade.
   longer keeps that run alive. Reuse one client and `close()` it at shutdown: that remains the
   supported lifecycle.
 
-### Changed
-
-- `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
-  at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
-- A failed provider-breaker report now backs off before the reporter retries it. The first retry
-  waits at least one flush interval, and later retries follow the reporter's retry backoff
-  (`reporterRetryBackoffBase` to `reporterRetryBackoffCap`, 1 to 60 seconds by default). While a
-  retry is pending, no breaker report is sent, including a changed breaker state. A successful
-  report clears the backoff. Reports sent by `close()` are not delayed.
 
 ## [0.1.0-rc.1] — 2026-09-11
 

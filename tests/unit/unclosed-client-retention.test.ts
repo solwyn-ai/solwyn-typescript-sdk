@@ -67,6 +67,24 @@ describe("clients dropped without close()", () => {
     expect(result.heldRoundsInWindow).toBeGreaterThanOrEqual(2);
   }, 65_000);
 
+  it.each([
+    ["heartbeat-every-tick", "succeeds"],
+    ["heartbeat-every-tick-failing", "fails"],
+  ])("release after a breaker cycle due every tick settles (%s: the report %s)", (scenario) => {
+    const result = probe(scenario);
+    expect(result.droppedBreakerBeforeDrop).toBeGreaterThan(0);
+    expect(result).toMatchObject({
+      droppedClients: 10,
+      droppedProvidersAlive: 0,
+      droppedReportersAlive: 0,
+      droppedBreakerPostsInWindow: 0,
+      droppedRequestsInWindow: 0,
+      droppedRoundsInWindow: 0,
+      heldProviderAlive: true,
+    });
+    expect(result.heldBreakerPostsInWindow).toBeGreaterThanOrEqual(2);
+  }, 65_000);
+
   it("stay rooted through failed and delayed first sends, deliver once, then release", () => {
     const result = probe("retry-delivery");
     expect(result.reservations).toBeGreaterThan(0);

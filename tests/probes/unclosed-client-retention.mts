@@ -106,6 +106,7 @@ interface PlaneOptions {
   readonly failFirstConfirm?: boolean;
   readonly failFirstIngest?: boolean;
   readonly failSurrenders?: boolean;
+  readonly failBreaker?: boolean;
 }
 
 let reservation = 0;
@@ -154,7 +155,7 @@ function controlPlane(count: Counters, options: PlaneOptions = {}): FetchLike {
     }
     if (url.includes("/providers/breaker-reports")) {
       count.breaker++;
-      return new Response(null, { status: 204 });
+      return new Response(null, { status: options.failBreaker ? 503 : 204 });
     }
     if (url.endsWith("/budgets/lease/surrender")) {
       count.surrenders++;
@@ -320,6 +321,60 @@ async function heartbeat() {
     droppedRoundsInWindow: rounds.dropped - before.rounds,
     heldBreakerPostsInWindow: heldCount.breaker - before.heldBreaker,
     heldRoundsInWindow: rounds.held - before.heldRounds,
+    heldProviderAlive: heldRaw.marker.length > 0,
+  };
+  await held.close();
+  return result;
+}
+
+/**
+ * A heartbeat period no longer than the flush interval makes a breaker cycle due on every
+ * tick, so every round starts one. Once the cycle settles an idle dropped client must be
+ * released, whether its breaker report succeeded or failed.
+ */
+async function heartbeatEveryTick(failBreaker: boolean) {
+  const cadence = { breakers: true, flush: 0.02, heartbeat: 0.01 };
+  const heldCount = counters();
+  const droppedCount = counters();
+  const heldRaw = provider();
+  const held = new Solwyn(heldRaw, options(controlPlane(heldCount, { failBreaker }), cadence));
+  const heldReporter = reporterRefs.at(-1)?.deref();
+  assert.ok(heldReporter);
+  heldReporters.add(heldReporter);
+  await held.chat.completions.create(call);
+
+  const firstReporter = reporterRefs.length;
+  const providers: WeakRef<object>[] = [];
+  for (let index = 0; index < 10; index++) {
+    const fetch = controlPlane(droppedCount, { failBreaker });
+    providers.push(await dropClient(fetch, "after-call", cadence));
+  }
+  const reporters = reporterRefs.slice(firstReporter);
+  // Let dropped clients deliver their settlement and start breaker reporting before the drop.
+  await sleep(150);
+  const droppedBreakerBeforeDrop = droppedCount.breaker;
+  await collectUntil([...providers, ...reporters]);
+
+  const before = {
+    dropped: requests(droppedCount),
+    breaker: droppedCount.breaker,
+    heldBreaker: heldCount.breaker,
+    rounds: rounds.dropped,
+  };
+  // An accelerated window of fifty flush intervals, each with a breaker cycle due.
+  for (let index = 0; index < 20; index++) {
+    await sleep(50);
+    forceGc?.();
+  }
+  const result = {
+    droppedClients: providers.length,
+    droppedBreakerBeforeDrop,
+    droppedProvidersAlive: alive(providers),
+    droppedReportersAlive: alive(reporters),
+    droppedBreakerPostsInWindow: droppedCount.breaker - before.breaker,
+    droppedRequestsInWindow: requests(droppedCount) - before.dropped,
+    droppedRoundsInWindow: rounds.dropped - before.rounds,
+    heldBreakerPostsInWindow: heldCount.breaker - before.heldBreaker,
     heldProviderAlive: heldRaw.marker.length > 0,
   };
   await held.close();
@@ -519,6 +574,8 @@ async function middleware() {
 const scenarios: Record<string, () => Promise<unknown>> = {
   "stage-a": stageA,
   heartbeat,
+  "heartbeat-every-tick": () => heartbeatEveryTick(false),
+  "heartbeat-every-tick-failing": () => heartbeatEveryTick(true),
   "retry-delivery": retryDelivery,
   registry: registryScenario,
   "run-retire": runRetire,

@@ -413,6 +413,8 @@ export class MetadataReporter {
   private tickTarget: TickTarget | null = null;
   private tickTimer: ReturnType<typeof setTimeout> | null = null;
   private activeRound: Promise<void> | null = null;
+  /** A quota-exhausted round armed a zero-delay continuation tick that has not run yet. */
+  private continuationPending = false;
   private breakerProjectId: string | null = null;
   private activeBreakerCycle: Promise<void> | null = null;
   private activeBreakerAbortController: AbortController | null = null;
@@ -1559,6 +1561,8 @@ export class MetadataReporter {
         this.activeBreakerCycle = null;
         this.activeBreakerAbortController = null;
       }
+      // The cycle may have been the only thing holding this reporter's strong root.
+      this._releaseIfIdle();
     };
     void cycle.then(clearActiveCycle, clearActiveCycle);
     return cycle;
@@ -1747,8 +1751,9 @@ export class MetadataReporter {
   private _armTick(more: boolean): void {
     const target = this.tickTarget;
     if (this.shuttingDown || target === null) return;
-    if (more || this._hasWork()) reportersWithWork.add(this);
-    else reportersWithWork.delete(this);
+    this.continuationPending = more;
+    if (more) reportersWithWork.add(this);
+    else this._releaseIfIdle();
     try {
       this.tickTimer = armFlushTick(target, more ? 0 : this.flushInterval);
     } catch (error) {
@@ -1757,9 +1762,28 @@ export class MetadataReporter {
     }
   }
 
+  /**
+   * Drop the strong root once nothing needs it: close has not begun (close() owns the
+   * root until it resolves), no round is active, no continuation tick is pending, and
+   * no item, drop or breaker cycle remains. Called when a round or a breaker cycle
+   * settles, whichever comes last; the pending tick then holds the reporter weakly.
+   */
+  private _releaseIfIdle(): void {
+    if (
+      this.shuttingDown ||
+      this.activeRound !== null ||
+      this.continuationPending ||
+      this._hasWork()
+    ) {
+      return;
+    }
+    reportersWithWork.delete(this);
+  }
+
   /** Timer entry point for one ordinary round. Internal: called only by the flush tick. */
   _tick(): void {
     this.tickTimer = null;
+    this.continuationPending = false;
     if (this.shuttingDown || this.activeRound !== null) return;
     reportersWithWork.add(this);
     const round = this._runRound().then((more) => {

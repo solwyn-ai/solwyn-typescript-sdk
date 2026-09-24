@@ -1539,10 +1539,102 @@ describe("failover — a same-provider 429 retry keeps the immutable provider-re
   });
 });
 
+describe("failover — caller abort during a same-provider Retry-After sleep", () => {
+  const SLEEP_OUTLASTED = Symbol("the Retry-After sleep was not interrupted");
+
+  async function abortDuringRetrySleep(abort: (controller: AbortController) => void): Promise<{
+    outcome: unknown;
+    primaryCalls: number;
+    fallbackCalls: number;
+    events: Array<Record<string, unknown>>;
+    clearedTimers: number;
+  }> {
+    let primaryCalls = 0;
+    // A provider that ignores its AbortSignal: a re-dispatch would succeed.
+    const primary = openaiClient(() => {
+      primaryCalls += 1;
+      if (primaryCalls === 1) {
+        throw Object.assign(new Error("rate limited"), {
+          status: 429,
+          headers: { "retry-after": "2" },
+        });
+      }
+      return { usage: { prompt_tokens: 2, completion_tokens: 1 } };
+    });
+    const fallback = compatClient("https://api.deepseek.com/v1", () => ({
+      usage: { prompt_tokens: 2, completion_tokens: 1 },
+    }));
+    const { fetchMock, events } = makeCapture();
+    const solwyn = new Solwyn(primary, {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      fallback: [[fallback, "deepseek-chat"]],
+      failoverTotalTimeout: 30,
+      sameProviderRetries: 1,
+      leaseEnabled: false,
+      velocityMode: "off",
+    });
+    const controller = new AbortController();
+    const clearTimer = vi.spyOn(globalThis, "clearTimeout");
+    let outcome: unknown;
+    try {
+      const call = solwyn.chat.completions
+        .create({ model: "gpt-4o", messages: [] }, { signal: controller.signal })
+        .then(
+          () => "resolved",
+          (error: unknown) => error,
+        );
+      // Abort once the first attempt has failed and the 2 s sleep has started.
+      await vi.waitFor(() => expect(primaryCalls).toBe(1));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const clearedBefore = clearTimer.mock.calls.length;
+      abort(controller);
+      outcome = await Promise.race([
+        call,
+        new Promise((resolve) => setTimeout(() => resolve(SLEEP_OUTLASTED), 1_000)),
+      ]);
+      const clearedTimers = clearTimer.mock.calls.length - clearedBefore;
+      await call;
+      await solwyn.close();
+      return {
+        outcome,
+        primaryCalls,
+        fallbackCalls: fallback.chat.completions.create.mock.calls.length,
+        events,
+        clearedTimers,
+      };
+    } finally {
+      clearTimer.mockRestore();
+    }
+  }
+
+  it("rejects with the signal's Error reason without re-dispatching or failing over", async () => {
+    const reason = new Error("caller cancelled");
+    const result = await abortDuringRetrySleep((controller) => controller.abort(reason));
+
+    expect(result.outcome).toBe(reason);
+    expect(result.primaryCalls).toBe(1);
+    expect(result.fallbackCalls).toBe(0);
+    expect(result.clearedTimers).toBeGreaterThanOrEqual(1);
+    // The un-retried 429 hop reports its one error event; nothing was served.
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]?.["provider"]).toBe("openai");
+    expect(result.events[0]?.["status"]).not.toBe("success");
+  });
+
+  it("rejects with an AbortError when the abort reason is not an Error", async () => {
+    const result = await abortDuringRetrySleep((controller) => controller.abort("stop"));
+
+    expect(result.outcome).toBeInstanceOf(Error);
+    expect((result.outcome as Error).name).toBe("AbortError");
+    expect(result.primaryCalls).toBe(1);
+    expect(result.fallbackCalls).toBe(0);
+  });
+});
+
 describe("failover — active-stream handle cleanup on terminal traversal", () => {
   it("releases the logical handle after Retry-After traversal reaches provider AbortSignal rejection", async () => {
     const controller = new AbortController();
-    controller.abort();
     let attempts = 0;
     const aborted = new DOMException("request cancelled", "AbortError");
     const primary = openaiClient((_kwargs, requestOptions) => {
@@ -1553,6 +1645,7 @@ describe("failover — active-stream handle cleanup on terminal traversal", () =
           headers: { "retry-after": "0" },
         });
       }
+      controller.abort();
       expect((requestOptions as { signal?: AbortSignal } | undefined)?.signal?.aborted).toBe(true);
       throw aborted;
     });

@@ -2862,7 +2862,7 @@ export class BudgetEnforcer {
         return { result: "breaker_open", settled: null };
       }
       const capture: { raw: Promise<unknown> | null } = { raw: null };
-      let posting: Promise<Response>;
+      let posting: Promise<void>;
       this.rawFetchCapture = capture;
       try {
         posting = this.transport.postJson(LEASE_SURRENDER_PATH, body, { timeoutMs });

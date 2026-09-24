@@ -766,6 +766,59 @@ describe("Responses streaming settlement", () => {
     }
   });
 
+  it("azure_openai deltas without terminal usage keep the preflight-only estimate", async () => {
+    async function* rawStream(): AsyncGenerator<unknown> {
+      yield { type: "response.created", response: { usage: null } };
+      for (let i = 0; i < 25; i++) {
+        yield {
+          type: "response.output_text.delta",
+          sequence_number: i,
+          item_id: "msg_synthetic",
+          output_index: 0,
+          content_index: 0,
+          delta: "synthetic delta",
+        };
+      }
+      yield { type: "response.output_text.done", sequence_number: 25 };
+    }
+    const create = vi.fn(() => rawStream());
+    const sdkClient = {
+      baseURL: "https://example.openai.azure.com/openai/v1",
+      chat: { completions: { create: vi.fn() } },
+      responses: { create },
+    };
+    const traffic = settlementFetch();
+    const solwyn = new Solwyn(sdkClient, {
+      apiKey: API_KEY,
+      fetch: traffic.fetchMock,
+      leaseEnabled: false,
+    });
+
+    const stream = (await responsesApi(solwyn).create({
+      model: "gpt-4o",
+      input: "12345678",
+      stream: true,
+    })) as AsyncIterable<unknown>;
+    let delivered = 0;
+    for await (const _event of stream) delivered++;
+    await solwyn.close();
+
+    expect(delivered).toBe(27);
+    expect(traffic.confirms).toHaveLength(1);
+    expect(traffic.events).toHaveLength(1);
+    const details = { input_tokens: 2, output_tokens: 0, is_estimated: true };
+    expect(traffic.confirms[0]).toMatchObject({
+      provider: "azure_openai",
+      token_details: details,
+    });
+    expect(traffic.events[0]).toMatchObject({
+      provider: "azure_openai",
+      input_tokens: 2,
+      output_tokens: 0,
+      token_details: details,
+    });
+  });
+
   it.each([
     "openai",
     "azure_openai",

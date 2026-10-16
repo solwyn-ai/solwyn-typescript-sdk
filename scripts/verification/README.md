@@ -1,5 +1,52 @@
 # Installed-package verification
 
+## Opt-in live control-plane integration
+
+`pnpm test:live` exercises a Solwyn control plane using the built SDK and plain fake provider
+objects. It never contacts an LLM provider or needs provider credentials. It runs separately from
+the offline `pnpm test` suite and skips cleanly when either required variable is unset.
+
+Use a dedicated, disposable project with a generous budget (for example, $1,000 in alert-only
+mode), no scoped budget rules, and a full-scope project key. The harness writes synthetic usage,
+denial receipts, run records, and operational reports. Those records remain after the run.
+Never point it at a project used by an application.
+
+```sh
+pnpm build
+export SOLWYN_LIVE_API_URL=http://127.0.0.1:8080
+export SOLWYN_LIVE_API_KEY=your_disposable_project_key
+# Optional: an owner JWT for the same disposable project enables policy and stop tests.
+export SOLWYN_LIVE_JWT=your_disposable_project_owner_token
+pnpm test:live
+```
+
+`SOLWYN_LIVE_API_URL` is the control-plane origin, without `/api/v1`. Provision the project and
+credentials through your control plane's development workflow; no database access is needed by
+the harness. Supply secrets through the environment and keep them out of reports and commits.
+The harness discovers the project from a budget check and settles that discovery reservation.
+
+The basic run covers OpenAI-, Anthropic-, Google-, and Bedrock-shaped clients with buffered and
+streaming usage, per-call budget admission, settlement, ingest dispositions (including
+`duplicates`), provider-breaker reports, untracked-surface reports, and `close()` draining. An
+untagged run additionally grants, renews, settles against, and surrenders a lease; renewal starts
+with a call after the advertised refresh interval, so this phase takes about twenty seconds.
+Tagged calls exercise the per-call path. Cost-event reads, cost totals, budget counters, and
+agent-run rollups are reconciled using the control plane's prices, with no local pricing formula.
+The same fake-provider traffic is replayed against `FakeControlPlane` for comparison. Dashboard
+event reads do not expose call or lease IDs; lease attribution is checked on SDK ingest and
+confirmation requests, and dashboard rows are matched by run, provider, model, status, and usage.
+
+With `SOLWYN_LIVE_JWT`, the harness also verifies hard denial before provider dispatch, a real
+`manual_kill` directive aborting a stream at its next chunk, and all five public `assert*Contract`
+helpers. It provisions the helpers' fixed run selectors, scoped tag/run denials, and 32 active
+lease holders through the API. It temporarily replaces the disposable project's budget rules
+and restores the original policy in `finally`; test-created holders are surrendered in `finally`
+too. A forced process termination can bypass that restoration: discard the project afterward.
+Without the JWT, policy/stop tests are explicitly skipped, so that run does not establish their
+coverage. The default offline suite tests the network boundary and all four fake provider shapes.
+
+## Installed artifacts
+
 Run these checks before publishing an SDK artifact. They install the supplied tarball into OS
 temporary consumers, clear `NODE_PATH`, and use mocked provider/control-plane requests at runtime.
 Setup may download public npm dependencies. No private review documents, historical commits,

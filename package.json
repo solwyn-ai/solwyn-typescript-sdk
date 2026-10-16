@@ -95,6 +95,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:dist": "vitest run --config vitest.dist.config.ts",
+    "test:live": "node --test scripts/verification/live-control-plane.test.mjs",
     "test:pack": "node scripts/pack-smoke.mjs",
     "test:consumers": "node scripts/verification/run.mjs",
     "surfaces:capture": "tsx scripts/capture-surface-inventory.ts --interval latest --update",

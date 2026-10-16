@@ -126,6 +126,10 @@ corresponding release notes before users upgrade.
 
 ### Added
 
+- **Opt-in live control-plane verification.** `pnpm test:live` runs the built SDK against a
+  disposable Solwyn control plane using fake providers, checks settlement and dashboard totals,
+  compares testing-double behavior, and exercises contract probes and run stops with an owner
+  token. It is separate from the offline unit suite and skips when credentials are unset.
 - **Effective call IDs on budget results.** `BudgetEnforcer.checkBudget()` returns `callId`,
   including an ID minted when the caller omits one, so direct callers can settle or release
   the corresponding lease reservation. `CheckBudgetOptions.signal` adds caller cancellation.

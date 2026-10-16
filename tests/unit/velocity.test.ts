@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { noopLogger } from "../../src/logging";
 import { VELOCITY_FLAGS, type VelocityFlag } from "../../src/types";
 import {
   DENY_ELIGIBLE_RULE_ORDER,
@@ -98,18 +99,54 @@ describe("VelocityMonitor repeat detection", () => {
     expect(observe(subject, "run", 100, 66)).not.toContain("repeat_size");
   });
 
-  it("bounds run histories at 128 and refreshes run recency on hits", () => {
+  it("drops stale histories before displacing active runs at the 4096-run bound", () => {
     const subject = monitor({ velocity_repeat_count: 2 });
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < 4096; index += 1) {
       observe(subject, `run-${index}`, 100, 0);
     }
-    expect(subject.runCount()).toBe(128);
+    expect(subject.runCount()).toBe(4096);
 
-    observe(subject, "run-0", 100, 1);
-    observe(subject, "run-128", 100, 1);
-    expect(subject.runCount()).toBe(128);
-    expect(observe(subject, "run-0", 100, 2)).toContain("repeat_size");
-    expect(observe(subject, "run-1", 100, 2)).not.toContain("repeat_size");
+    observe(subject, "run-0", 100, 211);
+    observe(subject, "new-run", 100, 212);
+    expect(subject.runCount()).toBe(2);
+    expect(observe(subject, "run-0", 100, 213)).toContain("repeat_size");
+  });
+
+  it.each([129, 4097])("detects repeating calls across %i round-robin runs", (runCount) => {
+    const subject = monitor({ velocity_mode: "deny" });
+    let repeats = 0;
+    for (let round = 0; round < 6; round += 1) {
+      for (let index = 0; index < runCount; index += 1) {
+        if (observe(subject, `run-${index}`, 100, round).includes("repeat_size")) {
+          repeats += 1;
+        }
+      }
+    }
+    expect(repeats).toBeGreaterThanOrEqual(runCount - 2);
+    expect(subject.runCount()).toBeLessThanOrEqual(4096);
+  });
+
+  it("rate-limits warnings when the hard cap discards live history", () => {
+    const warn = vi.fn();
+    const subject = new VelocityMonitor(BASE_CONFIG, { ...noopLogger, warn });
+    for (let index = 0; index < 4096; index += 1) {
+      observe(subject, `run-${index}`, 100, 0);
+    }
+    expect(warn).not.toHaveBeenCalled();
+    observe(subject, "overflow-a", 100, 1);
+    observe(subject, "overflow-b", 100, 30.999);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("velocity.history_evicted");
+    observe(subject, "overflow-c", 100, 31);
+    expect(warn).toHaveBeenCalledTimes(2);
+    observe(subject, "after-idle", 100, 300);
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains history through the longest configured rule horizon", () => {
+    const subject = monitor({ velocity_repeat_count: 2, velocity_repeat_window_s: 600 });
+    observe(subject, "run", 100, 0);
+    observe(subject, "other-run", 100, 500);
+    expect(observe(subject, "run", 100, 600)).toContain("repeat_size");
   });
 });
 
@@ -218,12 +255,13 @@ describe("VelocityMonitor rate-acceleration detection", () => {
     expect(observe(subject, "run", 100, 120.001)).toContain("rate_acceleration");
   });
 
-  it("suppresses a returning LRU-evicted run through its live tombstone deadline", () => {
+  it("suppresses a returning evicted run through its live tombstone deadline", () => {
     const subject = monitor({ velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 });
-    observe(subject, "victim", 100, 0);
-    for (let index = 0; index < 128; index += 1) {
-      observe(subject, `churn-${index}`, 100, 1);
+    for (let index = 0; index < 4095; index += 1) {
+      observe(subject, `seed-${index}`, 100, 0);
     }
+    observe(subject, "victim", 100, 0);
+    observe(subject, "churn", 100, 1);
 
     expect(observe(subject, "victim", 100, 120)).not.toContain("rate_acceleration");
     expect(observe(subject, "victim", 100, 120.001)).toContain("rate_acceleration");
@@ -231,7 +269,7 @@ describe("VelocityMonitor rate-acceleration detection", () => {
 
   it("fails closed on tombstone overflow and recovers strictly after the global deadline", () => {
     const subject = monitor({ velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 });
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < 4096; index += 1) {
       observe(subject, `seed-${index}`, 100, 0);
     }
     for (let index = 0; index < 257; index += 1) {

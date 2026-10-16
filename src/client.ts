@@ -1144,7 +1144,7 @@ export class SolwynCore {
     this.#hasNoGlobalDefaultParams = !hasOwnEnumerableKey(config.default_params);
     this.#requestedFailoverTuning = pickFailoverTuning(this.#config);
     const velocityConfig = pickVelocityConfig(this.#config);
-    this.#velocity = new VelocityMonitor(velocityConfig);
+    this.#velocity = new VelocityMonitor(velocityConfig, options.logger ?? consoleLogger);
     this.#velocityMode = velocityConfig.velocity_mode;
     this.#primaryModel = options.model ?? null;
     this.#providerOverride = options.provider;

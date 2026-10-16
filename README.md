@@ -741,6 +741,10 @@ The same cooperative mechanism can stop runaway work locally. It observes only r
 timestamps, and estimated input-token counts — never prompts or responses. In `"warn"` mode it
 adds structural `velocity_flags` and rate-limited warnings; in `"deny"` mode only
 `repeat_size` and `monotonic_growth` can terminate a run. `rate_acceleration` is advisory.
+The detector retains up to 64 observations per run for at most 4096 runs. Stale run histories
+are discarded first; if the hard cap displaces live history, `velocity.history_evicted` warns
+at most once every 30 seconds. Established histories keep progressing under round-robin traffic
+above the cap, but a displaced run can lose observations needed to detect a loop.
 
 | Option | Env var | Default | Meaning |
 |--------|---------|---------|---------|

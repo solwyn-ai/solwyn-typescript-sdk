@@ -11,6 +11,10 @@ corresponding release notes before users upgrade.
 
 ### Changed
 
+- **Velocity history survives higher run concurrency.** Structural loop detection now keeps
+  compact histories for up to 4096 runs and discards stale histories first. At the hard cap,
+  established histories continue progressing through round-robin traffic; discarding live
+  history emits a rate-limited `velocity.history_evicted` warning.
 - **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
   at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
   by scanning every retained run on each provider call. A surrender that is refused (any 4xx or

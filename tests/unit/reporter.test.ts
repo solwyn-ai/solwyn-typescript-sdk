@@ -63,7 +63,7 @@ function makeFetch(records: FetchRecord[], responder: Responder): FetchLike {
 }
 
 function ingest202(rejected: unknown[] = [], ingested = 0): Response {
-  return new Response(JSON.stringify({ ingested, rejected }), { status: 202 });
+  return new Response(JSON.stringify({ ingested, rejected, duplicates: [] }), { status: 202 });
 }
 
 interface CapturedLogger {
@@ -439,7 +439,8 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
       ),
     });
     await expect(reporter._sendBatch([makeEvent()])).resolves.toMatchObject({ outcome: "sent" });
-    expect(log.warn[0]).toContain("code=some_future_code");
+    expect(log.warn.some((line) => line.includes("code=some_future_code"))).toBe(true);
+    expect(log.warn).toContain("reporter.ingest_response_unparseable: exc_type=ZodError");
   });
 
   it("escapes raw control bytes in echoed values (raw byte never in the log line)", async () => {
@@ -496,7 +497,7 @@ describe("MetadataReporter — malformed 202 bodies fail open", () => {
     expect(log.warn[0]).toContain("reporter.ingest_response_unparseable: exc_type=");
   });
 
-  it("a 'rejected' array longer than the submitted batch fails open (contract violation)", async () => {
+  it("an oversized rejection array fails open while logging available rejections", async () => {
     const rejected = [
       { index: 0, code: "unknown_model", model: "m", message: "a" },
       { index: 1, code: "unknown_model", model: "m", message: "b" },
@@ -507,9 +508,15 @@ describe("MetadataReporter — malformed 202 bodies fail open", () => {
       fetch: makeFetch([], () => ingest202(rejected)),
     });
     // Only ONE event submitted, but TWO rejections echoed back.
-    await reporter._sendBatch([makeEvent()]);
-    expect(log.warn).toHaveLength(1);
+    await expect(reporter._sendBatch([makeEvent()])).resolves.toEqual({
+      outcome: "sent",
+      rejections: { kind: "malformed", indexes: [], count: 0 },
+    });
+    expect(log.warn).toHaveLength(2);
     expect(log.warn[0]).toContain("reporter.ingest_response_unparseable");
+    expect(log.warn[1]).toContain(
+      "reporter.ingest_events_rejected: code=unknown_model model=m count=2",
+    );
   });
 
   it("consecutive unparseable 202 bodies escalate to ERROR at the 10th", async () => {
@@ -1290,7 +1297,7 @@ describe("MetadataReporter — confirm sending", () => {
     expect(JSON.parse(ingestCalls[1]?.body ?? "null")).toHaveLength(2);
   });
 
-  it("preserves maxInFlight while strict FIFO dispatch remains serial", async () => {
+  it("keeps ingest batches serial while confirmation concurrency is configured", async () => {
     let active = 0;
     let maxActive = 0;
     let requestCount = 0;

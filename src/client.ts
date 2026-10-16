@@ -1225,6 +1225,7 @@ export class SolwynCore {
     this.#untrackedSurfaceReporter = this.#config.report_untracked_surfaces
       ? new UntrackedSurfaceReporter(this.#config.api_url, this.#config.api_key, {
           sdkInstanceId: this.#sdkInstanceId,
+          shutdownDeadline: this.#config.reporter_shutdown_deadline * 1000,
           fetch: options.fetch,
           logger: this.#logger,
         })

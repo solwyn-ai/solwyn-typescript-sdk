@@ -165,7 +165,9 @@ describe("read-only-key behavior across control-plane writes", () => {
         if (url.endsWith("/budgets/confirm")) {
           return readOnlyResponse();
         }
-        return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+        return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+          status: 202,
+        });
       },
       logger: throwingErrorLogger(),
     });

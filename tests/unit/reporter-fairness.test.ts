@@ -56,7 +56,9 @@ function bodyOf(init: RequestInit | undefined): unknown {
 }
 
 function ingested(count: number): Response {
-  return new Response(JSON.stringify({ ingested: count, rejected: [] }), { status: 202 });
+  return new Response(JSON.stringify({ ingested: count, rejected: [], duplicates: [] }), {
+    status: 202,
+  });
 }
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -542,7 +544,7 @@ describe("MetadataReporter bounded delivery rounds", () => {
     }
   });
 
-  it("a terminal-422 confirm stream with interleaved breaker successes still completes rounds and ingests", async () => {
+  it("a terminal-422 confirm stream keeps the control-plane breaker closed and ingests", async () => {
     const limit = 500;
     const logger = loggerSpies();
     let generated = 0;
@@ -568,8 +570,6 @@ describe("MetadataReporter bounded delivery rounds", () => {
       fetch: async (url, init) => {
         if (isConfirm(url)) {
           confirms += 1;
-          // Healthy budget-check traffic shares the control-plane breaker.
-          breaker.recordSuccess();
           if (generated < limit) {
             produce();
             produce();

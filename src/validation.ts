@@ -139,6 +139,7 @@ export const MetadataEventSchema = z
       .optional(),
     attempt_index: z.number().int().min(0).default(0),
     call_id: z.string().max(CALL_ID_MAX_LENGTH).regex(CANONICAL_UUID_PATTERN),
+    lease_id: z.string().max(64).nullable().optional(),
     possibly_succeeded: z.boolean().nullable().optional(),
     service_tier: z.string().max(SERVICE_TIER_MAX_LENGTH).nullable().optional(),
     sdk_instance_id: z.string(),
@@ -364,7 +365,27 @@ export const LeaseRenewRequestObjectSchema = z.strictObject({
 export const LeaseRenewRequestSchema = LeaseRenewRequestObjectSchema.refine(
   alignedLeaseFallbacks,
   alignedLeaseFallbacksIssue,
-).transform((value) => omitNullish(value) as unknown as LeaseRenewRequest);
+)
+  .superRefine((value, context) => {
+    if ((value.model != null) !== (value.provider != null)) {
+      context.addIssue({
+        code: "custom",
+        message: "model and provider must be provided together",
+        path: ["model"],
+      });
+    }
+    if (
+      (value.fallback_models.length > 0 || value.fallback_providers.length > 0) &&
+      value.model == null
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "fallbacks require a primary model/provider pair",
+        path: ["fallback_models"],
+      });
+    }
+  })
+  .transform((value) => omitNullish(value) as unknown as LeaseRenewRequest);
 
 export const LeaseSurrenderRequestObjectSchema = z.strictObject({
   lease_id: z.string().max(LEASE_ID_MAX_LENGTH),
@@ -392,9 +413,16 @@ export const IngestRejectionSchema = z.strictObject({
   message: z.string(),
 });
 
+export const IngestDuplicateSchema = z.strictObject({
+  index: z.number().int().min(0),
+  reason: z.enum(["legacy_key", "call_id"]),
+  call_id: z.string(),
+});
+
 export const IngestResponseSchema = z.strictObject({
   ingested: z.number().int().min(0),
   rejected: z.array(IngestRejectionSchema),
+  duplicates: z.array(IngestDuplicateSchema),
 });
 
 export const RateLimitErrorResponseSchema = z.strictObject({

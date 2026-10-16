@@ -11,7 +11,7 @@
  * and every failure mode (network error, 4xx/5xx, malformed 202 body, a raising
  * log stack) is caught, logged by exception CLASS NAME ONLY, and swallowed.
  * Retryable failures are parked in strict FIFO order with bounded attempts and
- * deterministic backoff; terminal/exhausted loss is synchronously accounted.
+ * jittered backoff; terminal/exhausted loss is synchronously accounted.
  *
  * Per CLAUDE.md ("one async client — JS is async-native") this is the single
  * reporter class, modeled on Python's `AsyncMetadataReporter`.
@@ -42,8 +42,10 @@ import {
   BUDGET_CONFIRM_PATH,
   type FetchLike,
   isRetryableTransportError,
+  MAX_RATE_LIMIT_ATTEMPTS,
   METADATA_INGEST_PATH,
   requireFetchLike,
+  retryBackoffDelay,
   Transport,
   TransportError,
   TransportHttpError,
@@ -54,6 +56,7 @@ import type { BudgetConfirmRequest, MetadataEvent } from "./types";
 import {
   BreakerStateReportSchema,
   BudgetConfirmRequestSchema,
+  IngestResponseSchema,
   MetadataEventSchema,
   serializeBudgetConfirmRequest,
   serializeMetadataEvent,
@@ -78,7 +81,7 @@ const INGEST_TIMEOUT_MS = 10_000;
 /** Confirm per-request timeout (Python explicit `timeout=5.0`). */
 const CONFIRM_TIMEOUT_MS = 5000;
 /** Provider breaker-state report per-request timeout. */
-const BREAKER_REPORT_TIMEOUT_MS = 5000;
+const BREAKER_REPORT_TIMEOUT_MS = 10_000;
 /** Private edge-safe handshake installed only by the dedicated `./node` entry. */
 const NODE_REPORTER_REGISTRATION = Symbol.for("@solwyn/sdk/node-reporter-registration");
 
@@ -102,10 +105,13 @@ type TickTarget =
  * nothing but `target`; a closure created inside the reporter would root it.
  */
 function armFlushTick(target: TickTarget, ms: number): ReturnType<typeof setTimeout> {
-  const timer = setTimeout(() => {
-    const reporter = "weak" in target ? target.weak.deref() : target.strong;
-    reporter?._tick();
-  }, ms);
+  const timer = setTimeout(
+    () => {
+      const reporter = "weak" in target ? target.weak.deref() : target.strong;
+      reporter?._tick();
+    },
+    Math.min(2 ** 31 - 1, Math.max(0, ms)),
+  );
   // The flush cadence must never keep the Node event loop alive on its own: a process
   // that never calls close() must still be able to exit. `unref` is Node-only; web/edge
   // timers lack it, so the optional call is a no-op there.
@@ -125,6 +131,8 @@ export interface IngestRejections {
 export interface BatchSendResult {
   readonly outcome: SendOutcome;
   readonly rejections: IngestRejections;
+  readonly retryAfterMs?: number;
+  readonly rateLimited?: boolean;
 }
 
 const MALFORMED_REJECTIONS: IngestRejections = Object.freeze({
@@ -160,62 +168,70 @@ export class RejectionContractError extends Error {
  * exception below. Prefix drains preserve insertion order.
  */
 class BoundedQueue<T> {
-  private items: T[] = [];
+  private readonly items = new Map<number, T>();
+  private head = 0;
+  private tail = 0;
 
   constructor(private readonly maxSize: number) {}
 
   get length(): number {
-    return this.items.length;
+    return this.tail - this.head;
   }
 
-  /** Append and return the evicted oldest entry, when capacity was already full. */
+  /** Append and return the evicted oldest entry, without reindexing the queue. */
   push(item: T, bypassCapacity = false): T | undefined {
-    const evicted =
-      !bypassCapacity && this.items.length >= this.maxSize ? this.items.shift() : undefined;
-    this.items.push(item);
+    const evicted = !bypassCapacity && this.length >= this.maxSize ? this.shift() : undefined;
+    this.items.set(this.tail++, item);
     return evicted;
   }
 
   peek(): T | undefined {
-    return this.items[0];
+    return this.items.get(this.head);
   }
 
   shift(): T | undefined {
-    return this.items.shift();
+    if (this.length === 0) return undefined;
+    const item = this.items.get(this.head);
+    this.items.delete(this.head++);
+    if (this.head === this.tail) this.head = this.tail = 0;
+    return item;
   }
 
   /**
-   * Restore a previously owned FIFO prefix while retaining the hard cap.
-   *
-   * Ordinary push overflow remains drop-oldest. Restoration is the deliberate
-   * exception: the claimed prefix already owns the oldest positions, so a
-   * concurrent refill's NEWEST suffix is evicted after the prefix is restored.
-   * Returned evictions preserve their oldest-to-newest order.
+   * A claimed prefix keeps its older positions. Evict the newest refill suffix
+   * when restoring it would exceed the cap; return evictions oldest-first.
    */
   restorePrefix(prefix: readonly T[]): T[] {
-    this.items.unshift(...prefix);
-    if (this.items.length <= this.maxSize) return [];
-    return this.items.splice(this.maxSize);
-  }
-
-  /** Remove and return up to `n` oldest items (fewer if the queue is smaller). */
-  drainUpTo(n: number): T[] {
-    return this.items.splice(0, n);
-  }
-
-  /** Remove one matching FIFO prefix with a single array reindex. */
-  drainWhileUpTo(n: number, predicate: (item: T) => boolean): T[] {
-    let count = 0;
-    for (const item of this.items) {
-      if (count >= n || !predicate(item)) break;
-      count += 1;
+    for (let index = prefix.length - 1; index >= 0; index -= 1) {
+      this.items.set(--this.head, prefix[index] as T);
     }
-    return this.items.splice(0, count);
+    const evicted: T[] = [];
+    while (this.length > this.maxSize) {
+      this.tail -= 1;
+      evicted.push(this.items.get(this.tail) as T);
+      this.items.delete(this.tail);
+    }
+    return evicted.reverse();
   }
 
-  /** Remove and return every item, oldest-first, emptying the queue. */
+  drainUpTo(n: number): T[] {
+    const drained: T[] = [];
+    while (drained.length < n && this.length > 0) drained.push(this.shift() as T);
+    return drained;
+  }
+
+  drainWhileUpTo(n: number, predicate: (item: T) => boolean): T[] {
+    const drained: T[] = [];
+    while (drained.length < n && this.length > 0) {
+      const item = this.peek() as T;
+      if (!predicate(item)) break;
+      drained.push(this.shift() as T);
+    }
+    return drained;
+  }
+
   drainAll(): T[] {
-    return this.items.splice(0);
+    return this.drainUpTo(this.length);
   }
 }
 
@@ -228,7 +244,9 @@ interface Settlement {
 interface Pending<T> {
   item: T;
   attempts: number;
+  rateLimitAttempts: number;
   nextAttemptAt: number;
+  retryNotBefore: number;
 }
 
 interface ProjectedEvent {
@@ -259,13 +277,26 @@ interface ConfirmAttemptResult {
   diagnosticRecorded?: boolean;
   /** Read-only-key skips are terminal but do not alter the confirm-failure diagnostic. */
   counterNeutral?: boolean;
+  retryAfterMs?: number;
+  rateLimited?: boolean;
 }
 
 interface ConfirmCycle {
+  nextSequence: number;
+  lastSequence: number;
   lastVerdict:
     | { readonly outcome: "sent" }
     | { readonly outcome: "failed"; error: unknown; diagnosticRecorded: boolean }
     | null;
+}
+
+interface ControlQueue<T> {
+  readonly queue: BoundedQueue<T>;
+  readonly claims: Map<number, T>;
+  readonly confirm: (item: T) => PendingConfirm;
+  readonly complete: (item: T) => void;
+  readonly dispose: (item: T, reason: string) => void;
+  readonly restore: (prefix: readonly T[]) => void;
 }
 
 /** Out-parameter for one ordinary delivery round. */
@@ -300,12 +331,9 @@ export interface MetadataReporterOptions {
   flushInterval?: number;
   /** Metadata queue cap; drop-oldest on overflow (default 10_000). */
   maxQueueSize?: number;
-  /**
-   * Accepted and retained, but currently has no effect: confirms and ingest
-   * batches are sent serially, one request at a time (default 3).
-   */
+  /** Maximum concurrent confirmation POSTs; ingest batches remain serial (default 3). */
   maxInFlight?: number;
-  /** Total send attempts before a retryable item is disposed (default 5). */
+  /** Ordinary send attempts before disposal (default 5); 429 has a separate cap of 20. */
   maxSendAttempts?: number;
   /** Retry backoff base in milliseconds (default 1000). */
   retryBackoffBase?: number;
@@ -331,6 +359,8 @@ export interface MetadataReporterOptions {
   wallClock?: () => Date;
   /** Injectable monotonic millisecond clock for retry/lifecycle tests. */
   monotonicClock?: () => number;
+  /** Injectable retry jitter source; values are clamped to 0..1. */
+  random?: () => number;
   /** Internal test seam for the confirm and settlement queue bound (default 1000). */
   controlQueueMaxSize?: number;
 }
@@ -396,6 +426,7 @@ export class MetadataReporter {
   private readonly settlementQueue: BoundedQueue<Settlement>;
   private readonly receiptFoldState = new ReceiptFoldState();
   private readonly monotonicClock: () => number;
+  private readonly random: () => number;
   private readonly dropCounts = new Map<string, number>();
   private lastDropLogAt: number | null = null;
   private lastLoggedDropTotal = 0;
@@ -419,6 +450,10 @@ export class MetadataReporter {
   private activeBreakerCycle: Promise<void> | null = null;
   private activeBreakerAbortController: AbortController | null = null;
   private readonly breakerLastSent = new Map<string, string>();
+  private readonly breakerLastReportedAt = new Map<string, number>();
+  private readonly breakerRateLimitAttempts = new Map<string, number>();
+  /** Ingest and breaker reports share the server's project rate-limit window. */
+  private telemetryRetryNotBefore = 0;
   private breakerHeartbeatAt = 0;
   /** Consecutive breaker cycles with a failed report; drives the retry backoff. */
   private breakerFailedCycles = 0;
@@ -445,7 +480,6 @@ export class MetadataReporter {
     this.batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE;
     this.flushInterval = options.flushInterval ?? DEFAULT_FLUSH_INTERVAL_MS;
     this.maxQueueSize = options.maxQueueSize ?? DEFAULT_MAX_QUEUE_SIZE;
-    // Retained for configuration compatibility; delivery is serial and never reads it.
     this.maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
     this.maxSendAttempts = options.maxSendAttempts ?? 5;
     this.retryBackoffBase = options.retryBackoffBase ?? 1000;
@@ -453,10 +487,16 @@ export class MetadataReporter {
     this.shutdownDeadline = options.shutdownDeadline ?? 5000;
     this.breakerReportHeartbeat = options.breakerReportHeartbeat ?? 60_000;
     this.monotonicClock = options.monotonicClock ?? (() => performance.now());
+    this.random = options.random ?? Math.random;
 
     const invalidPositiveInteger = (value: number): boolean =>
       !Number.isInteger(value) || !Number.isFinite(value) || value < 1;
     const controlQueueMaxSize = options.controlQueueMaxSize ?? CONFIRM_SETTLEMENT_QUEUE_MAX;
+    if (invalidPositiveInteger(this.maxInFlight)) {
+      throw new ConfigurationError("maxInFlight must be an integer >= 1", {
+        field: "maxInFlight",
+      });
+    }
     if (invalidPositiveInteger(controlQueueMaxSize)) {
       throw new ConfigurationError("controlQueueMaxSize must be an integer >= 1", {
         field: "controlQueueMaxSize",
@@ -589,6 +629,8 @@ export class MetadataReporter {
     }
     try {
       this.start();
+      const leaseId = request.lease_id;
+      if (leaseId != null) event = { ...event, lease_id: leaseId };
       const evicted = this.settlementQueue.push({ confirm: this._pendingConfirm(request), event });
       reportersWithWork.add(this);
       if (evicted !== undefined) {
@@ -616,11 +658,25 @@ export class MetadataReporter {
   }
 
   private _pendingEvent(item: MetadataEvent): PendingEvent {
-    return { item, attempts: 0, nextAttemptAt: 0, projection: null };
+    return {
+      item,
+      attempts: 0,
+      rateLimitAttempts: 0,
+      nextAttemptAt: 0,
+      retryNotBefore: 0,
+      projection: null,
+    };
   }
 
   private _pendingConfirm(item: BudgetConfirmRequest): PendingConfirm {
-    return { item, attempts: 0, nextAttemptAt: 0, projection: null };
+    return {
+      item,
+      attempts: 0,
+      rateLimitAttempts: 0,
+      nextAttemptAt: 0,
+      retryNotBefore: 0,
+      projection: null,
+    };
   }
 
   private _moveEventToQueue(event: MetadataEvent, emit = true): void {
@@ -749,14 +805,29 @@ export class MetadataReporter {
     );
   }
 
-  /** Overflow-safe, no-jitter backoff in monotonic milliseconds. */
+  /** Overflow-safe exponential backoff with equal jitter in monotonic milliseconds. */
   _backoffDelay(attempts: number): number {
-    // Python clamps exponentiation at 1023 before multiplying. JS would produce
-    // Infinity at larger exponents, but keeping the clamp preserves exact parity.
-    return Math.min(
-      this.retryBackoffCap,
-      this.retryBackoffBase * 2 ** Math.min(attempts - 1, 1023),
+    return retryBackoffDelay(attempts, this.retryBackoffBase, this.retryBackoffCap, this.random);
+  }
+
+  private _scheduleRetry(
+    pending: Pending<unknown>,
+    result: { readonly retryAfterMs?: number; readonly rateLimited?: boolean },
+  ): boolean {
+    if (result.rateLimited) {
+      pending.rateLimitAttempts += 1;
+      if (pending.rateLimitAttempts >= MAX_RATE_LIMIT_ATTEMPTS) return false;
+    } else {
+      pending.attempts += 1;
+      if (pending.attempts >= this.maxSendAttempts) return false;
+    }
+    const now = this.monotonicClock();
+    pending.retryNotBefore = now + (result.retryAfterMs ?? 0);
+    pending.nextAttemptAt = Math.max(
+      pending.retryNotBefore,
+      now + this._backoffDelay(Math.max(pending.attempts, pending.rateLimitAttempts)),
     );
+    return true;
   }
 
   /** The two auth headers (delegated to the transport). */
@@ -825,30 +896,44 @@ export class MetadataReporter {
 
   /**
    * Parse the durable ingest disposition without retaining the response or raw body.
-   * Missing indexes are the supported legacy form. Invalid index shapes preserve the
-   * trusted count but advance the contract-drift diagnostic.
+   * Validate the strict contract first. An explicitly logged fallback preserves any
+   * usable rejection dispositions without treating malformed responses as healthy.
    */
   _parseIngestRejections(body: unknown, batchSize: number): IngestRejections {
+    let contractDrift = false;
+    const recordDrift = (error: unknown): void => {
+      if (contractDrift) return;
+      contractDrift = true;
+      this._recordUnparseableResponse(error);
+      this.logger.debug(
+        "reporter.ingest_response_fallback: using available rejection dispositions",
+      );
+    };
+    const parsed = IngestResponseSchema.safeParse(body);
+    if (!parsed.success) recordDrift(parsed.error);
+    else {
+      const dispositions = [...parsed.data.rejected, ...parsed.data.duplicates];
+      const indexes = dispositions.map((entry) => entry.index);
+      if (indexes.some((index) => index >= batchSize) || new Set(indexes).size !== indexes.length) {
+        recordDrift(new RejectionContractError("invalid disposition indexes"));
+      }
+    }
     if (typeof body !== "object" || body === null || Array.isArray(body)) {
-      this._recordUnparseableResponse(new TypeError("ingest response body is not an object"));
+      recordDrift(new TypeError("ingest response body is not an object"));
       return MALFORMED_REJECTIONS;
     }
     const rejected = (body as Record<string, unknown>)["rejected"];
     if (!Array.isArray(rejected)) {
-      this._recordUnparseableResponse(
-        new RejectionContractError("ingest response 'rejected' is not an array"),
-      );
+      recordDrift(new RejectionContractError("ingest response 'rejected' is not an array"));
       return MALFORMED_REJECTIONS;
     }
-    if (rejected.length > batchSize) {
-      this._recordUnparseableResponse(
-        new RejectionContractError("'rejected' longer than the submitted batch"),
-      );
-      return MALFORMED_REJECTIONS;
+    const tooManyRejections = rejected.length > batchSize;
+    if (tooManyRejections) {
+      recordDrift(new RejectionContractError("'rejected' longer than the submitted batch"));
     }
     if (rejected.length === 0) {
-      this._recordParseableResponse();
-      return { kind: "clean", indexes: [], count: 0 };
+      if (!contractDrift) this._recordParseableResponse();
+      return contractDrift ? MALFORMED_REJECTIONS : { kind: "clean", indexes: [], count: 0 };
     }
 
     const groups: RejectionGroup[] = [];
@@ -856,10 +941,12 @@ export class MetadataReporter {
     const indexes: number[] = [];
     let indexesComplete = true;
     let shapeError = false;
+    let malformedEntries = false;
     for (const entry of rejected) {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-        this._recordUnparseableResponse(new TypeError("ingest rejection entry is not an object"));
-        return MALFORMED_REJECTIONS;
+        recordDrift(new TypeError("ingest rejection entry is not an object"));
+        malformedEntries = true;
+        continue;
       }
       const record = entry as Record<string, unknown>;
       const code = record["code"];
@@ -909,15 +996,27 @@ export class MetadataReporter {
       // Best-effort diagnostic containment.
     }
 
+    // Malformed siblings carry no disposition; retain only unambiguous indexed
+    // entries, after surfacing every available per-event diagnostic.
+    if (
+      tooManyRejections ||
+      (malformedEntries && (shapeError || !indexesComplete || indexes.length === 0))
+    ) {
+      return MALFORMED_REJECTIONS;
+    }
     if (shapeError) {
-      this._recordUnparseableResponse(new RejectionContractError("invalid rejection indexes"));
+      recordDrift(new RejectionContractError("invalid rejection indexes"));
       return { kind: "legacy", indexes: [], count: rejected.length };
     }
-    this._recordParseableResponse();
+    if (!contractDrift) this._recordParseableResponse();
     if (!indexesComplete) {
       return { kind: "legacy", indexes: [], count: rejected.length };
     }
-    return { kind: "exact", indexes: [...indexes].sort((a, b) => a - b), count: rejected.length };
+    return {
+      kind: "exact",
+      indexes: [...indexes].sort((a, b) => a - b),
+      count: indexes.length,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1015,6 +1114,12 @@ export class MetadataReporter {
       if (handleReadOnlyKeyError(sendError, this.logger)) {
         return { outcome: "sent", rejections: MALFORMED_REJECTIONS };
       }
+      if (sendError instanceof TransportHttpError && sendError.status === 429) {
+        this.telemetryRetryNotBefore = Math.max(
+          this.telemetryRetryNotBefore,
+          this.monotonicClock() + (sendError.retryAfterMs ?? 0),
+        );
+      }
       // Whole-batch failure (non-2xx or network). Body/status text never logged.
       this.logger.warn(
         `Failed to send metadata batch (${projected.length} events): ${exceptionName(sendError)}`,
@@ -1022,6 +1127,8 @@ export class MetadataReporter {
       return {
         outcome: isRetryableTransportError(sendError) ? "retry" : "dropped",
         rejections: MALFORMED_REJECTIONS,
+        retryAfterMs: sendError instanceof TransportHttpError ? sendError.retryAfterMs : undefined,
+        rateLimited: sendError instanceof TransportHttpError && sendError.status === 429,
       };
     } finally {
       this.inFlight -= 1;
@@ -1094,13 +1201,23 @@ export class MetadataReporter {
             error,
           };
         }
-        this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+        const status = error instanceof TransportHttpError ? error.status : null;
+        if (status === 503 || (status !== null && status >= 400 && status < 500)) {
+          this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+        } else {
+          this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+        }
         if (error instanceof TransportHttpError && !isRetryableTransportError(error)) {
           const status = error.status;
           this.logger.warn("reporter.confirm_terminal_status: status=%d", status);
           return { outcome: "dropped", error };
         }
-        return { outcome: "retry", error };
+        return {
+          outcome: "retry",
+          error,
+          retryAfterMs: error instanceof TransportHttpError ? error.retryAfterMs : undefined,
+          rateLimited: error instanceof TransportHttpError && error.status === 429,
+        };
       }
     } finally {
       this.controlPlaneBreaker?.releaseProbe(admission);
@@ -1148,11 +1265,16 @@ export class MetadataReporter {
     cycle: ConfirmCycle,
     error: unknown,
     diagnosticRecorded = false,
+    sequence: number,
   ): void {
+    if (sequence < cycle.lastSequence) return;
+    cycle.lastSequence = sequence;
     cycle.lastVerdict = { outcome: "failed", error, diagnosticRecorded };
   }
 
-  private _recordCycleSuccess(cycle: ConfirmCycle): void {
+  private _recordCycleSuccess(cycle: ConfirmCycle, sequence: number): void {
+    if (sequence < cycle.lastSequence) return;
+    cycle.lastSequence = sequence;
     cycle.lastVerdict = { outcome: "sent" };
   }
 
@@ -1161,32 +1283,15 @@ export class MetadataReporter {
     return this.ownershipToken;
   }
 
-  private _claimConfirm(): readonly [token: number, pending: PendingConfirm] | null {
-    if (this.deliveryClosed) return null;
-    const pending = this.confirmQueue.shift();
-    if (pending === undefined) return null;
-    const token = this._nextOwnershipToken();
-    this.inHandConfirms.set(token, pending);
-    return [token, pending];
-  }
-
-  private _claimSettlement(): readonly [token: number, settlement: Settlement] | null {
-    if (this.deliveryClosed) return null;
-    const settlement = this.settlementQueue.shift();
-    if (settlement === undefined) return null;
-    const token = this._nextOwnershipToken();
-    this.inHandSettlements.set(token, settlement);
-    return [token, settlement];
-  }
-
   private _claimEventBatch(
     final: boolean,
   ): readonly [token: number, pending: PendingEvent[]] | null {
     if (this.deliveryClosed) return null;
     const now = this.monotonicClock();
+    if (now < this.telemetryRetryNotBefore) return null;
     const pending = this.metadataQueue.drainWhileUpTo(
       this.batchSize,
-      (item) => final || item.nextAttemptAt <= now,
+      (item) => item.retryNotBefore <= now && (final || item.nextAttemptAt <= now),
     );
     if (pending.length === 0) return null;
     const token = this._nextOwnershipToken();
@@ -1208,127 +1313,147 @@ export class MetadataReporter {
   }
 
   /**
-   * Send due confirms FIFO. An ordinary round resolves at most `limit` items and
-   * returns true only when that quota ran out with a due head still queued.
+   * Refill free confirmation slots in FIFO dispatch order. A retry or held
+   * admission stops new dispatch; already-active calls finish independently.
+   * Restore retries in dispatch order and reduce the round's diagnostic by that
+   * same order, so completion timing cannot change its consecutive-failure count.
    */
-  private async _drainConfirms(
+  private async _drainControlQueue<T>(
+    stage: ControlQueue<T>,
     cycle: ConfirmCycle,
     deadline?: number,
     final = false,
     limit?: number,
   ): Promise<boolean> {
     let resolved = 0;
-    while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
-      if (limit !== undefined && resolved >= limit) {
-        return this._headDue(this.confirmQueue.peek());
+    let blocked = false;
+    let held = false;
+    const active = new Set<Promise<void>>();
+    const restore: Array<{ token: number; sequence: number; item: T }> = [];
+    const headDue = (): boolean => {
+      const head = stage.queue.peek();
+      return head !== undefined && this._headDue(stage.confirm(head));
+    };
+    const dispatch = (): void => {
+      while (
+        !blocked &&
+        active.size < this.maxInFlight &&
+        !this.deliveryClosed &&
+        !this._deadlineExpired(deadline) &&
+        (limit === undefined || resolved < limit)
+      ) {
+        const head = stage.queue.peek();
+        if (head === undefined) break;
+        const pending = stage.confirm(head);
+        if (pending.retryNotBefore > this.monotonicClock() || (!final && !this._headDue(pending)))
+          break;
+        const item = stage.queue.shift() as T;
+        const token = this._nextOwnershipToken();
+        const sequence = ++cycle.nextSequence;
+        stage.claims.set(token, item);
+        resolved += 1;
+        const operation = (async () => {
+          const result = await this.#sendConfirmAttempt(pending, deadline, () =>
+            this._claimIsCurrent(stage.claims, token, deadline),
+          );
+          if (this._deadlineExpired(deadline) || !stage.claims.has(token)) return;
+          if (result.outcome === "sent") {
+            stage.claims.delete(token);
+            if (!result.counterNeutral) this._recordCycleSuccess(cycle, sequence);
+            stage.complete(item);
+          } else if (result.outcome === "held") {
+            held = blocked = true;
+            if (final) {
+              stage.claims.delete(token);
+              stage.dispose(item, "exit_breaker_open");
+            } else restore.push({ token, sequence, item });
+          } else {
+            this._recordCycleFailure(cycle, result.error, result.diagnosticRecorded, sequence);
+            if (result.outcome === "dropped") {
+              stage.claims.delete(token);
+              stage.dispose(item, "terminal_status");
+            } else if (!this._scheduleRetry(pending, result) || final) {
+              stage.claims.delete(token);
+              stage.dispose(item, "retry_exhausted");
+            } else {
+              blocked = true;
+              restore.push({ token, sequence, item });
+            }
+          }
+        })().finally(() => {
+          active.delete(operation);
+        });
+        active.add(operation);
       }
-      const head = this.confirmQueue.peek();
-      if (head === undefined) return false;
-      if (!final && head.nextAttemptAt > this.monotonicClock()) return false;
-      const claimed = this._claimConfirm();
-      if (claimed === null) return false;
-      resolved += 1;
-      const [token, pending] = claimed;
-      const result = await this.#sendConfirmAttempt(pending, deadline, () =>
-        this._claimIsCurrent(this.inHandConfirms, token, deadline),
-      );
-      if (this._deadlineExpired(deadline) || !this.inHandConfirms.delete(token)) return false;
-
-      if (result.outcome === "sent") {
-        if (!result.counterNeutral) this._recordCycleSuccess(cycle);
-        continue;
-      }
-      if (result.outcome === "held") {
-        if (!final) {
-          this._restoreConfirmPrefix([pending]);
-          return false;
-        }
-        this._countDrop("confirm", "exit_breaker_open");
-        this._countDrop("confirm", "exit_breaker_open", this.confirmQueue.drainAll().length);
-        return false;
-      }
-
-      this._recordCycleFailure(cycle, result.error, result.diagnosticRecorded);
-      if (result.outcome === "dropped") {
-        this._countDrop("confirm", "terminal_status");
-        continue;
-      }
-      pending.attempts += 1;
-      if (final || pending.attempts >= this.maxSendAttempts) {
-        this._countDrop("confirm", "retry_exhausted");
-        continue;
-      }
-      pending.nextAttemptAt = this.monotonicClock() + this._backoffDelay(pending.attempts);
-      this._restoreConfirmPrefix([pending]);
-      // FIFO: nothing behind a backing-off head may jump it.
-      return false;
+    };
+    dispatch();
+    while (active.size > 0) {
+      await Promise.race(active);
+      dispatch();
     }
-    return false;
+    if (restore.length > 0 && !this.deliveryClosed && !this._deadlineExpired(deadline)) {
+      stage.restore(
+        restore
+          .sort((a, b) => a.sequence - b.sequence)
+          .filter(({ token }) => stage.claims.delete(token))
+          .map(({ item }) => item),
+      );
+      // A successful half-open probe can close the breaker while siblings are held.
+      return held && this.controlPlaneBreaker?.getState().state === "closed" && headDue();
+    }
+    if (held && final) {
+      for (const item of stage.queue.drainAll()) stage.dispose(item, "exit_breaker_open");
+    }
+    return !blocked && limit !== undefined && resolved >= limit && headDue();
   }
 
-  /** Settlement twin of {@link _drainConfirms}; each event follows its own confirm. */
-  private async _drainSettlements(
+  private _drainConfirms(
     cycle: ConfirmCycle,
     deadline?: number,
     final = false,
     limit?: number,
   ): Promise<boolean> {
-    let resolved = 0;
-    while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
-      if (limit !== undefined && resolved >= limit) {
-        return this._headDue(this.settlementQueue.peek()?.confirm);
-      }
-      const head = this.settlementQueue.peek();
-      if (head === undefined) return false;
-      if (!final && head.confirm.nextAttemptAt > this.monotonicClock()) return false;
-      const claimed = this._claimSettlement();
-      if (claimed === null) return false;
-      resolved += 1;
-      const [token, settlement] = claimed;
-      const result = await this.#sendConfirmAttempt(settlement.confirm, deadline, () =>
-        this._claimIsCurrent(this.inHandSettlements, token, deadline),
-      );
-      if (this._deadlineExpired(deadline) || !this.inHandSettlements.delete(token)) return false;
+    return this._drainControlQueue(
+      {
+        queue: this.confirmQueue,
+        claims: this.inHandConfirms,
+        confirm: (pending) => pending,
+        complete: () => {},
+        dispose: (_pending, reason) => this._countDrop("confirm", reason),
+        restore: (prefix) => this._restoreConfirmPrefix(prefix),
+      },
+      cycle,
+      deadline,
+      final,
+      limit,
+    );
+  }
 
-      if (result.outcome === "sent") {
-        if (!result.counterNeutral) this._recordCycleSuccess(cycle);
-        this._moveEventToQueue(settlement.event);
-        continue;
-      }
-      if (result.outcome === "held") {
-        if (!final) {
-          this._restoreSettlementPrefix([settlement]);
-          return false;
-        }
-        const stranded = [settlement, ...this.settlementQueue.drainAll()];
-        this._recordDrop("settlement_confirm", "exit_breaker_open", stranded.length);
-        for (const remainder of stranded) {
-          this._moveEventToQueue(remainder.event, false);
-        }
-        this._maybeLogDrops(false);
-        return false;
-      }
-
-      this._recordCycleFailure(cycle, result.error, result.diagnosticRecorded);
-      if (result.outcome === "dropped") {
-        this._recordDrop("settlement_confirm", "terminal_status");
-        this._moveEventToQueue(settlement.event, false);
-        this._maybeLogDrops(false);
-        continue;
-      }
-      settlement.confirm.attempts += 1;
-      if (final || settlement.confirm.attempts >= this.maxSendAttempts) {
-        this._recordDrop("settlement_confirm", "retry_exhausted");
-        this._moveEventToQueue(settlement.event, false);
-        this._maybeLogDrops(false);
-        continue;
-      }
-      settlement.confirm.nextAttemptAt =
-        this.monotonicClock() + this._backoffDelay(settlement.confirm.attempts);
-      this._restoreSettlementPrefix([settlement]);
-      return false;
-    }
-    return false;
+  /** Each settlement event follows its own confirm's final disposition. */
+  private _drainSettlements(
+    cycle: ConfirmCycle,
+    deadline?: number,
+    final = false,
+    limit?: number,
+  ): Promise<boolean> {
+    return this._drainControlQueue(
+      {
+        queue: this.settlementQueue,
+        claims: this.inHandSettlements,
+        confirm: (settlement) => settlement.confirm,
+        complete: (settlement) => this._moveEventToQueue(settlement.event),
+        dispose: (settlement, reason) => {
+          this._recordDrop("settlement_confirm", reason);
+          this._moveEventToQueue(settlement.event, false);
+          this._maybeLogDrops(false);
+        },
+        restore: (prefix) => this._restoreSettlementPrefix(prefix),
+      },
+      cycle,
+      deadline,
+      final,
+      limit,
+    );
   }
 
   /** Select exact/full/partial-legacy dispositions; partial legacy is stable-heaviest. */
@@ -1437,15 +1562,13 @@ export class MetadataReporter {
         );
         continue;
       }
-      const retryAt = this.monotonicClock();
       const survivors: PendingEvent[] = [];
       const exhausted: MetadataEvent[] = [];
       for (const pending of valid) {
-        pending.attempts += 1;
-        if (final || pending.attempts >= this.maxSendAttempts) {
+        const retry = this._scheduleRetry(pending, result);
+        if (final || !retry) {
           exhausted.push(pending.item);
         } else {
-          pending.nextAttemptAt = retryAt + this._backoffDelay(pending.attempts);
           survivors.push(pending);
         }
       }
@@ -1483,7 +1606,7 @@ export class MetadataReporter {
    */
   async _flushRemaining(deadline?: number, final = false, round?: FlushRound): Promise<boolean> {
     this._drainReceiptFoldsToQueue();
-    const cycle: ConfirmCycle = { lastVerdict: null };
+    const cycle: ConfirmCycle = { nextSequence: 0, lastSequence: 0, lastVerdict: null };
     const limit = final ? undefined : Math.max(1, Math.min(this.batchSize, this.maxQueueSize));
     const moreConfirms = await this._drainConfirms(cycle, deadline, final, limit);
     const moreSettlements = await this._drainSettlements(cycle, deadline, final, limit);
@@ -1506,6 +1629,7 @@ export class MetadataReporter {
   /** Cheap cadence precheck: no worker is spawned when every report is deduplicated. */
   _breakerReportsDue(): boolean {
     if (
+      this.monotonicClock() < this.telemetryRetryNotBefore ||
       this.activeBreakerCycle !== null ||
       !this.breakerReportingEnabled ||
       this.breakerSnapshots === null ||
@@ -1537,6 +1661,7 @@ export class MetadataReporter {
       return this.activeBreakerCycle;
     }
     if (
+      this.monotonicClock() < this.telemetryRetryNotBefore ||
       !this.breakerReportingEnabled ||
       this.breakerSnapshots === null ||
       this.sdkInstanceId === null ||
@@ -1603,10 +1728,13 @@ export class MetadataReporter {
         this.breakerLastSent.get(provider) !== this._breakerSnapshotKey(snapshot),
     );
     if (due.length === 0) return;
+    // Only acknowledged providers regain a last-sent key. A rate-limit hold or
+    // deadline can leave later heartbeat siblings unattempted and still due.
+    for (const [provider] of due) this.breakerLastSent.delete(provider);
 
-    const reportedAt = this.wallClock().toISOString();
+    const reportedAt = this.wallClock().getTime();
     const path = `/api/v1/projects/${encodeURIComponent(projectId)}/providers/breaker-reports`;
-    const outcome = { delivered: false, failed: false };
+    const outcome = { delivered: false, failed: false, retryAfterMs: 0 };
     try {
       await this._postBreakerReports(
         path,
@@ -1618,27 +1746,32 @@ export class MetadataReporter {
         signal,
       );
     } finally {
-      this._noteBreakerCycleOutcome(outcome.delivered, outcome.failed);
+      this._noteBreakerCycleOutcome(outcome.delivered, outcome.failed, outcome.retryAfterMs);
     }
   }
 
   private async _postBreakerReports(
     path: string,
     due: readonly BreakerSnapshot[],
-    reportedAt: string,
+    reportedAt: number,
     sdkInstanceId: string,
-    outcome: { delivered: boolean; failed: boolean },
+    outcome: { delivered: boolean; failed: boolean; retryAfterMs: number },
     deadline?: number,
     signal?: AbortSignal,
   ): Promise<void> {
     for (const [provider, snapshot] of due) {
       if (this._deadlineExpired(deadline)) return;
+      if (this.monotonicClock() < this.telemetryRetryNotBefore) return;
+      const timestamp = Math.max(
+        reportedAt,
+        (this.breakerLastReportedAt.get(provider) ?? -Infinity) + 1,
+      );
       const parsed = BreakerStateReportSchema.safeParse({
         provider,
         state: snapshot.state,
         failure_count: snapshot.failureCount,
         success_count: snapshot.successCount,
-        reported_at: reportedAt,
+        reported_at: new Date(timestamp).toISOString(),
         sdk_instance_id: sdkInstanceId,
       });
       if (!parsed.success) {
@@ -1650,6 +1783,7 @@ export class MetadataReporter {
         );
         continue;
       }
+      this.breakerLastReportedAt.set(provider, timestamp);
       try {
         await this.transport.postJson(path, parsed.data, {
           timeoutMs: this._sendTimeout(deadline, BREAKER_REPORT_TIMEOUT_MS),
@@ -1657,10 +1791,30 @@ export class MetadataReporter {
         });
         if (this._deadlineExpired(deadline)) return;
         this.breakerLastSent.set(provider, this._breakerSnapshotKey(snapshot));
+        this.breakerRateLimitAttempts.delete(provider);
         outcome.delivered = true;
       } catch (error) {
         if (this._deadlineExpired(deadline)) return;
+        // An unchanged failed heartbeat must remain due, not consume a TTL window.
+        this.breakerLastSent.delete(provider);
         outcome.failed = true;
+        if (error instanceof TransportHttpError) {
+          outcome.retryAfterMs = Math.max(outcome.retryAfterMs, error.retryAfterMs ?? 0);
+          if (error.status === 429) {
+            this.telemetryRetryNotBefore = Math.max(
+              this.telemetryRetryNotBefore,
+              this.monotonicClock() + (error.retryAfterMs ?? 0),
+            );
+            const attempts = (this.breakerRateLimitAttempts.get(provider) ?? 0) + 1;
+            this.breakerRateLimitAttempts.set(provider, attempts);
+            if (attempts >= MAX_RATE_LIMIT_ATTEMPTS) {
+              // Dispose this snapshot; the next heartbeat may report fresh health.
+              this.breakerLastSent.set(provider, this._breakerSnapshotKey(snapshot));
+              this.breakerRateLimitAttempts.delete(provider);
+              this.logger.warn("reporter.breaker_retry_exhausted: provider=%s", provider);
+            }
+          }
+        }
         if (isReadOnlyKeyError(error)) {
           handleReadOnlyKeyError(error, this.logger);
           return;
@@ -1675,17 +1829,22 @@ export class MetadataReporter {
   }
 
   /**
-   * A cycle with any failed report arms an independent retry deadline: never sooner
-   * than one flush interval, then the reporter's no-jitter retry backoff. A cycle
+   * A cycle with any failed report arms an independent jittered retry deadline,
+   * extended by any server Retry-After. A cycle
    * whose reports all succeed clears it. Cadence rounds, including zero-delay
-   * continuation rounds, respect the deadline; the forced close-time cycle does not.
+   * continuation rounds, respect the deadline. Close bypasses local backoff while
+   * respecting the shared server rate-limit hold.
    */
-  private _noteBreakerCycleOutcome(delivered: boolean, failed: boolean): void {
+  private _noteBreakerCycleOutcome(
+    delivered: boolean,
+    failed: boolean,
+    retryAfterMs: number,
+  ): void {
     if (failed) {
       this.breakerFailedCycles += 1;
       this.breakerRetryAt =
         this.monotonicClock() +
-        Math.max(this.flushInterval, this._backoffDelay(this.breakerFailedCycles));
+        Math.max(retryAfterMs, this._backoffDelay(this.breakerFailedCycles));
     } else if (delivered) {
       this.breakerFailedCycles = 0;
       this.breakerRetryAt = null;
@@ -1838,7 +1997,7 @@ export class MetadataReporter {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = Symbol("timed-out");
     const timeout = new Promise<typeof timedOut>((resolve) => {
-      timer = setTimeout(() => resolve(timedOut), remaining);
+      timer = setTimeout(() => resolve(timedOut), Math.min(2 ** 31 - 1, remaining));
     });
     try {
       const result = await Promise.race([

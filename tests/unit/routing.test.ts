@@ -116,7 +116,9 @@ function routingFetch(priceHints: Record<string, number> | null): FetchLike {
     if (url.includes("/api/v1/budgets/confirm")) {
       return new Response(null, { status: 204 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
 }
 
@@ -144,7 +146,9 @@ function routingFetchSequence(priceHints: readonly (Record<string, number> | nul
     if (url.includes("/api/v1/budgets/confirm")) {
       return new Response(null, { status: 204 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
 }
 

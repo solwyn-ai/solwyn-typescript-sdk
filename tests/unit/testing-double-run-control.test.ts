@@ -74,26 +74,28 @@ describe("FakeControlPlane run control", () => {
   it("holds one validated stop independently of denial scripts and returns a snapshot", () => {
     const plane = new FakeControlPlane();
     plane.denyNext();
-    plane.stopRun("__proto__", { reason: "operator_stop" });
+    plane.stopRun("__proto__", { reason: "manual_kill" });
     const snapshot = plane.stoppedRuns;
     expect(Object.getPrototypeOf(snapshot)).toBe(Object.prototype);
     expect(Object.hasOwn(snapshot, "__proto__")).toBe(true);
-    expect(Reflect.get(snapshot, "__proto__")).toBe("operator_stop");
+    expect(Reflect.get(snapshot, "__proto__")).toBe("manual_kill");
     Reflect.set(snapshot, "__proto__", "mutated");
-    expect(Reflect.get(plane.stoppedRuns, "__proto__")).toBe("operator_stop");
+    expect(Reflect.get(plane.stoppedRuns, "__proto__")).toBe("manual_kill");
     plane.clearDenials();
     plane.resetRecording();
-    expect(Object.entries(plane.stoppedRuns)).toEqual([["__proto__", "operator_stop"]]);
-    expect(() => plane.stopRun("run-a", { reason: "" })).toThrow(ConfigurationError);
-    expect(() => plane.stopRun("run-a", { reason: "x".repeat(65) })).toThrow(ConfigurationError);
+    expect(Object.entries(plane.stoppedRuns)).toEqual([["__proto__", "manual_kill"]]);
+    expect(() => plane.stopRun("run-a", { reason: "" as never })).toThrow(ConfigurationError);
+    expect(() => plane.stopRun("run-a", { reason: "x".repeat(65) as never })).toThrow(
+      ConfigurationError,
+    );
     plane.stopRun("run-a");
-    expect(() => plane.stopRun("run-a", { reason: "other" })).toThrow(ConfigurationError);
+    expect(() => plane.stopRun("run-a", { reason: "other" as never })).toThrow(ConfigurationError);
   });
 
   it("puts a fresh held stop ahead of a queued denial and emits its opted-in directive only", () => {
     const plane = new FakeControlPlane();
     plane.denyNext();
-    plane.stopRun("run-a", { reason: "operator_stop" });
+    plane.stopRun("run-a", { reason: "manual_kill" });
     expect(plane.handle("POST", CHECK_PATH, check()).body).toMatchObject({
       allowed: false,
       mode: "hard_deny",
@@ -103,7 +105,7 @@ describe("FakeControlPlane run control", () => {
         version: "1",
         action: "terminate",
         agent_run_id: "run-a",
-        reason: "operator_stop",
+        reason: "manual_kill",
       },
     });
     expect(plane.handle("POST", CHECK_PATH, check({ agent_run_id: "run-b" })).body).toMatchObject({
@@ -122,16 +124,16 @@ describe("FakeControlPlane run control", () => {
         CHECK_PATH,
         check({ agent_run_id: "run-c", model: "solwyn-test/deny-stopped" }),
       ).body,
-    ).not.toHaveProperty("run_control");
+    ).toHaveProperty("run_control.reason", "manual_kill");
   });
 
-  it("replays pre-stop lease authority before evaluating a fresh stopped renewal", () => {
+  it("checks stopped grants before replay while fresh renewals retain idempotency", () => {
     const plane = new FakeControlPlane();
     expect(plane.handle("POST", GRANT_PATH, grant()).body).toMatchObject({ generation: 1 });
     plane.stopRun("run-a");
     expect(plane.handle("POST", GRANT_PATH, grant()).body).toMatchObject({
-      allowed: true,
-      generation: 1,
+      allowed: false,
+      denied_by_period: "run_stopped",
     });
     expect(plane.handle("POST", RENEW_PATH, renew()).body).toMatchObject({
       allowed: false,
@@ -147,11 +149,11 @@ describe("FakeControlPlane run control", () => {
   it("freezes a fresh stopped lease directive across clearing its stop and misroute window", () => {
     const plane = new FakeControlPlane();
     plane.handle("POST", GRANT_PATH, grant());
-    plane.stopRun("run-a", { reason: "operator_stop" });
+    plane.stopRun("run-a", { reason: "manual_kill" });
     const window = plane.misrouteStops({ requests: 1 });
     const stopped = plane.handle("POST", RENEW_PATH, renew());
     expect(stopped.body).toMatchObject({
-      run_control: { agent_run_id: "solwyn-test-misrouted-run", reason: "operator_stop" },
+      run_control: { agent_run_id: "solwyn-test-misrouted-run", reason: "manual_kill" },
     });
     plane.clearStop("run-a");
     window.end();
@@ -206,25 +208,28 @@ describe("FakeControlPlane run control", () => {
     expect(renewalPlane.stoppedRuns).toEqual({ "run-a": "manual_kill" });
   });
 
-  it("does not spend a newly active misroute window on grant or frozen renewal replay", () => {
+  it("spends a misroute window on a fresh stopped grant but not frozen renewal replay", () => {
     const plane = new FakeControlPlane();
-    const preStopGrant = plane.handle("POST", GRANT_PATH, grant());
-    plane.stopRun("run-a", { reason: "operator_stop" });
+    plane.handle("POST", GRANT_PATH, grant());
+    plane.stopRun("run-a", { reason: "manual_kill" });
 
     const firstWindow = plane.misrouteStops({ requests: 1 });
-    expect(plane.handle("POST", GRANT_PATH, grant())).toEqual(preStopGrant);
+    expect(plane.handle("POST", GRANT_PATH, grant()).body).toMatchObject({
+      allowed: false,
+      run_control: { agent_run_id: "solwyn-test-misrouted-run" },
+    });
     const firstStopped = plane.handle("POST", RENEW_PATH, renew());
     expect(firstStopped.body).toMatchObject({
-      run_control: { agent_run_id: "solwyn-test-misrouted-run", reason: "operator_stop" },
+      run_control: { agent_run_id: "run-a", reason: "manual_kill" },
     });
 
     const secondWindow = plane.misrouteStops({ requests: 1 });
     expect(plane.handle("POST", RENEW_PATH, renew())).toEqual(firstStopped);
     expect(plane.handle("POST", RENEW_PATH, renew({ generation: 2 })).body).toMatchObject({
-      run_control: { agent_run_id: "solwyn-test-misrouted-run", reason: "operator_stop" },
+      run_control: { agent_run_id: "solwyn-test-misrouted-run", reason: "manual_kill" },
     });
     expect(plane.handle("POST", RENEW_PATH, renew({ generation: 3 })).body).toMatchObject({
-      run_control: { agent_run_id: "run-a", reason: "operator_stop" },
+      run_control: { agent_run_id: "run-a", reason: "manual_kill" },
     });
     firstWindow.end();
     secondWindow.end();
@@ -307,7 +312,7 @@ describe("FakeControlPlane run control", () => {
       await enforcer.checkBudget(
         budgetOptions("b3-renew-run", "00000000-0000-0000-0000-000000000001"),
       );
-      plane.stopRun("b3-renew-run", { reason: "operator_stop" });
+      plane.stopRun("b3-renew-run", { reason: "manual_kill" });
       // Both clocks use milliseconds. At two seconds the jittered 1-second refresh
       // deadline (0.85–1.15s) is due, while the 3-second lease remains live.
       now = 2_000;
@@ -323,7 +328,7 @@ describe("FakeControlPlane run control", () => {
 
       expect(plane.leaseRenewals).toHaveLength(1);
       expect(runTermination("b3-renew-run")).toMatchObject({
-        reason: "operator_stop",
+        reason: "manual_kill",
         source: "server",
       });
       expect(

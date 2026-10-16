@@ -68,7 +68,7 @@ describe("FakeControlPlane receipt projections", () => {
     expect(plane.aggregateReplays.map((entry) => entry.call_id)).toEqual([receipt["call_id"]]);
   });
 
-  it("records scripted rejected aggregate receipts through fetch even without a pricing basis", async () => {
+  it("excludes rejected aggregate receipts from storage until they are accepted", async () => {
     const plane = new FakeControlPlane();
     const rejected = event(1, {
       deny_source: "aggregate_replay",
@@ -80,7 +80,9 @@ describe("FakeControlPlane receipt projections", () => {
     const response = await post(plane, [rejected]);
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({ ingested: 0, rejected: [{ index: 0 }] });
-    expect(plane.denialReceipts.map((entry) => entry.call_id)).toEqual([rejected["call_id"]]);
+    expect(plane.denialReceipts).toEqual([]);
+    expect(plane.aggregateReplays).toEqual([]);
+    await post(plane, [rejected]);
     expect(plane.aggregateReplays.map((entry) => entry.call_id)).toEqual([rejected["call_id"]]);
     window.end();
   });
@@ -99,6 +101,7 @@ describe("FakeControlPlane receipt projections", () => {
     expect(plane.handle("POST", INGEST_PATH, [receipt]).body).toEqual({
       ingested: 0,
       rejected: [],
+      duplicates: [{ index: 0, reason: "legacy_key", call_id: receipt["call_id"] }],
     });
   });
 
@@ -110,7 +113,11 @@ describe("FakeControlPlane receipt projections", () => {
     expect(plane.handle("POST", INGEST_PATH, [valid, invalid]).status).toBe(422);
     expect(plane.ingested).toEqual([]);
     expect(plane.denialReceipts).toEqual([]);
-    expect(plane.handle("POST", INGEST_PATH, [valid]).body).toEqual({ ingested: 1, rejected: [] });
+    expect(plane.handle("POST", INGEST_PATH, [valid]).body).toEqual({
+      ingested: 1,
+      rejected: [],
+      duplicates: [],
+    });
     expect(plane.denialReceipts.map((entry) => entry.call_id)).toEqual([valid["call_id"]]);
   });
 });

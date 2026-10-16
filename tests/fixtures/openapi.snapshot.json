@@ -9,7 +9,7 @@
       "post": {
         "tags": ["budgets"],
         "summary": "Budget Check",
-        "description": "Pre-flight budget check. Creates a reservation if allowed.",
+        "description": "Pre-flight budget check. Creates a reservation if allowed.\n\nAn outage uncounted report riding the body is folded and committed FIRST,\nso the verdict below cannot lose it (see ``services.budget.uncounted_tally``).",
         "operationId": "budget_check_api_v1_budgets_check_post",
         "requestBody": {
           "content": {
@@ -51,13 +51,16 @@
             }
           },
           "422": {
-            "description": "Unknown model or request validation error",
+            "description": "Unknown model, unpriceable media configuration, or request validation error",
             "content": {
               "application/json": {
                 "schema": {
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/UnknownModelError422Response"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UnpriceableMediaError422Response"
                     },
                     {
                       "$ref": "#/components/schemas/HTTPValidationError"
@@ -109,7 +112,7 @@
       "post": {
         "tags": ["budgets"],
         "summary": "Budget Confirm",
-        "description": "Confirm actual cost for the authority that funded one served call.\n\nThe body names EXACTLY ONE funding source (wire-enforced): a\n``reservation_id`` from the legacy per-call check, or the ``lease_id`` the\ncall drew its tokens from. A lease-funded confirm has no reservation to look\nup \u2014 the lease itself is the ownership proof, bound to the caller's project\ninside the settlement \u2014 so it skips the reservation choreography entirely.\n\n``body.provider`` and ``body.is_provider_fallback`` are the *served*\nfailover attribution. They are accepted but **not persisted here** \u2014 the\ndurable served attribution is written via the metadata-ingest path onto\n``cost_events`` (see ``metadata_ingest._store_cost_event``). Confirm only\nsettles the Redis budget counter, so it has nothing to attribute them to.",
+        "description": "Confirm actual cost for the authority that funded one served call.\n\nThe body names EXACTLY ONE funding source (wire-enforced): a\n``reservation_id`` from the legacy per-call check, or the ``lease_id`` the\ncall drew its tokens from. A lease-funded confirm has no reservation to look\nup — the lease itself is the ownership proof, bound to the caller's project\ninside the settlement — so it skips the reservation choreography entirely.\n\n``body.provider`` and ``body.is_provider_fallback`` are the *served*\nfailover attribution. They are accepted but **not persisted here** — the\ndurable served attribution is written via the metadata-ingest path onto\n``cost_events`` (see ``metadata_ingest._store_cost_event``). Confirm only\nsettles the Redis budget counter, so it has nothing to attribute them to.",
         "operationId": "budget_confirm_api_v1_budgets_confirm_post",
         "requestBody": {
           "content": {
@@ -144,13 +147,16 @@
             }
           },
           "422": {
-            "description": "Unknown served model or request validation error",
+            "description": "Unknown served model, unpriceable media, or request validation error",
             "content": {
               "application/json": {
                 "schema": {
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/UnknownModelError422Response"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UnpriceableMediaError422Response"
                     },
                     {
                       "$ref": "#/components/schemas/HTTPValidationError"
@@ -183,7 +189,7 @@
       "post": {
         "tags": ["costs"],
         "summary": "Metadata Ingest",
-        "description": "Batch ingest metadata events from SDK instances (D16).\n\nResolves the project from the authenticated API key, deduplicates,\nand stores events as CostEvent records. Max batch size: 1000 events.\n\nReturns 202 for every well-formed request with per-event dispositions:\nevents the API refuses (unknown model, unknown service tier) appear in\n``rejected`` while accepted events commit \u2014 a rejected event never\ncosts the rest of the batch.",
+        "description": "Batch ingest metadata events from SDK instances (D16).\n\nResolves the project from the authenticated API key, deduplicates,\nand stores events as CostEvent records. Max batch size: 1000 events.\n\nReturns 202 after accepted events have committed, with per-event dispositions.\nTemporary accounting or tag contention/maintenance returns 503 with Retry-After;\nthat batch is unaccepted and must be retried.\n\nIn a 202 response,\nevents the API refuses (unknown model, unknown service tier) appear in\n``rejected`` while accepted events commit — a rejected event never\ncosts the rest of the batch. Events a dedup surface already holds a\ndurable row for appear in ``duplicates``: neither ingested nor rejected,\nso ``len(submitted) == ingested + len(rejected) + len(duplicates)``.",
         "operationId": "metadata_ingest_api_v1_metadata_ingest_post",
         "requestBody": {
           "content": {
@@ -251,6 +257,25 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RateLimitErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Temporary accounting or tag contention/maintenance; batch unaccepted, retry",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until the next request is allowed.",
+                "required": true,
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StringDetailErrorResponse"
                 }
               }
             }
@@ -873,7 +898,7 @@
                 "type": "null"
               }
             ],
-            "description": "Estimated non-text billing quantities for the pending call (image/video/audio/TTS). None for text-only calls; each quantity inside is None when unobservable pre-flight. The media analog of estimated_input_tokens \u2014 the server prices the reservation off it."
+            "description": "Estimated non-text billing quantities for the pending call (image/video/audio/TTS). None for text-only calls; each quantity inside is None when unobservable pre-flight. The media analog of estimated_input_tokens — the server prices the reservation off it."
           },
           "fallback_providers": {
             "items": {
@@ -965,6 +990,22 @@
             ],
             "title": "Price Hints Version",
             "description": "Explicit opt-in to server price hints on the response. Omitted requests keep price_hints null (no statement)."
+          },
+          "uncounted_calls": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Uncounted Calls",
+            "description": "Outage fail-open calls this client admitted on the per-call path since its last successful control-plane contact; advisory, never priced",
+            "default": 0
+          },
+          "uncounted_tokens": {
+            "type": "integer",
+            "maximum": 9223372036854775807,
+            "minimum": 0.0,
+            "title": "Uncounted Tokens",
+            "description": "Tokens consumed by those uncounted calls (provider-reported where the call completed, estimated input otherwise)",
+            "default": 0
           }
         },
         "additionalProperties": false,
@@ -1185,7 +1226,7 @@
         "type": "object",
         "required": ["model", "provider", "call_id", "token_details"],
         "title": "BudgetConfirmRequest",
-        "description": "Post-call budget confirmation sent after an LLM call completes.\n\nTies one call's actual token usage to the authority that funded it so the\nAPI can compute the exact cost via PricingService and settle it.\n\nA call draws on EXACTLY ONE funding source, so exactly one of the two ids\nis set (PJ-2):\n\n* ``reservation_id`` \u2014 the legacy per-call path: the pre-flight check\n  reserved an estimate, and this confirm trues it up.\n* ``lease_id`` \u2014 the run held a budget LEASE and drew the call from the\n  granted tokens, so there is no per-call reservation to settle. The server\n  folds the actual cost into the lease's settled total and moves the\n  enforcement counters only for spend that overshoots the lease's claim.\n\nNaming both would settle the same call against one budget twice; naming\nneither leaves nothing to settle."
+        "description": "Post-call budget confirmation sent after an LLM call completes.\n\nTies one call's actual token usage to the authority that funded it so the\nAPI can compute the exact cost via PricingService and settle it.\n\nA call draws on EXACTLY ONE funding source, so exactly one of the two ids\nis set (PJ-2):\n\n* ``reservation_id`` — the legacy per-call path: the pre-flight check\n  reserved an estimate, and this confirm trues it up.\n* ``lease_id`` — the run held a budget LEASE and drew the call from the\n  granted tokens, so there is no per-call reservation to settle. The server\n  folds the actual cost into the lease's settled total and moves the\n  enforcement counters only for spend that overshoots the lease's claim.\n\nNaming both would settle the same call against one budget twice; naming\nneither leaves nothing to settle."
       },
       "BudgetMode": {
         "type": "string",
@@ -1242,13 +1283,39 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "IngestDuplicate": {
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Index",
+            "description": "Position of the dedup-skipped event in the SUBMITTED batch. Independent of `rejected[].index` — neither lane shifts the other."
+          },
+          "reason": {
+            "type": "string",
+            "enum": ["legacy_key", "call_id"],
+            "title": "Reason",
+            "description": "Which dedup surface hit: `legacy_key` for the (timestamp, sdk_instance_id) uniqueness key, `call_id` for the (project_id, call_id, attempt_index) ledger identity. Attribution is the probe that hit, legacy first — exactly one per event."
+          },
+          "call_id": {
+            "type": "string",
+            "title": "Call Id",
+            "description": "call_id of the dedup-skipped event, echoed so a client can correlate without positional bookkeeping"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["index", "reason", "call_id"],
+        "title": "IngestDuplicate",
+        "description": "Per-event duplicate disposition returned in the 202 ingest body.\n\nA duplicate is neither ingested nor rejected: the API already holds (or is\nstoring, for an intra-batch redelivery) a durable row for this logical\nevent, so nothing was written and nothing is wrong with the event. Before\nthis lane existed the drop was reported only server-side, as a log line and\na counter, which made a colliding batch read as silent data loss.\n\n``index`` is the position in the SUBMITTED batch, exactly like\n``IngestRejection.index``. The two lanes are independent: duplicates do not\nshift rejection indexes and rejections do not shift duplicate ones, so\n``len(submitted) == ingested + len(rejected) + len(duplicates)``."
+      },
       "IngestMetadataEvent": {
         "properties": {
           "model": {
             "type": "string",
             "maxLength": 2048,
             "title": "Model",
-            "description": "LLM model identifier, VERBATIM as the provider reports it. For Bedrock this may be a plain id (amazon.nova-pro-v1:0), a geo-prefixed cross-region inference profile (us.anthropic....), or a full ARN \u2014 the 2048 bound is the AWS Converse modelId contract."
+            "description": "LLM model identifier, VERBATIM as the provider reports it. For Bedrock this may be a plain id (amazon.nova-pro-v1:0), a geo-prefixed cross-region inference profile (us.anthropic....), or a full ARN — the 2048 bound is the AWS Converse modelId contract."
           },
           "provider": {
             "$ref": "#/components/schemas/ProviderName",
@@ -1258,7 +1325,7 @@
             "type": "string",
             "enum": ["text", "image", "audio", "video", "embedding"],
             "title": "Modality",
-            "description": "Call modality. Defaults to 'text' so pre-modality SDKs omit it safely (API-first). The pricing card's unit \u2014 not this label alone \u2014 selects the billing basis; core bills text tokens only until per-modality cards land.",
+            "description": "Call modality. Defaults to 'text' so pre-modality SDKs omit it safely (API-first). The pricing card's unit — not this label alone — selects the billing basis; core bills text tokens only until per-modality cards land.",
             "default": "text"
           },
           "input_tokens": {
@@ -1364,7 +1431,7 @@
               }
             ],
             "title": "Failover Error Class",
-            "description": "type(exc).__name__ ONLY \u2014 never str(exc). Pattern-validated server-side (D7): the privacy allowlist admits this column only because it cannot carry an exception message body."
+            "description": "type(exc).__name__ ONLY — never str(exc). Pattern-validated server-side (D7): the privacy allowlist admits this column only because it cannot carry an exception message body."
           },
           "attempt_index": {
             "type": "integer",
@@ -1378,7 +1445,7 @@
             "maxLength": 36,
             "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
             "title": "Call Id",
-            "description": "uuid per intercepted call; join key for cache-hit spend reconciliation. Always present on the wire \u2014 it is NOT content. max_length=36 (D7) bounds the DB column and the Redis dedup key. Canonical lowercase UUID enforced server-side: the cost_event_ledger treats this as durable spend identity, so an empty or attacker-chosen string must never become a dedup key."
+            "description": "uuid per intercepted call; join key for cache-hit spend reconciliation. Always present on the wire — it is NOT content. max_length=36 (D7) bounds the DB column and the Redis dedup key. Canonical lowercase UUID enforced server-side: the cost_event_ledger treats this as durable spend identity, so an empty or attacker-chosen string must never become a dedup key."
           },
           "possibly_succeeded": {
             "anyOf": [
@@ -1390,7 +1457,7 @@
               }
             ],
             "title": "Possibly Succeeded",
-            "description": "post-send-ambiguous abort flag for reconciliation (wire-only; not persisted \u2014 D1)."
+            "description": "post-send-ambiguous abort flag for reconciliation (wire-only; not persisted — D1)."
           },
           "service_tier": {
             "anyOf": [
@@ -1403,7 +1470,7 @@
               }
             ],
             "title": "Service Tier",
-            "description": "Service tier echoed by the provider response, VERBATIM (bounded plain str, mirroring the SDK \u2014 any provider echo rides telemetry). None when providers omit it. Values outside the known ServiceTier set reject PER EVENT in the ingest service (unknown_service_tier), never the whole batch. Bedrock tiers reprice via multipliers; other providers store it for post-launch tier-based repricing."
+            "description": "Service tier echoed by the provider response, VERBATIM (bounded plain str, mirroring the SDK — any provider echo rides telemetry). None when providers omit it. Values outside the known ServiceTier set reject PER EVENT in the ingest service (unknown_service_tier), never the whole batch. Bedrock tiers reprice via multipliers; other providers store it for post-launch tier-based repricing."
           },
           "sdk_instance_id": {
             "type": "string",
@@ -1454,6 +1521,19 @@
             ],
             "title": "Agent Run Name",
             "description": "Optional human-readable name for the run. When the run is being created (no prior row with this id), defaults to ``agent_run_id``."
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Id",
+            "description": "Budget lease whose claim funded this call's admission, from LeaseGrantResponse; the same id the call's confirm carries. None when the call was funded by a per-call reservation, admitted from the allow cache, admitted fail-open or uncounted, or denied. Server-minted opaque id (lse_...), never content; bounded by LEASE_ID_MAX_LENGTH exactly as BudgetConfirmRequest.lease_id (D7)."
           },
           "provider_region": {
             "anyOf": [
@@ -1587,7 +1667,7 @@
               }
             ],
             "title": "Receipt Pricing Input Tokens",
-            "description": "Original per-call input-token count used only to select the pricing card for a homogeneous aggregate receipt. Requires receipt_aggregate_count. Absent on a COARSE aggregate, whose folded receipts had differing per-call input sizes: the aggregate has no single pricing card and the server prices it unpriced rather than reading a card off the summed total. Denial evidence \u2014 count, run, reason, period, token totals \u2014 survives either way."
+            "description": "Original per-call input-token count used only to select the pricing card for a homogeneous aggregate receipt. Requires receipt_aggregate_count. Absent on a COARSE aggregate, whose folded receipts had differing per-call input sizes: the aggregate has no single pricing card and the server prices it unpriced rather than reading a card off the summed total. Denial evidence — count, run, reason, period, token totals — survives either way."
           }
         },
         "additionalProperties": false,
@@ -1613,7 +1693,7 @@
             "type": "integer",
             "minimum": 0.0,
             "title": "Index",
-            "description": "Position of the rejected event in the SUBMITTED batch \u2014 the SDK correlates without the server echoing events back. Dedup-skipped duplicates are neither ingested nor rejected and do not shift these indexes."
+            "description": "Position of the rejected event in the SUBMITTED batch — the SDK correlates without the server echoing events back. Dedup-skipped duplicates are neither ingested nor rejected and do not shift these indexes; they are reported in `duplicates[]`."
           },
           "code": {
             "$ref": "#/components/schemas/IngestRejectionCode",
@@ -1646,7 +1726,7 @@
           "unsupported_modality"
         ],
         "title": "IngestRejectionCode",
-        "description": "Closed enum of per-event rejection codes.\n\nAlso the label set for ``solwyn_ingest_event_rejected_total{code}`` \u2014\nkeeping it closed keeps that metric's cardinality bounded."
+        "description": "Closed enum of per-event rejection codes.\n\nAlso the label set for ``solwyn_ingest_event_rejected_total{code}`` —\nkeeping it closed keeps that metric's cardinality bounded."
       },
       "IngestResponse": {
         "properties": {
@@ -1662,12 +1742,20 @@
             "type": "array",
             "title": "Rejected",
             "description": "Per-event rejections, indexed by position in the submitted batch"
+          },
+          "duplicates": {
+            "items": {
+              "$ref": "#/components/schemas/IngestDuplicate"
+            },
+            "type": "array",
+            "title": "Duplicates",
+            "description": "Per-event dedup skips, indexed by position in the submitted batch. Neither ingested nor rejected: the API already holds a durable row for the event. Independent of `rejected[].index` — neither lane shifts the other."
           }
         },
         "type": "object",
         "required": ["ingested", "rejected"],
         "title": "IngestResponse",
-        "description": "202 body for metadata ingest: per-event dispositions.\n\nEvery well-formed request gets a 202 \u2014 even all-rejected batches.\nWhole-request errors remain only for a malformed envelope (422), batch\nsize (400), auth (403), and infrastructure faults (5xx)."
+        "description": "202 body for metadata ingest: per-event dispositions.\n\nEvery well-formed request gets a 202 — even all-rejected batches.\nWhole-request errors remain only for a malformed envelope (422), batch\nsize (400), auth (403), and infrastructure faults (5xx).\n\nThe three lanes partition the submitted batch:\n``len(submitted) == ingested + len(rejected) + len(duplicates)``."
       },
       "LeaseErrorDetail": {
         "properties": {
@@ -1717,7 +1805,7 @@
             "type": "string",
             "maxLength": 64,
             "title": "Holder Id",
-            "description": "SDK instance id \u2014 one holder per SDK process"
+            "description": "SDK instance id — one holder per SDK process"
           },
           "model": {
             "type": "string",
@@ -1786,7 +1874,7 @@
           "eligible": {
             "type": "boolean",
             "title": "Eligible",
-            "description": "False \u2192 the run is lease-ineligible; use the legacy per-call path"
+            "description": "False → the run is lease-ineligible; use the legacy per-call path"
           },
           "ineligible_reason": {
             "anyOf": [
@@ -1803,7 +1891,7 @@
           "allowed": {
             "type": "boolean",
             "title": "Allowed",
-            "description": "False \u2192 authoritative HARD DENY verdict for this run"
+            "description": "False → authoritative HARD DENY verdict for this run"
           },
           "denied_by_period": {
             "anyOf": [
@@ -1815,7 +1903,7 @@
               }
             ],
             "title": "Denied By Period",
-            "description": "Which budget period denied \u2014 deny responses only, same literals as the check"
+            "description": "Which budget period denied — deny responses only, same literals as the check"
           },
           "run_control": {
             "anyOf": [
@@ -1896,7 +1984,7 @@
               }
             ],
             "title": "Headroom Share Tokens",
-            "description": "This holder's apportioned share of project headroom \u2014 the outage drawdown bound"
+            "description": "This holder's apportioned share of project headroom — the outage drawdown bound"
           },
           "posture": {
             "anyOf": [
@@ -1918,7 +2006,7 @@
               }
             ],
             "title": "Final Grant",
-            "description": "True \u2192 wind-down; no further grants will be issued"
+            "description": "True → wind-down; no further grants will be issued"
           },
           "project_id": {
             "type": "string",
@@ -1952,7 +2040,7 @@
           "remaining_budget"
         ],
         "title": "LeaseGrantResponse",
-        "description": "Grant and renew response \u2014 one shape, three populations.\n\n* INELIGIBLE (``eligible=False``): the run takes the legacy per-call path;\n  no lease block.\n* DENY (``allowed=False``): an authoritative hard-deny verdict feeding the\n  SDK's existing sticky-deny machinery; no lease block.\n* GRANT: the lease block is present. ``granted_tokens`` may be 0 (an\n  alert_only project past its cap) \u2014 admission then falls to the legacy\n  per-call path for each call without the run becoming ineligible.\n\nThe display snapshot at the bottom is always present so the SDK can log a\nlast-known budget position on any of the three."
+        "description": "Grant and renew response — one shape, three populations.\n\n* INELIGIBLE (``eligible=False``): the run takes the legacy per-call path;\n  no lease block.\n* DENY (``allowed=False``): an authoritative hard-deny verdict feeding the\n  SDK's existing sticky-deny machinery; no lease block.\n* GRANT: the lease block is present. ``granted_tokens`` may be 0 (an\n  alert_only project past its cap) — admission then falls to the legacy\n  per-call path for each call without the run becoming ineligible.\n\nThe display snapshot at the bottom is always present so the SDK can log a\nlast-known budget position on any of the three."
       },
       "LeasePosture": {
         "properties": {
@@ -1964,7 +2052,7 @@
             "type": "string",
             "enum": ["fail_open", "local_enforce"],
             "title": "On Unreachable",
-            "description": "What the holder does when Solwyn is unreachable and the share is exhausted \u2014 echoed from the client's configured fail_open until a server-side setting exists."
+            "description": "What the holder does when Solwyn is unreachable and the share is exhausted — echoed from the client's configured fail_open until a server-side setting exists."
           }
         },
         "additionalProperties": false,
@@ -1989,7 +2077,7 @@
             "type": "integer",
             "minimum": 1.0,
             "title": "Generation",
-            "description": "Generation of the grant the holder operates under \u2014 echoing it acknowledges it"
+            "description": "Generation of the grant the holder operates under — echoing it acknowledges it"
           },
           "spent_tokens": {
             "type": "integer",
@@ -2199,7 +2287,7 @@
               }
             ],
             "title": "Input Characters",
-            "description": "TTS input length \u2014 measured length only, computed inside the firewall"
+            "description": "TTS input length — measured length only, computed inside the firewall"
           },
           "resolution": {
             "anyOf": [
@@ -2237,7 +2325,7 @@
         "additionalProperties": false,
         "type": "object",
         "title": "MediaUsage",
-        "description": "Observable non-text billing quantities, measured inside the SDK firewall.\n\nBilling rule: the SDK sends EVERY observable billing basis it can measure\nfrom the request/response \u2014 WITHOUT ever reading prompt\nor media content \u2014 and the SERVER's pricing-card unit (matched against the\ndataset card's ``PriceVariant`` grid) selects WHICH single quantity prices\nthe call. A quantity is ``None`` when it is unobservable for that call \u2014\nnever zero-as-default \u2014 so an unpriceable call routes to the server's\n``is_unpriced`` lane instead of being billed as zero.\n\nWhy this model exists: OpenAI-compatible/Together image endpoints return\n``usage: null``, so token counts are absent; for those calls these\nrequest-derived quantities are the ONLY billing signal (verified against live\nresponses, 2026-07-10)."
+        "description": "Observable non-text billing quantities, measured inside the SDK firewall.\n\nBilling rule: the SDK sends EVERY observable billing basis it can measure\nfrom the request/response — WITHOUT ever reading prompt\nor media content — and the SERVER's pricing-card unit (matched against the\ndataset card's ``PriceVariant`` grid) selects WHICH single quantity prices\nthe call. A quantity is ``None`` when it is unobservable for that call —\nnever zero-as-default — so an unpriceable call routes to the server's\n``is_unpriced`` lane instead of being billed as zero.\n\nWhy this model exists: OpenAI-compatible/Together image endpoints return\n``usage: null``, so token counts are absent; for those calls these\nrequest-derived quantities are the ONLY billing signal (verified against live\nresponses, 2026-07-10)."
       },
       "ProviderName": {
         "type": "string",
@@ -2263,7 +2351,7 @@
           "openai_compatible"
         ],
         "title": "ProviderName",
-        "description": "Supported LLM provider identifiers.\n\nThe first four are native API dialects (Bedrock's Converse API is its\nown dialect). The rest are OpenAI-compatible providers: they speak the\nChat Completions dialect but are distinct providers for attribution,\npricing, budget enforcement, and circuit breaking. ``OPENAI_COMPATIBLE``\nis the generic catch-all for any unrecognized OpenAI-compatible endpoint\n(custom proxies, new vendors).\n\nWire contract: these values ride MetadataEvent/BudgetCheckRequest/\nBudgetConfirmRequest. The Cloud API must accept every value here BEFORE\nan SDK carrying it is released (API deploys first) \u2014 keep lock-step with\nthe SDK's vendored ``solwyn._types.ProviderName``."
+        "description": "Supported LLM provider identifiers.\n\nThe first four are native API dialects (Bedrock's Converse API is its\nown dialect). The rest are OpenAI-compatible providers: they speak the\nChat Completions dialect but are distinct providers for attribution,\npricing, budget enforcement, and circuit breaking. ``OPENAI_COMPATIBLE``\nis the generic catch-all for any unrecognized OpenAI-compatible endpoint\n(custom proxies, new vendors).\n\nWire contract: these values ride MetadataEvent/BudgetCheckRequest/\nBudgetConfirmRequest. The Cloud API must accept every value here BEFORE\nan SDK carrying it is released (API deploys first) — keep lock-step with\nthe SDK's vendored ``solwyn._types.ProviderName``."
       },
       "RateLimitErrorResponse": {
         "properties": {
@@ -2378,7 +2466,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Cache Creation 5M Tokens",
-            "description": "Anthropic ephemeral_5m_input_tokens \u2014 cache write with 5-minute TTL.",
+            "description": "Anthropic ephemeral_5m_input_tokens — cache write with 5-minute TTL.",
             "default": 0
           },
           "cache_creation_1h_tokens": {
@@ -2386,7 +2474,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Cache Creation 1H Tokens",
-            "description": "Anthropic ephemeral_1h_input_tokens \u2014 cache write with 1-hour TTL.",
+            "description": "Anthropic ephemeral_1h_input_tokens — cache write with 1-hour TTL.",
             "default": 0
           },
           "reasoning_tokens": {
@@ -2402,7 +2490,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Audio Input Tokens",
-            "description": "Audio input tokens (OpenAI)",
+            "description": "Audio input tokens — a SUBSET of input_tokens (mirrors image ⊂ input). OpenAI reports audio_tokens inside prompt_tokens_details / input_token_details; Google reports the AUDIO modality bucket of prompt_token_count. The text side is the remainder, derived server-side; documented, not validator-enforced.",
             "default": 0
           },
           "audio_output_tokens": {
@@ -2410,7 +2498,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Audio Output Tokens",
-            "description": "Audio output tokens (OpenAI)",
+            "description": "Audio output tokens — a SUBSET of output_tokens (mirrors reasoning ⊂ output). OpenAI reports audio_tokens inside completion_tokens_details / output_tokens_details; Google reports the AUDIO modality bucket of candidates_token_count. The text side is the remainder, derived server-side; documented, not validator-enforced.",
             "default": 0
           },
           "image_input_tokens": {
@@ -2418,7 +2506,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Image Input Tokens",
-            "description": "Image input tokens \u2014 a SUBSET of input_tokens (mirrors reasoning \u2282 output). OpenAI Images/Responses report image_tokens inside input_tokens_details; documented, not validator-enforced.",
+            "description": "Image input tokens — a SUBSET of input_tokens (mirrors reasoning ⊂ output). OpenAI Images/Responses report image_tokens inside input_tokens_details; documented, not validator-enforced.",
             "default": 0
           },
           "image_output_tokens": {
@@ -2426,7 +2514,7 @@
             "maximum": 100000000,
             "minimum": 0.0,
             "title": "Image Output Tokens",
-            "description": "Image output tokens \u2014 a SUBSET of output_tokens (mirrors reasoning \u2282 output). Generated-image tokens reported in the output channel; documented, not validator-enforced.",
+            "description": "Image output tokens — a SUBSET of output_tokens (mirrors reasoning ⊂ output). Generated-image tokens reported in the output channel; documented, not validator-enforced.",
             "default": 0
           },
           "accepted_prediction_tokens": {
@@ -2456,14 +2544,14 @@
           "is_estimated": {
             "type": "boolean",
             "title": "Is Estimated",
-            "description": "True when the provider returned no usage data and these counts are SDK-side length-based estimates (explicit degradation marker \u2014 the API can surface estimated costs distinctly). False for provider-reported counts. Wire shape: the SDK OMITS the key when False, so key-absent means provider-reported.",
+            "description": "True when the provider returned no usage data and these counts are SDK-side length-based estimates (explicit degradation marker — the API can surface estimated costs distinctly). False for provider-reported counts. Wire shape: the SDK OMITS the key when False, so key-absent means provider-reported.",
             "default": false
           }
         },
         "additionalProperties": false,
         "type": "object",
         "title": "TokenDetails",
-        "description": "Normalized token usage breakdown for one LLM call.\n\nProvider adapters populate whichever fields their API exposes; the rest\nstay at 0.  The API uses this struct to compute exact costs rather than\ntrusting SDK-side estimates.\n\nNormalization contract: ``input_tokens`` includes uncached input, cached\ninput reads, and cache-creation writes.  PricingService subtracts cached\nbuckets from ``input_tokens`` to derive uncached input, so provider adapters\nmust not send \"uncached only\" input totals.\n\nNesting contract: ``image_input_tokens`` is a SUBSET of ``input_tokens`` and\n``image_output_tokens`` a SUBSET of ``output_tokens`` (probed live 2026-07-10:\nan images.edit response reported input_tokens=222 with image_tokens=194 in\n``input_tokens_details``). These mirror the existing ``reasoning_tokens`` \u2282\n``output_tokens`` relationship \u2014 DOCUMENTED semantics, NOT validator-enforced\n(reasoning is likewise unenforced). The only enforced subset invariant is the\ncache-bucket one below; image tokens deliberately do not participate in it."
+        "description": "Normalized token usage breakdown for one LLM call.\n\nProvider adapters populate whichever fields their API exposes; the rest\nstay at 0.  The API uses this struct to compute exact costs rather than\ntrusting SDK-side estimates.\n\nNormalization contract: ``input_tokens`` includes uncached input, cached\ninput reads, and cache-creation writes.  PricingService subtracts cached\nbuckets from ``input_tokens`` to derive uncached input, so provider adapters\nmust not send \"uncached only\" input totals.\n\nNesting contract: ``image_input_tokens`` and ``audio_input_tokens`` are\nSUBSETS of ``input_tokens``; ``image_output_tokens`` and\n``audio_output_tokens`` are SUBSETS of ``output_tokens`` (probed live\n2026-07-10: an images.edit response reported input_tokens=222 with\nimage_tokens=194 in ``input_tokens_details``; the audio buckets come from\nthe same per-modality sub-objects — OpenAI's\n``prompt_tokens_details.audio_tokens`` / ``completion_tokens_details.audio_tokens``\nand Google's AUDIO ``ModalityTokenCount`` entries). These mirror the existing\n``reasoning_tokens`` ⊂ ``output_tokens`` relationship — DOCUMENTED semantics,\nNOT validator-enforced (reasoning is likewise unenforced). The only enforced\nsubset invariant is the cache-bucket one below; image and audio tokens\ndeliberately do not participate in it.\n\nPricingService derives every text remainder from these subsets\n(``input_tokens − image_input_tokens − audio_input_tokens`` on the uncached\nslice, and the output mirror), so an adapter MUST report the inclusive\nchannel total. Sending an audio count beside a zeroed ``input_tokens`` /\n``output_tokens`` under-bills the call; sending it on top of a text-only\ntotal double-bills it."
       },
       "UnknownModelError422Response": {
         "properties": {
@@ -2503,6 +2591,45 @@
         "required": ["model", "provider", "message"],
         "title": "UnknownModelErrorDetail",
         "description": "Body of a 422 raised when Solwyn has no pricing for the served model."
+      },
+      "UnpriceableMediaError422Response": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/UnpriceableMediaErrorDetail"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["detail"],
+        "title": "UnpriceableMediaError422Response",
+        "description": "OpenAPI envelope for the unpriceable-media 422 response."
+      },
+      "UnpriceableMediaErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "unsupported_modality",
+            "title": "Code",
+            "default": "unsupported_modality"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": ["model", "provider", "message"],
+        "title": "UnpriceableMediaErrorDetail",
+        "description": "Body of a 422 raised when a KNOWN model's CALL media config cannot be priced.\n\nDistinct from ``unknown_model``: the model itself carries a pricing card,\nbut this call's media configuration cannot select a rate from it (both a\nvideo and an audio duration, or selectors matching no variant in a gridded\ncard). The ``code`` is deliberately the SAME word ingest uses for the same\ncondition (``IngestRejectionCode.UNSUPPORTED_MODALITY``), so a client sees\none vocabulary across the telemetry and enforcement surfaces."
       },
       "UntrackedSurfaceAccepted": {
         "properties": {

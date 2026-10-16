@@ -367,6 +367,7 @@ describe("lease request schemas", () => {
         generation: 1,
         spent_tokens: Number.MAX_SAFE_INTEGER,
         model: "m".repeat(2_048),
+        provider: "openai",
         fallback_providers: providers,
         fallback_models: models,
       }).success,
@@ -1328,6 +1329,7 @@ describe("new ingest rejection codes", () => {
       expect(
         validation.IngestResponseSchema.safeParse({
           ingested: 0,
+          duplicates: [],
           rejected: [{ index: 0, code, model: "gpt-4o", message: "rejected" }],
         }).success,
       ).toBe(true);

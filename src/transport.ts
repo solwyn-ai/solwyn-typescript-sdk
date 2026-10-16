@@ -14,8 +14,8 @@
  *   from trusted type identities, never mutable exception properties.
  * - A bounded retry policy (reporter.md: never a retry-forever loop). Retries
  *   default to OFF (`maxRetries: 0`) because callers such as the reporter own
- *   item-level retry/disposition and budget confirm is non-idempotent — a single
- *   transport attempt is the correct default. Retries, when
+ *   item-level idempotency, retry, and disposition — a single transport attempt
+ *   is the correct default. Retries, when
  *   explicitly enabled, apply only to transient conditions (network error,
  *   timeout, 429, 5xx) and are capped.
  *
@@ -40,6 +40,25 @@ export const METADATA_INGEST_PATH = "/api/v1/metadata/ingest";
 
 /** Minimal structural type of the global `fetch`; injectable for tests. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** Endpoint paths extend the configured gateway prefix, including a trailing-slash base. */
+export function joinApiUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}${path}`;
+}
+
+/** Equal jitter keeps exponential retries bounded while spreading concurrent clients. */
+export function retryBackoffDelay(
+  attempts: number,
+  base: number,
+  cap: number,
+  random: () => number = Math.random,
+): number {
+  const bound = Math.min(cap, base * 2 ** Math.min(Math.max(0, attempts - 1), 1023));
+  return bound * (0.5 + 0.5 * Math.max(0, Math.min(1, random())));
+}
+
+/** Rate-limit responses have a separate finite budget from ordinary send failures. */
+export const MAX_RATE_LIMIT_ATTEMPTS = 20;
 
 /** Validate the caller-owned transport seam before any component can start work. */
 export function requireFetchLike(fetch: unknown): asserts fetch is FetchLike | undefined {
@@ -90,17 +109,32 @@ export class TransportError extends Error {
 export class TransportHttpError extends TransportError {
   readonly status: number;
   readonly marker: "read_only_key" | undefined;
+  readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, marker?: "read_only_key") {
+  constructor(status: number, marker?: "read_only_key", retryAfterMs?: number) {
     super(`HTTP ${status}`);
     this.name = "TransportHttpError";
     this.status = status;
     this.marker = marker;
+    this.retryAfterMs = retryAfterMs;
     transportFailures.set(this, {
       label: "TransportHttpError",
       retryable: status === 408 || status === 429 || status >= 500,
     });
   }
+}
+
+/** Parse only retry timing; response text and raw headers never enter diagnostics. */
+function parseRetryAfter(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const trimmed = value.trim();
+  const delay = /^\d+$/.test(trimmed)
+    ? Number(trimmed) * 1000
+    : /[A-Za-z]/.test(trimmed)
+      ? Date.parse(trimmed) - Date.now()
+      : Number.NaN;
+  if (Number.isNaN(delay)) return undefined;
+  return Math.max(0, Math.min(3_600_000, delay));
 }
 
 /** The per-request timeout fired (the `AbortController` aborted the fetch). */
@@ -362,7 +396,7 @@ export class Transport {
     options: RequestOptions,
     consume: ResponseConsumer<T>,
   ): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    const url = joinApiUrl(this.baseUrl, path);
     const payload = JSON.stringify(body);
     const attempts = this.maxRetries + 1;
 
@@ -376,7 +410,13 @@ export class Transport {
         if (isLast || !isRetryableTransportError(error) || options.signal?.aborted) {
           throw error;
         }
-        await sleep(this.retryBaseDelayMs * 2 ** attempt, options.signal);
+        await sleep(
+          Math.max(
+            this.retryBaseDelayMs * 2 ** attempt,
+            error instanceof TransportHttpError ? (error.retryAfterMs ?? 0) : 0,
+          ),
+          options.signal,
+        );
       }
     }
     // Unreachable: the loop either returns or throws.
@@ -448,6 +488,7 @@ export class Transport {
           const failure = new TransportHttpError(
             response.status,
             await sanitizedHttpMarker(response),
+            parseRetryAfter(response.headers.get("Retry-After")),
           );
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.

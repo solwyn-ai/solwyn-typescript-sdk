@@ -49,7 +49,7 @@ function warningThrowingLogger(): Logger {
 function reporter(
   options: ConstructorParameters<typeof MetadataReporter>[2] = {},
 ): MetadataReporter {
-  return new MetadataReporter(API_URL, API_KEY, options);
+  return new MetadataReporter(API_URL, API_KEY, { random: () => 1, ...options });
 }
 
 function metadataEvent(): MetadataEvent {
@@ -86,7 +86,7 @@ function settlementPair(index: number): [BudgetConfirmRequest, MetadataEvent] {
 }
 
 describe("provider breaker report cycles", () => {
-  it("posts exact six-key reports sequentially with one fixed timestamp and 5s timeouts", async () => {
+  it("posts exact six-key reports sequentially with one fixed timestamp and 10s timeouts", async () => {
     const bodies: Array<Record<string, unknown>> = [];
     let active = 0;
     let maxActive = 0;
@@ -113,7 +113,7 @@ describe("provider breaker report cycles", () => {
     instance.observeProjectId(PROJECT_ID);
 
     await instance._startBreakerCycle();
-    const timeoutCalls = setTimeoutSpy.mock.calls.filter((call) => call[1] === 5000).length;
+    const timeoutCalls = setTimeoutSpy.mock.calls.filter((call) => call[1] === 10_000).length;
     setTimeoutSpy.mockRestore();
 
     expect(maxActive).toBe(1);
@@ -255,6 +255,106 @@ describe("provider breaker report cycles", () => {
     expect(instance._breakerReportsDue()).toBe(true);
     await instance._startBreakerCycle();
     expect(instance._breakerReportsDue()).toBe(false);
+  });
+
+  it("keeps an unchanged failed heartbeat due for a backoff retry", async () => {
+    let now = 0;
+    const statuses = [204, 500, 204];
+    const sentAt: number[] = [];
+    const instance = reporter({
+      monotonicClock: () => now,
+      sdkInstanceId: SDK_INSTANCE_ID,
+      breakerSnapshots: () => [["openai", state({ state: "open", failureCount: 3 })]],
+      fetch: async () => {
+        sentAt.push(now);
+        return new Response(null, { status: statuses.shift() });
+      },
+    });
+    instance.observeProjectId(PROJECT_ID);
+    await instance._startBreakerCycle();
+    now = 60_000;
+    await instance._startBreakerCycle();
+    now = 65_000;
+    expect(instance._breakerReportsDue()).toBe(true);
+    await instance._startBreakerCycle();
+    expect(sentAt).toEqual([0, 60_000, 65_000]);
+    expect(instance._breakerReportsDue()).toBe(false);
+  });
+
+  it("uses strictly increasing per-provider timestamps when the wall clock stalls or moves backward", async () => {
+    let wallNow = Date.parse("2026-01-01T00:00:00Z");
+    const timestamps: number[] = [];
+    const instance = reporter({
+      wallClock: () => new Date(wallNow),
+      sdkInstanceId: SDK_INSTANCE_ID,
+      breakerSnapshots: () => [["openai", state()]],
+      fetch: async (_url, init) => {
+        timestamps.push(Date.parse(JSON.parse(String(init?.body)).reported_at));
+        return new Response(null, { status: 204 });
+      },
+    });
+    instance.observeProjectId(PROJECT_ID);
+    await instance._startBreakerCycle(true);
+    await instance._startBreakerCycle(true);
+    wallNow -= 10_000;
+    await instance._startBreakerCycle(true);
+    expect(timestamps[1]).toBeGreaterThan(timestamps[0] as number);
+    expect(timestamps[2]).toBeGreaterThan(timestamps[1] as number);
+  });
+
+  it("honors a breaker report's Retry-After before retrying or forcing another cycle", async () => {
+    let now = 0;
+    let sends = 0;
+    const instance = reporter({
+      monotonicClock: () => now,
+      sdkInstanceId: SDK_INSTANCE_ID,
+      breakerSnapshots: () => [["openai", state()]],
+      fetch: async () => {
+        sends += 1;
+        return new Response(null, { status: 429, headers: { "Retry-After": "60" } });
+      },
+    });
+    instance.observeProjectId(PROJECT_ID);
+    await instance._startBreakerCycle();
+    now = 59_999;
+    expect(instance._breakerReportsDue()).toBe(false);
+    await instance._startBreakerCycle(true);
+    expect(sends).toBe(1);
+    now = 60_000;
+    await instance._startBreakerCycle();
+    expect(sends).toBe(2);
+  });
+
+  it("keeps heartbeat siblings due when a project rate limit interrupts their sends", async () => {
+    let now = 0;
+    const statuses = [204, 204, 429, 204, 204];
+    const sends: Array<[number, string]> = [];
+    const instance = reporter({
+      monotonicClock: () => now,
+      sdkInstanceId: SDK_INSTANCE_ID,
+      breakerSnapshots: () => [
+        ["openai", state()],
+        ["anthropic", state()],
+      ],
+      fetch: async (_url, init) => {
+        sends.push([now, JSON.parse(String(init?.body)).provider]);
+        const status = statuses.shift();
+        return new Response(null, {
+          status,
+          headers: status === 429 ? { "Retry-After": "1" } : {},
+        });
+      },
+    });
+    instance.observeProjectId(PROJECT_ID);
+    await instance._startBreakerCycle();
+    now = 60_000;
+    await instance._startBreakerCycle();
+    now = 61_000;
+    await instance._startBreakerCycle();
+    expect(sends.filter(([time]) => time === 61_000).map(([, provider]) => provider)).toEqual([
+      "openai",
+      "anthropic",
+    ]);
   });
 
   it("isolates supplier, invalid-snapshot, and per-provider send failures", async () => {

@@ -105,7 +105,13 @@ describe("GoogleAdapter.extractUsage — usageMetadata normalization", () => {
   });
 
   it("cached_input_tokens maps from cachedContentTokenCount verbatim", () => {
-    const usage = adapter.extractUsage({ usageMetadata: { cachedContentTokenCount: 800 } });
+    const usage = adapter.extractUsage({
+      usageMetadata: {
+        promptTokenCount: 1000,
+        candidatesTokenCount: 0,
+        cachedContentTokenCount: 800,
+      },
+    });
     expect(usage.cached_input_tokens).toBe(800);
   });
 

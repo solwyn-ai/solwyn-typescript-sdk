@@ -112,8 +112,6 @@ describe("FakeControlPlane checks", () => {
         denied_by_period: null,
         project_id: "proj_fake",
         price_hints: null,
-        failover_directive: null,
-        run_control: null,
       },
       headers: {},
     });
@@ -157,8 +155,6 @@ describe("FakeControlPlane checks", () => {
       denied_by_period: null,
       project_id: "proj_fake",
       price_hints: { openai: 0.25, future: 1.5 },
-      failover_directive: null,
-      run_control: null,
     });
 
     const runV1 = plane.handle(
@@ -193,13 +189,11 @@ describe("FakeControlPlane checks", () => {
         denied_by_period: null,
         project_id: "proj_fake",
         price_hints: null,
-        failover_directive: null,
-        run_control: null,
       }),
     );
   });
 
-  it("returns configured hard and alert-only denials without reservations", async () => {
+  it("returns hard denials and allows alert-only overruns with reservations", async () => {
     const plane = await makePlane({ mode: "hard_deny", budgetLimit: 10, currentUsage: 20 });
     plane.denyNext();
     const hard = plane.handle("POST", "/api/v1/budgets/check", checkBody());
@@ -212,8 +206,6 @@ describe("FakeControlPlane checks", () => {
     expect(hard.body).toHaveProperty("reservation_id", null);
     expect(hard.body).toMatchObject({
       price_hints: null,
-      failover_directive: null,
-      run_control: null,
     });
 
     plane.denyNext();
@@ -234,9 +226,9 @@ describe("FakeControlPlane checks", () => {
     const alert = await makePlane({ mode: "alert_only" });
     alert.denyNext();
     expect(alert.handle("POST", "/api/v1/budgets/check", checkBody()).body).toMatchObject({
-      allowed: false,
+      allowed: true,
       mode: "alert_only",
-      denied_by_period: "monthly",
+      remaining_budget: -1,
     });
   });
 
@@ -263,8 +255,8 @@ describe("FakeControlPlane checks", () => {
     const plane = await makePlane();
     const body = checkBody({ model, agent_run_id: "run-a" });
     expect(plane.handle("POST", "/api/v1/budgets/check", body).body).toMatchObject({
-      allowed: false,
-      denied_by_period: period,
+      allowed: mode === "alert_only",
+      denied_by_period: mode === "alert_only" ? null : period,
       mode,
     });
   });
@@ -379,9 +371,9 @@ describe("FakeControlPlane checks", () => {
       }),
     );
     expect(firstFallback.body).toMatchObject({
-      allowed: false,
+      allowed: true,
       mode: "alert_only",
-      denied_by_period: "monthly",
+      remaining_budget: -1,
     });
 
     const stopped = plane.handle(

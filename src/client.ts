@@ -129,6 +129,7 @@ import {
   retryFitsWithinDeadline,
   type SelectionPolicy,
   sameProviderCandidates,
+  stricterIdempotencyMode,
 } from "./routing";
 import { getCurrentRun } from "./run-context";
 import {
@@ -190,6 +191,31 @@ import { DENY_ELIGIBLE_RULE_ORDER, VelocityMonitor } from "./velocity";
 
 const CUSTOM_INSPECT = Symbol.for("nodejs.util.inspect.custom");
 const EMPTY_VELOCITY_FLAGS: readonly VelocityFlag[] = Object.freeze([]);
+
+/** A finalizer must never capture the client or the frame that constructed its stream. */
+function streamReleaseCallback(
+  breaker: CircuitBreaker,
+  admission: CircuitBreakerAdmission,
+  releaseTermination: (() => void) | undefined,
+  probeTimeoutMs: number,
+): () => void {
+  // Retain the single probe until terminal health is known, but never beyond one
+  // recovery window (at least one second). Expiry consumes the admission neutrally;
+  // its later callbacks cannot credit or reopen a newer probe/episode.
+  let timer = admission.ownsProbe
+    ? setTimeout(() => {
+        timer = undefined;
+        breaker.releaseProbe(admission);
+      }, probeTimeoutMs)
+    : undefined;
+  (timer as { unref?: () => void } | undefined)?.unref?.();
+  return () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    breaker.releaseProbe(admission);
+    releaseTermination?.();
+  };
+}
 
 /** Restore only target-owned Google transport fields, preserving canonical generation settings. */
 function restoreGoogleTargetTransport(
@@ -1103,9 +1129,39 @@ export class SolwynCore {
 
   #initPromise: Promise<InitState> | null = null;
   #closePromise: Promise<void> | null = null;
+  readonly #inFlightCalls = new Set<Promise<void>>();
+  readonly #streamSettlements = new Set<() => void>();
   #failoverTuningSuppressionLogged = false;
 
   constructor(client: unknown, options: SolwynOptions = {}) {
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw new ConfigurationError("options must be an object", { field: "options" });
+    }
+    if (options.model !== undefined && typeof options.model !== "string") {
+      throw new ConfigurationError("model must be a string", { field: "model" });
+    }
+    if (options.fallback !== undefined && !Array.isArray(options.fallback)) {
+      throw new ConfigurationError("fallback must be an array", { field: "fallback" });
+    }
+    if (
+      options.logger !== undefined &&
+      (options.logger === null ||
+        !["debug", "info", "warn", "error"].every(
+          (level) => typeof Reflect.get(Object(options.logger), level) === "function",
+        ))
+    ) {
+      throw new ConfigurationError("logger must expose debug, info, warn, and error methods", {
+        field: "logger",
+      });
+    }
+    if (
+      options.selectionPolicy !== undefined &&
+      (options.selectionPolicy === null || typeof options.selectionPolicy.order !== "function")
+    ) {
+      throw new ConfigurationError("selectionPolicy must expose an order method", {
+        field: "selectionPolicy",
+      });
+    }
     // This synchronous identity gate precedes config/resource construction and every
     // provider override lookup/detection. Inspect only tuple-shaped fallback entries here;
     // malformed unrelated values remain on parseFallbackSpec's established validation path.
@@ -2021,7 +2077,18 @@ export class SolwynCore {
    * provider's response (buffered) or a stream wrapper (streaming) — reshaped back to the
    * caller's dialect on a cross-dialect served hop, identical for a same-dialect one.
    */
-  async interceptedCall(
+  interceptedCall(
+    surface: InterceptSurface,
+    kwargs: Record<string, unknown>,
+    options: InterceptOptions = {},
+    passthroughArgs: readonly unknown[] = [],
+  ): Promise<unknown> {
+    return this.#trackCall(() =>
+      this.#captureInterceptedCall(surface, kwargs, options, passthroughArgs),
+    );
+  }
+
+  async #captureInterceptedCall(
     surface: InterceptSurface,
     kwargs: Record<string, unknown>,
     options: InterceptOptions = {},
@@ -2054,6 +2121,7 @@ export class SolwynCore {
     kwargs: Record<string, unknown>,
     passthroughArgs: readonly unknown[] = [],
   ): DeferredResponseStream {
+    this.#assertOpen();
     const { callerKwargs, perCallTags } = copyKwargsAndExtractTags(kwargs);
     const run = captureCallAttribution(
       perCallTags,
@@ -2073,13 +2141,15 @@ export class SolwynCore {
     this.#ensureInit(this.#surfaceContext.provider ?? undefined).catch(() => {});
     return createDeferredResponseStream({
       start: async () =>
-        (await this.#executeInterceptedCall(
-          "responses",
-          effective,
-          run,
-          callId,
-          { responsesLeaf: "stream", forceStream: true },
-          capturedOptions,
+        (await this.#trackCall(() =>
+          this.#executeInterceptedCall(
+            "responses",
+            effective,
+            run,
+            callId,
+            { responsesLeaf: "stream", forceStream: true },
+            capturedOptions,
+          ),
         )) as ResponseStreamLike,
       onAbortBeforeStart: () => {},
       logger: this.#logger,
@@ -2259,7 +2329,7 @@ export class SolwynCore {
       throw this.#budget.buildDenialError(budget, estimatedInputTokens, run?.agentRunId);
     }
 
-    // Idempotency resolves per call (explicit override wins over the client-level config).
+    // A per-call idempotency statement can only tighten the client-level policy.
     const mode = resolveIdempotencyMode(perCallIdempotent, tuning.idempotency);
     const streamTermination =
       isStreaming && hasRunIdentity(run)
@@ -2290,6 +2360,7 @@ export class SolwynCore {
     kwargs: Record<string, unknown>,
     markers: MediaInternalMarkers = {},
   ): Promise<ResolvedMediaRequest> {
+    this.#assertOpen();
     const { callerKwargs, perCallTags } = copyKwargsAndExtractTags(kwargs);
     const attribution = captureCallAttribution(
       perCallTags,
@@ -2305,7 +2376,19 @@ export class SolwynCore {
    * Primary-only lifecycle for tracked non-chat calls. Media calls deliberately bypass
    * candidate selection, translation, provider/model fallbacks, retries, and streaming.
    */
-  async mediaCall(
+  mediaCall(
+    spec: MediaSurfaceSpec,
+    kwargs: Record<string, unknown>,
+    passthroughArgs: readonly unknown[] = [],
+    resolvedRequest?: ResolvedMediaRequest,
+    markers: MediaInternalMarkers = {},
+  ): Promise<unknown> {
+    return this.#trackCall(() =>
+      this.#executeMediaCall(spec, kwargs, passthroughArgs, resolvedRequest, markers),
+    );
+  }
+
+  async #executeMediaCall(
     spec: MediaSurfaceSpec,
     kwargs: Record<string, unknown>,
     passthroughArgs: readonly unknown[] = [],
@@ -2330,7 +2413,8 @@ export class SolwynCore {
     const resolved =
       resolvedRequest ??
       this.#resolveMediaRequest(primary, directRequest?.callerKwargs ?? {}, run, markers);
-    const merged = resolved.kwargs;
+    const merged = { ...resolved.kwargs };
+    delete merged[PER_CALL_IDEMPOTENT_KEY];
     const model = resolved.model;
     if (primary.adapter.dialect === "google") validateMeteredGoogleOptions(merged);
     const requestMeasurement = spec.measureRequest(merged);
@@ -2695,6 +2779,19 @@ export class SolwynCore {
           // A paid buffered response can fail caller-facing normalization after its usage
           // has settled. It is terminal work, not another provider failure or retry.
           if (ctx.bufferedSettlementComplete) throw error;
+          if (
+            callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect)?.aborted
+          ) {
+            breaker.releaseProbe(admission);
+            const region = safeExtractRegion(
+              () => runtime.adapter.extractRegion(runtime.sdkClient),
+              this.#logger,
+            );
+            this.#reporter.report(
+              this.#buildErrorEvent(ctx, hop, error, nowMs() - hopStarted, true, region),
+            );
+            throw error;
+          }
           lastError = error;
           anyAttemptFailed = true;
           const latencyMs = nowMs() - hopStarted;
@@ -2933,7 +3030,24 @@ export class SolwynCore {
    */
   #applyFailoverTuningDirective(allowed: boolean | null): FailoverTuning {
     if (allowed !== null) {
-      const target = allowed ? this.#requestedFailoverTuning : FAILOVER_TUNING_DEFAULTS;
+      const requested = this.#requestedFailoverTuning;
+      const target = allowed
+        ? requested
+        : {
+            ...FAILOVER_TUNING_DEFAULTS,
+            failover_idempotency: stricterIdempotencyMode(
+              requested.failover_idempotency,
+              FAILOVER_TUNING_DEFAULTS.failover_idempotency,
+            ),
+            same_provider_retries: Math.min(
+              requested.same_provider_retries,
+              FAILOVER_TUNING_DEFAULTS.same_provider_retries,
+            ),
+            failover_total_timeout: Math.min(
+              requested.failover_total_timeout,
+              FAILOVER_TUNING_DEFAULTS.failover_total_timeout,
+            ),
+          };
       const changed =
         this.#config.failover_total_timeout !== target.failover_total_timeout ||
         this.#config.failover_hop_read_timeout !== target.failover_hop_read_timeout ||
@@ -2966,7 +3080,7 @@ export class SolwynCore {
         if (!allowed && !this.#failoverTuningSuppressionLogged) {
           this.#failoverTuningSuppressionLogged = true;
           this.#safeWarn(
-            "Custom failover tuning is unavailable for this plan; SDK defaults applied",
+            "Custom failover tuning is unavailable for this plan; SDK defaults applied while preserving stricter idempotency, retry, and total-timeout limits",
           );
         }
       }
@@ -3286,7 +3400,8 @@ export class SolwynCore {
    * #20). Once established the wrapper is returned and the hop is committed: NEITHER breaker
    * credit nor metadata fires at hop-return; both settle EXACTLY ONCE at stream end
    * (behaviors 25/26). A mid-stream provider error (wrapper already returned) never fails over —
-   * it credits one breaker failure and reports the sole possibly_succeeded event (F9). An
+   * it counts a classified provider failure and reports the sole possibly_succeeded event (F9).
+   * Caller cancellation instead settles observed usage without a provider-health verdict. An
    * internal translation failure instead settles observed usage and releases the admission
    * neutrally while preserving the structural error. A
    * cross-dialect served stream is normalized per-chunk via the translation seam (behavior
@@ -3326,6 +3441,7 @@ export class SolwynCore {
     );
     let cleanupTarget: unknown = rawResponse;
     let terminationHandoff: ProvisionalTerminationHandoff | undefined;
+    let releaseStream: (() => void) | undefined;
     try {
       const rawSource = adapter.unwrapStreamSource(rawResponse);
       cleanupTarget = rawSource;
@@ -3360,6 +3476,7 @@ export class SolwynCore {
         velocityFlags: ctx.velocityFlags,
         funding: ctx.funding,
         primaryDialect: ctx.primaryDialect,
+        callerSignal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
       };
       // Cross-dialect: translate each raw served chunk to the caller's dialect (the
       // accumulator still observes the RAW served chunk, so usage settles against what was
@@ -3386,68 +3503,92 @@ export class SolwynCore {
         ctx.streamTermination === undefined
           ? undefined
           : new ProvisionalTerminationHandoff(ctx.streamTermination.handle);
+      let streamSettled = false;
+      // Close retains only content-blind settlement state, never the provider stream or request.
+      // Consumer-held streams are settled at observed usage without awaiting another chunk.
+      const settleOnClose = (): void => {
+        releaseStream?.();
+        completeStream(accumulator.finalize(), nowMs() - hopStarted);
+      };
+      const completeStream = (tokenDetails: TokenDetails, elapsedMs: number): void => {
+        if (streamSettled) return;
+        streamSettled = true;
+        this.#streamSettlements.delete(settleOnClose);
+        try {
+          let settledTokenDetails = tokenDetails;
+          let usageUnmeasured = tokenDetails.is_estimated;
+          if (settlement.surface === "responses") {
+            if (tokenDetails.input_tokens === 0 && tokenDetails.output_tokens === 0) {
+              settledTokenDetails = buildTokenDetails({
+                input_tokens: settlement.estimatedInputTokens,
+                output_tokens: 0,
+                is_estimated: true,
+              });
+              usageUnmeasured = true;
+            } else if (tokenDetails.is_estimated) {
+              usageUnmeasured = true;
+            }
+          }
+          breaker.recordSuccess(admission);
+          this.#latency.recordLatency(hop.provider, elapsedMs);
+          const serviceTier = safeExtractServiceTier(
+            () => accumulator.getServiceTier(),
+            this.#logger,
+          );
+          const event = this.#buildSuccessEvent(settlement, hop, {
+            tokenDetails: settledTokenDetails,
+            latencyMs: elapsedMs,
+            serviceTier,
+            region,
+          });
+          if (hasSettlementFunding(settlement.funding)) {
+            // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
+            // reportSettlement — the same queue path used by buffered settlement (behavior 26).
+            this.#settlePaidCall(event, {
+              reservationId: settlement.funding.reservationId,
+              leaseId: settlement.funding.leaseId,
+              leaseClaimToken: settlement.funding.leaseClaimToken,
+              model: hop.model,
+              tokenDetails: settledTokenDetails,
+              provider: hop.provider,
+              isProviderFallback: hop.isProviderFallback,
+              callId: settlement.callId,
+              providerRegion: region,
+              serviceTier,
+              ...(settlement.surface === "responses" || usageUnmeasured
+                ? { floorAtReservation: usageUnmeasured }
+                : {}),
+            });
+          } else {
+            this.#reporter.report(event);
+          }
+          if (settlement.funding.leaseId === null) {
+            this.#releaseFunding(settlement.callId, settlement.funding);
+          }
+        } catch (error) {
+          this.#releaseFunding(settlement.callId, settlement.funding);
+          throw error;
+        }
+      };
+      releaseStream = streamReleaseCallback(
+        breaker,
+        admission,
+        terminationHandoff?.abortRelease,
+        Math.max(1, this.#config.circuit_breaker_recovery_timeout) * 1000,
+      );
       const streamOptions: StreamWrapperOptions = {
         stream: source,
         accumulator,
         startTime: hopStarted,
-        onComplete: (tokenDetails, elapsedMs) => {
-          try {
-            let settledTokenDetails = tokenDetails;
-            let usageUnmeasured = tokenDetails.is_estimated;
-            if (settlement.surface === "responses") {
-              if (tokenDetails.input_tokens === 0 && tokenDetails.output_tokens === 0) {
-                settledTokenDetails = buildTokenDetails({
-                  input_tokens: settlement.estimatedInputTokens,
-                  output_tokens: 0,
-                  is_estimated: true,
-                });
-                usageUnmeasured = true;
-              } else if (tokenDetails.is_estimated) {
-                usageUnmeasured = true;
-              }
-            }
-            breaker.recordSuccess(admission);
-            this.#latency.recordLatency(hop.provider, elapsedMs);
-            const serviceTier = safeExtractServiceTier(
-              () => accumulator.getServiceTier(),
-              this.#logger,
-            );
-            const event = this.#buildSuccessEvent(settlement, hop, {
-              tokenDetails: settledTokenDetails,
-              latencyMs: elapsedMs,
-              serviceTier,
-              region,
-            });
-            if (hasSettlementFunding(settlement.funding)) {
-              // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
-              // reportSettlement — the same queue path used by buffered settlement (behavior 26).
-              this.#settlePaidCall(event, {
-                reservationId: settlement.funding.reservationId,
-                leaseId: settlement.funding.leaseId,
-                leaseClaimToken: settlement.funding.leaseClaimToken,
-                model: hop.model,
-                tokenDetails: settledTokenDetails,
-                provider: hop.provider,
-                isProviderFallback: hop.isProviderFallback,
-                callId: settlement.callId,
-                providerRegion: region,
-                serviceTier,
-                ...(settlement.surface === "responses" || usageUnmeasured
-                  ? { floorAtReservation: usageUnmeasured }
-                  : {}),
-              });
-            } else {
-              this.#reporter.report(event);
-            }
-            if (settlement.funding.leaseId === null) {
-              this.#releaseFunding(settlement.callId, settlement.funding);
-            }
-          } catch (error) {
-            this.#releaseFunding(settlement.callId, settlement.funding);
-            throw error;
-          }
-        },
+        onComplete: completeStream,
         onError: (error) => {
+          if (streamSettled) return;
+          if (settlement.callerSignal?.aborted) {
+            breaker.releaseProbe(admission);
+            return completeStream(accumulator.finalize(), nowMs() - hopStarted);
+          }
+          streamSettled = true;
+          this.#streamSettlements.delete(settleOnClose);
           if (translationFailure !== undefined && translationFailure.error === error) {
             translationFailure = undefined;
             // Translation stopped a paid stream after observe(); it is neither a provider
@@ -3497,12 +3638,14 @@ export class SolwynCore {
             return;
           }
           try {
-            this.#recordBreakerFailureDedup(
-              breaker,
-              hop.provider,
-              failedBreakerProviders,
-              admission,
-            );
+            if (classifyException(error) === Disposition.FAIL_FAST) breaker.releaseProbe(admission);
+            else
+              this.#recordBreakerFailureDedup(
+                breaker,
+                hop.provider,
+                failedBreakerProviders,
+                admission,
+              );
             this.#reporter.report(
               this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
             );
@@ -3512,12 +3655,22 @@ export class SolwynCore {
         },
         chunkTranslator,
         logger: this.#logger,
-        abortCheck: terminationHandoff?.abortCheck,
-        abortRelease: terminationHandoff?.abortRelease,
+        abortCheck: () =>
+          this.#closePromise !== null
+            ? new SolwynError("client is closed")
+            : terminationHandoff?.abortCheck(),
+        abortRelease: releaseStream,
       };
       const wrapper =
         ctx.responsesLeaf === "stream"
           ? observeResponseStream(rawResponse, streamOptions, (error) => {
+              if (streamSettled) return;
+              if (settlement.callerSignal?.aborted) {
+                breaker.releaseProbe(admission);
+                return completeStream(accumulator.finalize(), nowMs() - hopStarted);
+              }
+              streamSettled = true;
+              this.#streamSettlements.delete(settleOnClose);
               try {
                 const disposition = classifyException(error);
                 if (disposition === Disposition.FAIL_FAST) breaker.releaseProbe(admission);
@@ -3555,9 +3708,11 @@ export class SolwynCore {
       if (ctx.streamTermination !== undefined) {
         ctx.streamTermination.transferred = true;
       }
+      if (!streamSettled) this.#streamSettlements.add(settleOnClose);
       return result;
     } catch (error) {
       terminationHandoff?.discard();
+      releaseStream?.();
       try {
         if (
           ctx.responsesLeaf === "stream" &&
@@ -3601,6 +3756,8 @@ export class SolwynCore {
     crossProvider: boolean,
     entryDefaultParams: Record<string, unknown>,
   ): Promise<unknown> {
+    merged = { ...merged };
+    delete merged[PER_CALL_IDEMPOTENT_KEY];
     if (crossProvider && runtime.adapter.dialect === "google") {
       const signalOptions = passthroughArgs[0];
       if (
@@ -3864,13 +4021,58 @@ export class SolwynCore {
   close(): Promise<void> {
     // Install the shared promise before cleanup begins. Besides ordinary concurrency, this
     // covers synchronous re-entry from a lifecycle hook or hostile thenable getter.
-    this.#closePromise ??= Promise.resolve().then(() => this.#closeOnce());
+    if (this.#closePromise === null) {
+      const deadline = nowMs() + this.#config.reporter_shutdown_deadline * 1000;
+      this.#closePromise = Promise.resolve().then(() => this.#closeOnce(deadline));
+    }
     return this.#closePromise;
   }
 
-  async #closeOnce(): Promise<void> {
+  #assertOpen(): void {
+    if (this.#closePromise !== null) throw new SolwynError("client is closed");
+  }
+
+  async #trackCall<T>(operation: () => Promise<T>): Promise<T> {
+    this.#assertOpen();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#inFlightCalls.add(pending);
+    try {
+      return await operation();
+    } finally {
+      this.#inFlightCalls.delete(pending);
+      release();
+    }
+  }
+
+  async #closeOnce(deadline: number): Promise<void> {
+    const remaining = Math.max(0, deadline - nowMs());
+    if (this.#inFlightCalls.size > 0 && remaining > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, remaining);
+        void Promise.all(this.#inFlightCalls).then(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    if (this.#inFlightCalls.size > 0) {
+      this.#safeWarn(
+        `client.close_inflight_timeout: ${this.#inFlightCalls.size} calls still active`,
+      );
+    }
+    for (const settle of this.#streamSettlements) {
+      try {
+        settle();
+      } catch {
+        this.#safeWarn("client.close_stream_settlement_failed");
+      }
+    }
+    this.#streamSettlements.clear();
     // Settlement telemetry takes precedence over the best-effort advisory channel.
-    await this.#reporter.close();
+    await this.#reporter.close(Math.max(0, deadline - nowMs()));
     await this.#untrackedSurfaceReporter?.close();
     await this.#budget.close();
 
@@ -3948,7 +4150,9 @@ type EventContext = Pick<DispatchContext, "callId" | "run" | "velocityFlags">;
  * estimates, funding, call identity, surface and the primary dialect, but no request content.
  */
 type StreamSettlementContext = EventContext &
-  Pick<DispatchContext, "surface" | "estimatedInputTokens" | "funding" | "primaryDialect">;
+  Pick<DispatchContext, "surface" | "estimatedInputTokens" | "funding" | "primaryDialect"> & {
+    readonly callerSignal: AbortSignal | undefined;
+  };
 
 interface AdmissionContext {
   readonly callId: string;

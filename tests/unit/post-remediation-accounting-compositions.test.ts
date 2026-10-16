@@ -65,7 +65,7 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
               target: "openai",
               feature: "cross_provider_tool_stream",
             })
-          : new TypeError();
+          : Object.assign(new TypeError(), { status: 503 });
       const fallback = new Anthropic({
         apiKey: "offline",
         maxRetries: 0,
@@ -164,9 +164,11 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
             else await expect(branches[1].next()).rejects.toBe(failure);
           }
           await stream.close();
-          expect(fallbackBreaker.getState().state).toBe(outcome === "stop" ? "closed" : "open");
+          expect(fallbackBreaker.getState().state).toBe(
+            outcome === "stop" ? "closed" : outcome === "error" ? "open" : "half_open",
+          );
           expect(failures.mock.contexts.filter((item) => item === fallbackBreaker)).toHaveLength(
-            outcome === "stop" ? 1 : 2,
+            outcome === "error" ? 2 : 1,
           );
           expect(successes.mock.contexts.filter((item) => item === fallbackBreaker)).toHaveLength(
             outcome === "stop" ? 1 : 0,
@@ -179,7 +181,7 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
       expect(fallbackCalls).toBe(2);
       expect(plane.confirms).toHaveLength(outcome === "stop" ? 1 : 0);
       expect(plane.leaseSurrenders).toHaveLength(1);
-      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(outcome === "stop" ? 128 : 0);
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(outcome === "stop" ? 50 : 0);
       if (outcome === "stop") expect(signal?.aborted).toBe(true);
     });
   }
@@ -342,7 +344,6 @@ describe("PR-A1: native translated error authority", () => {
       const successes = vi.spyOn(CircuitBreaker.prototype, "recordSuccess");
       const releases = vi.spyOn(CircuitBreaker.prototype, "releaseProbe");
       const admissions = vi.spyOn(CircuitBreaker.prototype, "admit");
-      const check = vi.spyOn(BudgetEnforcer.prototype, "checkBudget");
       const marker = crypto.randomUUID();
       let targetCalls = 0;
       vi.stubGlobal("fetch", async () => {
@@ -384,7 +385,6 @@ describe("PR-A1: native translated error authority", () => {
           fallback: [[new GoogleGenAI({ apiKey: "offline" }), "gemini-2.5-flash"]],
         },
       );
-      let reservationFloor = 0;
       try {
         await run("paid-stream-authority", async () => {
           const request = () =>
@@ -407,10 +407,6 @@ describe("PR-A1: native translated error authority", () => {
           );
           expect(targetAdmission?.type).toBe("return");
           expect(targetBreaker.getState().state).toBe("half_open");
-          const requestAdmission = check.mock.calls.at(-1)?.[0];
-          reservationFloor =
-            (requestAdmission?.estimatedInputTokens ?? 0) +
-            (requestAdmission?.estimatedOutputBound ?? 0);
           if (outcome === "stop")
             markTerminated(currentRun()?.agentRunId ?? "", {
               source: "server",
@@ -444,13 +440,11 @@ describe("PR-A1: native translated error authority", () => {
       expect(targetCalls).toBe(2);
       expect(plane.confirms).toHaveLength(1);
       expect(plane.confirms[0]?.token_details).toMatchObject({
-        input_tokens: outcome === "stop" ? 0 : 30,
-        output_tokens: outcome === "stop" ? 0 : 20,
+        input_tokens: 30,
+        output_tokens: 20,
       });
       expect(plane.leaseSurrenders).toHaveLength(1);
-      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(
-        outcome === "stop" ? reservationFloor : 50,
-      );
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(50);
     });
   }
 });

@@ -28,7 +28,7 @@
  * allowlist and must stay that way.
  */
 
-import { ConfigurationError, UnsupportedSurfaceError } from "../errors";
+import { ConfigurationError, markCallerAbort, UnsupportedSurfaceError } from "../errors";
 import type { TokenDetails } from "../token-details";
 import { buildReportedTokenDetails, isUsageCount } from "../token-details";
 import { detectGoogleClient } from "./detection";
@@ -269,7 +269,7 @@ function googleDispatch(
         isObject(result) &&
         typeof Reflect.get(result, Symbol.asyncIterator) === "function"
       ) {
-        return deadlineStream(result as unknown as AsyncIterable<unknown>, dispose);
+        return deadlineStream(result as unknown as AsyncIterable<unknown>, dispose, caller);
       }
       dispose();
       return result;
@@ -288,13 +288,13 @@ function googleDispatch(
           .then(finish)
           .catch((error: unknown) => {
             dispose();
-            throw error;
+            throw markCallerAbort(error, caller);
           });
       }
       return finish(result);
     } catch (error) {
       dispose();
-      throw error;
+      throw markCallerAbort(error, caller);
     }
   };
 }
@@ -303,6 +303,7 @@ function googleDispatch(
 function deadlineStream(
   source: AsyncIterable<unknown>,
   dispose: () => void,
+  caller: AbortSignal | undefined,
 ): AsyncIterableIterator<unknown> {
   const iterator = source[Symbol.asyncIterator]();
   let closed = false;
@@ -322,7 +323,7 @@ function deadlineStream(
       } catch (error) {
         closed = true;
         dispose();
-        throw error;
+        throw markCallerAbort(error, caller);
       }
     },
     async return(value?: unknown) {

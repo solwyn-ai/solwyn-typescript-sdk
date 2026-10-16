@@ -1433,11 +1433,12 @@ describe("disposition → breaker verdict (#22)", () => {
 });
 
 describe("idempotency-mode resolution (#23)", () => {
-  it("an explicit per-call boolean override wins over the client-level config", () => {
-    // Per-call true selects always; false selects safe.
-    expect(resolveIdempotencyMode(true, "safe")).toBe("always");
+  it("a per-call boolean can only tighten the client-level config", () => {
+    expect(resolveIdempotencyMode(true, "safe")).toBe("safe");
     expect(resolveIdempotencyMode(false, "always")).toBe("safe");
-    expect(resolveIdempotencyMode(true, "never")).toBe("always");
+    expect(resolveIdempotencyMode(true, "never")).toBe("never");
+    expect(resolveIdempotencyMode(false, "never")).toBe("never");
+    expect(resolveIdempotencyMode(true, "always")).toBe("always");
   });
 
   it("absent an override, the client-level setting applies (default safe)", () => {

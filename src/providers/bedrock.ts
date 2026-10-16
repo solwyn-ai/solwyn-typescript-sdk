@@ -29,7 +29,7 @@
  * `contentBlockDelta.delta.text`. It remains outside the privacy-firewall allowlist.
  */
 
-import { ConfigurationError } from "../errors";
+import { ConfigurationError, markCallerAbort } from "../errors";
 import type { Logger } from "../logging";
 import { consoleLogger } from "../logging";
 import type { TokenDetails } from "../token-details";
@@ -121,7 +121,8 @@ function resolveConverseCommand(
   const modelOverridden = typeof servedModel === "string" && servedModel !== originalModelId;
   const defaults = isObject(entryDefaults) ? entryDefaults : {};
   const hasDefaults = Object.keys(defaults).length > 0;
-  const hasReservedTags = Object.hasOwn(originalInput, "solwyn_tags");
+  const hasReservedTags =
+    Object.hasOwn(originalInput, "solwyn_tags") || Object.hasOwn(originalInput, "solwynIdempotent");
   const capChanged = !Object.is(
     getProp(getProp(originalInput, "inferenceConfig"), "maxTokens"),
     getProp(getProp(sanitizedInput, "inferenceConfig"), "maxTokens"),
@@ -134,6 +135,7 @@ function resolveConverseCommand(
   rebuiltInput["modelId"] = typeof servedModel === "string" ? servedModel : originalModelId;
   delete rebuiltInput["stream"];
   delete rebuiltInput["solwyn_tags"];
+  delete rebuiltInput["solwynIdempotent"];
   const ctor = commandConstructor(command);
   if (ctor !== null && ctor !== Object) {
     let stateDescriptors: PropertyDescriptorMap;
@@ -502,14 +504,22 @@ export class BedrockAdapter implements ProviderAdapter {
     }
     const fn = send as DispatchMethod;
     const dispatchCommand = resolveConverseCommand(command, kwargs, options.entryDefaultParams);
-    return (...passthroughArgs) =>
-      fn.call(
-        client,
-        dispatchCommand,
-        ...mergeProviderRequestOptions(passthroughArgs, {
-          requestTimeout: providerTimeoutMilliseconds(options.timeout),
-        }),
-      );
+    return (...passthroughArgs) => {
+      const requestOptions = mergeProviderRequestOptions(passthroughArgs, {
+        requestTimeout: providerTimeoutMilliseconds(options.timeout),
+      });
+      const caller = getProp(requestOptions[0], "abortSignal") as AbortSignal | undefined;
+      try {
+        const result = fn.call(client, dispatchCommand, ...requestOptions);
+        return isObject(result) && typeof result["then"] === "function"
+          ? Promise.resolve(result).catch((error: unknown) => {
+              throw markCallerAbort(error, caller);
+            })
+          : result;
+      } catch (error) {
+        throw markCallerAbort(error, caller);
+      }
+    };
   }
 
   /**

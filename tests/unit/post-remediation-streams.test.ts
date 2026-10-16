@@ -144,7 +144,7 @@ describe("post-remediation consuming stream helpers", () => {
     }
     await f.stream.close();
     expect(f.pulled).toHaveBeenCalledTimes(1);
-    expect(f.observed).not.toHaveBeenCalled();
+    expect(f.observed).toHaveBeenCalledExactlyOnceWith(0);
     expect(f.complete).toHaveBeenCalledTimes(1);
     expect(f.error).not.toHaveBeenCalled();
     expect(f.release).toHaveBeenCalledTimes(1);

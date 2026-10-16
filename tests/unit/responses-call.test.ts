@@ -1256,13 +1256,13 @@ describe("Responses active-stream run control", () => {
     expect(events).toHaveLength(3);
     expect(confirms).toHaveLength(3);
     expect(events.map((event) => [event["input_tokens"], event["output_tokens"]])).toEqual([
-      [4, 2],
-      [5, 3],
+      [900, 900],
+      [900, 900],
       [6, 4],
     ]);
     expect(confirms.map((confirm) => confirm["token_details"])).toEqual([
-      expect.objectContaining({ input_tokens: 4, output_tokens: 2 }),
-      expect.objectContaining({ input_tokens: 5, output_tokens: 3 }),
+      expect.objectContaining({ input_tokens: 900, output_tokens: 900 }),
+      expect.objectContaining({ input_tokens: 900, output_tokens: 900 }),
       expect.objectContaining({ input_tokens: 6, output_tokens: 4 }),
     ]);
     expect(confirms.map((confirm) => confirm["reservation_id"])).toEqual([

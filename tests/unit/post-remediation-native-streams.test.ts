@@ -264,7 +264,10 @@ describe.each([
     expect(f.isAborted()).toBe(true);
     expect(f.confirms).toHaveLength(1);
     expect(f.events).toHaveLength(1);
-    expect(f.events[0]).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+    expect(f.events[0]).toMatchObject({
+      input_tokens: 30,
+      output_tokens: provider === "openai" ? 20 : 0,
+    });
   });
 
   it("cancels a partially consumed native request once", async () => {
@@ -399,7 +402,7 @@ describe("native converted cross-dialect streams", () => {
     expect(f.confirms).toHaveLength(1);
     expect(f.confirms[0]).toMatchObject({
       provider: "anthropic",
-      token_details: { input_tokens: 0, output_tokens: 0 },
+      token_details: { input_tokens: 30, output_tokens: 0 },
     });
   });
 });

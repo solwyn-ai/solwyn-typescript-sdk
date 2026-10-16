@@ -158,7 +158,11 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
       await sdk.close();
       expect(confirms).toHaveLength(1);
       expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({ status: "success", input_tokens: 0, output_tokens: 0 });
+      expect(events[0]).toMatchObject({
+        status: "success",
+        input_tokens: firstBoundary ? 0 : 18,
+        output_tokens: firstBoundary ? 0 : 7,
+      });
       expect([...active.values()].reduce((count, listeners) => count + listeners.size, 0)).toBe(0);
       expect(native?.controller.signal.aborted).toBe(true);
     } finally {

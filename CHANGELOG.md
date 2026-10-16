@@ -11,6 +11,21 @@ corresponding release notes before users upgrade.
 
 ### Changed
 
+- **Breaking: closed clients reject intercepted calls.** Once `close()` begins, chat,
+  Responses, media, and Bedrock calls reject with `SolwynError("client is closed")` before
+  admission or provider dispatch. Buffered calls and stream setup already in flight drain
+  within `reporterShutdownDeadline`, sharing that deadline with settlement delivery. Open
+  streams settle once from usage observed so far without waiting for the consumer; later
+  chunks are withheld at the next provider-chunk boundary. Finish or cancel streams before
+  closing the client to include terminal usage. Calls that outlast the drain deadline may
+  finish after reporting closes, and produce a shutdown warning.
+- **Conservative failover limits.** When a plan suppresses custom failover tuning, the SDK
+  preserves the stricter requested idempotency policy, smaller total failover window, and
+  lower retry count instead of loosening them to defaults.
+- **Per-call idempotency only tightens policy.** `solwynIdempotent: false` limits a call to
+  `"safe"` failover while preserving a configured `"never"`; `true` preserves the configured
+  policy. The option is stripped from every intercepted request, including media and native
+  Bedrock commands, without mutating caller-owned params.
 - **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
   at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
   by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
@@ -58,6 +73,24 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
+- **Caller cancellation preserves provider health and observed usage.** Buffered and stream
+  setup aborts never fail over or count as provider failures. Mid-stream cancellation settles
+  observed usage once, using the reservation floor when usage is estimated, including Google
+  reader errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts
+  remain provider failures. Other stream errors now follow the exception classifier, so
+  request errors release recovery probes without a health penalty.
+- **Unread recovery streams release probe ownership.** A half-open streaming probe is held for
+  at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second minimum. Expiry
+  or finalization releases the probe neutrally; stale outcomes cannot affect later probes.
+  Terminal stream health still decides recovery when it arrives within that bound.
+- **Run stops retain usage from the pulled chunk.** Stream accumulators observe usage before
+  checking a latched stop, including terminal usage events on native Responses helpers.
+- **Consumer stream throws settle observed usage.** Iterator `throw()` now follows the same
+  settlement and cleanup path as early return, forwards the consumer error to the underlying
+  iterator where supported, and rethrows it without counting a provider failure.
+- **Constructor shape errors are typed and synchronous.** Invalid options objects, fallback
+  lists, model values, loggers, and selection policies raise `ConfigurationError` before
+  reporters or budget resources start.
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
   reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
   standalone confirmations and of settlements, then sends the metadata batches that were queued

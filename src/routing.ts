@@ -29,6 +29,7 @@
  */
 
 import { z } from "zod";
+import { isCallerAbort } from "./errors";
 import type { CircuitState } from "./types";
 import { ProviderNameSchema } from "./validation";
 
@@ -491,6 +492,7 @@ function classifyApiConnectionCause(root: unknown): Disposition {
  */
 export function classifyException(exc: unknown): Disposition {
   try {
+    if (isCallerAbort(exc)) return Disposition.FAIL_FAST;
     return classifyInspectableException(exc);
   } catch {
     // Error decoration is caller/provider controlled. Inspection must never replace
@@ -799,21 +801,21 @@ export const IDEMPOTENCY_MODES = ["safe", "never", "always"] as const;
 export type IdempotencyMode = (typeof IDEMPOTENCY_MODES)[number];
 
 /**
- * Resolve the effective idempotency mode for one call (#23): an explicit per-call boolean
- * override wins over the client-level config — `true` → `"always"`, `false` → `"safe"`;
- * absent an override, the client-level `configMode` applies.
+ * Resolve one call's idempotency limit. A per-call boolean may tighten the client's
+ * policy (`false` requests `"safe"`) but never authorize a looser cross-provider policy.
  */
 export function resolveIdempotencyMode(
   perCallOverride: boolean | undefined,
   configMode: IdempotencyMode,
 ): IdempotencyMode {
-  if (perCallOverride === true) {
-    return "always";
-  }
-  if (perCallOverride === false) {
-    return "safe";
-  }
-  return configMode;
+  return stricterIdempotencyMode(configMode, perCallOverride === false ? "safe" : "always");
+}
+
+/** Conservative intersection for caller limits and server-governed defaults. */
+export function stricterIdempotencyMode(a: IdempotencyMode, b: IdempotencyMode): IdempotencyMode {
+  if (a === "never" || b === "never") return "never";
+  if (a === "safe" || b === "safe") return "safe";
+  return "always";
 }
 
 /**

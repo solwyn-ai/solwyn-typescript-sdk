@@ -14,7 +14,7 @@
 import type OpenAI from "openai";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { SolwynCore } from "../../src/client";
-import { ConfigurationError, SolwynError, UntrackedSpendSurfaceError } from "../../src/errors";
+import { ConfigurationError, UntrackedSpendSurfaceError } from "../../src/errors";
 import { coverage, Solwyn } from "../../src/index";
 import type { Logger } from "../../src/logging";
 import { currentRun, run } from "../../src/node";
@@ -161,7 +161,9 @@ describe("proxies — passthrough", () => {
     const second = Reflect.get(target, property);
     expect(second).not.toBe(first);
     expect(second()).toBe(raw);
-    expect(Object.getOwnPropertyDescriptor(target, property)?.value).toBe(second);
+    const reflected = Object.getOwnPropertyDescriptor(target, property)?.value;
+    expect(reflected()).toBe(raw);
+    expect(Object.getOwnPropertyDescriptor(target, property)?.value).toBe(reflected);
     const thirdRaw = function (this: unknown): unknown {
       return this;
     };
@@ -175,6 +177,9 @@ describe("proxies — passthrough", () => {
     const third = Reflect.get(target, property);
     expect(third).not.toBe(second);
     expect(third()).toBe(raw);
+    const reflectedThird = Object.getOwnPropertyDescriptor(target, property)?.value;
+    expect(reflectedThird).not.toBe(reflected);
+    expect(reflectedThird()).toBe(raw);
     await wrapped.close();
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -1256,7 +1261,7 @@ describe("proxies — specialized namespace mutation", () => {
       }
     });
 
-    it("preserves fixed inert descriptors but refuses active accessors without reading them", async () => {
+    it("preserves fixed inert and active descriptors without reading accessors", async () => {
       const fields = Object.defineProperties(
         {},
         {
@@ -1286,7 +1291,9 @@ describe("proxies — specialized namespace mutation", () => {
           Object.getOwnPropertyDescriptor(target, "inert"),
         );
         for (const property of ["getter", "setter"]) {
-          expect(() => Object.getOwnPropertyDescriptor(namespace, property)).toThrow(SolwynError);
+          expect(Object.getOwnPropertyDescriptor(namespace, property)).toEqual(
+            Object.getOwnPropertyDescriptor(target, property),
+          );
         }
         expect(reads).not.toHaveBeenCalled();
         expect(logger.warnings).toEqual([]);
@@ -1467,7 +1474,11 @@ describe("proxies — specialized namespace mutation", () => {
         expect(active?.get).toBeTypeOf("function");
         expect(active?.set).toBeTypeOf("function");
       } else {
-        expect(() => Object.getOwnPropertyDescriptor(namespace, "active")).toThrow(SolwynError);
+        expect(Object.getOwnPropertyDescriptor(namespace, "active")).toMatchObject({
+          configurable: false,
+          get: expect.any(Function),
+          set: expect.any(Function),
+        });
       }
       expect(reads).not.toHaveBeenCalled();
       expect(logger.warnings).toEqual([]);
@@ -2107,17 +2118,19 @@ describe("proxies — Google models interception", () => {
           descriptor && "value" in descriptor
             ? descriptor.value
             : descriptor?.get?.call(wrapped.models);
-        expect(reflected).toBe(direct);
+        if (shape === "getter") expect(reflected).toBe(direct);
+        else expect(reflected).toBe(Object.getOwnPropertyDescriptor(wrapped.models, method)?.value);
         expect(Reflect.get(wrapped.models, method)).toBe(direct);
         expect(calls).toEqual([]);
         if (typeof direct !== "function") {
           throw new TypeError("Expected a callable optional method interceptor");
         }
         await expect(direct(kwargs, options)).resolves.toBe(result);
+        await expect(reflected(kwargs, options)).resolves.toBe(result);
       } finally {
         await wrapped.close();
       }
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       expect(calls[0]).toHaveLength(2);
       expect(calls[0]?.[0]).toMatchObject(kwargs);
       // Admission snapshots native request options before awaiting control-plane work.
@@ -2126,7 +2139,7 @@ describe("proxies — Google models interception", () => {
       expect(kwargs.config).toEqual({ durationSeconds: 2, numberOfImages: 1 });
       expect(checks).toHaveLength(1);
       expect(checks[0]).toMatchObject({ provider: "google", model });
-      expect(ingested).toHaveLength(1);
+      expect(ingested).toHaveLength(2);
       expect(ingested[0]).toMatchObject({ provider: "google", modality, model });
       expect(logger.warnings).toHaveLength(shape === "getter" && posture === "warn" ? 1 : 0);
     });

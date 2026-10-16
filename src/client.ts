@@ -1098,6 +1098,7 @@ export class SolwynCore {
   readonly #velocityMode: "off" | "warn" | "deny";
   #surfaceRuntimes: readonly SurfaceRuntimeDescriptor[];
   #surfaceContext: SurfaceContext;
+  #surfaceRuntimesCurrent = false;
   readonly #surfaceGuards = new SurfaceNamespaceGuardCache();
   readonly #untrackedSurfaceReporter: UntrackedSurfaceReporter | null;
 
@@ -1252,9 +1253,9 @@ export class SolwynCore {
 
   /** Detached structural inputs used to register the public wrapper with `coverage()`. */
   surfaceCoverageSource(): CoverageSource {
-    this.#refreshSurfaceRuntimesBeforeInit();
+    this.#refreshSurfaceRuntimesBeforeInit(true);
     if (!isSurfaceObject(this.#client)) {
-      throw new TypeError("invalid coverage source");
+      throw new ConfigurationError("invalid coverage source", { field: "client" });
     }
     return {
       rawClient: this.#client,
@@ -1344,6 +1345,7 @@ export class SolwynCore {
         const property = surface.slice(surface.lastIndexOf(".") + 1);
         return this.resolveSurfaceRead(target, property, surface, "raw", execute);
       },
+      () => this.invalidateSurfaceRuntimes(),
     ) as T;
   }
 
@@ -1377,6 +1379,7 @@ export class SolwynCore {
   ): unknown {
     this.#refreshSurfaceRuntimesBeforeInit();
     if (property.startsWith("_")) return execute();
+    if (property === "toJSON" && !Reflect.has(target, property)) return undefined;
     const surface = validateSurfacePath(path);
     const rule = resolveSurfaceRule({ context: this.#surfaceContext, path: surface, source });
     const provisional = provisionalSurfaceDecision(surface, rule);
@@ -1438,6 +1441,28 @@ export class SolwynCore {
       const value = execute();
       const actual = observeEvaluatedProperty(surface, observation.descriptorCategory, value);
       if (rule?.acceptsShape(actual)) return interceptedMethod();
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+    }
+    if (
+      rule === undefined &&
+      decision.kind === "unknown" &&
+      observation.descriptorCategory === "field" &&
+      (observation.returnShape === "resource" || observation.returnShape === "mapping")
+    ) {
+      const value = execute();
+      const actual = observeEvaluatedProperty(surface, observation.descriptorCategory, value);
+      if (
+        isSurfaceObject(value) &&
+        (actual.returnShape === "resource" || actual.returnShape === "mapping")
+      ) {
+        const guarded = this.#guardSurfaceValue(value, surface);
+        if (this.#config.on_unmetered !== "raise") {
+          this.#surfaceGuards.observeTerminal(guarded, () => {
+            this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+          });
+        }
+        return guarded;
+      }
       return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
     }
     this.#throwSurfaceDecision(decision);
@@ -1710,7 +1735,7 @@ export class SolwynCore {
   /** Lazily build (and memoize) the `[primary, ...fallbacks]` runtime chain. */
   #ensureInit(issuanceProvider?: string): Promise<InitState> {
     if (this.#initPromise === null) {
-      this.#refreshSurfaceRuntimesBeforeInit();
+      this.#refreshSurfaceRuntimesBeforeInit(true);
       this.#initPromise = this.#buildInit(issuanceProvider);
     }
     return this.#initPromise;
@@ -1722,8 +1747,12 @@ export class SolwynCore {
    * provider before initialization; the SDK family/dialect must remain stable because the
    * public proxy topology was chosen at construction.
    */
-  #refreshSurfaceRuntimesBeforeInit(): void {
-    if (this.#initPromise !== null) return;
+  invalidateSurfaceRuntimes(): void {
+    this.#surfaceRuntimesCurrent = false;
+  }
+
+  #refreshSurfaceRuntimesBeforeInit(force = false): void {
+    if (this.#initPromise !== null || (this.#surfaceRuntimesCurrent && !force)) return;
     let next: readonly SurfaceRuntimeDescriptor[];
     try {
       next = buildSurfaceRuntimeDescriptors(
@@ -1767,10 +1796,14 @@ export class SolwynCore {
           runtime.model === current.model
         );
       });
-    if (unchanged) return;
+    if (unchanged) {
+      this.#surfaceRuntimesCurrent = true;
+      return;
+    }
     this.#validateSurfaceAcknowledgments(nextPrimary.context);
     this.#surfaceRuntimes = next;
     this.#surfaceContext = nextPrimary.context;
+    this.#surfaceRuntimesCurrent = true;
   }
 
   async #buildInit(issuanceProvider?: string): Promise<InitState> {

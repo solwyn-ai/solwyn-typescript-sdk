@@ -20,6 +20,8 @@ export default defineConfig({
   clean: true,
   target: "es2022",
   platform: "neutral",
+  removeNodeProtocol: false,
+  external: ["node:async_hooks"],
   treeshake: true,
   // Code-split the ESM build so the analyzable literal `import("./openai")` in
   // src/providers/index.ts becomes a real, lazily-fetched chunk (dist/openai-*.js)

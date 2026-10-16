@@ -153,7 +153,8 @@ function partTextLength(part: unknown): number {
  *   no `type` key required).
  * - `system`: a string (Anthropic — add its length) OR a list of `{text}` blocks
  *   (Bedrock `SystemContentBlock` list — sum each `text`, skip non-text blocks).
- * - `contents` (Google): a string, or a list of strings and/or `{text}` dicts.
+ * - `contents` and `config.systemInstruction` (Google): strings, text parts, or
+ *   Content objects containing `parts`.
  *
  * Missing/empty kwargs, or kwargs with none of these keys, returns 0. Result is
  * always a non-negative integer. Content in, integer out — never the text itself.
@@ -182,21 +183,8 @@ export function estimateContentLength(kwargs: Record<string, unknown>): number {
     total += sumTextBlockList(system);
   }
 
-  const contents = kwargs["contents"];
-  if (typeof contents === "string") {
-    total += contents.length;
-  } else if (Array.isArray(contents)) {
-    for (const item of contents) {
-      if (typeof item === "string") {
-        total += item.length;
-      } else if (isRecord(item)) {
-        const text = item["text"];
-        if (typeof text === "string") {
-          total += text.length;
-        }
-      }
-    }
-  }
+  total += googleContentLength(getProp(kwargs, "contents"));
+  total += googleContentLength(getProp(getProp(kwargs, "config"), "systemInstruction"));
 
   return total;
 }
@@ -302,46 +290,37 @@ export function estimateGoogleEmbeddingInputTokens(
   kwargs: Record<string, unknown>,
   provider: string,
 ): number {
-  let characters = 0;
+  const characters = googleContentLength(getProp(kwargs, "contents"));
+  return characters === 0 ? 0 : estimateTokensFromLength(characters, provider);
+}
 
+/** Count Google's Content/Part unions without joining or retaining their text. */
+function googleContentLength(value: unknown): number {
+  let characters = 0;
   const countContent = (content: unknown): void => {
     if (typeof content === "string") {
       characters += content.length;
       return;
     }
-    if (content === null || typeof content !== "object" || Array.isArray(content)) {
-      return;
-    }
     const parts = getProp(content, "parts");
     if (!Array.isArray(parts)) {
-      const text = getProp(content, "text");
-      if (typeof text === "string") {
-        characters += text.length;
-      }
+      characters += stringLength(getProp(content, "text"));
       return;
     }
     for (const part of parts) {
-      const text = getProp(part, "text");
-      if (typeof text === "string") {
-        characters += text.length;
-      }
+      characters += typeof part === "string" ? part.length : stringLength(getProp(part, "text"));
     }
   };
-
   try {
-    const contents = getProp(kwargs, "contents");
-    if (Array.isArray(contents)) {
-      for (const content of contents) {
-        countContent(content);
-      }
+    if (Array.isArray(value)) {
+      for (const content of value) countContent(content);
     } else {
-      countContent(contents);
+      countContent(value);
     }
   } catch {
-    // Malformed arrays/proxies are unobservable, never an application failure.
+    // Unreadable provider data contributes no further observable text.
   }
-
-  return characters === 0 ? 0 : estimateTokensFromLength(characters, provider);
+  return characters;
 }
 
 /** OpenAI-dialect image request measurement using non-content selectors only. */

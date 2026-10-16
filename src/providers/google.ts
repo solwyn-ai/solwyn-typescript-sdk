@@ -117,7 +117,8 @@ function extractGoogleUsage(usageMetadata: unknown): TokenDetails {
       audio_output_tokens: outputModalities.audio,
       // Google exposes no cache-creation-split / prediction token fields — all 0.
     },
-    !isUsageCount(getProp(usageMetadata, "candidatesTokenCount")) ||
+    (getProp(usageMetadata, "candidatesTokenCount") !== undefined &&
+      !isUsageCount(getProp(usageMetadata, "candidatesTokenCount"))) ||
       inputModalities.unmeasured ||
       outputModalities.unmeasured,
   );

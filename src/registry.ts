@@ -14,8 +14,13 @@
  */
 
 import { ConfigurationError } from "./errors";
+import type { Logger } from "./logging";
 import { validatePinnedClientFamily } from "./providers/detection";
-import { getAdapterByName, getAdapterForClient } from "./providers/index";
+import {
+  type AdapterRegistryOptions,
+  getAdapterByName,
+  getAdapterForClient,
+} from "./providers/index";
 import type { ProviderAdapter } from "./providers/protocol";
 import type { ProviderEntry, ProviderName } from "./types";
 
@@ -84,6 +89,8 @@ function freezeRuntime(
 export interface BuildRuntimesOptions {
   /** Explicit provider identity pin for the PRIMARY client only. */
   primaryProvider?: string;
+  /** Client-local adapter diagnostics and warning latches. */
+  logger?: Logger;
 }
 
 /**
@@ -171,16 +178,17 @@ export function parseFallbackSpec(spec: unknown): ParsedFallbackSpec {
 async function resolveAdapter(
   client: unknown,
   override: string | undefined,
+  adapterOptions: AdapterRegistryOptions,
 ): Promise<ProviderAdapter> {
   // Defensive second gate: direct registry callers cannot bypass the synchronous
   // constructor guard, and an override lookup must never run for an already-wrapped client.
   assertRawProviderClient(client);
   if (override === undefined) {
-    return getAdapterForClient(client);
+    return getAdapterForClient(client, adapterOptions);
   }
 
   // Named adapter lookup is authoritative for a pin. A miss retains field "provider".
-  const named = await getAdapterByName(override);
+  const named = await getAdapterByName(override, adapterOptions);
   validatePinnedClientFamily(client, named.name, named.dialect);
   return named;
 }
@@ -207,9 +215,14 @@ export async function buildRuntimes(
   options: BuildRuntimesOptions = {},
 ): Promise<ProviderRuntime[]> {
   const runtimes: ProviderRuntime[] = [];
+  const adapterOptions: AdapterRegistryOptions = { logger: options.logger };
 
   // Primary.
-  const primaryAdapter = await resolveAdapter(primaryClient, options.primaryProvider);
+  const primaryAdapter = await resolveAdapter(
+    primaryClient,
+    options.primaryProvider,
+    adapterOptions,
+  );
   const primaryEntry: ProviderEntry = {
     provider: primaryAdapter.name as ProviderName,
     model: primaryModel ?? "",
@@ -220,7 +233,7 @@ export async function buildRuntimes(
   // Fallbacks, in declared order.
   for (const spec of fallbackSpecs) {
     const { client, model, defaultParams, providerOverride } = parseFallbackSpec(spec);
-    const adapter = await resolveAdapter(client, providerOverride);
+    const adapter = await resolveAdapter(client, providerOverride, adapterOptions);
     const entry: ProviderEntry = {
       provider: adapter.name as ProviderName,
       model,

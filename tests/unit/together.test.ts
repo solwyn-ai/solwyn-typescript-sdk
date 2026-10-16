@@ -527,7 +527,7 @@ describe("Together unmetered spend posture", () => {
         WARNING,
         "together",
         "native_together",
-        "code_interpreter",
+        "code_interpreter.run",
         null,
       ),
     );
@@ -535,7 +535,7 @@ describe("Together unmetered spend posture", () => {
       WARNING,
       "together",
       "native_together",
-      "code_interpreter",
+      "code_interpreter.run",
       null,
     );
     expect(fetchMock).not.toHaveBeenCalled();

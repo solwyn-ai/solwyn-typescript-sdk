@@ -170,9 +170,9 @@ describe("GoogleAdapter.extractUsage — usageMetadata normalization", () => {
     expect(usage.rejected_prediction_tokens).toBe(0);
   });
 
-  it("marks missing output usage estimated while preserving the reported input count", () => {
+  it("treats an omitted zero output count as measured when input is reported", () => {
     const usage = adapter.extractUsage({ usageMetadata: { promptTokenCount: 1 } });
-    expect(usage.is_estimated).toBe(true);
+    expect(usage.is_estimated).toBe(false);
     expect(usage.input_tokens).toBe(1);
   });
 

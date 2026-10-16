@@ -1,5 +1,5 @@
 /**
- * Adapter registry: the global, ordered list of {@link ProviderAdapter} instances
+ * Adapter registry: lazy, ordered scopes of {@link ProviderAdapter} instances
  * plus the three sans-I/O lookup functions (`getAdapterByName` /
  * `getAdapterForModel` / `getAdapterForClient`).
  *
@@ -30,6 +30,7 @@
  */
 
 import { ConfigurationError } from "../errors";
+import type { Logger } from "../logging";
 import type { ProviderName } from "../types";
 import { ADAPTER_REGISTRATION_ORDER, describeDetectedClientType } from "./detection";
 import type { ProviderAdapter } from "./protocol";
@@ -45,8 +46,14 @@ export { ADAPTER_REGISTRATION_ORDER, resolveProviderIdentity } from "./detection
 // Lazy loader table.
 // ---------------------------------------------------------------------------
 
-/** Constructs (or otherwise resolves) a concrete adapter instance on first use. */
-export type AdapterLoader = () => Promise<ProviderAdapter>;
+/** One client-local adapter scope, including diagnostics and once-only warnings. */
+export interface AdapterRegistryOptions {
+  readonly logger?: Logger;
+}
+
+/** Constructs a concrete adapter instance on first use within a scope. */
+export type AdapterLoader = (options?: AdapterRegistryOptions) => Promise<ProviderAdapter>;
+const DEFAULT_OPTIONS: AdapterRegistryOptions = {};
 
 /** Native adapter names; every other name in the order table is a shared compat profile. */
 const NATIVE_ADAPTER_NAMES: ReadonlySet<ProviderName> = new Set<ProviderName>([
@@ -58,24 +65,29 @@ const NATIVE_ADAPTER_NAMES: ReadonlySet<ProviderName> = new Set<ProviderName>([
 ]);
 
 /**
- * Memoized index of the shared OpenAI-compatible profile adapters, keyed by profile name.
+ * Memoized OpenAI-compatible profile adapters within each client scope, keyed by name.
  * The whole `./openai-compatible` module builds the profile table in one pass
  * (`buildCompatAdapters`), so the FIRST shared compat-name loader triggers the dynamic
  * import + build and every subsequent compat-name loader reads from this cache. The
- * first-class Together slot bypasses this map. Cleared alongside the adapter singleton by
+ * first-class Together slot bypasses this map. Cleared alongside the scoped registries by
  * the test hooks so injected-loader runs never see a stale cache. Building these does not
  * import any provider SDK (compat detection is duck-typed), so eager materialization on
  * first use keeps CLAUDE.md invariant 3.
  */
-let compatAdaptersByName: Map<string, ProviderAdapter> | null = null;
+let compatAdaptersByScope = new WeakMap<AdapterRegistryOptions, Map<string, ProviderAdapter>>();
 
 /** Resolve one compat-profile adapter by name, materializing the full set on first call. */
-async function loadCompatAdapterByName(name: string): Promise<ProviderAdapter> {
-  if (compatAdaptersByName === null) {
+async function loadCompatAdapterByName(
+  name: string,
+  options: AdapterRegistryOptions = DEFAULT_OPTIONS,
+): Promise<ProviderAdapter> {
+  let compatAdaptersByName = compatAdaptersByScope.get(options);
+  if (compatAdaptersByName === undefined) {
     const mod = await import("./openai-compatible");
     compatAdaptersByName = new Map(
-      mod.buildCompatAdapters().map((adapter) => [adapter.name, adapter]),
+      mod.buildCompatAdapters(options).map((adapter) => [adapter.name, adapter]),
     );
+    compatAdaptersByScope.set(options, compatAdaptersByName);
   }
   const adapter = compatAdaptersByName.get(name);
   if (adapter === undefined) {
@@ -108,59 +120,53 @@ async function loadCompatAdapterByName(name: string): Promise<ProviderAdapter> {
  * type-resolution is deferred.
  */
 const DEFAULT_LOADERS: Partial<Record<ProviderName, AdapterLoader>> = {
-  openai: async () => new (await import("./openai")).OpenAIAdapter(),
-  anthropic: async () => new (await import("./anthropic")).AnthropicAdapter(),
+  openai: async (options) => new (await import("./openai")).OpenAIAdapter(options),
+  anthropic: async (options) => new (await import("./anthropic")).AnthropicAdapter(options),
   google: async () => new (await import("./google")).GoogleAdapter(),
-  bedrock: async () => new (await import("./bedrock")).BedrockAdapter(),
-  together: async () => new (await import("./together")).TogetherAdapter(),
+  bedrock: async (options) => new (await import("./bedrock")).BedrockAdapter(options),
+  together: async (options) => new (await import("./together")).TogetherAdapter(options),
 };
 // Every non-native name is an OpenAI-compatible profile served by the shared builder.
 for (const name of ADAPTER_REGISTRATION_ORDER) {
   if (!NATIVE_ADAPTER_NAMES.has(name)) {
-    DEFAULT_LOADERS[name] = () => loadCompatAdapterByName(name);
+    DEFAULT_LOADERS[name] = (options) => loadCompatAdapterByName(name, options);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Lazy singleton state (mirrors Python's `_ensure_loaded()` module globals).
+// Lazy scopes. Direct lookups share the default scope; runtime chains own theirs.
 // ---------------------------------------------------------------------------
 
 let activeLoaders: Partial<Record<ProviderName, AdapterLoader>> = DEFAULT_LOADERS;
-let loadedAdapters: ProviderAdapter[] | null = null;
-let loadedByName: Map<string, ProviderAdapter> | null = null;
-/** In-flight guard: concurrent first-callers share a single load. */
-let loadPromise: Promise<void> | null = null;
-
-async function runLoad(): Promise<void> {
-  const adapters: ProviderAdapter[] = [];
-  const byName = new Map<string, ProviderAdapter>();
-  for (const name of ADAPTER_REGISTRATION_ORDER) {
-    const loader = activeLoaders[name];
-    if (loader === undefined) {
-      continue;
-    }
-    const adapter = await loader();
-    adapters.push(adapter);
-    byName.set(adapter.name, adapter);
-  }
-  loadedAdapters = adapters;
-  loadedByName = byName;
+interface RegistryState {
+  adapters: ProviderAdapter[] | null;
+  byName: Map<string, ProviderAdapter> | null;
+  loadPromise: Promise<void> | null;
 }
+let registries = new WeakMap<AdapterRegistryOptions, RegistryState>();
 
-/**
- * Idempotent, side-effect-free-to-re-call lazy initializer. Populates the adapter
- * singletons on first invocation; a no-op afterwards. Node is single-threaded per
- * isolate, but async interleaving is still possible, so a shared in-flight promise
- * collapses concurrent first-callers onto one load.
- */
-function ensureLoaded(): Promise<void> {
-  if (loadedAdapters !== null) {
-    return Promise.resolve();
+async function ensureLoaded(options: AdapterRegistryOptions): Promise<RegistryState> {
+  let state = registries.get(options);
+  if (state === undefined) {
+    state = { adapters: null, byName: null, loadPromise: null };
+    registries.set(options, state);
   }
-  if (loadPromise === null) {
-    loadPromise = runLoad();
-  }
-  return loadPromise;
+  const current = state;
+  current.loadPromise ??= (async () => {
+    const adapters: ProviderAdapter[] = [];
+    const byName = new Map<string, ProviderAdapter>();
+    for (const name of ADAPTER_REGISTRATION_ORDER) {
+      const loader = activeLoaders[name];
+      if (loader === undefined) continue;
+      const adapter = await loader(options);
+      adapters.push(adapter);
+      byName.set(adapter.name, adapter);
+    }
+    current.adapters = adapters;
+    current.byName = byName;
+  })();
+  await current.loadPromise;
+  return current;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,8 +186,8 @@ export function describeClientType(client: unknown): string {
 // Lookup functions (async — see file header on lazy dynamic import).
 // ---------------------------------------------------------------------------
 
-function knownNames(): string[] {
-  return [...(loadedByName?.keys() ?? [])].sort();
+function knownNames(state: RegistryState): string[] {
+  return [...(state.byName?.keys() ?? [])].sort();
 }
 
 /**
@@ -189,13 +195,19 @@ function knownNames(): string[] {
  * (field `"provider"`) on a miss, echoing the queried name and the sorted list of
  * known names. Never returns a default/wildcard adapter — an empty name is a miss.
  */
-export async function getAdapterByName(name: string): Promise<ProviderAdapter> {
-  await ensureLoaded();
-  const adapter = loadedByName?.get(name);
+export async function getAdapterByName(
+  name: string,
+  options: AdapterRegistryOptions = DEFAULT_OPTIONS,
+): Promise<ProviderAdapter> {
+  const state = await ensureLoaded(options);
+  const adapter = state.byName?.get(name);
   if (adapter === undefined) {
-    throw new ConfigurationError(`Unknown provider '${name}'. Known: ${knownNames().join(", ")}`, {
-      field: "provider",
-    });
+    throw new ConfigurationError(
+      `Unknown provider '${name}'. Known: ${knownNames(state).join(", ")}`,
+      {
+        field: "provider",
+      },
+    );
   }
   return adapter;
 }
@@ -206,8 +218,8 @@ export async function getAdapterByName(name: string): Promise<ProviderAdapter> {
  * string — NEVER silently falls back to any default provider.
  */
 export async function getAdapterForModel(model: string): Promise<ProviderAdapter> {
-  await ensureLoaded();
-  for (const adapter of loadedAdapters ?? []) {
+  const state = await ensureLoaded(DEFAULT_OPTIONS);
+  for (const adapter of state.adapters ?? []) {
     if (adapter.detectModel(model)) {
       return adapter;
     }
@@ -220,9 +232,12 @@ export async function getAdapterForModel(model: string): Promise<ProviderAdapter
  * returns true. Throws {@link ConfigurationError} on a miss — NEVER silently falls
  * back to any default adapter. Detection is purely structural; performs no I/O.
  */
-export async function getAdapterForClient(client: unknown): Promise<ProviderAdapter> {
-  await ensureLoaded();
-  for (const adapter of loadedAdapters ?? []) {
+export async function getAdapterForClient(
+  client: unknown,
+  options: AdapterRegistryOptions = DEFAULT_OPTIONS,
+): Promise<ProviderAdapter> {
+  const state = await ensureLoaded(options);
+  for (const adapter of state.adapters ?? []) {
     if (adapter.detectClient(client)) {
       return adapter;
     }
@@ -246,17 +261,13 @@ export function __setAdapterLoadersForTesting(
   loaders: Partial<Record<ProviderName, AdapterLoader>>,
 ): void {
   activeLoaders = loaders;
-  loadedAdapters = null;
-  loadedByName = null;
-  loadPromise = null;
-  compatAdaptersByName = null;
+  registries = new WeakMap();
+  compatAdaptersByScope = new WeakMap();
 }
 
 /** Restore the default (production) loader table and reset the lazy singleton. */
 export function __resetAdapterRegistry(): void {
   activeLoaders = DEFAULT_LOADERS;
-  loadedAdapters = null;
-  loadedByName = null;
-  loadPromise = null;
-  compatAdaptersByName = null;
+  registries = new WeakMap();
+  compatAdaptersByScope = new WeakMap();
 }

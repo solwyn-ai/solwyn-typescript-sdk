@@ -34,13 +34,19 @@ import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } fr
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
-import { ConfigurationError } from "../errors";
+import { ConfigurationError, RunStoppedError } from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
 import { resolveAiSdkOutputBound } from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
+import {
+  acquireTerminationHandle,
+  postcheckTermination,
+  runTermination,
+  type TerminationHandle,
+} from "../run-control";
 import { buildTokenDetails, isUsageCount, type TokenDetails } from "../token-details";
 import type { FetchLike } from "../transport";
 import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
@@ -63,6 +69,11 @@ import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
  * order is not load-bearing beyond first-hit determinism.
  */
 export const AI_SDK_PROVIDER_PREFIXES: ReadonlyArray<readonly [string, ProviderName]> = [
+  ["vertex.anthropic", "anthropic"],
+  ["openai-compatible", "openai_compatible"],
+  ["lmstudio", "lmstudio"],
+  ["vllm", "vllm"],
+  ["alibaba", "qwen"],
   ["openai", "openai"],
   ["azure", "azure_openai"],
   ["anthropic", "anthropic"],
@@ -87,7 +98,11 @@ export const FALLBACK_PROVIDER_NAME: ProviderName = "openai_compatible";
 /** First prefix hit for a lowercased provider/vendor string, or `null` when unrecognized. */
 function matchProviderPrefix(lower: string): ProviderName | null {
   for (const [prefix, name] of AI_SDK_PROVIDER_PREFIXES) {
-    if (lower.startsWith(prefix)) {
+    if (
+      prefix === "openai"
+        ? lower === prefix || lower.startsWith(`${prefix}.`)
+        : lower.startsWith(prefix)
+    ) {
       return name;
     }
   }
@@ -172,7 +187,7 @@ interface UsageContext {
  * {@link buildTokenDetails}; a garbage out-of-bound count flows through unmodified and is
  * caught (dropped fail-open) at the reporter's wire-validation boundary, matching the core.
  */
-function reportedUsageToTokenDetails(usage: unknown): TokenDetails | null {
+function reportedUsageToTokenDetails(usage: unknown, ctx: UsageContext): TokenDetails | null {
   const input = readUsageTotal(getProp(usage, "inputTokens"));
   const output = readUsageTotal(getProp(usage, "outputTokens"));
 
@@ -184,16 +199,32 @@ function reportedUsageToTokenDetails(usage: unknown): TokenDetails | null {
     getProp(getProp(usage, "inputTokens"), "cacheRead") ?? getProp(usage, "cachedInputTokens");
   const reasoning =
     getProp(getProp(usage, "outputTokens"), "reasoning") ?? getProp(usage, "reasoningTokens");
+  const cacheWrite = getProp(getProp(usage, "inputTokens"), "cacheWrite");
+  const inputTokens = isUsageCount(input) ? input : input === null ? ctx.estimatedInputTokens : 0;
+  const outputTokens = isUsageCount(output)
+    ? output
+    : output === null && ctx.outputChars > 0
+      ? estimateTokensFromLength(ctx.outputChars, ctx.provider)
+      : 0;
+  const cachedTokens = Math.min(isUsageCount(cached) ? cached : 0, inputTokens);
+  const cacheWriteTokens = Math.min(
+    isUsageCount(cacheWrite) ? cacheWrite : 0,
+    inputTokens - cachedTokens,
+  );
 
   return buildTokenDetails({
-    input_tokens: isUsageCount(input) ? input : 0,
-    output_tokens: isUsageCount(output) ? output : 0,
-    cached_input_tokens: isUsageCount(cached) ? cached : 0,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cached_input_tokens: cachedTokens,
+    cache_creation_5m_tokens: cacheWriteTokens,
     reasoning_tokens: isUsageCount(reasoning) ? reasoning : 0,
     is_estimated:
       !isUsageCount(input) ||
       !isUsageCount(output) ||
       (cached != null && !isUsageCount(cached)) ||
+      (cacheWrite != null && !isUsageCount(cacheWrite)) ||
+      (isUsageCount(cached) && cachedTokens !== cached) ||
+      (isUsageCount(cacheWrite) && cacheWriteTokens !== cacheWrite) ||
       (reasoning != null && !isUsageCount(reasoning)),
   });
 }
@@ -208,7 +239,7 @@ function estimateUsageFromLength(ctx: UsageContext): TokenDetails {
 }
 
 export function usageToTokenDetails(usage: unknown, ctx: UsageContext): TokenDetails {
-  return reportedUsageToTokenDetails(usage) ?? estimateUsageFromLength(ctx);
+  return reportedUsageToTokenDetails(usage, ctx) ?? estimateUsageFromLength(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +540,8 @@ function toConfigOptions(options: SolwynMiddlewareOptions): SolwynConfigOptions 
 // ---------------------------------------------------------------------------
 
 interface StreamHooks<T> {
+  /** Abort before forwarding a source chunk when its captured run is stopped. */
+  checkTermination(): void;
   /** Called for every source part, in order, BEFORE it is enqueued to the consumer. */
   onPart(part: T): void;
   /** Called once when the source completes normally (all parts delivered). */
@@ -551,10 +584,12 @@ async function instrumentReadable<T>(
     const stream = new ReadableStream<T>({
       async pull(controller) {
         try {
+          hooks.checkTermination();
           const { done, value } = await reader.read();
           if (aborted) {
             return;
           }
+          hooks.checkTermination();
           if (done) {
             hooks.onEnd();
             controller.close();
@@ -819,6 +854,51 @@ export function createSolwynMiddleware(
     }
   };
 
+  const stoppedError = (
+    ctx: CallContext,
+    handle?: TerminationHandle,
+  ): RunStoppedError | undefined => {
+    if (ctx.run === undefined) return undefined;
+    const termination =
+      handle?.check() ??
+      runTermination(ctx.run.agentRunId) ??
+      postcheckTermination(ctx.run.agentRunId);
+    return termination === undefined
+      ? undefined
+      : new RunStoppedError({
+          agentRunId: ctx.run.agentRunId,
+          reason: termination.reason,
+          source: termination.source,
+        });
+  };
+
+  const assertDispatchAllowed = (ctx: CallContext, handle?: TerminationHandle): void => {
+    const error = stoppedError(ctx, handle);
+    if (error === undefined) return;
+    try {
+      reporter.report(
+        buildEvent({
+          status: "budget_denied",
+          provider: ctx.provider,
+          model: ctx.model,
+          callId: ctx.callId,
+          run: ctx.run,
+          inputTokens: ctx.estimatedInputTokens,
+          outputTokens: 0,
+          tokenDetails: null,
+          latencyMs: 0,
+          failoverErrorClass: null,
+          possiblySucceeded: null,
+        }),
+      );
+    } catch {
+      // A concurrent run stop remains authoritative if telemetry is unavailable.
+    } finally {
+      releaseFunding(ctx);
+    }
+    throw error;
+  };
+
   /** Build a content-free {@link MetadataEvent} for one call (single primary hop). */
   function buildEvent(fields: {
     status: MetadataEvent["status"];
@@ -976,6 +1056,7 @@ export function createSolwynMiddleware(
   const middleware: LanguageModelMiddleware = {
     wrapGenerate: async ({ doGenerate, model, params }) => {
       const ctx = await preflight(model, params);
+      assertDispatchAllowed(ctx);
       const started = performance.now();
       try {
         const result = await doGenerate();
@@ -983,7 +1064,14 @@ export function createSolwynMiddleware(
         let providerUsageAbsent = true;
         const usage = extractUsageFailSoft({
           extract: () => {
-            const details = reportedUsageToTokenDetails(result.usage);
+            const details = reportedUsageToTokenDetails(result.usage, {
+              provider: ctx.provider,
+              estimatedInputTokens: ctx.estimatedInputTokens,
+              outputChars:
+                readUsageTotal(getProp(result.usage, "outputTokens")) === null
+                  ? measureResponseChars(result.content)
+                  : 0,
+            });
             providerUsageAbsent = details === null;
             return details;
           },
@@ -1008,6 +1096,14 @@ export function createSolwynMiddleware(
 
     wrapStream: async ({ doStream, model, params }) => {
       const ctx = await preflight(model, params);
+      const terminationHandle =
+        ctx.run === undefined ? undefined : acquireTerminationHandle(ctx.run.agentRunId);
+      try {
+        assertDispatchAllowed(ctx, terminationHandle);
+      } catch (error) {
+        terminationHandle?.release();
+        throw error;
+      }
       const started = performance.now();
       let result: Awaited<ReturnType<typeof doStream>>;
       try {
@@ -1016,6 +1112,7 @@ export function createSolwynMiddleware(
         // Establishment (pre-first-chunk) failure — carries the class name like a buffered
         // failure (#buildErrorEvent); it is a failover-eligible health signal, unlike a
         // mid-stream drop. Report one error event and propagate.
+        terminationHandle?.release();
         reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
         throw error;
       }
@@ -1033,7 +1130,11 @@ export function createSolwynMiddleware(
         let providerUsageAbsent = true;
         const usage = extractUsageFailSoft({
           extract: () => {
-            const details = reportedUsageToTokenDetails(getProp(capturedFinishPart, "usage"));
+            const details = reportedUsageToTokenDetails(getProp(capturedFinishPart, "usage"), {
+              provider: ctx.provider,
+              estimatedInputTokens: ctx.estimatedInputTokens,
+              outputChars,
+            });
             providerUsageAbsent = details === null;
             return details;
           },
@@ -1091,6 +1192,7 @@ export function createSolwynMiddleware(
           return;
         }
         settled = true;
+        terminationHandle?.release();
         // A finish part with usage settles success; a mid-stream error part or a stream
         // rejection settles an error event (possibly_succeeded — the stream established, so
         // the provider may have generated billable output) and sends NO confirm. Mid-stream
@@ -1111,6 +1213,10 @@ export function createSolwynMiddleware(
       let abortSetup = (): Promise<void> => cancelReadableSource(result.stream);
       try {
         const instrumented = await instrumentReadable(result.stream, {
+          checkTermination() {
+            const error = stoppedError(ctx, terminationHandle);
+            if (error !== undefined) throw error;
+          },
           onPart(part) {
             const type = getProp(part, "type");
             if (type === "finish") {
@@ -1128,6 +1234,7 @@ export function createSolwynMiddleware(
         abortSetup = instrumented.abort;
         return { ...result, stream: instrumented.stream };
       } catch (error) {
+        terminationHandle?.release();
         try {
           await abortSetup();
         } catch {

@@ -11,7 +11,7 @@ import {
   coverage,
   registerCoverageSource,
 } from "../../src/coverage";
-import { CoverageMismatchError } from "../../src/errors";
+import { ConfigurationError, CoverageMismatchError } from "../../src/errors";
 import { Solwyn } from "../../src/proxies";
 import { SurfaceInspectionError } from "../../src/surface-graph";
 import type { SurfaceClientShape, SurfaceDialect } from "../../src/surfaces";
@@ -130,9 +130,9 @@ function registeredReport(
 }
 
 describe("coverage", () => {
-  it("rejects an unregistered object with the exact data-free TypeError", () => {
+  it("rejects an unregistered object with a data-free ConfigurationError", () => {
     expect(() => coverage({})).toThrowError(
-      new TypeError("coverage requires a registered Solwyn wrapper"),
+      new ConfigurationError("coverage requires a registered Solwyn wrapper", { field: "client" }),
     );
   });
 

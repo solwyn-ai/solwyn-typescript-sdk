@@ -377,9 +377,7 @@ function validateRuleInput(input: SurfaceRuleInput): void {
   const prefix = expectedRuleIdPrefix(surface, input.kind);
   if (
     !input.ruleId.startsWith(prefix) ||
-    !new RegExp(
-      `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.[a-z0-9][a-z0-9-]*)*$`,
-    ).test(input.ruleId) ||
+    !/^(?:\.[a-z0-9][a-z0-9-]*)*$/.test(input.ruleId.slice(prefix.length)) ||
     !includes(SURFACE_KINDS, input.kind) ||
     !includes(SURFACE_SOURCES, input.source) ||
     input.selectors.length === 0 ||

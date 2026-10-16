@@ -536,11 +536,11 @@ export class BedrockAdapter implements ProviderAdapter {
    * Rebuild the AWS SDK v3 ConverseStream response shape around the wrapped iterable:
    *  - same-dialect (mapping `servedResponse`): spread-preserve every other top-level key
    *    (e.g. `$metadata`) and overwrite `stream`;
-   *  - cross-provider (non-mapping `servedResponse` — a foreign stream object): return a minimal
+   *  - cross-provider (no Bedrock `stream` envelope): return a minimal
    *    `{ stream: wrapper }` with nothing else to preserve.
    */
   wrapStreamResult(wrapper: unknown, servedResponse: unknown): unknown {
-    if (isObject(servedResponse)) {
+    if (isObject(servedResponse) && getProp(servedResponse, "stream") !== undefined) {
       return { ...servedResponse, stream: wrapper };
     }
     return { stream: wrapper };

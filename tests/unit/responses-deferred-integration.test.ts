@@ -477,15 +477,24 @@ describe("deferred Responses client integration", () => {
       );
     }
     const helper = f.solwyn.responses.stream({ input: "hi" }, { signal: controller.signal });
-    const outcome = expect(helper.done()).rejects.toBeInstanceOf(OpenAI.APIUserAbortError);
-    if (phase === "pending connection") {
-      await requestStarted;
-      controller.abort();
+    if (phase === "already aborted") {
+      await expect(helper.done()).rejects.toBe(controller.signal.reason);
+      await f.solwyn.close();
+      expect(f.streamCall).not.toHaveBeenCalled();
+      expect(f.providerFetch).not.toHaveBeenCalled();
+      expect(f.checks).toHaveLength(0);
+      expect(f.confirms).toHaveLength(0);
+      expect(f.events).toHaveLength(0);
+      expect(f.breakerReports).toHaveLength(0);
+      return;
     }
+    const outcome = expect(helper.done()).rejects.toBeInstanceOf(OpenAI.APIUserAbortError);
+    await requestStarted;
+    controller.abort();
     await outcome;
     await f.solwyn.close();
     expect(f.streamCall).toHaveBeenCalledTimes(1);
-    expect(f.providerFetch).toHaveBeenCalledTimes(phase === "already aborted" ? 0 : 1);
+    expect(f.providerFetch).toHaveBeenCalledTimes(1);
     expect(f.checks).toHaveLength(1);
     expect(f.confirms).toHaveLength(0);
     expect(f.events).toHaveLength(1);

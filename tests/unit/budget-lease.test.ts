@@ -329,6 +329,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
         leaseCheck(1, { estimatedInputTokens: 100, estimatedOutputBound: undefined }),
       ),
     ).resolves.toEqual({
+      callId: callId(1),
       allowed: true,
       remainingBudget: 80,
       projectId: PROJECT_ID,
@@ -526,11 +527,13 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
   it("releases the check breaker admission when the dispatch clock throws", async () => {
     const breaker = new CountingBreaker();
     const clockError = new Error("clock failed");
+    let clockReads = 0;
     const fetch = vi.fn(async () => jsonResponse(checkResponse()));
     const budget = enforcer(fetch, {
       controlPlaneBreaker: breaker,
       monotonicNow: () => {
-        throw clockError;
+        if (++clockReads === 3) throw clockError;
+        return 0;
       },
     });
 
@@ -553,6 +556,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
   ])("retains the claim on non-503 outage when failOpen=%s", async (failOpen, allowed, warning, denySource, denyReason) => {
     const budget = enforcer(async () => new Response(null, { status: 500 }), { failOpen });
     await expect(budget.checkBudget(leaseCheck(1))).resolves.toEqual({
+      callId: callId(1),
       allowed,
       remainingBudget: 0,
       projectId: null,

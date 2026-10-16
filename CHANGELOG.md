@@ -11,6 +11,17 @@ corresponding release notes before users upgrade.
 
 ### Changed
 
+- **Breaking: numeric configuration rejects unsafe values.** Budget-check and reporter timers
+  must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive timers
+  reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown deadlines
+  allow zero and reject negatives. Empty numeric environment values are rejected. Breaker
+  thresholds must be positive integers, retries must be non-negative integers, and jitter must
+  be between zero and one. Reporter batches cannot exceed 1000 events, and breaker heartbeats
+  cannot exceed 60 seconds. Documented defaults are unchanged.
+- **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects non-number,
+  non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite, non-positive,
+  and oversized per-call `timeout` values with `ConfigurationError`. Both durations are in
+  seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
 - **Velocity history survives higher run concurrency.** Structural loop detection now keeps
   compact histories for up to 4096 runs and discards stale histories first. At the hard cap,
   established histories continue progressing through round-robin traffic; discarding live
@@ -60,8 +71,19 @@ corresponding release notes before users upgrade.
   retry is pending, no breaker report is sent, including a changed breaker state. A successful
   report clears the backoff. Reports sent by `close()` are not delayed.
 
+### Added
+
+- **Effective call IDs on budget results.** `BudgetEnforcer.checkBudget()` returns `callId`,
+  including an ID minted when the caller omits one, so direct callers can settle or release
+  the corresponding lease reservation. `CheckBudgetOptions.signal` adds caller cancellation.
+
 ### Fixed
 
+- **Budget preflight shares one deadline and honors cancellation.** An initial lease attempt
+  and its per-call fallback now share the requested timeout. An exhausted deadline skips the
+  fallback without adding a breaker failure. Caller `AbortSignal`s reach preflight transport;
+  already-aborted requests skip budget I/O, and cancellation rejects without treating it as a
+  control-plane outage.
 - **Completed calls release lease bookkeeping immediately.** Settlement, release, and unknown
   usage no longer retain a full claim and expiry entry for 900 seconds. Per-call budget results
   release their unused lease claims, and a bounded recent-ID history still rejects accidental

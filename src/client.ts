@@ -2198,6 +2198,8 @@ export class SolwynCore {
     // error and the wrapped client is never called. checkBudget never throws
     // (it degrades on an outage per its own sticky-deny -> fail-open -> local-enforcement
     // precedence — invariant 9 lives inside it); the client never swallows its result.
+    const signal = callerAbortSignal(passthroughArgs, mergedPrimary, primaryDialect);
+    if (signal?.aborted) throw callerAbortError(signal);
     const budget = budgetCheckResult(
       await this.#budget.checkBudget({
         runLifetime: run?.lifetime,
@@ -2212,6 +2214,7 @@ export class SolwynCore {
         fallbackModels: surface === "responses" ? [] : fallbackModels,
         ...(surface === "responses" ? { modality: "text" as const } : {}),
         timeout: budgetCheckTimeout(deadline, this.#config.budget_check_timeout),
+        signal,
       }),
     );
     this.#postcheckRunControl(admission, budget, velocity);
@@ -2348,6 +2351,8 @@ export class SolwynCore {
       estimatedMedia,
     };
     const velocity = this.#precheckRunControl(admission);
+    const signal = callerAbortSignal(passthroughArgs, merged, primary.adapter.dialect);
+    if (signal?.aborted) throw callerAbortError(signal);
     const budget = budgetCheckResult(
       await this.#budget.checkBudget({
         runLifetime: run?.lifetime,
@@ -2362,6 +2367,7 @@ export class SolwynCore {
         fallbackProviders: [],
         fallbackModels: [],
         timeout: budgetCheckTimeout(deadline, this.#config.budget_check_timeout),
+        signal,
       }),
     );
     this.#postcheckRunControl(admission, budget, velocity);

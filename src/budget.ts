@@ -708,6 +708,7 @@ export class BudgetEnforcer {
     this.controlPlaneBreaker = options.controlPlaneBreaker ?? null;
     this.leaseLedger = new LeaseLedger({
       holderId: options.holderId ?? crypto.randomUUID(),
+      failOpen: options.failOpen ?? true,
       enabled: options.leaseEnabled ?? true,
       outputBoundDefault: options.leaseOutputBoundDefault,
     });
@@ -1031,137 +1032,146 @@ export class BudgetEnforcer {
 
     let widenAfterAllow = false;
 
-    if (this.leaseEntryEligible(captured)) {
-      leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
-      let leaseAdmission = this.admitLease(captured, leaseCallId, null);
-      leaseClaimToken = leaseAdmission.claimToken;
-      widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
+    try {
+      if (this.leaseEntryEligible(captured)) {
+        leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
+        let leaseAdmission = this.admitLease(captured, leaseCallId, null);
+        leaseClaimToken = leaseAdmission.claimToken;
+        widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
 
-      const immediate = this.localLeaseResult(captured, leaseAdmission);
-      if (immediate !== null) {
-        this.noteAdmissionUncounted(captured, leaseAdmission);
-        return immediate;
+        const immediate = this.localLeaseResult(captured, leaseAdmission);
+        if (immediate !== null) {
+          this.noteAdmissionUncounted(captured, leaseAdmission);
+          return immediate;
+        }
+
+        if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
+          const runId = captured.agentRunId;
+          if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
+            // Critical section: claim the run's grant slot before the first await.
+            this.initialGrantInFlight.add(runId);
+            const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
+            if (grant.kind === "admission") {
+              leaseAdmission = grant.admission;
+              leaseClaimToken = leaseAdmission.claimToken;
+              const granted = this.localLeaseResult(captured, leaseAdmission);
+              if (granted !== null) {
+                this.noteAdmissionUncounted(captured, leaseAdmission);
+                return granted;
+              }
+            } else if (grant.kind === "denied") {
+              return this.withLeaseClaim(grant.result, leaseClaimToken);
+            } else if (grant.kind === "outage") {
+              return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
+            }
+            // A grant loser, refused/malformed grant, or one-shot re-entry that still
+            // needs authority continues to the legacy per-call endpoint exactly once.
+          }
+        }
       }
 
-      if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
-        const runId = captured.agentRunId;
-        if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
-          // Critical section: claim the run's grant slot before the first await.
-          this.initialGrantInFlight.add(runId);
-          const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
-          if (grant.kind === "admission") {
-            leaseAdmission = grant.admission;
-            leaseClaimToken = leaseAdmission.claimToken;
-            const granted = this.localLeaseResult(captured, leaseAdmission);
-            if (granted !== null) {
-              this.noteAdmissionUncounted(captured, leaseAdmission);
-              return granted;
-            }
-          } else if (grant.kind === "denied") {
-            return this.withLeaseClaim(grant.result, leaseClaimToken);
-          } else if (grant.kind === "outage") {
+      // --- Critical section: cache read + LRU touch (no `await` inside). ---
+      const cached = this.cachedAllow(cacheKey, stableOptions);
+      if (cached !== null) {
+        return this.withLeaseClaim(
+          budgetCheckResult({
+            allowed: true,
+            remainingBudget: cached.remaining_budget,
+            projectId: cached.project_id ?? null,
+            reservationId: null,
+            mode: cached.mode,
+            budgetLimit: cached.budget_limit,
+            currentUsage: cached.current_usage,
+            priceHints: cached.price_hints ?? null,
+            failoverTuningAllowed: null,
+          }),
+          leaseClaimToken,
+        );
+      }
+
+      const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
+      if (admission !== null && !admission.allowed) {
+        this.logger.debug("budget.check_skipped_breaker_open");
+        if (leaseCallId !== null && leaseClaimToken !== null) {
+          const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
+          const local = this.localLeaseResult(captured, reentry);
+          if (local !== null) {
+            this.noteAdmissionUncounted(captured, reentry);
+            return local;
+          }
+          if (reentry.decision === LeaseDecision.NeedGrant) {
             return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
           }
-          // A grant loser, refused/malformed grant, or one-shot re-entry that still
-          // needs authority continues to the legacy per-call endpoint exactly once.
         }
+        return this.withLeaseClaim(
+          this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+          leaseClaimToken,
+        );
       }
-    }
-
-    // --- Critical section: cache read + LRU touch (no `await` inside). ---
-    const cached = this.cachedAllow(cacheKey, stableOptions);
-    if (cached !== null) {
-      return this.withLeaseClaim(
-        budgetCheckResult({
-          allowed: true,
-          remainingBudget: cached.remaining_budget,
-          projectId: cached.project_id ?? null,
-          reservationId: null,
-          mode: cached.mode,
-          budgetLimit: cached.budget_limit,
-          currentUsage: cached.current_usage,
-          priceHints: cached.price_hints ?? null,
-          failoverTuningAllowed: null,
-        }),
-        leaseClaimToken,
-      );
-    }
-
-    const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
-    if (admission !== null && !admission.allowed) {
-      this.logger.debug("budget.check_skipped_breaker_open");
-      if (leaseCallId !== null && leaseClaimToken !== null) {
-        const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
-        const local = this.localLeaseResult(captured, reentry);
-        if (local !== null) {
-          this.noteAdmissionUncounted(captured, reentry);
-          return local;
-        }
-        if (reentry.decision === LeaseDecision.NeedGrant) {
-          return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
-        }
-      }
-      return this.withLeaseClaim(
-        this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-        leaseClaimToken,
-      );
-    }
-    try {
-      // Ordered response authority exists only for a real check POST. Capture and register
-      // its dispatch after lease/cache/breaker decisions and immediately before the POST.
-      const requestDispatch = this.captureAuthorityDispatch();
-      this.registerPendingOrderedRequest(requestDispatch);
       try {
-        let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+        // Ordered response authority exists only for a real check POST. Capture and register
+        // its dispatch after lease/cache/breaker decisions and immediately before the POST.
+        const requestDispatch = this.captureAuthorityDispatch();
+        this.registerPendingOrderedRequest(requestDispatch);
         try {
-          raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
-            timeoutMs: captured.timeoutMs,
-          });
-        } catch (error) {
-          if (isReadOnlyKeyError(error)) {
+          let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+          try {
+            raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
+              timeoutMs: captured.timeoutMs,
+            });
+          } catch (error) {
+            if (isReadOnlyKeyError(error)) {
+              this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+              handleReadOnlyKeyError(error, this.logger);
+            } else {
+              this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+              this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            }
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
+          }
+
+          let response: BudgetCheckResponse;
+          try {
+            if (!raw.parsed) {
+              throw raw.error;
+            }
+            response = BudgetCheckResponseSchema.parse(raw.value);
+          } catch (error) {
             this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-            handleReadOnlyKeyError(error, this.logger);
-          } else {
-            this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-            this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            this.logger.error(
+              "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
+              exceptionName(error),
+              this.failOpen,
+            );
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
           }
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
-        }
 
-        let response: BudgetCheckResponse;
-        try {
-          if (!raw.parsed) {
-            throw raw.error;
-          }
-          response = BudgetCheckResponseSchema.parse(raw.value);
-        } catch (error) {
           this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-          this.logger.error(
-            "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
-            exceptionName(error),
-            this.failOpen,
+          const result = this.applyCheckResponse(
+            response,
+            stableOptions,
+            cacheKey,
+            requestDispatch,
           );
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
+          // Only a live allow for this run widens; denied, unreadable and outage paths never do.
+          if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
+            this.scheduleWidening(captured);
+          }
+          return this.withLeaseClaim(result, leaseClaimToken);
+        } finally {
+          this.unregisterPendingOrderedRequest(requestDispatch);
         }
-
-        this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        const result = this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch);
-        // Only a live allow for this run widens; denied, unreadable and outage paths never do.
-        if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
-          this.scheduleWidening(captured);
-        }
-        return this.withLeaseClaim(result, leaseClaimToken);
       } finally {
-        this.unregisterPendingOrderedRequest(requestDispatch);
+        this.controlPlaneBreaker?.releaseProbe(admission);
       }
     } finally {
-      this.controlPlaneBreaker?.releaseProbe(admission);
+      if (leaseCallId !== null) this.leaseLedger.forgetClaim(leaseCallId, leaseClaimToken);
     }
   }
 
@@ -1252,6 +1262,12 @@ export class BudgetEnforcer {
     }
     this.scheduleRenewal(captured, admission);
     if (!admission.admitted) return null;
+    if (
+      admission.decision === LeaseDecision.AdmitOutageMetered ||
+      admission.decision === LeaseDecision.AdmitUncounted
+    ) {
+      this.trackLocalCost(DEFAULT_COST_PER_TOKEN * captured.estimatedInputTokens);
+    }
     return this.leaseResultFromSnapshot(snapshot, {
       allowed: true,
       leaseId: admission.leaseId,

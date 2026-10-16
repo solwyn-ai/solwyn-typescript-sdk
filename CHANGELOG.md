@@ -62,6 +62,20 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
+- **Completed calls release lease bookkeeping immediately.** Settlement, release, and unknown
+  usage no longer retain a full claim and expiry entry for 900 seconds. Per-call budget results
+  release their unused lease claims, and a bounded recent-ID history still rejects accidental
+  call-ID reuse.
+- **Late lease settlements remain accounted for.** After the 900-second reservation sweep
+  refunds an abandoned reservation, a matching late settlement debits its full usage against
+  the original lease. The SDK retains at most 4096 swept reservations and fences settlements
+  from replacement lease incarnations.
+- **Lease reports contain only their own spend.** Dropping or replacing a lease clears its
+  advisory spend tally so a successor lease's renewal or surrender cannot report the old burn.
+- **Lease outage admissions accrue local estimates.** Calls admitted against the outage share
+  or after lease expiry now accrue the fixed estimate in the current UTC-day bucket. Per-call
+  outage checks use that shared spend, and a server's fail-open lease posture cannot relax a
+  client's `failOpen: false` setting.
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
   reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
   standalone confirmations and of settlements, then sends the metadata batches that were queued

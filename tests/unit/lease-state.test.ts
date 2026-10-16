@@ -658,7 +658,7 @@ describe("LeaseLedger grants and accounting", () => {
     expect(fresh.stateFor(RUN)?.grantedRemainingTokens).toBe(500);
     fresh.drop(RUN);
     fresh.trueUp("release", 10_000, { claimToken: release.claimToken });
-    expect(fresh.stateFor(RUN)?.spentTokensSinceReport).toBe(1_500);
+    expect(fresh.stateFor(RUN)?.spentTokensSinceReport).toBe(0);
 
     const share = installed(grant({ granted_tokens: 0, headroom_share_tokens: 5_000 }));
     const shareReservation = admit(share, { callId: "share", breakerOpen: true });
@@ -1111,6 +1111,120 @@ describe("LeaseLedger widening claims and refused models", () => {
 });
 
 describe("LeaseLedger bounded claims, renewal, and shutdown", () => {
+  it("forgets settled claims and expiry entries instead of retaining each completed call", () => {
+    const value = installed(grant({ lease_length_s: 10_000 }));
+    for (let index = 0; index < 10_000; index += 1) {
+      const callId = `settled-${index}`;
+      const admitted = admit(value, { callId });
+      if (index % 2 === 0) value.release(callId, { claimToken: admitted.claimToken });
+      else value.trueUp(callId, 0, { claimToken: admitted.claimToken });
+    }
+    expect(value.bookkeepingSize()).toMatchObject({ claims: 0, expiries: 0 });
+    expect(value.bookkeepingSize().recent).toBeLessThanOrEqual(4096);
+    expect(value.sweep(10_000)).toBe(0);
+  });
+
+  it("forgets a per-call claim only for its exact token and rejects recent call-id reuse", () => {
+    const value = installed();
+    const fallback = admit(value, { callId: "per-call", model: "other" });
+    expect(fallback.decision).toBe(LeaseDecision.LegacyCheck);
+    expect(value.bookkeepingSize()).toMatchObject({ claims: 1, expiries: 0 });
+    value.forgetClaim("per-call", (fallback.claimToken ?? 0) + 1);
+    expect(value.bookkeepingSize().claims).toBe(1);
+    value.forgetClaim("per-call", fallback.claimToken);
+    expect(value.bookkeepingSize()).toMatchObject({ claims: 0, expiries: 0 });
+    expect(() => admit(value, { callId: "per-call" })).toThrow("call_id");
+  });
+
+  it("protects settled call ids while rejecting stale settlement tokens after reuse", () => {
+    const value = installed(grant({ lease_length_s: 10_000 }));
+    const first = admit(value, { callId: "settled-id" });
+    value.release("settled-id", { claimToken: first.claimToken });
+    expect(() => admit(value, { callId: "settled-id" })).toThrow("call_id");
+    const next = admit(value, { callId: "settled-id", now: 1_902 });
+    value.release("settled-id", { claimToken: first.claimToken });
+    expect(value.stateFor(RUN)?.reservedTokens).toBe(1_500);
+    value.release("settled-id", { claimToken: next.claimToken });
+    expect(value.stateFor(RUN)?.reservedTokens).toBe(0);
+  });
+
+  it.each([
+    "granted",
+    "share",
+  ] as const)("debits full late usage after the sweep refunds the %s reservation", (pool) => {
+    const value = installed(
+      grant({
+        granted_tokens: pool === "granted" ? 5_000 : 0,
+        headroom_share_tokens: 5_000,
+        lease_length_s: 10_000,
+      }),
+    );
+    const admitted = admit(value, { callId: "late", breakerOpen: pool === "share" });
+    expect(value.sweep(1_901)).toBe(1);
+    value.trueUp("late", 9_000, { claimToken: admitted.claimToken });
+    expect(value.stateFor(RUN)).toMatchObject({
+      [pool === "granted" ? "grantedRemainingTokens" : "shareRemainingTokens"]: -4_000,
+      spentTokensSinceReport: 9_000,
+    });
+    value.trueUp("late", 9_000, { claimToken: admitted.claimToken });
+    expect(value.stateFor(RUN)?.spentTokensSinceReport).toBe(9_000);
+    expect(value.bookkeepingSize().swept).toBe(0);
+  });
+
+  it("bounds swept reservations and fences late settlements from replacement leases", () => {
+    const value = installed(grant({ granted_tokens: 10_000_000, lease_length_s: 10_000 }));
+    let lastToken: number | null = null;
+    for (let index = 0; index < 4097; index += 1) {
+      lastToken = admit(value, { callId: `swept-${index}` }).claimToken;
+    }
+    value.sweep(1_901);
+    expect(value.bookkeepingSize()).toMatchObject({ claims: 0, expiries: 0, swept: 4096 });
+    value.drop(RUN);
+    value.applyGrantResponse(RUN, grant({ lease_id: "lse-1", lease_length_s: 10_000 }), {
+      now: 1_902,
+      declaredModels: ["gpt-5"],
+    });
+    value.trueUp("swept-4096", 9_000, { claimToken: lastToken });
+    expect(value.stateFor(RUN)).toMatchObject({
+      grantedRemainingTokens: 15_000,
+      spentTokensSinceReport: 0,
+    });
+  });
+
+  it("keeps spend from a dropped or replaced lease out of its successor's reports", () => {
+    const value = installed();
+    const first = admit(value, { callId: "first-lease" });
+    value.trueUp("first-lease", 5_000, { claimToken: first.claimToken });
+    value.drop(RUN);
+    value.applyGrantResponse(RUN, grant({ lease_id: "lse-2" }), {
+      now: 1_002,
+      declaredModels: ["gpt-5"],
+    });
+    const next = admit(value, { callId: "next-lease", now: 1_003 });
+    value.trueUp("next-lease", 100, { claimToken: next.claimToken });
+    expect(value.buildSurrenderRequest(RUN)?.spent_tokens).toBe(100);
+    value.applyGrantResponse(RUN, grant({ lease_id: "lse-3", generation: 2 }), { now: 1_004 });
+    expect(value.buildRenewalRequest(RUN)?.spent_tokens).toBe(0);
+  });
+
+  it.each([
+    [false, "fail_open", "local_enforce"],
+    [true, "local_enforce", "local_enforce"],
+    [true, "fail_open", "fail_open"],
+  ] as const)("combines client failOpen=%s with server posture %s", (failOpen, server, expected) => {
+    const value = new LeaseLedger({ holderId: HOLDER, failOpen, rng: () => 1 });
+    value.applyGrantResponse(
+      RUN,
+      grant({ posture: { mode: "hard_deny", on_unreachable: server } }),
+      { now: 1_000, declaredModels: ["gpt-5"] },
+    );
+    expect(value.stateFor(RUN)?.onUnreachable).toBe(expected);
+    const result = admit(value, { now: 1_121, breakerOpen: true });
+    expect(result.decision).toBe(
+      expected === "fail_open" ? LeaseDecision.AdmitUncounted : LeaseDecision.AdmitOutageMetered,
+    );
+  });
+
   it("checks the current renewal origin by lease id and generation without mutation", () => {
     const value = installed();
     const before = value.stateFor(RUN);

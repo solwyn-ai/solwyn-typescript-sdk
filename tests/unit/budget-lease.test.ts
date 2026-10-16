@@ -172,6 +172,60 @@ class CountingBreaker extends CircuitBreaker {
 }
 
 describe("BudgetEnforcer lease grant and synchronous admission", () => {
+  it.each([
+    true,
+    false,
+  ])("accrues lease-share outage estimates before per-call checks with failOpen=%s", async (failOpen) => {
+    const breaker = new CircuitBreaker({ failureThreshold: 1 });
+    const budget = enforcer(
+      async () =>
+        jsonResponse(
+          grant({
+            granted_tokens: 600,
+            final_grant: true,
+            budget_limit: 0.005,
+            current_usage: 0,
+            remaining_budget: 0.005,
+          }),
+        ),
+      { failOpen, controlPlaneBreaker: breaker, monotonicNow: () => 0 },
+    );
+    const first = await budget.checkBudget(leaseCheck(580));
+    budget.consumeUnknownUsage(callId(580), first.leaseClaimToken ?? null);
+    expect(budget.getLocalCurrentSpend()).toBe(0);
+    breaker.recordFailure();
+    const shared = await budget.checkBudget(leaseCheck(581));
+    expect(shared).toMatchObject({ allowed: true, leaseId: "lease-1" });
+    expect(budget.getLocalCurrentSpend()).toBeCloseTo(0.003, 8);
+    const perCall = await budget.checkBudget(leaseCheck(582, { tags: { environment: "test" } }));
+    expect(perCall.allowed).toBe(failOpen);
+    expect(budget.getLocalCurrentSpend()).toBeCloseTo(failOpen ? 0.006 : 0.003, 8);
+  });
+
+  it("accrues expired-lease fail-open calls once in the current UTC day", async () => {
+    let clock = Date.UTC(2026, 0, 1, 23, 59);
+    let monotonic = 0;
+    const breaker = new CircuitBreaker({ failureThreshold: 1 });
+    const budget = enforcer(
+      async () => jsonResponse(grant({ lease_length_s: 1, final_grant: true })),
+      {
+        failOpen: true,
+        controlPlaneBreaker: breaker,
+        now: () => clock,
+        monotonicNow: () => monotonic,
+      },
+    );
+    await budget.checkBudget(leaseCheck(583));
+    breaker.recordFailure();
+    monotonic = 2_000;
+    expect((await budget.checkBudget(leaseCheck(584))).leaseId).toBeNull();
+    expect(budget.getLocalCurrentSpend()).toBeCloseTo(0.003, 8);
+    clock = Date.UTC(2026, 0, 2);
+    expect(budget.getLocalCurrentSpend()).toBe(0);
+    await budget.checkBudget(leaseCheck(585));
+    expect(budget.getLocalCurrentSpend()).toBeCloseTo(0.003, 8);
+  });
+
   it("enables leases by default at the low-level constructor", async () => {
     const urls: string[] = [];
     const budget = new BudgetEnforcer({
@@ -2553,6 +2607,19 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
 });
 
 describe("BudgetEnforcer lease settlement capabilities", () => {
+  it("forgets claims after per-call checks and unknown-usage settlement", async () => {
+    const budget = enforcer(async (url) =>
+      jsonResponse(url === LEASE_URL ? grant() : checkResponse()),
+    );
+    const first = await budget.checkBudget(leaseCheck(590));
+    budget.consumeUnknownUsage(callId(590), first.leaseClaimToken ?? null);
+    const ledger = (budget as unknown as { leaseLedger: LeaseLedger }).leaseLedger;
+    expect(ledger.bookkeepingSize()).toMatchObject({ claims: 0, expiries: 0 });
+    const result = await budget.checkBudget(leaseCheck(591, { model: "outside-model" }));
+    expect(result.reservationId).toBe("reservation-check");
+    expect(ledger.bookkeepingSize()).toMatchObject({ claims: 0, expiries: 0 });
+  });
+
   it("true-ups a named lease confirm only after validation and preserves reservation bytes", async () => {
     const budget = enforcer(async () => jsonResponse(grant({ granted_tokens: 1_000 })));
     const admitted = await budget.checkBudget(

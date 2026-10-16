@@ -317,6 +317,11 @@ for await (const chunk of stream) {
 
 > Note: an intercepted `create(...)` returns a plain `Promise`, not OpenAI's `APIPromise`. The response-envelope helpers `.withResponse()` / `.asResponse()` are unavailable on an intercepted call — a deliberate divergence surfaced as a **compile** error rather than a runtime crash. Every non-intercepted path keeps OpenAI's exact types.
 
+The Chat Completions helpers `chat.completions.stream`, `chat.completions.parse`, and
+`chat.completions.runTools` are unmetered. With the default `onUnmetered: "warn"`, each
+surface passes through after one warning, with no budget check or cost event. Use
+`chat.completions.create` for metered calls, including streaming with `stream: true`.
+
 ### Anthropic
 
 ```ts
@@ -332,7 +337,13 @@ await client.messages.create({
 });
 ```
 
-Streaming settles usage from the terminal `message_delta` event.
+Streaming settles usage from cumulative `message_delta` counters, including input and cache
+totals updated by server tools. When supplied, thinking tokens are reported as a subset of
+the output total, and `usage.service_tier` is preserved.
+
+`messages.stream` and `messages.parse` are unmetered helpers. With the default
+`onUnmetered: "warn"`, each passes through after one warning, with no budget check or cost
+event. Use `messages.create`, with `stream: true` for streaming, for metered calls.
 
 ### Google Gemini
 
@@ -497,6 +508,13 @@ try {
 
 The middleware handle owns the budget enforcer + reporter; call `solwyn.close()` (or use `await using`) to flush queued telemetry. Attribution is derived from the wrapped model's `provider`/`modelId`; there is no failover here (the AI SDK owns the single model), so every event is a primary hop.
 
+Run stops are cooperative: the middleware rechecks the captured run after preflight and
+aborts an active stream at its next chunk boundary with `RunStoppedError`. Clearing a stop
+allows future work; an already stopped stream retains its stop. Local velocity detection
+is not supported by the AI SDK middleware. Cache writes are reported in the default
+five-minute bucket, and missing usage totals fall back to length estimates for that side
+of the call while preserving reported totals.
+
 > **Gateway attribution.** When a model id is resolved through the Vercel AI Gateway (a bare string model like `generateText({ model: "anthropic/claude-sonnet-4.5" })`), the AI SDK stamps `provider: "gateway"`. Solwyn derives the true vendor from the `vendor/model` prefix of the model id, so per-vendor budgets and metadata are attributed correctly instead of collapsing onto `openai_compatible`.
 
 ## Media surfaces
@@ -587,7 +605,9 @@ different graph and needs its own reviewed fingerprint.
 
 Strict mode is a cooperative pre-call guard, not a sandbox. Retaining the raw provider client,
 reaching private wrapper state, acknowledging a scoped raw escape, or invoking behavior on a
-returned response, page, stream, job, or operation object can bypass this guard; keep those
+returned response, page, stream, job, or operation object can bypass this guard. Fixed
+non-configurable descriptors retain their native values and accessors to preserve JavaScript
+Proxy invariants, and can also expose raw capabilities; keep those
 capabilities out of code that relies on strict enforcement or review their use explicitly.
 
 </details>
@@ -675,6 +695,12 @@ await run("nightly-batch", async () => {
 ```
 
 `run(name, fn)` is callback-based and returns whatever `fn` returns. Ordinary async work (`await`, `setTimeout`, promises) propagates the active run automatically, including streaming calls drained later within the same async flow. Concurrent async tasks each in their own `run(...)` are fully isolated. Calls made outside any `run(...)` scope are still tracked; the API groups them automatically.
+
+Importing the Node entry leaves its extra lifetime-tracking async hook disabled. The hook
+is enabled while callback runs, unfinished detached handles, or their async work retain a
+run lifetime, and adds process-wide promise overhead during that time. It is disabled once
+the last lifetime is garbage-collected; ending a callback or finishing a handle can
+therefore precede hook shutdown. Finish detached handles when their work is complete.
 
 For a stable run identity that crosses separately scheduled call stacks, create a detached handle
 and activate it explicitly:
@@ -958,10 +984,20 @@ The AI SDK middleware handle exposes the same `close()` / `Symbol.asyncDispose` 
 <details>
 <summary>Wrapper compatibility</summary>
 
-The wrapper preserves `instanceof`, `.constructor`, stable method identity, own keys and property
-descriptors, and property writes, deletes, and definitions. Solwyn-owned lifecycle members such
+The wrapper preserves `instanceof`, `.constructor`, stable method identity across repeated
+direct reads, key and descriptor reflection, and property writes, deletes, and definitions. Solwyn-owned lifecycle members such
 as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails synchronously with
 `ConfigurationError(field: "client")`.
+
+Key, membership, and descriptor inspection do not count as use of an untracked surface.
+Configurable reflected callables and resources enforce the surface policy when used. These
+descriptor values are live guarded handles: they follow later replacement of the property,
+and a reflected callable can have a different identity from a direct method read.
+Traversing an unknown data namespace records the terminal child rather than the container;
+a namespace read with no traversal is recorded on the next microtask under `warn` or `allow`.
+Native serialization limits, including circular `_client` references, still apply.
+`coverage()` accepts wrappers created through either ESM or CommonJS and throws
+`ConfigurationError(field: "client")` for an unregistered object.
 
 </details>
 

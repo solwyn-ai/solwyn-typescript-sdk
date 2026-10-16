@@ -11,6 +11,21 @@ corresponding release notes before users upgrade.
 
 ### Changed
 
+- **Run lifetime tracking starts on demand.** Importing the Node entry no longer enables a
+  process-wide async hook. Tracking starts with the first callback run or detached handle and
+  stops when the last run lifetime is collected. Active lifetimes still add promise overhead.
+- **Surface reflection is observational.** Key, membership, and descriptor inspection no longer
+  applies untracked-spend posture. Configurable reflected operations enforce policy when used;
+  their descriptor values are live guarded handles, and reflected callable identity can differ
+  from a direct read. Fixed descriptors preserve native Proxy invariants. Unknown data namespaces can be traversed
+  in strict mode, and `warn`/`allow` record only the terminal child, or a bare namespace on the
+  next microtask. Surface reads reuse attribution until mutation or initialization refreshes it.
+- **Typed coverage errors.** In this public preview, `coverage()` now throws
+  `ConfigurationError(field: "client")` instead of `TypeError` for an unregistered object.
+- **Helper coverage guidance.** The README now explicitly identifies Anthropic
+  `messages.stream`/`messages.parse` and OpenAI Chat Completions `stream`/`parse`/`runTools`
+  helpers as unmetered, with no budget check or cost event under the default warning posture.
+
 - **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
   at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
   by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
@@ -57,6 +72,29 @@ corresponding release notes before users upgrade.
   report clears the backoff. Reports sent by `close()` are not delayed.
 
 ### Fixed
+
+- **Complete Anthropic usage.** Streaming input and cache totals now follow cumulative
+  `message_delta` counters, including server-tool usage. Buffered and streamed usage map
+  thinking tokens without adding them twice to output, and preserve reported service tiers.
+- **Google sizing and omitted zero counters.** Preflight estimates include Content `parts` and
+  `config.systemInstruction`. A measured input total with omitted candidate output tokens is
+  treated as reported usage with zero candidate output, including thinking-only responses.
+- **Client-local provider diagnostics.** Adapter warnings and local-port detection messages use
+  the client's injected logger. Missing-usage warning latches are independent between clients,
+  and compatible streams bound and warn about an overlong service tier only at settlement.
+- **Cross-dialect stream compatibility.** Bedrock results retain only the metered `stream` when
+  served by another dialect, and empty OpenAI `tool_calls` arrays no longer abort translation.
+- **AI SDK accounting and attribution.** Middleware maps aggregate cache writes to the
+  five-minute bucket, bounds cache buckets by input totals, and estimates a missing usage total
+  while retaining its reported counterpart. Vertex Anthropic, LM Studio, vLLM, generic
+  compatible clients, and Alibaba gateway models receive their own provider attribution.
+- **AI SDK run stops.** Middleware refuses dispatch after a concurrent run stop and aborts
+  in-flight streams at the next chunk boundary. A stopped stream keeps its termination across
+  `clearRunTermination()`; local velocity detection remains unsupported by this integration.
+- **Shared coverage and explicit Node imports.** ESM and CommonJS builds share wrapper coverage
+  registrations. Built Node entries preserve the `node:async_hooks` prefix; core entries remain
+  free of Node builtin imports. Surface-rule validation also avoids compiling a regular
+  expression for every rule during import.
 
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
   reporter now delivers in bounded rounds: each round confirms at most one batch's worth of

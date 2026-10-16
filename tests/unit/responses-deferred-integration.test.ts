@@ -271,7 +271,7 @@ describe("deferred Responses client integration", () => {
     await f.solwyn.close();
   });
 
-  it("stops an active helper before observing another event", async () => {
+  it("stops an active helper after accounting for the pulled event", async () => {
     const f = fixture();
     let wire!: ReadableStreamDefaultController<Uint8Array>;
     const encode = new TextEncoder();
@@ -313,7 +313,7 @@ describe("deferred Responses client integration", () => {
     await f.solwyn.close();
     expect(f.confirms).toHaveLength(1);
     expect(f.events).toHaveLength(1);
-    expect(f.events[0]).toMatchObject({ status: "success", input_tokens: 2, output_tokens: 0 });
+    expect(f.events[0]).toMatchObject({ status: "success", input_tokens: 18, output_tokens: 7 });
     resetRunControlForTest();
   });
 
@@ -345,7 +345,7 @@ describe("deferred Responses client integration", () => {
     expect(f.confirms).toHaveLength(0);
   });
 
-  it("uses established-stream error semantics after connect", async () => {
+  it("keeps unclassified established-stream errors neutral after connect", async () => {
     const f = fixture(undefined, { circuitBreakerFailureThreshold: 1 });
     f.providerFetch.mockImplementationOnce(
       async () =>
@@ -355,13 +355,11 @@ describe("deferred Responses client integration", () => {
         ),
     );
     await expect(f.solwyn.responses.stream({ input: "hi" }).done()).rejects.toBeInstanceOf(Error);
-    await expect(f.solwyn.responses.stream({ input: "hi" }).done()).rejects.toMatchObject({
-      name: "ProviderUnavailableError",
-    });
+    await expect(f.solwyn.responses.stream({ input: "hi" }).done()).resolves.toBeUndefined();
     await f.solwyn.close();
-    expect(f.streamCall).toHaveBeenCalledTimes(1);
-    expect(f.confirms).toHaveLength(0);
-    expect(f.events).toHaveLength(1);
+    expect(f.streamCall).toHaveBeenCalledTimes(2);
+    expect(f.confirms).toHaveLength(1);
+    expect(f.events).toHaveLength(2);
     expect(f.events[0]).toMatchObject({ status: "error", possibly_succeeded: true });
   });
 
@@ -455,7 +453,7 @@ describe("deferred Responses client integration", () => {
   it.each([
     "already aborted",
     "pending connection",
-  ] as const)("classifies a request signal cancellation (%s) before connect without success or health verdict", async (phase) => {
+  ] as const)("settles a request signal cancellation (%s) before connect without a health verdict", async (phase) => {
     const f = fixture(undefined, { circuitBreakerFailureThreshold: 1 });
     const controller = new AbortController();
     let started!: () => void;
@@ -487,11 +485,10 @@ describe("deferred Responses client integration", () => {
     expect(f.streamCall).toHaveBeenCalledTimes(1);
     expect(f.providerFetch).toHaveBeenCalledTimes(phase === "already aborted" ? 0 : 1);
     expect(f.checks).toHaveLength(1);
-    expect(f.confirms).toHaveLength(0);
+    expect(f.confirms).toHaveLength(1);
     expect(f.events).toHaveLength(1);
     expect(f.events[0]).toMatchObject({
-      status: "error",
-      failover_error_class: "APIUserAbortError",
+      status: "success",
     });
     expect(f.events[0]).not.toHaveProperty("possibly_succeeded");
     expect(f.breakerReports).toHaveLength(1);

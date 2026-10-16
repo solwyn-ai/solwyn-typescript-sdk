@@ -615,6 +615,22 @@ JavaScript provider SDKs expose one per-request timeout rather than separate con
 
 Circuit breakers, latency signals, and failover labeling key off the provider **name** — so give distinct endpoints distinct identities (via `provider` or the 4th fallback element) when you want them tracked separately.
 
+Caller cancellation never advances to another provider or counts as a provider failure. A
+cancelled stream settles the usage observed so far, using the reservation floor when usage is
+estimated. SDK request-deadline aborts still count as provider failures. A half-open streaming
+probe is held for at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second
+minimum. Expiry or finalization releases it neutrally, so an unread stream cannot block later
+recovery indefinitely. Its later outcome cannot affect a newer probe.
+
+`failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
+known to be eligible for failover, and `"always"` also permits ambiguous failures after send.
+The per-call request field `solwynIdempotent: false` tightens `"always"` to `"safe"` and keeps
+`"never"` unchanged; `true` preserves the configured policy. Solwyn strips this field before
+every intercepted provider dispatch, including media and Bedrock command input. It never
+changes the caller's params or command. When a plan suppresses custom failover tuning, the SDK
+uses the stricter requested/default idempotency policy, fewer retries, and smaller total window;
+a requested zero window still prevents dispatch.
+
 **Selection policy.** Attempt order is chosen by an injectable `selectionPolicy` (the drop-in seam — swapping it changes ordering with zero changes to dispatch, translation, or budgets):
 
 - `HealthBasedPolicy` — health-tier ordering (default).
@@ -945,6 +961,23 @@ try {
   await client.close();
 }
 ```
+
+Once `close()` begins, new intercepted calls reject with `SolwynError("client is closed")`
+before a budget check or provider request. Deferred `responses.stream()` helpers issued earlier
+also reject if first activated after closing begins. Repeated `close()` and async disposal share
+the same shutdown promise.
+
+Buffered calls and stream setup already in flight drain within `reporterShutdownDeadline`;
+settlement delivery uses the time remaining in that same deadline. A call that outlasts it can
+finish after reporting closes, and the SDK logs a shutdown warning with the number still active.
+The settlement reporter closes first, followed by the advisory reporter, budget/lease holder,
+and wrapped provider.
+
+Open streams settle once from usage observed so far, without waiting for the consumer to pull
+another chunk. Further chunks are withheld at the next provider-chunk boundary. Finish or
+cancel streams before closing the client when you need their terminal usage included; provider
+stream cleanup still belongs to the consumer. Usage that is estimated retains the reservation
+floor during settlement.
 
 Or let `await using` do it:
 

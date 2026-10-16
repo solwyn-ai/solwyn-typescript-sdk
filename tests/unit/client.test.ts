@@ -788,16 +788,17 @@ describe("SolwynCore — streaming settlement", () => {
     expect(event.service_tier).toBe("flex");
   });
 
-  it("does not report before the stream is drained (settlement is at stream end)", async () => {
+  it("settles an unread stream's observed usage when the client closes", async () => {
     const client = openAIClient(() => fakeStream());
     const { fetchMock, ingested } = makeFetch();
     const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch: fetchMock });
 
-    // Obtain the stream but never drain it; the client shuts down without a settlement.
+    // No stream chunk is read; shutdown still emits a conservative settlement receipt.
     await solwyn.chat.completions.create({ model: "gpt-4o", messages: [], stream: true });
     await solwyn.close();
 
-    expect(ingested).toHaveLength(0);
+    expect(ingested).toHaveLength(1);
+    expect(ingested[0]).toMatchObject({ status: "success", input_tokens: 0, output_tokens: 0 });
   });
 });
 
@@ -1692,7 +1693,7 @@ describe("SolwynCore — local run-control admission", () => {
     expect(postcheckTermination(runId)).toBeUndefined();
   });
 
-  it("settles a same-provider stopped stream once from usage observed before the discarded item", async () => {
+  it("settles a same-provider stopped stream once including usage on the discarded item", async () => {
     let rawPulls = 0;
     let closed = 0;
     async function* rawStream(): AsyncGenerator<unknown> {
@@ -1773,15 +1774,15 @@ describe("SolwynCore — local run-control admission", () => {
         call_id: expect.any(String),
         provider: "openai",
         model: "gpt-4o",
-        token_details: { input_tokens: 6, output_tokens: 2 },
+        token_details: { input_tokens: 900, output_tokens: 900 },
       },
       event: {
         status: "success",
         provider: "openai",
         model: "gpt-4o",
-        input_tokens: 6,
-        output_tokens: 2,
-        token_details: { input_tokens: 6, output_tokens: 2 },
+        input_tokens: 900,
+        output_tokens: 900,
+        token_details: { input_tokens: 900, output_tokens: 900 },
         agent_run_id: runId,
       },
     });

@@ -14,6 +14,21 @@
 import { escapeControlChars } from "./logging";
 import type { CapabilityScope, EffectiveSurfaceKind, SurfaceClientShape } from "./surfaces";
 
+const callerAbortErrors = new WeakSet<object>();
+
+/** @internal Preserve cancellation provenance without mutating or retaining provider errors. */
+export function markCallerAbort(error: unknown, signal: AbortSignal | undefined): unknown {
+  if (signal?.aborted && typeof error === "object" && error !== null) {
+    callerAbortErrors.add(error);
+  }
+  return error;
+}
+
+/** @internal Only dispatch owners can establish caller-cancellation provenance. */
+export function isCallerAbort(error: unknown): boolean {
+  return typeof error === "object" && error !== null && callerAbortErrors.has(error);
+}
+
 const ERROR_IDENTITIES_KEY = Symbol.for("@solwyn/sdk.errorIdentities.v1");
 interface GlobalErrorIdentities {
   [ERROR_IDENTITIES_KEY]?: WeakMap<object, Set<string>>;

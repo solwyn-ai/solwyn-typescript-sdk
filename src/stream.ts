@@ -692,6 +692,7 @@ export function observeResponseStream(
   listen("event", (event) => {
     if (settled) return;
     try {
+      accumulator.observe(event);
       stopped = abortCheck?.();
       if (stopped !== undefined) {
         // Native EventStream snapshots listeners before invoking this observer. Abort
@@ -710,7 +711,6 @@ export function observeResponseStream(
         provider.abort();
         return;
       }
-      accumulator.observe(event);
     } catch (error) {
       finish(true, error);
       provider.abort();
@@ -1071,6 +1071,8 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
           return { done: true, value: pulled.value };
         }
 
+        // Account for the pulled item even when a stop prevents delivering it to the caller.
+        this.#accumulator.observe(pulled.value);
         const abortError = this.#abortCheck?.();
         if (abortError !== undefined) {
           this.#abortError = abortError;
@@ -1080,8 +1082,6 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
           throw abortError;
         }
 
-        // Observe the RAW served item before translating it. The item itself remains opaque.
-        this.#accumulator.observe(pulled.value);
         if (cursor === null) {
           return { done: false, value: pulled.value };
         }
@@ -1122,7 +1122,21 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
       throw this.#abortError;
     }
     if (!this.#terminal) {
-      await this.#ordinaryFailureInside(error);
+      this.#terminal = true;
+      this.#translationCursor?.clear();
+      try {
+        await this.#settle();
+        const iterator = this.#iterator;
+        if (typeof iterator?.throw === "function") await iterator.throw(error);
+      } catch {
+        // Consumer termination remains authoritative over finalization and delegated throw.
+      } finally {
+        try {
+          await this.#cleanupInside();
+        } catch {
+          /* Preserve the consumer's error. */
+        }
+      }
     }
     throw error;
   }

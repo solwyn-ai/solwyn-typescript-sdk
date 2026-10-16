@@ -578,7 +578,7 @@ function isAllowedFetchMemberWriteOrForward(
   );
 }
 
-function findTestingNetworkViolations(file: SourceFile): string[] {
+function findEdgeNetworkViolations(file: SourceFile): string[] {
   const offenders: string[] = [];
   const source = ts.createSourceFile(
     file.abs,
@@ -635,9 +635,6 @@ function findTestingNetworkViolations(file: SourceFile): string[] {
   if (/\bconsole\s*\./.test(stripLiteralsAndComments(file.text))) {
     offenders.push(`${file.rel}: calls console`);
   }
-  if (/\b(?:Logger|logger)\b/.test(stripLiteralsAndComments(file.text))) {
-    offenders.push(`${file.rel}: names a logger`);
-  }
   if ([...imported].some((specifier) => specifier.startsWith("node:"))) {
     offenders.push(`${file.rel}: imports node:*`);
   }
@@ -667,6 +664,14 @@ function findTestingNetworkViolations(file: SourceFile): string[] {
     if ([...imported].some((specifier) => specifier === pkg || specifier.startsWith(`${pkg}/`))) {
       offenders.push(`${file.rel}: imports network client '${pkg}'`);
     }
+  }
+  return offenders;
+}
+
+function findTestingNetworkViolations(file: SourceFile): string[] {
+  const offenders = findEdgeNetworkViolations(file);
+  if (/\b(?:Logger|logger)\b/.test(stripLiteralsAndComments(file.text))) {
+    offenders.push(`${file.rel}: names a logger`);
   }
   return offenders;
 }
@@ -761,12 +766,12 @@ describe("privacy firewall — content never reaches a logger", () => {
     expect(FIREWALLED).toContain(receiptFold);
   });
 
-  it("keeps velocity.ts content-blind, logger-free, and edge-safe", () => {
+  it("keeps velocity.ts content-blind and edge-safe when logging structural warnings", () => {
     const velocity = ALL_SOURCES.find((file) => file.rel === "velocity.ts");
     expect(velocity).toBeDefined();
     expect(FIREWALLED).toContain(velocity);
     expect(findLoggerViolations(velocity as SourceFile)).toEqual([]);
-    expect(findTestingNetworkViolations(velocity as SourceFile)).toEqual([]);
+    expect(findEdgeNetworkViolations(velocity as SourceFile)).toEqual([]);
   });
 
   it("keeps run-control.ts content-blind, logger-free, and edge-safe", () => {

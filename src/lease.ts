@@ -25,6 +25,8 @@ export const REFRESH_JITTER_MIN = 0.85;
 export const REFRESH_JITTER_MAX = 1.15;
 export const BACKOFF_BASE_S = 1;
 export const BACKOFF_CAP_S = 30;
+const RECENT_CALL_LIMIT = 4096;
+const SWEPT_RESERVATION_LIMIT = 4096;
 
 export interface InstallableLeaseGrantResponse extends LeaseGrantResponse {
   lease_id: string;
@@ -129,6 +131,10 @@ interface Expiry {
   readonly at: number;
   readonly token: number;
   readonly callId: string;
+}
+interface SweptReservation {
+  readonly runId: string;
+  readonly reservation: Reservation;
 }
 /** The release owed after an ineligible renewal, pending until its outcome arrives. */
 export interface RefusalRelease {
@@ -235,6 +241,7 @@ export class LeaseState {
 
 export interface LeaseLedgerOptions {
   holderId: string;
+  failOpen?: boolean;
   enabled?: boolean;
   outputBoundDefault?: number;
   rng?: (() => number) | { uniform(min: number, max: number): number };
@@ -312,6 +319,10 @@ export class LeaseLedger {
   readonly #callIndex = new Map<string, string>();
   readonly #callClaims = new Map<string, CallClaim>();
   readonly #callExpiries: Expiry[] = [];
+  readonly #expiryIndex = new Map<string, number>();
+  readonly #recentCalls = new Map<string, number>();
+  readonly #sweptReservations = new Map<string, SweptReservation>();
+  readonly #failOpen: boolean;
   /** Runs whose aged reservations a sweep released since the owner last took them. */
   readonly #sweptRuns = new Set<string>();
   #nextClaimToken = 0;
@@ -321,6 +332,7 @@ export class LeaseLedger {
 
   constructor({
     holderId,
+    failOpen = true,
     enabled = true,
     outputBoundDefault = DEFAULT_OUTPUT_BOUND,
     rng,
@@ -331,6 +343,7 @@ export class LeaseLedger {
       });
     }
     this.holderId = holderId;
+    this.#failOpen = failOpen;
     this.enabled = enabled;
     this.outputBoundDefault = outputBoundDefault;
     this.#rng = rng;
@@ -378,6 +391,27 @@ export class LeaseLedger {
   }
   activeRunIds(): string[] {
     return [...this.#states].flatMap(([runId, state]) => (state.hasLease ? [runId] : []));
+  }
+  /** Internal bookkeeping diagnostics; not part of the package entry points. */
+  bookkeepingSize(): { claims: number; expiries: number; recent: number; swept: number } {
+    return {
+      claims: this.#callClaims.size,
+      expiries: this.#callExpiries.length,
+      recent: this.#recentCalls.size,
+      swept: this.#sweptReservations.size,
+    };
+  }
+  /** Release preflight ownership when no lease reservation was made. */
+  forgetClaim(callId: string, token: number | null): void {
+    const claim = this.#callClaims.get(callId);
+    if (!claim || claim.token !== token || this.#callIndex.has(callId)) return;
+    this.#callClaims.delete(callId);
+    this.#recentCalls.delete(callId);
+    this.#recentCalls.set(callId, claim.createdAt + RESERVATION_MAX_AGE_S);
+    if (this.#recentCalls.size > RECENT_CALL_LIMIT) {
+      const oldest = this.#recentCalls.keys().next().value;
+      if (oldest !== undefined) this.#recentCalls.delete(oldest);
+    }
   }
 
   admit(options: AdmitOptions): LeaseAdmission {
@@ -516,7 +550,10 @@ export class LeaseLedger {
     const sameLease = state.leaseId === leaseId;
     const carriedGranted = sameLease ? this.#carriedGrantedDrawdown(state) : 0;
     const carriedShare = sameLease ? this.#carriedShareDrawdown(state) : 0;
-    if (!sameLease) this.#rotateLeaseIncarnation(state);
+    if (!sameLease) {
+      this.#rotateLeaseIncarnation(state);
+      state.spentTokensSinceReport = 0;
+    }
     state.leaseId = leaseId;
     state.generation = generation;
     state.grantedTokens = Math.max(0, grantedTokens);
@@ -526,7 +563,7 @@ export class LeaseLedger {
       now + refreshInterval * this.#uniform(REFRESH_JITTER_MIN, REFRESH_JITTER_MAX);
     state.leaseDeadline = now + leaseLength;
     state.postureMode = posture.mode;
-    state.onUnreachable = posture.on_unreachable;
+    state.onUnreachable = this.#failOpen ? posture.on_unreachable : "local_enforce";
     state.finalGrant = Boolean(response.final_grant);
     if (sameLease) for (const model of declaredModels) state.declaredModels.add(model);
     else state.declaredModels = new Set(declaredModels);
@@ -606,7 +643,9 @@ export class LeaseLedger {
   discard(runId: string): void {
     const state = this.#states.get(runId);
     if (!state) return;
-    for (const callId of state.reservations.keys()) this.#callIndex.delete(callId);
+    for (const [callId, reservation] of state.reservations) {
+      this.#takeReservation(callId, reservation.claimToken);
+    }
     this.#states.delete(runId);
   }
   /** A completed surrender cannot leave reusable local authority on a revived identity. */
@@ -630,6 +669,9 @@ export class LeaseLedger {
     this.#callIndex.clear();
     this.#callClaims.clear();
     this.#callExpiries.length = 0;
+    this.#expiryIndex.clear();
+    this.#recentCalls.clear();
+    this.#sweptReservations.clear();
     this.#sweptRuns.clear();
     return requests;
   }
@@ -658,13 +700,17 @@ export class LeaseLedger {
     this.#callIndex.clear();
     this.#callClaims.clear();
     this.#callExpiries.length = 0;
+    this.#expiryIndex.clear();
+    this.#recentCalls.clear();
+    this.#sweptReservations.clear();
   }
   trueUp(
     callId: string,
     actualTokens: number,
     { claimToken, floorAtReservation = false }: ClaimSettlementOptions,
   ): void {
-    const taken = this.#takeReservation(callId, claimToken);
+    const live = this.#takeReservation(callId, claimToken);
+    const taken = live ?? this.#takeSweptReservation(callId, claimToken);
     if (
       !taken ||
       taken.reservation.leaseId !== taken.state.leaseId ||
@@ -674,13 +720,14 @@ export class LeaseLedger {
     const actual = floorAtReservation
       ? Math.max(Math.max(0, actualTokens), taken.reservation.tokens)
       : Math.max(0, actualTokens);
-    const delta = actual - taken.reservation.tokens;
+    const delta = actual - (live ? taken.reservation.tokens : 0);
     if (taken.reservation.pool === "granted") taken.state.grantedRemainingTokens -= delta;
     else taken.state.shareRemainingTokens -= delta;
     taken.state.spentTokensSinceReport += actual;
   }
   release(callId: string, { claimToken }: ClaimSettlementOptions): void {
     const taken = this.#takeReservation(callId, claimToken);
+    if (!taken) this.#takeSweptReservation(callId, claimToken);
     if (
       !taken ||
       taken.reservation.leaseId !== taken.state.leaseId ||
@@ -701,6 +748,15 @@ export class LeaseLedger {
         continue;
       const runId = this.#callIndex.get(expiry.callId);
       if (runId !== undefined) {
+        const reservation = this.#states.get(runId)?.reservations.get(expiry.callId);
+        if (reservation) {
+          this.#sweptReservations.delete(expiry.callId);
+          this.#sweptReservations.set(expiry.callId, { runId, reservation });
+          if (this.#sweptReservations.size > SWEPT_RESERVATION_LIMIT) {
+            const oldest = this.#sweptReservations.keys().next().value;
+            if (oldest !== undefined) this.#sweptReservations.delete(oldest);
+          }
+        }
         this.release(expiry.callId, { claimToken: expiry.token });
         this.#sweptRuns.add(runId);
         swept++;
@@ -1042,6 +1098,7 @@ export class LeaseLedger {
       claimToken: claim.token,
     });
     this.#callIndex.set(callId, state.runId);
+    this.#pushExpiry({ at: now + RESERVATION_MAX_AGE_S, token: claim.token, callId });
   }
   #claimCall(runId: string, callId: string, now: number, claimToken: number | null): number {
     const existing = this.#callClaims.get(callId);
@@ -1052,9 +1109,14 @@ export class LeaseLedger {
       return existing.token;
     }
     if (existing) throw new SolwynError("call_id has already been used by this SDK client");
+    const recentDeadline = this.#recentCalls.get(callId);
+    if (recentDeadline !== undefined) {
+      if (now < recentDeadline)
+        throw new SolwynError("call_id has already been used by this SDK client");
+      this.#recentCalls.delete(callId);
+    }
     const token = ++this.#nextClaimToken;
     this.#callClaims.set(callId, { runId, createdAt: now, token });
-    this.#pushExpiry({ at: now + RESERVATION_MAX_AGE_S, token, callId });
     return token;
   }
   #takeReservation(
@@ -1068,7 +1130,19 @@ export class LeaseLedger {
     if (!state || !reservation || reservation.claimToken !== claimToken) return null;
     this.#callIndex.delete(callId);
     state.reservations.delete(callId);
+    this.#removeExpiry(callId);
+    this.forgetClaim(callId, claimToken);
     return { state, reservation };
+  }
+  #takeSweptReservation(
+    callId: string,
+    claimToken: number | null,
+  ): { state: LeaseState; reservation: Reservation } | null {
+    const swept = this.#sweptReservations.get(callId);
+    if (!swept || swept.reservation.claimToken !== claimToken) return null;
+    this.#sweptReservations.delete(callId);
+    const state = this.#states.get(swept.runId);
+    return state ? { state, reservation: swept.reservation } : null;
   }
   #dropLease(state: LeaseState): void {
     this.#rotateLeaseIncarnation(state);
@@ -1083,6 +1157,7 @@ export class LeaseLedger {
     state.renewalInFlight = false;
     state.renewalDeclaration = null;
     state.pendingReport = null;
+    state.spentTokensSinceReport = 0;
   }
   /**
    * Settle the refused renewal's report (the control plane applied its tallies and its spend is
@@ -1158,29 +1233,51 @@ export class LeaseLedger {
       const parent = Math.floor((index - 1) / 2);
       const parentItem = heap[parent];
       if (!parentItem || parentItem.at <= item.at) break;
-      heap[index] = parentItem;
+      this.#placeExpiry(index, parentItem);
       index = parent;
     }
-    heap[index] = item;
+    this.#placeExpiry(index, item);
   }
   #popExpiry(): Expiry | null {
-    const heap = this.#callExpiries;
-    const first = heap[0];
-    const last = heap.pop();
+    const first = this.#callExpiries[0];
     if (!first) return null;
-    if (!last || heap.length === 0) return first;
-    let index = 0;
+    this.#removeExpiry(first.callId);
+    return first;
+  }
+  #placeExpiry(index: number, item: Expiry): void {
+    this.#callExpiries[index] = item;
+    this.#expiryIndex.set(item.callId, index);
+  }
+  #removeExpiry(callId: string): void {
+    const found = this.#expiryIndex.get(callId);
+    if (found === undefined) return;
+    let index: number = found;
+    const heap = this.#callExpiries;
+    const last = heap.pop();
+    this.#expiryIndex.delete(callId);
+    if (!last || index === heap.length) return;
+    const parent = heap[Math.floor((index - 1) / 2)];
+    if (parent && parent.at > last.at) {
+      while (index > 0) {
+        const parentIndex = Math.floor((index - 1) / 2);
+        const item = heap[parentIndex];
+        if (!item || item.at <= last.at) break;
+        this.#placeExpiry(index, item);
+        index = parentIndex;
+      }
+      this.#placeExpiry(index, last);
+      return;
+    }
     while (index * 2 + 1 < heap.length) {
       let child = index * 2 + 1;
       const right = child + 1;
       if ((heap[right]?.at ?? Infinity) < (heap[child]?.at ?? Infinity)) child = right;
       const childItem = heap[child];
       if (!childItem || last.at <= childItem.at) break;
-      heap[index] = childItem;
+      this.#placeExpiry(index, childItem);
       index = child;
     }
-    heap[index] = last;
-    return first;
+    this.#placeExpiry(index, last);
   }
 }
 

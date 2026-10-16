@@ -1431,7 +1431,7 @@ describe("failover / tuning knobs", () => {
     expect((caught as ConfigurationError).field).toBe(field);
   });
 
-  it.each([0, -1, 0.25])("accepts failover_total_timeout=%s", (value) => {
+  it.each([0, 0.25])("accepts failover_total_timeout=%s", (value) => {
     expect(
       resolveConfig({
         api_key: VALID_KEY,
@@ -1609,5 +1609,159 @@ describe("strict schema", () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(ConfigurationError);
+  });
+});
+
+describe("numeric configuration safety bounds", () => {
+  const maxTimerSeconds = 2_147_483_647 / 1000;
+  const integerFields = [
+    "same_provider_retries",
+    "circuit_breaker_failure_threshold",
+    "circuit_breaker_success_threshold",
+    "control_plane_failure_threshold",
+    "reporter_batch_size",
+    "reporter_max_queue_size",
+    "reporter_max_in_flight",
+    "reporter_max_send_attempts",
+  ] as const;
+  const timerFields = [
+    "failover_total_timeout",
+    "failover_hop_read_timeout",
+    "circuit_breaker_recovery_timeout",
+    "budget_check_cache_ttl",
+    "budget_check_timeout",
+    "control_plane_recovery_timeout",
+    "reporter_flush_interval",
+    "reporter_retry_backoff_base",
+    "reporter_retry_backoff_cap",
+    "reporter_shutdown_deadline",
+    "breaker_report_heartbeat",
+  ] as const;
+  const numericFields = [
+    ...integerFields,
+    ...timerFields,
+    "circuit_breaker_recovery_timeout_jitter",
+  ] as const;
+
+  it.each(
+    numericFields.flatMap((field) =>
+      [true, false, null, "", " ", NaN, Infinity, -Infinity].map(
+        (value) => [field, value] as const,
+      ),
+    ),
+  )("rejects non-numeric or non-finite %s=%s with the exact field", (field, value) => {
+    expect(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, [field]: value } as unknown as SolwynConfigOptions,
+        {},
+      ),
+    ).toThrow(expect.objectContaining({ name: "ConfigurationError", field }));
+  });
+
+  it.each(
+    integerFields.flatMap((field) =>
+      [-1, 1.5, Number.MAX_SAFE_INTEGER + 1].map((value) => [field, value] as const),
+    ),
+  )("rejects invalid integer %s=%s", (field, value) => {
+    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: value }, {})).toThrow(
+      expect.objectContaining({ field }),
+    );
+  });
+
+  it.each([
+    "circuit_breaker_failure_threshold",
+    "circuit_breaker_success_threshold",
+    "control_plane_failure_threshold",
+  ] as const)("requires a positive %s", (field) => {
+    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: 0 }, {})).toThrow(
+      expect.objectContaining({ field }),
+    );
+  });
+
+  it.each(
+    timerFields.flatMap((field) =>
+      [-1, maxTimerSeconds + 1].map((value) => [field, value] as const),
+    ),
+  )("rejects out-of-range timer %s=%s", (field, value) => {
+    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: value }, {})).toThrow(
+      expect.objectContaining({ field }),
+    );
+  });
+
+  it.each([
+    "budget_check_timeout",
+    "failover_hop_read_timeout",
+    "reporter_flush_interval",
+    "reporter_retry_backoff_base",
+    "reporter_retry_backoff_cap",
+    "breaker_report_heartbeat",
+  ] as const)("requires positive timer %s", (field) => {
+    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: 0 }, {})).toThrow(
+      expect.objectContaining({ field }),
+    );
+  });
+
+  it.each([-1, 1.001, 5])("rejects out-of-range breaker jitter %s", (value) => {
+    expect(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, circuit_breaker_recovery_timeout_jitter: value },
+        {},
+      ),
+    ).toThrow(expect.objectContaining({ field: "circuit_breaker_recovery_timeout_jitter" }));
+  });
+
+  it("enforces the server batch limit and a heartbeat no greater than 60 seconds", () => {
+    expect(() =>
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, reporter_batch_size: 1001 }, {}),
+    ).toThrow(expect.objectContaining({ field: "reporter_batch_size" }));
+    expect(() =>
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, breaker_report_heartbeat: 60.001 }, {}),
+    ).toThrow(expect.objectContaining({ field: "breaker_report_heartbeat" }));
+    expect(
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, reporter_batch_size: 1000, breaker_report_heartbeat: 60 },
+        {},
+      ),
+    ).toMatchObject({ reporter_batch_size: 1000, breaker_report_heartbeat: 60 });
+  });
+
+  it("rejects empty and oversized timer environment values", () => {
+    for (const raw of ["", " ", "3000000"]) {
+      expect(() =>
+        resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_BUDGET_CHECK_TIMEOUT: raw }),
+      ).toThrow(expect.objectContaining({ field: "budget_check_timeout" }));
+    }
+  });
+
+  it("accepts documented zero values, jitter endpoints, and the largest timer delay", () => {
+    expect(
+      resolveConfigFromEnvSnapshot(
+        {
+          api_key: VALID_KEY,
+          failover_total_timeout: 0,
+          budget_check_cache_ttl: 0,
+          reporter_shutdown_deadline: 0,
+          circuit_breaker_recovery_timeout: 0,
+          control_plane_recovery_timeout: 0,
+          same_provider_retries: 0,
+          circuit_breaker_recovery_timeout_jitter: 0,
+          reporter_flush_interval: maxTimerSeconds,
+          budget_check_timeout: maxTimerSeconds,
+          reporter_retry_backoff_cap: maxTimerSeconds,
+        },
+        {},
+      ),
+    ).toMatchObject({
+      failover_total_timeout: 0,
+      budget_check_cache_ttl: 0,
+      reporter_shutdown_deadline: 0,
+      reporter_flush_interval: maxTimerSeconds,
+    });
+    expect(
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, circuit_breaker_recovery_timeout_jitter: 1 },
+        {},
+      ).circuit_breaker_recovery_timeout_jitter,
+    ).toBe(1);
   });
 });

@@ -177,6 +177,11 @@ estimate. The ordinary check path uses `POST /api/v1/budgets/check`; when it ret
 the reporter settles it through `POST /api/v1/budgets/confirm` with observed usage. Streaming
 settles once, at stream end. Eligible calls can reuse cached authority or a run lease. A hard
 deny throws before provider dispatch and reports a `budget_denied` event carrying the estimate.
+The budget preflight timeout is shared by a lease attempt and any per-call fallback. A caller's
+request `AbortSignal` also cancels preflight; cancellation rejects without recording a
+control-plane breaker failure. Direct `BudgetEnforcer.checkBudget()` callers can pass `signal`
+and use the returned `callId` to settle or release a lease reservation, including when the SDK
+generated the ID.
 
 Settlement is automatic and private. Close the wrapped client to flush queued confirmations
 and events; your application does not need a separate confirmation call.
@@ -757,6 +762,10 @@ The same cooperative mechanism can stop runaway work locally. It observes only r
 timestamps, and estimated input-token counts — never prompts or responses. In `"warn"` mode it
 adds structural `velocity_flags` and rate-limited warnings; in `"deny"` mode only
 `repeat_size` and `monotonic_growth` can terminate a run. `rate_acceleration` is advisory.
+The detector retains up to 64 observations per run for at most 4096 runs. Stale run histories
+are discarded first; if the hard cap displaces live history, `velocity.history_evicted` warns
+at most once every 30 seconds. Established histories keep progressing under round-robin traffic
+above the cap, but a displaced run can lose observations needed to detect a loop.
 
 | Option | Env var | Default | Meaning |
 |--------|---------|---------|---------|
@@ -1024,7 +1033,7 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `sameProviderRetries` | — | `0` | Same-provider `Retry-After` retries |
 | `failoverTotalTimeout` | — | `30` | Failover-window seconds; does not cap an in-flight provider read |
 | `failoverHopReadTimeout` | — | `600` | Constant provider request bound in seconds |
-| `circuitBreakerRecoveryTimeoutJitter` | — | `0.2` | Provider-breaker recovery jitter fraction |
+| `circuitBreakerRecoveryTimeoutJitter` | — | `0.2` | Provider-breaker recovery jitter fraction (0–1) |
 | `circuitBreakerFailureThreshold` | `SOLWYN_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive failures before a provider breaker opens |
 | `circuitBreakerRecoveryTimeout` | `SOLWYN_CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `60` | Provider-breaker recovery timeout in seconds |
 | `circuitBreakerSuccessThreshold` | `SOLWYN_CIRCUIT_BREAKER_SUCCESS_THRESHOLD` | `2` | Half-open successes required to close a provider breaker |
@@ -1035,7 +1044,7 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `controlPlaneFailureThreshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive outages before the shared control-plane breaker opens |
 | `controlPlaneRecoveryTimeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30` | Control-plane breaker recovery timeout in seconds |
 | `breakerReportingEnabled` | `SOLWYN_BREAKER_REPORTING_ENABLED` | `true` | Publish provider-breaker snapshots |
-| `reporterBatchSize` | `SOLWYN_REPORTER_BATCH_SIZE` | `50` | Events per ingest batch |
+| `reporterBatchSize` | `SOLWYN_REPORTER_BATCH_SIZE` | `50` | Events per ingest batch (1–1000) |
 | `reporterFlushInterval` | `SOLWYN_REPORTER_FLUSH_INTERVAL` | `5` | Background flush interval in seconds |
 | `reporterMaxQueueSize` | `SOLWYN_REPORTER_MAX_QUEUE_SIZE` | `10000` | Reporter queue cap; overflow drops oldest |
 | `reporterMaxInFlight` | `SOLWYN_REPORTER_MAX_IN_FLIGHT` | `3` | Accepted but currently has no effect: reporter sends are serial, one request at a time |
@@ -1043,7 +1052,7 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Retry backoff base in seconds |
 | `reporterRetryBackoffCap` | `SOLWYN_REPORTER_RETRY_BACKOFF_CAP` | `60` | Retry backoff cap in seconds |
 | `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Final reporter deadline in seconds; `0` is valid |
-| `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds |
+| `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds (greater than 0, at most 60) |
 | `velocityMode` | `SOLWYN_VELOCITY_MODE` | `"warn"` | Local velocity posture: `"off"`, `"warn"`, or `"deny"` |
 | `velocityRepeatCount` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required (2–64) |
 | `velocityRepeatWindowS` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60` | Repeat detection window in seconds |
@@ -1054,9 +1063,17 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 
 Env fallback is a **presence check**: an env var is consulted only when the corresponding option is `undefined`. An explicitly-passed `false`, `0`, or `""` always wins over the env var. Client objects, request defaults, routing policies, injected transports, and failover-only knobs remain code-only. Unknown option keys and a present non-function `fetch` fail synchronously with `ConfigurationError`.
 
-Both failover timeout values must be finite, non-boolean numbers;
-`failoverHopReadTimeout` must also be positive. A zero `failoverTotalTimeout` is valid and prevents
-new work from starting after call entry. JavaScript provider SDKs expose a single per-request
+Numeric settings reject booleans and empty strings. Breaker thresholds and reporter counts must
+be positive integers; `sameProviderRetries` permits zero. Timeout, cache, recovery, flush,
+backoff, and shutdown durations must be finite and no greater than `2147483.647` seconds, so
+their millisecond delays fit the runtime timer range. Cache TTLs and provider-breaker recovery
+waits remain integer seconds. `budgetCheckTimeout`, `failoverHopReadTimeout`, flush/backoff
+intervals, and heartbeats must be positive; cache TTLs, recovery waits, and shutdown deadlines
+permit zero. Direct `BudgetEnforcer` options apply the same duration limit to `cacheTtl` and
+per-call `timeout`, with zero allowed only for `cacheTtl`.
+
+`failoverTotalTimeout` must be non-negative. A zero value prevents new work from starting after
+call entry. JavaScript provider SDKs expose a single per-request
 timeout carrier rather than separate connect and read phases, and what it covers differs by SDK.
 For the OpenAI, OpenAI-compatible, and Anthropic SDKs, `failoverHopReadTimeout` covers only
 connecting and receiving response headers: a response body or stream that stalls after its first

@@ -26,6 +26,21 @@ corresponding release notes before users upgrade.
   `"safe"` failover while preserving a configured `"never"`; `true` preserves the configured
   policy. The option is stripped from every intercepted request, including media and native
   Bedrock commands, without mutating caller-owned params.
+- **Breaking: numeric configuration rejects unsafe values.** Budget-check and reporter timers
+  must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive timers
+  reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown deadlines
+  allow zero and reject negatives. Empty numeric environment values are rejected. Breaker
+  thresholds must be positive integers, retries must be non-negative integers, and jitter must
+  be between zero and one. Reporter batches cannot exceed 1000 events, and breaker heartbeats
+  cannot exceed 60 seconds. Documented defaults are unchanged.
+- **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects non-number,
+  non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite, non-positive,
+  and oversized per-call `timeout` values with `ConfigurationError`. Both durations are in
+  seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
+- **Velocity history survives higher run concurrency.** Structural loop detection now keeps
+  compact histories for up to 4096 runs and discards stale histories first. At the hard cap,
+  established histories continue progressing through round-robin traffic; discarding live
+  history emits a rate-limited `velocity.history_evicted` warning.
 - **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
   at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
   by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
@@ -71,6 +86,12 @@ corresponding release notes before users upgrade.
   retry is pending, no breaker report is sent, including a changed breaker state. A successful
   report clears the backoff. Reports sent by `close()` are not delayed.
 
+### Added
+
+- **Effective call IDs on budget results.** `BudgetEnforcer.checkBudget()` returns `callId`,
+  including an ID minted when the caller omits one, so direct callers can settle or release
+  the corresponding lease reservation. `CheckBudgetOptions.signal` adds caller cancellation.
+
 ### Fixed
 
 - **Caller cancellation preserves provider health and observed usage.** Buffered and stream
@@ -91,6 +112,25 @@ corresponding release notes before users upgrade.
 - **Constructor shape errors are typed and synchronous.** Invalid options objects, fallback
   lists, model values, loggers, and selection policies raise `ConfigurationError` before
   reporters or budget resources start.
+- **Budget preflight shares one deadline and honors cancellation.** An initial lease attempt
+  and its per-call fallback now share the requested timeout. An exhausted deadline skips the
+  fallback without adding a breaker failure. Caller `AbortSignal`s reach preflight transport;
+  already-aborted requests skip budget I/O, and cancellation rejects without treating it as a
+  control-plane outage.
+- **Completed calls release lease bookkeeping immediately.** Settlement, release, and unknown
+  usage no longer retain a full claim and expiry entry for 900 seconds. Per-call budget results
+  release their unused lease claims, and a bounded recent-ID history still rejects accidental
+  call-ID reuse.
+- **Late lease settlements remain accounted for.** After the 900-second reservation sweep
+  refunds an abandoned reservation, a matching late settlement debits its full usage against
+  the original lease. The SDK retains at most 4096 swept reservations and fences settlements
+  from replacement lease incarnations.
+- **Lease reports contain only their own spend.** Dropping or replacing a lease clears its
+  advisory spend tally so a successor lease's renewal or surrender cannot report the old burn.
+- **Lease outage admissions accrue local estimates.** Calls admitted against the outage share
+  or after lease expiry now accrue the fixed estimate in the current UTC-day bucket. Per-call
+  outage checks use that shared spend, and a server's fail-open lease posture cannot relax a
+  client's `failOpen: false` setting.
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
   reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
   standalone confirmations and of settlements, then sends the metadata batches that were queued

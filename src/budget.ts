@@ -131,6 +131,27 @@ export const DEFAULT_COST_PER_TOKEN = 0.00003;
 
 /** Default per-request timeout for the check POST (Python `httpx timeout=5.0`). */
 const DEFAULT_CHECK_TIMEOUT_MS = 5000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function validateDuration(value: number, field: string, allowZero: boolean): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    (allowZero ? value < 0 : value <= 0) ||
+    value > MAX_TIMER_DELAY_MS / 1000
+  ) {
+    throw new ConfigurationError(`${field} must be a finite duration within the timer range`, {
+      field,
+    });
+  }
+  return value;
+}
+
+function throwIfCheckAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+  }
+}
 
 /** Maximum distinct server-priced chains retained in the unscoped allow cache. */
 const ALLOW_CACHE_MAX_ENTRIES = 16;
@@ -185,6 +206,8 @@ const SERVICE_TIER_VALUES: ReadonlySet<string> = new Set(SERVICE_TIERS);
  * proper typed structure, never a loose object literal (budget.md behavior 21).
  */
 export interface BudgetCheckResult {
+  /** Effective reconciliation identity, including an ID minted when the caller omitted one. */
+  callId?: string;
   /** Whether the call may proceed (an alert-only cloud deny still allows). */
   allowed: boolean;
   /** Remaining budget in the response's units (0 on the outage/fallback paths). */
@@ -278,6 +301,7 @@ function stickyDenyReason(
  */
 export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudgetCheckResult {
   return {
+    ...(init.callId === undefined ? {} : { callId: init.callId }),
     allowed: init.allowed,
     remainingBudget: init.remainingBudget,
     projectId: init.projectId ?? null,
@@ -366,6 +390,8 @@ export interface CheckBudgetOptions {
   fallbackModels?: string[];
   /** Per-call timeout override in SECONDS (Python parity); falls back to the 5s default. */
   timeout?: number;
+  /** Caller cancellation; an abort rejects without changing control-plane breaker health. */
+  signal?: AbortSignal;
   /** Active agent-run attribution. Scoped checks bypass the global allow cache. */
   agentRunId?: string;
   /** Internal ownership evidence; omitted by identity-only/direct callers. */
@@ -451,7 +477,8 @@ interface CapturedCheck {
   readonly fallbackModels: readonly string[];
   readonly modality: Modality;
   readonly hasEstimatedMedia: boolean;
-  readonly timeoutMs: number;
+  readonly deadlineMs: number;
+  readonly signal: AbortSignal | undefined;
 }
 
 type InitialGrantResult =
@@ -667,6 +694,11 @@ export class BudgetEnforcer {
   private closed = false;
 
   constructor(options: BudgetEnforcerOptions) {
+    const cacheTtl = validateDuration(
+      options.cacheTtl === undefined ? 5 : options.cacheTtl,
+      "cacheTtl",
+      true,
+    );
     requireFetchLike(options.fetch);
     // A surrender attempt observes its underlying request so a request that ignores abort
     // keeps its dispatcher slot until it settles. Every other request is passed through; the
@@ -708,13 +740,14 @@ export class BudgetEnforcer {
     this.controlPlaneBreaker = options.controlPlaneBreaker ?? null;
     this.leaseLedger = new LeaseLedger({
       holderId: options.holderId ?? crypto.randomUUID(),
+      failOpen: options.failOpen ?? true,
       enabled: options.leaseEnabled ?? true,
       outputBoundDefault: options.leaseOutputBoundDefault,
     });
     this.terminationFor = options.terminationFor ?? outageTermination;
     this.budgetMode = options.budgetMode ?? "alert_only";
     this.failOpen = options.failOpen ?? true;
-    this.cacheTtl = options.cacheTtl ?? 5;
+    this.cacheTtl = cacheTtl;
 
     try {
       const register = Reflect.get(globalThis, NODE_LEASE_REGISTRATION);
@@ -936,6 +969,17 @@ export class BudgetEnforcer {
    * the sticky-deny → fail-open → local-enforcement precedence.
    */
   async checkBudget(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
+    const signal = options.signal;
+    const deadlineMs =
+      this.monotonicNow() +
+      validateDuration(
+        options.timeout === undefined ? DEFAULT_CHECK_TIMEOUT_MS / 1000 : options.timeout,
+        "timeout",
+        false,
+      ) *
+        1000;
+    throwIfCheckAborted(signal);
+    const callId = options.callId ?? crypto.randomUUID();
     const unmanagedRunId = options.runLifetime === undefined ? options.agentRunId : undefined;
     if (unmanagedRunId !== undefined) {
       this.preserveUnmanagedRun(unmanagedRunId);
@@ -945,7 +989,17 @@ export class BudgetEnforcer {
       );
     }
     try {
-      return await this.checkBudgetWithOwnership(options);
+      const result = await this.checkBudgetWithOwnership(
+        { ...options, callId, signal },
+        deadlineMs,
+      );
+      try {
+        throwIfCheckAborted(signal);
+      } catch (error) {
+        this.releaseReservation(callId, result.leaseClaimToken ?? null);
+        throw error;
+      }
+      return { ...result, callId };
     } finally {
       // First direct admission creates the state during the call. Remember unmanaged
       // use on that state regardless of whether a managed owner was seen earlier.
@@ -958,7 +1012,10 @@ export class BudgetEnforcer {
     }
   }
 
-  private async checkBudgetWithOwnership(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
+  private async checkBudgetWithOwnership(
+    options: CheckBudgetOptions,
+    deadlineMs: number,
+  ): Promise<BudgetCheckResult> {
     // Invariant 7 / D5: `provider` is required AT RUNTIME, even from untyped JS callers.
     if (!options.provider) {
       throw new ConfigurationError("provider is required for budget check", { field: "provider" });
@@ -1022,8 +1079,8 @@ export class BudgetEnforcer {
       modality: checkOptions.modality ?? "text",
       hasEstimatedMedia:
         checkOptions.estimatedMedia !== null && checkOptions.estimatedMedia !== undefined,
-      timeoutMs:
-        checkOptions.timeout !== undefined ? checkOptions.timeout * 1000 : DEFAULT_CHECK_TIMEOUT_MS,
+      deadlineMs,
+      signal: checkOptions.signal,
     });
     const cacheKey = this.allowCacheKey(stableOptions);
     let leaseCallId: string | null = null;
@@ -1031,137 +1088,152 @@ export class BudgetEnforcer {
 
     let widenAfterAllow = false;
 
-    if (this.leaseEntryEligible(captured)) {
-      leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
-      let leaseAdmission = this.admitLease(captured, leaseCallId, null);
-      leaseClaimToken = leaseAdmission.claimToken;
-      widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
+    try {
+      if (this.leaseEntryEligible(captured)) {
+        leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
+        let leaseAdmission = this.admitLease(captured, leaseCallId, null);
+        leaseClaimToken = leaseAdmission.claimToken;
+        widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
 
-      const immediate = this.localLeaseResult(captured, leaseAdmission);
-      if (immediate !== null) {
-        this.noteAdmissionUncounted(captured, leaseAdmission);
-        return immediate;
+        const immediate = this.localLeaseResult(captured, leaseAdmission);
+        if (immediate !== null) {
+          this.noteAdmissionUncounted(captured, leaseAdmission);
+          return immediate;
+        }
+
+        if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
+          const runId = captured.agentRunId;
+          if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
+            // Critical section: claim the run's grant slot before the first await.
+            this.initialGrantInFlight.add(runId);
+            const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
+            if (grant.kind === "admission") {
+              leaseAdmission = grant.admission;
+              leaseClaimToken = leaseAdmission.claimToken;
+              const granted = this.localLeaseResult(captured, leaseAdmission);
+              if (granted !== null) {
+                this.noteAdmissionUncounted(captured, leaseAdmission);
+                return granted;
+              }
+            } else if (grant.kind === "denied") {
+              return this.withLeaseClaim(grant.result, leaseClaimToken);
+            } else if (grant.kind === "outage") {
+              return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
+            }
+            // A grant loser, refused/malformed grant, or one-shot re-entry that still
+            // needs authority continues to the legacy per-call endpoint exactly once.
+          }
+        }
       }
 
-      if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
-        const runId = captured.agentRunId;
-        if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
-          // Critical section: claim the run's grant slot before the first await.
-          this.initialGrantInFlight.add(runId);
-          const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
-          if (grant.kind === "admission") {
-            leaseAdmission = grant.admission;
-            leaseClaimToken = leaseAdmission.claimToken;
-            const granted = this.localLeaseResult(captured, leaseAdmission);
-            if (granted !== null) {
-              this.noteAdmissionUncounted(captured, leaseAdmission);
-              return granted;
-            }
-          } else if (grant.kind === "denied") {
-            return this.withLeaseClaim(grant.result, leaseClaimToken);
-          } else if (grant.kind === "outage") {
+      // --- Critical section: cache read + LRU touch (no `await` inside). ---
+      const cached = this.cachedAllow(cacheKey, stableOptions);
+      if (cached !== null) {
+        return this.withLeaseClaim(
+          budgetCheckResult({
+            allowed: true,
+            remainingBudget: cached.remaining_budget,
+            projectId: cached.project_id ?? null,
+            reservationId: null,
+            mode: cached.mode,
+            budgetLimit: cached.budget_limit,
+            currentUsage: cached.current_usage,
+            priceHints: cached.price_hints ?? null,
+            failoverTuningAllowed: null,
+          }),
+          leaseClaimToken,
+        );
+      }
+
+      throwIfCheckAborted(captured.signal);
+      const remainingMs = captured.deadlineMs - this.monotonicNow();
+      const admission: CircuitBreakerAdmission | null =
+        remainingMs > 0 ? (this.controlPlaneBreaker?.admit() ?? null) : null;
+      if (remainingMs <= 0 || (admission !== null && !admission.allowed)) {
+        this.logger.debug("budget.check_skipped_breaker_open");
+        if (leaseCallId !== null && leaseClaimToken !== null) {
+          const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
+          const local = this.localLeaseResult(captured, reentry);
+          if (local !== null) {
+            this.noteAdmissionUncounted(captured, reentry);
+            return local;
+          }
+          if (reentry.decision === LeaseDecision.NeedGrant) {
             return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
           }
-          // A grant loser, refused/malformed grant, or one-shot re-entry that still
-          // needs authority continues to the legacy per-call endpoint exactly once.
         }
+        return this.withLeaseClaim(
+          this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+          leaseClaimToken,
+        );
       }
-    }
-
-    // --- Critical section: cache read + LRU touch (no `await` inside). ---
-    const cached = this.cachedAllow(cacheKey, stableOptions);
-    if (cached !== null) {
-      return this.withLeaseClaim(
-        budgetCheckResult({
-          allowed: true,
-          remainingBudget: cached.remaining_budget,
-          projectId: cached.project_id ?? null,
-          reservationId: null,
-          mode: cached.mode,
-          budgetLimit: cached.budget_limit,
-          currentUsage: cached.current_usage,
-          priceHints: cached.price_hints ?? null,
-          failoverTuningAllowed: null,
-        }),
-        leaseClaimToken,
-      );
-    }
-
-    const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
-    if (admission !== null && !admission.allowed) {
-      this.logger.debug("budget.check_skipped_breaker_open");
-      if (leaseCallId !== null && leaseClaimToken !== null) {
-        const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
-        const local = this.localLeaseResult(captured, reentry);
-        if (local !== null) {
-          this.noteAdmissionUncounted(captured, reentry);
-          return local;
-        }
-        if (reentry.decision === LeaseDecision.NeedGrant) {
-          return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
-        }
-      }
-      return this.withLeaseClaim(
-        this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-        leaseClaimToken,
-      );
-    }
-    try {
-      // Ordered response authority exists only for a real check POST. Capture and register
-      // its dispatch after lease/cache/breaker decisions and immediately before the POST.
-      const requestDispatch = this.captureAuthorityDispatch();
-      this.registerPendingOrderedRequest(requestDispatch);
       try {
-        let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+        // Ordered response authority exists only for a real check POST. Capture and register
+        // its dispatch after lease/cache/breaker decisions and immediately before the POST.
+        const requestDispatch = this.captureAuthorityDispatch();
+        this.registerPendingOrderedRequest(requestDispatch);
         try {
-          raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
-            timeoutMs: captured.timeoutMs,
-          });
-        } catch (error) {
-          if (isReadOnlyKeyError(error)) {
+          let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+          try {
+            raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
+              timeoutMs: remainingMs,
+              signal: captured.signal,
+            });
+          } catch (error) {
+            throwIfCheckAborted(captured.signal);
+            if (isReadOnlyKeyError(error)) {
+              this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+              handleReadOnlyKeyError(error, this.logger);
+            } else {
+              this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+              this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            }
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
+          }
+
+          throwIfCheckAborted(captured.signal);
+          let response: BudgetCheckResponse;
+          try {
+            if (!raw.parsed) {
+              throw raw.error;
+            }
+            response = BudgetCheckResponseSchema.parse(raw.value);
+          } catch (error) {
             this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-            handleReadOnlyKeyError(error, this.logger);
-          } else {
-            this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-            this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            this.logger.error(
+              "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
+              exceptionName(error),
+              this.failOpen,
+            );
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
           }
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
-        }
 
-        let response: BudgetCheckResponse;
-        try {
-          if (!raw.parsed) {
-            throw raw.error;
-          }
-          response = BudgetCheckResponseSchema.parse(raw.value);
-        } catch (error) {
           this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-          this.logger.error(
-            "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
-            exceptionName(error),
-            this.failOpen,
+          const result = this.applyCheckResponse(
+            response,
+            stableOptions,
+            cacheKey,
+            requestDispatch,
           );
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
+          // Only a live allow for this run widens; denied, unreadable and outage paths never do.
+          if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
+            this.scheduleWidening(captured);
+          }
+          return this.withLeaseClaim(result, leaseClaimToken);
+        } finally {
+          this.unregisterPendingOrderedRequest(requestDispatch);
         }
-
-        this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        const result = this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch);
-        // Only a live allow for this run widens; denied, unreadable and outage paths never do.
-        if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
-          this.scheduleWidening(captured);
-        }
-        return this.withLeaseClaim(result, leaseClaimToken);
       } finally {
-        this.unregisterPendingOrderedRequest(requestDispatch);
+        this.controlPlaneBreaker?.releaseProbe(admission);
       }
     } finally {
-      this.controlPlaneBreaker?.releaseProbe(admission);
+      if (leaseCallId !== null) this.leaseLedger.forgetClaim(leaseCallId, leaseClaimToken);
     }
   }
 
@@ -1252,6 +1324,12 @@ export class BudgetEnforcer {
     }
     this.scheduleRenewal(captured, admission);
     if (!admission.admitted) return null;
+    if (
+      admission.decision === LeaseDecision.AdmitOutageMetered ||
+      admission.decision === LeaseDecision.AdmitUncounted
+    ) {
+      this.trackLocalCost(DEFAULT_COST_PER_TOKEN * captured.estimatedInputTokens);
+    }
     return this.leaseResultFromSnapshot(snapshot, {
       allowed: true,
       leaseId: admission.leaseId,
@@ -1579,8 +1657,12 @@ export class BudgetEnforcer {
     const runId = captured.agentRunId;
     if (runId === undefined) return { kind: "legacy" };
     const closeDispatchEpoch = this.closeEpoch;
-    const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
+    const remainingMs = captured.deadlineMs - this.monotonicNow();
+    const admission: CircuitBreakerAdmission | null =
+      remainingMs > 0 ? (this.controlPlaneBreaker?.admit() ?? null) : null;
     try {
+      throwIfCheckAborted(captured.signal);
+      if (remainingMs <= 0) return { kind: "outage" };
       if (admission !== null && !admission.allowed) {
         this.logger.debug("lease.grant_skipped_breaker_open");
         return { kind: "outage" };
@@ -1593,9 +1675,10 @@ export class BudgetEnforcer {
         raw = await this.transport.postJsonAndReadJson(
           LEASE_GRANT_PATH,
           serializeLeaseGrantRequest(request),
-          { timeoutMs: captured.timeoutMs },
+          { timeoutMs: remainingMs, signal: captured.signal },
         );
       } catch (error) {
+        throwIfCheckAborted(captured.signal);
         const status = error instanceof TransportHttpError ? error.status : null;
         const responded =
           isReadOnlyKeyError(error) ||
@@ -1618,6 +1701,7 @@ export class BudgetEnforcer {
         return closeDispatchEpoch === this.closeEpoch ? { kind: "outage" } : { kind: "legacy" };
       }
 
+      throwIfCheckAborted(captured.signal);
       if (!raw.parsed) {
         this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         if (closeDispatchEpoch === this.closeEpoch) {

@@ -181,6 +181,20 @@ deny throws before provider dispatch and reports a `budget_denied` event carryin
 Settlement is automatic and private. Close the wrapped client to flush queued confirmations
 and events; your application does not need a separate confirmation call.
 
+Confirmations run concurrently up to `reporterMaxInFlight` (default `3`), with independent
+idempotent call IDs. Metadata batches remain serial. Retryable failures park the FIFO head;
+already-active confirmations can finish. Retries honor `Retry-After` (seconds or HTTP-date, up to
+one hour) and use exponential backoff with half-to-full jitter. HTTP 429 has a separate cap of
+20 responses per pending item. A shutdown flush respects a server's retry deadline.
+
+Persistent confirmation failures reach ERROR after ten consecutive failing delivery rounds.
+A round uses its last non-neutral confirmation verdict in dispatch order, so completion order
+cannot change the count. A success resets it; held admissions and read-only skips do not count.
+Lease-funded metadata includes the same `lease_id` as its confirmation. Cache reads and creation
+buckets must fit within input tokens; normalization clamps inconsistent provider breakdowns and
+marks them estimated. Ingest responses require `ingested`, `rejected`, and `duplicates`; malformed
+responses produce contract-drift diagnostics while usable rejection dispositions are still logged.
+
 **Run-scoped leases.** With `leaseEnabled: true` (the default), an untagged text call inside a
 Node `run(...)` or `RunHandle.activate(...)` scope can reserve estimated input plus an output bound
 from a local run lease. That removes a control-plane round trip from most calls while the lease is
@@ -550,6 +564,10 @@ Native OpenAI and Azure OpenAI `responses.create`, `responses.parse`, and `respo
 tracked. Other OpenAI-compatible clients retain their native Responses managers under the
 unmetered posture because their wire behavior is not assumed to match OpenAI's native client.
 
+Untracked-surface advisories coalesce occurrences for fifteen minutes per key. Retries keep the
+same report ID and occurrence snapshot; later observations wait for a separate report. Closing
+flushes unsent occurrences within `reporterShutdownDeadline`, while respecting `Retry-After`.
+
 `coverage(client)` computes a local structural report without calling a provider operation or
 transmitting data. For CI, pin an independently reviewed literal. This exhaustive strict,
 unacknowledged example is reviewed against `openai@6.45.0`:
@@ -843,7 +861,7 @@ try {
     await run("operator-kill-example", async () => {
       const runId = currentRun()?.agentRunId;
       if (runId === undefined) throw new Error("missing run scope");
-      plane.stopRun(runId, { reason: "operator_stop" });
+      plane.stopRun(runId, { reason: "manual_kill" });
       await client.chat.completions.create();
     });
     throw new Error("expected the operator kill");
@@ -860,13 +878,25 @@ means a denial response omits lease-authority fields.
 
 | Model | Check | Lease | Run scope |
 |-------|-------|-------|-----------|
-| `solwyn-test/deny` | Monthly denial in the plane's configured mode | `hard_deny` monthly denial; no lease block | no |
-| `solwyn-test/deny-alert` | Monthly denial forced to `alert_only`; dispatch continues | `hard_deny` monthly denial; no lease block | no |
-| `solwyn-test/deny-tag` | Tag denial in the configured mode | `eligible=false`, `allowed=true`, `ineligible_reason="scoped_rules_present"` | no |
-| `solwyn-test/deny-stopped` | `run_stopped`, forced `hard_deny`, remaining budget 0; no run-control directive | Same `run_stopped` denial; no lease block | yes |
-| `solwyn-test/runaway` | First sighting per run is allowed; later sightings deny `agent_run` | Same | yes |
+| `solwyn-test/deny` | Monthly denial under `hard_deny`; allowed overrun under `alert_only` | Same project-mode behavior | no |
+| `solwyn-test/deny-alert` | Allowed overrun forced to `alert_only`, with a reservation and negative remaining budget | Allowed lease with alert-only posture and negative remaining budget | no |
+| `solwyn-test/deny-tag` | Tag denial in `hard_deny` mode | `eligible=false`, `allowed=true`, `ineligible_reason="scoped_rules_present"` | no |
+| `solwyn-test/deny-stopped` | `run_stopped`, `hard_deny`, remaining budget 0; opted-in `manual_kill` directive | Same stopped-run verdict; no lease block | yes |
+| `solwyn-test/runaway` | First sighting per run is allowed; later sightings deny `agent_run` in `hard_deny` mode | Same | yes |
 | `solwyn-test/kill` | First sighting per run is allowed; later sightings stop the run with `run_stopped` | Same, including the run-control directive when opted in | yes |
 | `solwyn-test/lease-ineligible` | Transparent and allowed | `eligible=false`, `allowed=true`, `ineligible_reason="zero_rate_model"`; no lease block | no |
+
+`FakeControlPlane` leases default to a 120-second lifetime and a 15-second refresh. Use
+`postureMode: "hard_deny"` to model scoped or run enforcement on an alert-only project; only a
+hard posture can produce `final_grant`. `runUsage: { "synthetic-run": 7.5 }` supplies explicit
+synthetic spend for stopped-run checks, independently of project `currentUsage`. Stop reasons
+are limited to `"manual_kill"`. Legacy checks omit directive keys, and opted-in text checks return
+a price-hint map (by default `{ [provider]: 1 }`; non-text or unpriceable checks return `{}`).
+
+The fake stores only accepted ingest events and returns indexed `rejected` and `duplicates`
+arrays. It enforces the server's 1,000-event metadata batch limit, 100-report untracked batch
+limit, 256 KiB untracked body limit, unique untracked keys within a batch, and project matching
+for breaker reports. Contract probes preserve any gateway prefix in `apiUrl`.
 
 ### Vitest fixtures (explicit opt-in)
 
@@ -1005,11 +1035,11 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `reporterBatchSize` | `SOLWYN_REPORTER_BATCH_SIZE` | `50` | Events per ingest batch |
 | `reporterFlushInterval` | `SOLWYN_REPORTER_FLUSH_INTERVAL` | `5` | Background flush interval in seconds |
 | `reporterMaxQueueSize` | `SOLWYN_REPORTER_MAX_QUEUE_SIZE` | `10000` | Reporter queue cap; overflow drops oldest |
-| `reporterMaxInFlight` | `SOLWYN_REPORTER_MAX_IN_FLIGHT` | `3` | Accepted but currently has no effect: reporter sends are serial, one request at a time |
-| `reporterMaxSendAttempts` | `SOLWYN_REPORTER_MAX_SEND_ATTEMPTS` | `5` | Attempts before retryable telemetry is disposed |
-| `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Retry backoff base in seconds |
+| `reporterMaxInFlight` | `SOLWYN_REPORTER_MAX_IN_FLIGHT` | `3` | Maximum concurrent confirmation POSTs; ingest batches remain serial |
+| `reporterMaxSendAttempts` | `SOLWYN_REPORTER_MAX_SEND_ATTEMPTS` | `5` | Ordinary retryable send attempts; HTTP 429 has a separate 20-response cap |
+| `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Exponential retry base in seconds, with half-to-full jitter |
 | `reporterRetryBackoffCap` | `SOLWYN_REPORTER_RETRY_BACKOFF_CAP` | `60` | Retry backoff cap in seconds |
-| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Final reporter deadline in seconds; `0` is valid |
+| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Close deadline for each settlement and untracked reporter in seconds; `0` is valid |
 | `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds |
 | `velocityMode` | `SOLWYN_VELOCITY_MODE` | `"warn"` | Local velocity posture: `"off"`, `"warn"`, or `"deny"` |
 | `velocityRepeatCount` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required (2–64) |

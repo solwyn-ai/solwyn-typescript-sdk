@@ -1,6 +1,6 @@
 import { safeExceptionType } from "../error-diagnostics";
 import { createTokenDetails } from "../token-details";
-import type { FetchLike } from "../transport";
+import { type FetchLike, joinApiUrl } from "../transport";
 import type {
   BudgetCheckRequest,
   BudgetConfirmRequest,
@@ -79,7 +79,7 @@ async function postJson(
 ): Promise<Exchange> {
   let response: Response;
   try {
-    response = await fetch(new URL(path, options.apiUrl).toString(), {
+    response = await fetch(joinApiUrl(options.apiUrl, path), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${options.apiKey}`,
@@ -834,9 +834,21 @@ async function requireReceiptAccepted(
   const exchange = await postJson(fetch, options, INGEST_PATH, [event], phase);
   requireStatus(exchange, 202, phase);
   const body = requireRecord(parseJson(exchange, phase), phase, exchange.text);
-  requireExactKeys(body, ["ingested", "rejected"], phase, exchange.text, "ingest response");
-  if (body["ingested"] !== 1 || !Array.isArray(body["rejected"]) || body["rejected"].length !== 0) {
-    fail(phase, "expected exactly {ingested: 1, rejected: []}", exchange.text);
+  requireExactKeys(
+    body,
+    ["ingested", "rejected", "duplicates"],
+    phase,
+    exchange.text,
+    "ingest response",
+  );
+  if (
+    body["ingested"] !== 1 ||
+    !Array.isArray(body["rejected"]) ||
+    body["rejected"].length !== 0 ||
+    !Array.isArray(body["duplicates"]) ||
+    body["duplicates"].length !== 0
+  ) {
+    fail(phase, "expected exactly {ingested: 1, rejected: [], duplicates: []}", exchange.text);
   }
   requireSchema(IngestResponseSchema, body, phase, exchange.text);
 }

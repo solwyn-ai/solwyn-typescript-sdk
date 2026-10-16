@@ -73,7 +73,10 @@ async function flushRounds(reporter: MetadataReporter, maxRounds = 25): Promise<
 }
 
 function response202(body: unknown): Response {
-  return new Response(JSON.stringify(body), { status: 202 });
+  return new Response(
+    JSON.stringify(typeof body === "object" && body !== null ? { duplicates: [], ...body } : body),
+    { status: 202 },
+  );
 }
 
 function loggerSpies(): Logger {
@@ -248,7 +251,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
 
     expect(result.rejections).toEqual({ kind: "legacy", indexes: [], count: 1 });
     expect(logger.warn).toHaveBeenCalledWith(
-      "reporter.ingest_response_unparseable: exc_type=RejectionContractError",
+      "reporter.ingest_response_unparseable: exc_type=ZodError",
     );
   });
 
@@ -281,7 +284,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     });
   });
 
-  it("treats mixed indexed and index-less rejections as supported partial legacy", async () => {
+  it("logs contract drift while using mixed indexed and index-less fallback dispositions", async () => {
     const logger = loggerSpies();
     const body = {
       ingested: 1,
@@ -307,15 +310,15 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
       rejections: { kind: "legacy", indexes: [], count: 2 },
     });
     expect(reporter._dispositionIndexes(submitted, result.rejections)).toEqual([0, 2]);
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      "reporter.ingest_response_unparseable: exc_type=RejectionContractError",
+    expect(logger.warn).toHaveBeenCalledWith(
+      "reporter.ingest_response_unparseable: exc_type=ZodError",
     );
 
     for (const item of submitted) reporter.report(item);
     await expect(reporter._flushRemaining()).resolves.toBe(false);
     expect(reporter.droppedCounts).toEqual({ "event.ingest_rejected": 10 });
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      "reporter.ingest_response_unparseable: exc_type=RejectionContractError",
+    expect(logger.warn).toHaveBeenCalledWith(
+      "reporter.ingest_response_unparseable: exc_type=ZodError",
     );
   });
 
@@ -367,7 +370,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     vi.useRealTimers();
   });
 
-  it("resets malformed-response escalation on supported missing-index legacy", async () => {
+  it("does not reset malformed-response escalation on missing-index fallback", async () => {
     const logger = loggerSpies();
     const invalid = {
       ingested: 0,
@@ -385,7 +388,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
 
     for (let index = 0; index < 11; index += 1) await reporter._sendBatch([event(index)]);
 
-    expect(logger.error).not.toHaveBeenCalledWith(
+    expect(logger.error).toHaveBeenCalledWith(
       expect.stringContaining("reporter.ingest_response_unparseable_persistent"),
     );
   });
@@ -404,7 +407,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     for (let index = 0; index < 10; index += 1) await reporter._sendBatch([event(index)]);
 
     expect(logger.error).toHaveBeenCalledWith(
-      "reporter.ingest_response_unparseable_persistent: exc_type=RejectionContractError consecutive_failures=10",
+      "reporter.ingest_response_unparseable_persistent: exc_type=ZodError consecutive_failures=10",
     );
   });
 });
@@ -415,6 +418,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     const urls: string[] = [];
     const confirmStatuses = [503, 503, 204];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
+      random: () => 1,
       monotonicClock: () => now,
       retryBackoffBase: 1000,
       retryBackoffCap: 60_000,
@@ -506,6 +510,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       retryBackoffBase: 1000,
       retryBackoffCap: 60_000,
+      random: () => 1,
     });
 
     expect([1, 2, 3, 4].map((attempt) => reporter._backoffDelay(attempt))).toEqual([
@@ -514,11 +519,26 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     expect(reporter._backoffDelay(1_000_000)).toBe(60_000);
   });
 
+  it("spreads retries within the bounded exponential jitter window", () => {
+    let random = 0;
+    const reporter = new MetadataReporter(API_URL, API_KEY, {
+      random: () => random,
+      retryBackoffBase: 1000,
+      retryBackoffCap: 60_000,
+    });
+    expect(reporter._backoffDelay(1)).toBe(500);
+    random = 0.5;
+    expect(reporter._backoffDelay(2)).toBe(1500);
+    random = 1;
+    expect(reporter._backoffDelay(1_000_000)).toBe(60_000);
+  });
+
   it("parks a retrying confirm head so later confirms cannot jump it", async () => {
     let now = 0;
     const sent: string[] = [];
     const statuses = [503, 204, 204];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
+      maxInFlight: 1,
       monotonicClock: () => now,
       retryBackoffBase: 1000,
       fetch: async (_url, init) => {
@@ -650,6 +670,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     const payloads: string[][] = [];
     const statuses = [503];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
+      random: () => 1,
       monotonicClock: () => now,
       retryBackoffBase: 1000,
       fetch: async (_url, init) => {

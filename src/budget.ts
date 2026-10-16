@@ -1968,7 +1968,10 @@ export class BudgetEnforcer {
     response: BudgetCheckResponse,
     activeAgentRunId: string | undefined,
   ): MaterializedBudgetCheckResult {
-    if (response.allowed) {
+    if (
+      response.allowed &&
+      !(response.mode === "alert_only" && response.current_usage >= response.budget_limit)
+    ) {
       return budgetCheckResult({
         allowed: true,
         remainingBudget: response.remaining_budget,

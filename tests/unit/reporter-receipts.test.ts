@@ -60,7 +60,7 @@ function confirm(index: number): BudgetConfirmRequest {
 }
 
 function ingest(rejected: unknown[] = [], ingested = 0): Response {
-  return new Response(JSON.stringify({ ingested, rejected }), { status: 202 });
+  return new Response(JSON.stringify({ ingested, rejected, duplicates: [] }), { status: 202 });
 }
 
 function scriptedReporter(

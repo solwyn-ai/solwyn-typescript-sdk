@@ -822,6 +822,33 @@ describe("cloud reachable + allow", () => {
 // ---------------------------------------------------------------------------
 
 describe("cloud reachable + deny (alert_only)", () => {
+  it("warns for an allowed alert-only overrun while preserving its reservation", async () => {
+    const log = capturingLogger();
+    const enforcer = new BudgetEnforcer({
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      logger: log.logger,
+      fetch: async () =>
+        new Response(
+          JSON.stringify({
+            allowed: true,
+            mode: "alert_only",
+            budget_limit: 100,
+            current_usage: 101,
+            remaining_budget: -1,
+            reservation_id: "synthetic-reservation",
+            project_id: "proj_synthetic",
+          }),
+          { status: 200 },
+        ),
+    });
+    const result = await enforcer.checkBudget(baseCheck());
+    expect(result.allowed).toBe(true);
+    expect(result.reservationId).toBe("synthetic-reservation");
+    expect(result.warning).toBe("Budget limit reached: $101.00/$100.00 used");
+    expect(log.warn.join("\n")).toContain("Budget limit reached (alert_only mode)");
+  });
+
   it("still allows with a 'limit' warning and 2-decimal dollar amounts", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({

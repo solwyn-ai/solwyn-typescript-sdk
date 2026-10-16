@@ -48,16 +48,63 @@ corresponding release notes before users upgrade.
   chain names one of them keep per-call checks, and the rest of the run returns to the lease after
   the SDK releases and re-acquires it. Widening to a more expensive model re-prices the lease for
   every model in the run, so each model's token grant shrinks.
-- `reporterMaxInFlight` is documented as having no effect: reporter sends are serial, one request
-  at a time. The option and `SOLWYN_REPORTER_MAX_IN_FLIGHT` are still accepted.
-- A failed provider-breaker report now backs off before the reporter retries it. The first retry
-  waits at least one flush interval, and later retries follow the reporter's retry backoff
-  (`reporterRetryBackoffBase` to `reporterRetryBackoffCap`, 1 to 60 seconds by default). While a
-  retry is pending, no breaker report is sent, including a changed breaker state. A successful
-  report clears the backoff. Reports sent by `close()` are not delayed.
+- **Concurrent settlement confirmations.** `reporterMaxInFlight` now limits confirmation POSTs
+  (three by default); metadata batches remain serial. A retrying FIFO head holds later dispatch
+  while already-active confirmations finish independently. For ERROR escalation, a round fails
+  when its last non-neutral confirmation verdict in dispatch order fails. A successful last
+  verdict resets the counter; held admissions and read-only skips leave it unchanged. ERROR
+  begins at ten consecutive failing rounds, independent of completion order.
+- **Rate-limit-aware retries.** Reporting honors delta-seconds and HTTP-date `Retry-After`
+  headers, bounded to one hour, including during shutdown. HTTP 429 responses have a separate
+  twenty-response cap instead of consuming ordinary send attempts. Confirmation, ingest,
+  provider-breaker, and untracked-surface retries use bounded exponential backoff with
+  half-to-full jitter. Ingest and provider-breaker reports share a project rate-limit hold.
+- **Current settlement wire contract (preview breaking).** Ingest responses now require a strict
+  `duplicates` disposition list. Metadata accepts an optional, nullable `lease_id` up to 64
+  characters. Lease renewals require model and provider together, and fallback declarations
+  require that primary pair. The reviewed endpoint snapshot and its contract tables now include
+  duplicate dispositions, lease metadata, ingest availability responses, and unsupported-media
+  errors.
+- **Server-faithful testing verdicts (preview breaking).** `FakeControlPlane` now allows project
+  overruns in `alert_only` mode with a reservation and negative remaining budget, including
+  `solwyn-test/deny-alert` checks and leases. Scoped and run denials use `hard_deny`. Lease
+  `postureMode` can model independent scoped enforcement; `final_grant` applies only to a hard
+  posture. Opted-in text checks provide price hints, legacy checks omit directive keys, and all
+  opted-in stopped-run verdicts include the directive. `stopRun()` accepts only `manual_kill`;
+  `runUsage` supplies explicit synthetic stopped-run spend. Default lease timers are 120 seconds
+  with a 15-second refresh.
+- **Server-faithful testing ingestion (preview breaking).** The test double returns duplicate
+  dispositions and stores only accepted events; scripted count rejections now carry indexes.
+  It rejects metadata batches above 1,000 events, duplicate untracked keys in one batch,
+  untracked bodies above 256 KiB, and breaker reports outside the key's project. A stopped run
+  is checked before replaying an existing holder's grant.
 
 ### Fixed
 
+- **Healthy control-plane refusals.** Confirmation 4xx and 503 responses count as reachability,
+  matching lease operations, so terminal confirmation refusals cannot open the shared breaker.
+- **Reliable untracked-surface reports.** Closing flushes unsent occurrences without the normal
+  fifteen-minute gate and uses the configured reporter shutdown deadline. Retries keep the same
+  report ID, occurrence count, and cursor; later observations form a separate report. Refused
+  keys stop retrying, failures produce rate-limited diagnostics, and read-only credentials use
+  the shared configuration diagnostic. Reads with nothing due use a constant-time schedule check.
+- **Provider-health heartbeat recovery.** A failed unchanged heartbeat remains due for a normal
+  backoff retry before the server's snapshot expires. Reports allow ten seconds for delivery and
+  use strictly increasing per-provider timestamps even if the wall clock stalls or rolls back.
+- **Bounded queue and timer overhead.** Report queue overflow, prefix restoration, and draining
+  now avoid array reindexing. Large flush and close timer delays are clamped to the runtime's
+  signed 32-bit timer bound.
+- **Strict ingest diagnostics.** Successful ingest bodies are validated before dispositions are
+  applied. Missing fields, extra keys, and unknown rejection codes count as contract drift;
+  an explicitly logged fallback still surfaces usable per-event rejections.
+- **Lease reconciliation and cache usage.** Every lease-funded settlement's metadata now carries
+  its confirmation's lease ID, including when the confirmation is abandoned. Overlapping cache
+  buckets are clamped to the input total and marked estimated during normalization; unnormalized
+  invalid cache breakdowns are rejected locally before they can invalidate a whole ingest batch.
+- **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
+  now produces the budget warning while retaining the reservation for settlement.
+- **Gateway-prefixed contract probes.** Testing contract helpers append endpoint paths to the
+  configured API prefix using the same URL join as runtime transport.
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background
   reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
   standalone confirmations and of settlements, then sends the metadata batches that were queued

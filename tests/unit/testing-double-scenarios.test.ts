@@ -389,7 +389,7 @@ describe("FakeControlPlane scenario windows", () => {
 });
 
 describe("FakeControlPlane ingest fault scenarios", () => {
-  it("records complete overrun batches before throwing and exhausts bounded reject windows", async () => {
+  it("rejects out-of-range scripts atomically and exhausts bounded reject windows", async () => {
     for (const scenario of [
       {
         rejection: { count: 3 },
@@ -413,24 +413,24 @@ describe("FakeControlPlane ingest fault scenarios", () => {
           scenario.overrunEvents.map((index) => event(index)),
         ),
       ).rejects.toThrow(scenario.failure);
-      expect(plane.ingested).toEqual(
-        scenario.overrunEvents.map((index) => expect.objectContaining({ model: `model-${index}` })),
-      );
+      expect(plane.ingested).toEqual([]);
       expect(await (await post(plane, INGEST_PATH, [event(scenario.nextEvent)])).json()).toEqual({
         ingested: 1,
         rejected: [],
+        duplicates: [],
       });
       window.end();
     }
   });
 
-  it("emits schema-valid exact-index rejections after recording the whole batch", async () => {
+  it("emits schema-valid rejections while recording only accepted events", async () => {
     const plane = new FakeControlPlane();
     const window = plane.rejectIngest({ indices: [1], code: "invalid_tags", requests: 1 });
     const response = await post(plane, INGEST_PATH, [event(1), event(2)]);
     expect(response.status).toBe(202);
     expect(await response.json()).toEqual({
       ingested: 1,
+      duplicates: [],
       rejected: [
         {
           index: 1,
@@ -440,18 +440,20 @@ describe("FakeControlPlane ingest fault scenarios", () => {
         },
       ],
     });
-    expect(plane.ingested).toHaveLength(2);
+    expect(plane.ingested).toHaveLength(1);
     window.end();
   });
 
-  it("emits only the intentional legacy count and malformed spec-invalid bodies", async () => {
+  it("emits indexed count rejections and an explicit malformed-response scenario", async () => {
     const plane = new FakeControlPlane();
     const legacy = plane.rejectIngest({ count: 1 });
     const legacyResponse = await post(plane, INGEST_PATH, [event(3), event(4)]);
     expect(await legacyResponse.json()).toEqual({
       ingested: 1,
+      duplicates: [],
       rejected: [
         {
+          index: 0,
           code: "invalid_tags",
           model: "model-3",
           message: "scripted invalid_tags rejection",
@@ -461,6 +463,7 @@ describe("FakeControlPlane ingest fault scenarios", () => {
     expect(await (await post(plane, INGEST_PATH, [event(6)])).json()).toEqual({
       ingested: 1,
       rejected: [],
+      duplicates: [],
     });
     legacy.end();
 
@@ -482,6 +485,7 @@ describe("FakeControlPlane ingest fault scenarios", () => {
 
     expect(await (await post(plane, INGEST_PATH, [event(8)])).json()).toEqual({
       ingested: 0,
+      duplicates: [],
       rejected: [
         {
           index: 0,
@@ -491,14 +495,15 @@ describe("FakeControlPlane ingest fault scenarios", () => {
         },
       ],
     });
-    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested).toHaveLength(0);
     readOnly.end();
 
     expect(await (await post(plane, INGEST_PATH, [event(9)])).json()).toEqual({
       ingested: 1,
       rejected: [],
+      duplicates: [],
     });
-    expect(plane.ingested).toHaveLength(2);
+    expect(plane.ingested).toHaveLength(1);
     rejection.end();
   });
 
@@ -514,7 +519,7 @@ describe("FakeControlPlane ingest fault scenarios", () => {
       status: 202,
       body: { ingested: 0, rejected: [expect.objectContaining({ index: 0 })] },
     });
-    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested).toHaveLength(0);
     rejection.end();
   });
 });

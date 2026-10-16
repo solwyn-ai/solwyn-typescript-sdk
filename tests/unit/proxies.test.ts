@@ -53,7 +53,9 @@ function makeFetch(): {
     }
     // A valid ingest response keeps the console-backed default logger quiet, while a
     // malformed body would print an unparseable-response warning during flush.
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), ingested };
 }
@@ -90,7 +92,9 @@ function makeTrackedMediaFetch(): {
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(body)) {
       ingested.push(...(body as Array<Record<string, unknown>>));
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), checks, ingested };
 }
@@ -1931,7 +1935,9 @@ function makeDenyFetch(): { fetchMock: ReturnType<typeof vi.fn<FetchLike>> } {
         { status: 200 },
       );
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl) };
 }

@@ -70,6 +70,15 @@ describe("non-lease game days", () => {
   it("folds rejected denial receipts and replays one aggregate after an ordinary clean cycle", async () => {
     vi.useFakeTimers();
     const plane = new FakeControlPlane();
+    const submittedReceipts: MetadataEvent[] = [];
+    const baseFetch = plane.fetch;
+    vi.spyOn(plane, "fetch").mockImplementation((input, init) => {
+      if (new URL(input).pathname === "/api/v1/metadata/ingest") {
+        const batch = JSON.parse(String(init?.body)) as MetadataEvent[];
+        submittedReceipts.push(...batch.filter((event) => event.status === "budget_denied"));
+      }
+      return baseFetch(input, init);
+    });
     const client = openAIClient(() => ({ usage: { prompt_tokens: 3, completion_tokens: 1 } }));
     const solwyn = plane.wrap(client, {
       leaseEnabled: false,
@@ -100,12 +109,12 @@ describe("non-lease game days", () => {
           );
         });
 
-        for (let turn = 0; turn < 20 && plane.denialReceipts.length < 2; turn += 1) {
+        for (let turn = 0; turn < 20 && submittedReceipts.length < 2; turn += 1) {
           await vi.advanceTimersByTimeAsync(10);
           await Promise.resolve();
         }
 
-        rejectedReceipts = plane.denialReceipts;
+        rejectedReceipts = [...submittedReceipts];
         expect(rejectedReceipts).toHaveLength(2);
         expect(plane.aggregateReplays).toEqual([]);
         expect(client.chat.completions.create).not.toHaveBeenCalled();
@@ -136,7 +145,7 @@ describe("non-lease game days", () => {
         rejection.end();
       }
 
-      expect(plane.denialReceipts).toEqual(rejectedReceipts);
+      expect(plane.denialReceipts).toEqual([]);
       await vi.advanceTimersByTimeAsync(20);
       expect(plane.aggregateReplays).toEqual([]);
       await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
@@ -154,7 +163,7 @@ describe("non-lease game days", () => {
       const replay = plane.aggregateReplays[0];
       expect(
         plane.denialReceipts.filter((receipt) => receipt.deny_source !== "aggregate_replay"),
-      ).toEqual(rejectedReceipts);
+      ).toEqual([]);
       expect(replay).toMatchObject({
         status: "budget_denied",
         deny_source: "aggregate_replay",
@@ -615,7 +624,7 @@ describe("lease game days", () => {
         actualRunId = currentRun()?.agentRunId ?? "";
         expect(actualRunId).not.toBe("");
         await wrapped.chat.completions.create({ model: "gpt-5.5", messages: [] });
-        plane.stopRun(actualRunId, { reason: "operator_stop" });
+        plane.stopRun(actualRunId, { reason: "manual_kill" });
 
         // Two milliseconds exceeds the 0.85–1.15 ms jittered deadline but is well
         // before the 60-second lease expiry. The second call may itself see the stop.
@@ -629,7 +638,7 @@ describe("lease game days", () => {
 
         expect(plane.leaseRenewals.length).toBeGreaterThan(0);
         expect(runTermination(actualRunId)).toMatchObject({
-          reason: "operator_stop",
+          reason: "manual_kill",
           source: "server",
         });
         expect(currentRunTerminated()).toBe(true);
@@ -658,7 +667,7 @@ describe("lease game days", () => {
     expect(stopped).toBeInstanceOf(RunStoppedError);
     expect(stopped).toMatchObject({
       agentRunId: actualRunId,
-      reason: "operator_stop",
+      reason: "manual_kill",
       source: "server",
     });
     expect(provider.chat.completions.create.mock.calls.length).toBeLessThanOrEqual(3);
@@ -667,7 +676,7 @@ describe("lease game days", () => {
     expect(
       plane.denialReceipts.every((receipt) => receipt.denied_by_period === "run_stopped"),
     ).toBe(true);
-    expect(plane.denialReceipts.every((receipt) => receipt.deny_reason === "operator_stop")).toBe(
+    expect(plane.denialReceipts.every((receipt) => receipt.deny_reason === "manual_kill")).toBe(
       true,
     );
     expect(plane.unmatchedRequests).toEqual([]);

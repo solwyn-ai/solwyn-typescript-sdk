@@ -73,6 +73,38 @@ afterEach(() => {
 });
 
 describe("MetadataReporter bounded shutdown", () => {
+  it("does not wrap a large flush interval into an immediate timer", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async () => ingest(1));
+    const reporter = new MetadataReporter(API_URL, API_KEY, {
+      flushInterval: 2 ** 31 + 1000,
+      fetch,
+    });
+    reporter.report(event());
+    await vi.advanceTimersByTimeAsync(10);
+    expect(fetch).not.toHaveBeenCalled();
+    await reporter.close(0);
+  });
+
+  it("does not expire a large close deadline after a wrapped timer delay", async () => {
+    vi.useFakeTimers();
+    const gate = deferred<Response>();
+    const reporter = new MetadataReporter(API_URL, API_KEY, { fetch: () => gate.promise });
+    reporter.reportConfirm(confirm());
+    const closing = reporter.close(2 ** 31 + 1000);
+    let closed = false;
+    void closing.then(() => {
+      closed = true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      expect(closed).toBe(false);
+    } finally {
+      gate.resolve(new Response(null, { status: 204 }));
+      await closing;
+    }
+  });
+
   it("zero-deadline close seals queued work and counts both settlement halves", async () => {
     const reporter = new MetadataReporter(API_URL, API_KEY, { shutdownDeadline: 0 });
     reporter.reportConfirm(confirm(1));

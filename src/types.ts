@@ -231,6 +231,8 @@ export interface MetadataEvent {
   failover_error_class?: string | null;
   attempt_index: number;
   call_id: string;
+  /** Funding lease used by the paired settlement confirmation. */
+  lease_id?: string | null;
   possibly_succeeded?: boolean | null;
   service_tier?: string | null;
   sdk_instance_id: string;

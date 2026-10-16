@@ -118,7 +118,9 @@ function makeFetch(): {
     }
     // Valid ingest 202 body (never the malformed `[]`): the default logger is now
     // console-backed, so a malformed body would print an unparseable warning.
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), ingested, confirms };
 }
@@ -149,7 +151,9 @@ function stoppedRunFetch(): {
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       ingested.push(...(raw as WireEvent[]));
     }
-    return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), ingested };
 }
@@ -2273,7 +2277,9 @@ describe("SolwynCore — options validation", () => {
         checkCalls += 1;
         return new Response("", { status: 500 });
       }
-      return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     });
     const client = openAIClient(() => ({}));
     const solwyn = new Solwyn(client, {

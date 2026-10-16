@@ -43,22 +43,31 @@ const counter = () => z.number().int().min(0).max(TOKEN_DETAILS_MAX).default(0);
  * Note: the schema always includes `is_estimated` after parsing — the
  * omit-when-false wire quirk lives in {@link serializeTokenDetails}, not here.
  */
-export const TokenDetailsSchema = z.strictObject({
-  input_tokens: counter(),
-  output_tokens: counter(),
-  cached_input_tokens: counter(),
-  cache_creation_5m_tokens: counter(),
-  cache_creation_1h_tokens: counter(),
-  reasoning_tokens: counter(),
-  audio_input_tokens: counter(),
-  audio_output_tokens: counter(),
-  image_input_tokens: counter(),
-  image_output_tokens: counter(),
-  accepted_prediction_tokens: counter(),
-  rejected_prediction_tokens: counter(),
-  tool_use_input_tokens: counter(),
-  is_estimated: z.boolean().default(false),
-});
+export const TokenDetailsSchema = z
+  .strictObject({
+    input_tokens: counter(),
+    output_tokens: counter(),
+    cached_input_tokens: counter(),
+    cache_creation_5m_tokens: counter(),
+    cache_creation_1h_tokens: counter(),
+    reasoning_tokens: counter(),
+    audio_input_tokens: counter(),
+    audio_output_tokens: counter(),
+    image_input_tokens: counter(),
+    image_output_tokens: counter(),
+    accepted_prediction_tokens: counter(),
+    rejected_prediction_tokens: counter(),
+    tool_use_input_tokens: counter(),
+    is_estimated: z.boolean().default(false),
+  })
+  .refine(
+    (details) =>
+      details.cached_input_tokens +
+        details.cache_creation_5m_tokens +
+        details.cache_creation_1h_tokens <=
+      details.input_tokens,
+    { message: "cache buckets must be included in input_tokens", path: ["input_tokens"] },
+  );
 
 /** Parsed TokenDetails shape (all fields present, defaults applied). */
 export type TokenDetails = z.infer<typeof TokenDetailsSchema>;
@@ -90,7 +99,7 @@ export function createTokenDetails(partial: Partial<TokenDetails> = {}): TokenDe
  * is caught at that boundary, matching Python's unbounded vendored model.
  */
 export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDetails {
-  return {
+  return clampCacheBuckets({
     input_tokens: partial.input_tokens ?? 0,
     output_tokens: partial.output_tokens ?? 0,
     cached_input_tokens: partial.cached_input_tokens ?? 0,
@@ -105,7 +114,26 @@ export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDet
     rejected_prediction_tokens: partial.rejected_prediction_tokens ?? 0,
     tool_use_input_tokens: partial.tool_use_input_tokens ?? 0,
     is_estimated: partial.is_estimated ?? false,
-  };
+  });
+}
+
+/** Preserve the input total; trim cache reads, then short- and long-lived writes to fit. */
+function clampCacheBuckets(details: TokenDetails): TokenDetails {
+  const fields = [
+    "cached_input_tokens",
+    "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens",
+  ] as const;
+  if (!isUsageCount(details.input_tokens) || fields.some((field) => !isUsageCount(details[field])))
+    return details;
+  let remaining = details.input_tokens;
+  for (const field of fields) {
+    const count = Math.min(details[field], remaining);
+    if (count !== details[field]) details.is_estimated = true;
+    details[field] = count;
+    remaining -= count;
+  }
+  return details;
 }
 
 /** A provider counter must be an explicit non-negative integer; zero is valid. */
@@ -134,7 +162,7 @@ export function buildReportedTokenDetails(
     if (isUsageCount(value)) details[field] = value;
     else if (value !== undefined && value !== null) details.is_estimated = true;
   }
-  return details;
+  return clampCacheBuckets(details);
 }
 
 /**

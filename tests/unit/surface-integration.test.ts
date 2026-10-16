@@ -31,6 +31,7 @@ interface SurfaceOptionOverrides {
   readonly onUnmetered?: "warn" | "raise" | "allow";
   readonly acknowledgeUntracked?: string[];
   readonly reportUntrackedSurfaces?: boolean;
+  readonly reporterShutdownDeadline?: number;
 }
 
 interface WireCall {
@@ -48,7 +49,9 @@ function wireRecorder() {
       const accepted = Array.isArray(body) ? body.length : 0;
       return new Response(JSON.stringify({ accepted }), { status: 202 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
   return { calls, fetch };
 }
@@ -178,7 +181,7 @@ describe("public surface controls", () => {
         });
       }
       if (path === "/api/v1/budgets/confirm") return new Response(null, { status: 204 });
-      return Response.json({ ingested: 1, rejected: [] }, { status: 202 });
+      return Response.json({ ingested: 1, rejected: [], duplicates: [] }, { status: 202 });
     };
     const log = recordingLogger();
     const wrapped = new Solwyn(raw, {
@@ -298,7 +301,7 @@ describe("public surface controls", () => {
     expect(wire.calls).toEqual([]);
   });
 
-  it("bounds advisory shutdown to ten seconds and leaves no later batches or timers", async () => {
+  it("bounds advisory shutdown to the configured deadline without later batches or timers", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
     const raw = fakeOpenAI();
     let providerClosed = false;
@@ -316,7 +319,10 @@ describe("public surface controls", () => {
       // A hostile transport ignores cancellation; Transport must still settle.
       return new Promise<Response>(() => {});
     };
-    const wrapped = wrap(client, fetch, recordingLogger().logger, { onUnmetered: "allow" });
+    const wrapped = wrap(client, fetch, recordingLogger().logger, {
+      onUnmetered: "allow",
+      reporterShutdownDeadline: 0.25,
+    });
     for (let index = 0; index < 512; index += 1) Reflect.get(wrapped, `future_${index}`);
     const closing = wrapped.close();
     let settled = false;
@@ -325,7 +331,7 @@ describe("public surface controls", () => {
     });
     try {
       await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(9_999);
+      await vi.advanceTimersByTimeAsync(249);
       expect(providerClosed).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(settled).toBe(true);
@@ -1917,7 +1923,10 @@ describe("runtime surface guard", () => {
 
     expect(raw.operations.retrieve).toHaveBeenCalledTimes(hits);
     expect(log.warn).toHaveBeenCalledTimes(warnings);
-    expect(wire.calls.map((call) => call.path)).toEqual([UNTRACKED_REPORT_PATH]);
+    expect(wire.calls.map((call) => call.path)).toEqual([
+      UNTRACKED_REPORT_PATH,
+      UNTRACKED_REPORT_PATH,
+    ]);
     expect(wire.calls[0]?.body).toEqual([
       expect.objectContaining({
         provider: "openai",
@@ -1930,6 +1939,7 @@ describe("runtime surface guard", () => {
         occurrences: 1,
       }),
     ]);
+    expect(wire.calls[1]?.body).toEqual([expect.objectContaining({ occurrences: hits - 1 })]);
   });
 
   it("allows an exact responses.retrieve acknowledgment while keeping the namespace and sibling guarded", async () => {

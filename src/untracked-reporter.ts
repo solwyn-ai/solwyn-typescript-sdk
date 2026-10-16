@@ -1,6 +1,16 @@
-import { type Logger, noopLogger } from "./logging";
+import { ConfigurationError } from "./errors";
+import { bestEffortLogger, type Logger, noopLogger } from "./logging";
+import { handleReadOnlyKeyError } from "./read-only-key";
 import { SURFACE_CLIENT_SHAPES, type SurfaceClientShape, validateSurfacePath } from "./surfaces";
-import { type FetchLike, Transport } from "./transport";
+import {
+  type FetchLike,
+  isRetryableTransportError,
+  MAX_RATE_LIMIT_ATTEMPTS,
+  retryBackoffDelay,
+  Transport,
+  TransportHttpError,
+  transportErrorLabel,
+} from "./transport";
 import {
   PROVIDER_NAMES,
   type ProviderName,
@@ -41,6 +51,12 @@ export interface UntrackedSurfaceReporterOptions {
   readonly monotonicClock?: () => number;
   readonly randomUUID?: () => string;
   readonly logger?: Logger;
+  /** Close budget in milliseconds, shared by an active send and the final flush. */
+  readonly shutdownDeadline?: number;
+  readonly maxSendAttempts?: number;
+  readonly retryBackoffBase?: number;
+  readonly retryBackoffCap?: number;
+  readonly random?: () => number;
 }
 
 export type UntrackedSurfaceObservationDisposition =
@@ -50,6 +66,8 @@ export type UntrackedSurfaceObservationDisposition =
       reason: "client_shape_not_in_wire";
       clientShape: SurfaceClientShape;
     }>;
+
+const IDLE_FLUSH = Promise.resolve();
 
 const ADMITTED_OBSERVATION = Object.freeze({ status: "admitted" as const });
 const LOCAL_CLIENT_SHAPE_WARNING =
@@ -67,12 +85,18 @@ interface MutableObservation {
   lastSeenAt: number;
   sentCursor: number;
   lastAttemptedAt: number | null;
+  pending: BuiltUntrackedReport | null;
+  disabled: boolean;
+  poisonUntil: number;
 }
 
 interface BuiltUntrackedReport {
   readonly key: string;
   readonly cursor: number;
   readonly report: UntrackedSurfaceReport;
+  attempts: number;
+  rateLimitAttempts: number;
+  nextAttemptAt: number;
 }
 
 function isOneOf<T extends string>(values: readonly T[], value: unknown): value is T {
@@ -90,6 +114,34 @@ function toUtcRfc3339(milliseconds: number): string {
 /** Reporter-owned state with no transport, timer, or reporter reference. */
 class UntrackedReportState {
   readonly #observations = new Map<string, MutableObservation>();
+  #nextDueAt = Number.POSITIVE_INFINITY;
+
+  isDue(now: number, final = false): boolean {
+    if (!final) return now >= this.#nextDueAt;
+    for (const observation of this.#observations.values()) {
+      if (observation.disabled || now < observation.poisonUntil) continue;
+      if (observation.pending !== null) {
+        if (now >= observation.pending.nextAttemptAt) return true;
+      } else if (observation.totalOccurrences > observation.sentCursor) return true;
+    }
+    return false;
+  }
+
+  #noteDue(observation: MutableObservation): void {
+    if (observation.disabled) return;
+    const due =
+      observation.pending !== null
+        ? observation.pending.nextAttemptAt
+        : observation.totalOccurrences > observation.sentCursor
+          ? Math.max(
+              observation.poisonUntil,
+              observation.lastAttemptedAt === null
+                ? 0
+                : observation.lastAttemptedAt + UNTRACKED_SURFACE_REPORT_INTERVAL_MS,
+            )
+          : Number.POSITIVE_INFINITY;
+    this.#nextDueAt = Math.min(this.#nextDueAt, due);
+  }
 
   observe(observation: UntrackedSurfaceObservation, seenAt: number): boolean {
     const occurrences = observation.occurrences ?? 1;
@@ -117,6 +169,7 @@ class UntrackedReportState {
     const key = observationKey(observation, surface);
     const current = this.#observations.get(key);
     if (current !== undefined) {
+      if (current.disabled) return false;
       current.ruleKind = observation.ruleKind;
       current.capabilityScope = observation.capabilityScope;
       current.posture = observation.posture;
@@ -126,6 +179,7 @@ class UntrackedReportState {
       );
       current.firstSeenAt = Math.min(current.firstSeenAt, seenAt);
       current.lastSeenAt = Math.max(current.lastSeenAt, seenAt);
+      this.#noteDue(current);
       return true;
     }
     if (this.#observations.size >= UNTRACKED_SURFACE_REPORT_KEY_LIMIT) {
@@ -143,7 +197,11 @@ class UntrackedReportState {
       lastSeenAt: seenAt,
       sentCursor: 0,
       lastAttemptedAt: null,
+      pending: null,
+      disabled: false,
+      poisonUntil: 0,
     });
+    this.#nextDueAt = 0;
     return true;
   }
 
@@ -151,14 +209,28 @@ class UntrackedReportState {
     monotonicNow: number,
     sdkInstanceId: string,
     randomUUID: () => string,
+    final = false,
   ): BuiltUntrackedReport[] {
     const built: BuiltUntrackedReport[] = [];
+    if (!this.isDue(monotonicNow, final)) return built;
+    this.#nextDueAt = Number.POSITIVE_INFINITY;
     for (const [key, observation] of this.#observations) {
+      if (observation.disabled) continue;
+      if (observation.pending !== null) {
+        if (monotonicNow >= observation.pending.nextAttemptAt) {
+          observation.pending.nextAttemptAt = Number.POSITIVE_INFINITY;
+          built.push(observation.pending);
+        } else this.#noteDue(observation);
+        continue;
+      }
       if (observation.totalOccurrences <= observation.sentCursor) continue;
       if (
-        observation.lastAttemptedAt !== null &&
-        monotonicNow - observation.lastAttemptedAt < UNTRACKED_SURFACE_REPORT_INTERVAL_MS
+        monotonicNow < observation.poisonUntil ||
+        (!final &&
+          observation.lastAttemptedAt !== null &&
+          monotonicNow - observation.lastAttemptedAt < UNTRACKED_SURFACE_REPORT_INTERVAL_MS)
       ) {
+        this.#noteDue(observation);
         continue;
       }
 
@@ -183,13 +255,23 @@ class UntrackedReportState {
           sdk_instance_id: sdkInstanceId,
           report_id: randomUUID().toLowerCase(),
         });
-        if (!parsed.success) continue;
-        built.push({
+        if (!parsed.success) {
+          observation.poisonUntil = monotonicNow + UNTRACKED_SURFACE_REPORT_INTERVAL_MS;
+          this.#noteDue(observation);
+          continue;
+        }
+        observation.pending = {
           key,
           cursor: observation.sentCursor + occurrences,
           report: parsed.data,
-        });
+          attempts: 0,
+          rateLimitAttempts: 0,
+          nextAttemptAt: Number.POSITIVE_INFINITY,
+        };
+        built.push(observation.pending);
       } catch {
+        observation.poisonUntil = monotonicNow + UNTRACKED_SURFACE_REPORT_INTERVAL_MS;
+        this.#noteDue(observation);
         // A poison entry is local-only and must not block valid siblings.
       }
     }
@@ -201,6 +283,26 @@ class UntrackedReportState {
       const observation = this.#observations.get(built.key);
       if (observation !== undefined) {
         observation.sentCursor = Math.max(observation.sentCursor, built.cursor);
+        observation.pending = null;
+        this.#noteDue(observation);
+      }
+    }
+  }
+
+  defer(reports: readonly BuiltUntrackedReport[], nextAttemptAt: number): void {
+    for (const built of reports) {
+      built.nextAttemptAt = nextAttemptAt;
+      const observation = this.#observations.get(built.key);
+      if (observation !== undefined) this.#noteDue(observation);
+    }
+  }
+
+  reject(reports: readonly BuiltUntrackedReport[]): void {
+    for (const built of reports) {
+      const observation = this.#observations.get(built.key);
+      if (observation !== undefined) {
+        observation.disabled = true;
+        observation.pending = null;
       }
     }
   }
@@ -214,6 +316,14 @@ export class UntrackedSurfaceReporter {
   readonly #randomUUID: () => string;
   readonly #logger: Logger;
   readonly #state = new UntrackedReportState();
+  readonly #shutdownBudget: number;
+  readonly #maxSendAttempts: number;
+  readonly #retryBackoffBase: number;
+  readonly #retryBackoffCap: number;
+  readonly #random: () => number;
+  #disabled = false;
+  #rateLimitedUntil = 0;
+  readonly #lastFailureLogAt = new Map<string, number>();
   readonly #warnedLocalClientShapes = new Set<SurfaceClientShape>();
   #activeFlush: Promise<void> | undefined;
   #flushRequested = false;
@@ -230,13 +340,35 @@ export class UntrackedSurfaceReporter {
     this.#wallClock = options.wallClock ?? Date.now;
     this.#monotonicClock = options.monotonicClock ?? (() => performance.now());
     this.#randomUUID = options.randomUUID ?? (() => crypto.randomUUID());
-    this.#logger = options.logger ?? noopLogger;
+    this.#logger = bestEffortLogger(options.logger ?? noopLogger);
+    this.#shutdownBudget = options.shutdownDeadline ?? 5000;
+    this.#maxSendAttempts = options.maxSendAttempts ?? 5;
+    this.#retryBackoffBase = options.retryBackoffBase ?? 1000;
+    this.#retryBackoffCap = options.retryBackoffCap ?? 60_000;
+    this.#random = options.random ?? Math.random;
+    if (!Number.isFinite(this.#shutdownBudget) || this.#shutdownBudget < 0) {
+      throw new ConfigurationError("shutdownDeadline must be finite and >= 0", {
+        field: "shutdownDeadline",
+      });
+    }
+    if (!Number.isInteger(this.#maxSendAttempts) || this.#maxSendAttempts < 1) {
+      throw new ConfigurationError("maxSendAttempts must be an integer >= 1", {
+        field: "maxSendAttempts",
+      });
+    }
+    for (const [field, value] of [
+      ["retryBackoffBase", this.#retryBackoffBase],
+      ["retryBackoffCap", this.#retryBackoffCap],
+    ] as const) {
+      if (!Number.isFinite(value) || value <= 0)
+        throw new ConfigurationError(`${field} must be finite and > 0`, { field });
+    }
   }
 
   observe(
     observation: UntrackedSurfaceObservation,
   ): UntrackedSurfaceObservationDisposition | undefined {
-    if (this.#closePromise !== undefined) return undefined;
+    if (this.#closePromise !== undefined || this.#disabled) return undefined;
     try {
       if (!isOneOf(SURFACE_CLIENT_SHAPES, observation.clientShape)) {
         return undefined;
@@ -265,15 +397,22 @@ export class UntrackedSurfaceReporter {
 
   flushDue(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
+    const now = this.#monotonicClock();
+    if (this.#disabled || now < this.#rateLimitedUntil || !this.#state.isDue(now)) {
+      return this.#activeFlush ?? IDLE_FLUSH;
+    }
     return this.#requestFlush();
   }
 
   /** One bounded final cycle, including any already-active advisory send. */
   close(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
-    this.#shutdownDeadline = performance.now() + UNTRACKED_SURFACE_REPORT_TIMEOUT_MS;
+    this.#shutdownDeadline = performance.now() + this.#shutdownBudget;
     this.#closePromise = Promise.resolve().then(async () => {
-      const timer = setTimeout(() => this.#shutdownController.abort(), this.#sendTimeout());
+      const timer = setTimeout(
+        () => this.#shutdownController.abort(),
+        Math.min(2 ** 31 - 1, this.#shutdownBudget),
+      );
       try {
         await this.#requestFlush();
       } finally {
@@ -287,7 +426,10 @@ export class UntrackedSurfaceReporter {
   #sendTimeout(): number {
     return this.#shutdownDeadline === undefined
       ? UNTRACKED_SURFACE_REPORT_TIMEOUT_MS
-      : Math.max(0, this.#shutdownDeadline - performance.now());
+      : Math.max(
+          0,
+          Math.min(UNTRACKED_SURFACE_REPORT_TIMEOUT_MS, this.#shutdownDeadline - performance.now()),
+        );
   }
 
   #requestFlush(): Promise<void> {
@@ -307,7 +449,10 @@ export class UntrackedSurfaceReporter {
     do {
       this.#flushRequested = false;
       try {
-        await this.#flushOnce();
+        const final = this.#closePromise !== undefined;
+        const progressed = await this.#flushOnce(final);
+        if (final && progressed && this.#state.isDue(this.#monotonicClock(), true))
+          this.#flushRequested = true;
       } catch {
         // Advisory failures must not reject a provider call or close().
       }
@@ -319,17 +464,70 @@ export class UntrackedSurfaceReporter {
     finishFlush();
   }
 
-  async #flushOnce(): Promise<void> {
+  #warnSendFailure(error: unknown): void {
+    const now = this.#monotonicClock();
+    const status = error instanceof TransportHttpError ? error.status : null;
+    const failureType = transportErrorLabel(error) ?? "unknown";
+    const key = status === null ? failureType : String(status);
+    const last = this.#lastFailureLogAt.get(key);
+    if (last !== undefined && now - last < 60_000) return;
+    this.#lastFailureLogAt.set(key, now);
+    this.#logger.warn("untracked.send_failed: status=%s exc_type=%s", status, failureType);
+  }
+
+  #retryBatch(batch: readonly BuiltUntrackedReport[], error: unknown): void {
+    const now = this.#monotonicClock();
+    const rateLimited = error instanceof TransportHttpError && error.status === 429;
+    const retryAfterMs = error instanceof TransportHttpError ? (error.retryAfterMs ?? 0) : 0;
+    if (rateLimited) {
+      this.#rateLimitedUntil = Math.max(this.#rateLimitedUntil, now + retryAfterMs);
+    }
+    for (const built of batch) {
+      if (rateLimited) built.rateLimitAttempts += 1;
+      else built.attempts += 1;
+      if (
+        built.attempts >= this.#maxSendAttempts ||
+        built.rateLimitAttempts >= MAX_RATE_LIMIT_ATTEMPTS
+      ) {
+        this.#state.markSent([built]);
+        this.#logger.warn("untracked.retry_exhausted");
+        continue;
+      }
+      const delay = Math.max(
+        retryAfterMs,
+        retryBackoffDelay(
+          Math.max(built.attempts, built.rateLimitAttempts),
+          this.#retryBackoffBase,
+          this.#retryBackoffCap,
+          this.#random,
+        ),
+      );
+      this.#state.defer([built], now + delay);
+      if (rateLimited) this.#rateLimitedUntil = Math.max(this.#rateLimitedUntil, now + delay);
+    }
+  }
+
+  async #flushOnce(final: boolean): Promise<boolean> {
+    if (this.#disabled || this.#monotonicClock() < this.#rateLimitedUntil) return false;
     let reports: BuiltUntrackedReport[];
     try {
-      reports = this.#state.buildDue(this.#monotonicClock(), this.#sdkInstanceId, this.#randomUUID);
+      reports = this.#state.buildDue(
+        this.#monotonicClock(),
+        this.#sdkInstanceId,
+        this.#randomUUID,
+        final,
+      );
     } catch {
-      return;
+      return false;
     }
-
+    let progressed = false;
     for (let offset = 0; offset < reports.length; offset += UNTRACKED_SURFACE_REPORT_BATCH_SIZE) {
       const timeoutMs = this.#sendTimeout();
-      if (timeoutMs <= 0 || this.#shutdownController.signal.aborted) return;
+      if (timeoutMs <= 0 || this.#shutdownController.signal.aborted) return progressed;
+      if (this.#monotonicClock() < this.#rateLimitedUntil) {
+        this.#state.defer(reports.slice(offset), this.#rateLimitedUntil);
+        return progressed;
+      }
       const batch = reports.slice(offset, offset + UNTRACKED_SURFACE_REPORT_BATCH_SIZE);
       try {
         await this.#transport.postJson(
@@ -337,10 +535,20 @@ export class UntrackedSurfaceReporter {
           batch.map((built) => built.report),
           { timeoutMs, signal: this.#shutdownController.signal },
         );
-      } catch {
+      } catch (error) {
+        if (handleReadOnlyKeyError(error, this.#logger)) {
+          this.#disabled = true;
+          this.#state.reject(batch);
+          return progressed;
+        }
+        this.#warnSendFailure(error);
+        if (!isRetryableTransportError(error)) this.#state.reject(batch);
+        else this.#retryBatch(batch, error);
         continue;
       }
       this.#state.markSent(batch);
+      progressed = true;
     }
+    return progressed;
   }
 }

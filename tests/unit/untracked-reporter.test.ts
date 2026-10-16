@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resetReadOnlyKeyDiagnosticForTest } from "../../src/read-only-key";
 import type { FetchLike } from "../../src/transport";
 import {
   type UntrackedSurfaceObservation,
@@ -37,6 +38,7 @@ describe("UntrackedSurfaceReporter", () => {
     const signals: AbortSignal[] = [];
     const reporter = new UntrackedSurfaceReporter("https://api.solwyn.ai", API_KEY, {
       sdkInstanceId: "sdk-instance-1",
+      shutdownDeadline: 4000,
       fetch: (_url, init) => {
         batches.push(JSON.parse(String(init?.body)).length);
         if (init?.signal) signals.push(init.signal);
@@ -54,18 +56,18 @@ describe("UntrackedSurfaceReporter", () => {
     void closing.then(() => {
       settled = true;
     });
-    await vi.advanceTimersByTimeAsync(9_999);
+    await vi.advanceTimersByTimeAsync(3_999);
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     await closing;
     await active;
-    expect(batches).toEqual([100, 100]);
+    expect(batches).toEqual([100]);
     expect(signals.every((signal) => signal.aborted)).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
     expect(reporter.observe(observation({ surface: "newAfterClose" }))).toBeUndefined();
     await reporter.flushDue();
     await vi.advanceTimersByTimeAsync(900_000);
-    expect(batches).toEqual([100, 100]);
+    expect(batches).toEqual([100]);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -143,7 +145,7 @@ describe("UntrackedSurfaceReporter", () => {
     ]);
   });
 
-  it("uses a per-key monotonic cadence and retries retained deltas with a fresh id", async () => {
+  it("retries the same report unchanged and sends later occurrences under a separate id", async () => {
     let monotonicNow = 0;
     let wallNow = FIRST_SEEN;
     let idSequence = 0;
@@ -160,6 +162,7 @@ describe("UntrackedSurfaceReporter", () => {
       wallClock: () => wallNow,
       monotonicClock: () => monotonicNow,
       randomUUID: () => reportId(++idSequence),
+      random: () => 1,
     });
 
     reporter.observe(observation());
@@ -167,19 +170,23 @@ describe("UntrackedSurfaceReporter", () => {
     wallNow += 60_000;
     reporter.observe(observation());
 
-    monotonicNow = 899_999;
+    monotonicNow = 999;
     await reporter.flushDue();
     expect(bodies).toHaveLength(1);
 
-    monotonicNow = 900_000;
+    monotonicNow = 1000;
     await reporter.flushDue();
     expect(bodies).toHaveLength(2);
     expect(bodies[0]?.[0]).toMatchObject({
       occurrences: 1,
       report_id: reportId(1),
     });
-    expect(bodies[1]?.[0]).toMatchObject({
-      occurrences: 2,
+    expect(bodies[1]).toEqual(bodies[0]);
+    monotonicNow = 900_000;
+    await reporter.flushDue();
+    expect(bodies).toHaveLength(3);
+    expect(bodies[2]?.[0]).toMatchObject({
+      occurrences: 1,
       first_seen_at: "2026-08-13T12:00:00Z",
       last_seen_at: "2026-08-13T12:01:00Z",
       report_id: reportId(2),
@@ -361,7 +368,182 @@ describe("UntrackedSurfaceReporter", () => {
     expect(bodies[2]?.map((report) => report.surface)).toEqual(
       Array.from({ length: 100 }, (_, index) => `responses.operation_${index}`),
     );
-    expect(bodies[2]?.map((report) => report.report_id)).not.toEqual(firstAttemptIds);
+    expect(bodies[2]?.map((report) => report.report_id)).toEqual(firstAttemptIds);
+  });
+
+  it("flushes all unsent occurrences on close without waiting for the per-key interval", async () => {
+    const counts: number[] = [];
+    let sequence = 0;
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => 0,
+      randomUUID: () => reportId(++sequence),
+      fetch: async (_url, init) => {
+        counts.push(
+          ...JSON.parse(String(init?.body)).map(
+            (report: { occurrences: number }) => report.occurrences,
+          ),
+        );
+        return new Response(null, { status: 204 });
+      },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    reporter.observe(observation({ occurrences: 99 }));
+    await reporter.close();
+    expect(counts).toEqual([1, 99]);
+  });
+
+  it.each([400, 403, 422])("logs HTTP %d once and stops retrying refused keys", async (status) => {
+    const warn = vi.fn();
+    const fetch = vi.fn(async () => new Response(null, { status }));
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      fetch,
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    reporter.observe(observation());
+    await reporter.close();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      "untracked.send_failed: status=%s exc_type=%s",
+      status,
+      "TransportHttpError",
+    );
+  });
+
+  it("surfaces a definitive refusal even immediately after a transient failure", async () => {
+    let now = 0;
+    const statuses = [500, 422];
+    const warn = vi.fn();
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => now,
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+      fetch: async () => new Response(null, { status: statuses.shift() }),
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    now = 1000;
+    await reporter.flushDue();
+    expect(warn).toHaveBeenCalledWith(
+      "untracked.send_failed: status=%s exc_type=%s",
+      422,
+      "TransportHttpError",
+    );
+    await reporter.close();
+  });
+
+  it("routes read-only credentials through the shared diagnostic and stops advisory delivery", async () => {
+    resetReadOnlyKeyDiagnosticForTest();
+    const warn = vi.fn();
+    const error = vi.fn();
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ detail: { code: "read_only_key" } }), { status: 403 }),
+    );
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      fetch,
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    reporter.observe(observation({ surface: "files.create" }));
+    await reporter.close();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0]?.[0]).toContain("read_only_key");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("honors Retry-After and keeps rate-limited report identities stable", async () => {
+    let now = 0;
+    let sequence = 0;
+    const bodies: unknown[] = [];
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => now,
+      maxSendAttempts: 1,
+      randomUUID: () => reportId(++sequence),
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return bodies.length < 3
+          ? new Response(null, { status: 429, headers: { "Retry-After": "60" } })
+          : new Response(null, { status: 204 });
+      },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    now = 59_999;
+    await reporter.flushDue();
+    expect(bodies).toHaveLength(1);
+    now = 60_000;
+    await reporter.flushDue();
+    expect(bodies).toHaveLength(2);
+    now = 120_000;
+    await reporter.flushDue();
+    expect(bodies).toHaveLength(3);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[2]).toEqual(bodies[0]);
+    await reporter.close();
+  });
+
+  it("eventually disposes a permanently rate-limited report", async () => {
+    let now = 0;
+    const fetch = vi.fn(
+      async () => new Response(null, { status: 429, headers: { "Retry-After": "60" } }),
+    );
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      fetch,
+      maxSendAttempts: 1,
+      monotonicClock: () => now,
+    });
+    reporter.observe(observation());
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      await reporter.flushDue();
+      now += 60_000;
+    }
+    await reporter.close();
+    expect(fetch).toHaveBeenCalledTimes(20);
+  });
+
+  it("keeps the endpoint Retry-After hold after a report exhausts its retries", async () => {
+    let now = 0;
+    const fetch = vi.fn(async () =>
+      fetch.mock.calls.length <= 20
+        ? new Response(null, { status: 429, headers: { "Retry-After": "60" } })
+        : new Response(null, { status: 204 }),
+    );
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      fetch,
+      maxSendAttempts: 1,
+      monotonicClock: () => now,
+    });
+    try {
+      reporter.observe(observation());
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        now = attempt * 60_000;
+        await reporter.flushDue();
+      }
+      expect(fetch).toHaveBeenCalledTimes(20);
+      reporter.observe(observation({ surface: "files.create" }));
+      await reporter.flushDue();
+      expect(fetch).toHaveBeenCalledTimes(20);
+      now = 20 * 60_000 - 1;
+      await reporter.flushDue();
+      expect(fetch).toHaveBeenCalledTimes(20);
+      now += 1;
+      await reporter.flushDue();
+      expect(fetch).toHaveBeenCalledTimes(21);
+    } finally {
+      await reporter.close();
+    }
   });
 
   it("retains the first 512 distinct keys and ignores later distinct keys", async () => {

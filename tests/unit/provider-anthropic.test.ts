@@ -226,10 +226,10 @@ describe("AnthropicAdapter.extractUsage — cache_creation aggregate fallback", 
 // extractUsage — permanent-zero fields & graceful degradation
 // ---------------------------------------------------------------------------
 
-describe("AnthropicAdapter.extractUsage — permanent-zero fields", () => {
+describe("AnthropicAdapter.extractUsage — absent detail fields", () => {
   const adapter = new AnthropicAdapter();
 
-  it("reasoning_tokens is always 0 (extended thinking folded into output — permanent blind spot)", () => {
+  it("defaults reasoning_tokens to zero when no thinking breakdown is reported", () => {
     const usage = adapter.extractUsage({ usage: { input_tokens: 10, output_tokens: 5000 } });
     expect(usage.reasoning_tokens).toBe(0);
   });
@@ -312,7 +312,7 @@ describe("AnthropicAdapter — always-null seams", () => {
     expect(adapter.estimateMissingUsage({}, { estimatedInputTokens: 0 })).toBe(null);
   });
 
-  it("extractServiceTier always returns null regardless of response shape", () => {
+  it("returns null when usage contains no service tier", () => {
     expect(adapter.extractServiceTier({})).toBe(null);
     expect(adapter.extractServiceTier({ service_tier: "priority" })).toBe(null);
     expect(adapter.extractServiceTier(null)).toBe(null);

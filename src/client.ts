@@ -1775,12 +1775,10 @@ export class SolwynCore {
 
   async #buildInit(issuanceProvider?: string): Promise<InitState> {
     const primaryProvider = this.#providerOverride ?? issuanceProvider;
-    const runtimes = await buildRuntimes(
-      this.#client,
-      this.#primaryModel,
-      this.#fallbackSpecs,
-      primaryProvider === undefined ? {} : { primaryProvider },
-    );
+    const runtimes = await buildRuntimes(this.#client, this.#primaryModel, this.#fallbackSpecs, {
+      ...(primaryProvider === undefined ? {} : { primaryProvider }),
+      logger: this.#logger,
+    });
     const primary = runtimes[0];
     if (primary === undefined) {
       // buildRuntimes always yields at least the primary; defensive only.

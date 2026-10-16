@@ -40,7 +40,14 @@ import {
 import type { TokenDetails } from "../token-details";
 import { buildTokenDetails } from "../token-details";
 import type { ProviderName } from "../types";
-import { extractOpenAIUsage, extractServiceTier, usageValue } from "./accumulator";
+import {
+  type BoundedServiceTier,
+  boundServiceTier,
+  extractOpenAIUsage,
+  extractServiceTier,
+  settledServiceTier,
+  usageValue,
+} from "./accumulator";
 import { COMPAT_PROFILES, type CompatProfile, matchOpenAICompatibleClient } from "./detection";
 import { prepareOpenAIDialectMediaCall } from "./openai";
 import type {
@@ -145,8 +152,8 @@ function portHeuristicMessage(name: string): string {
  * {@link ProviderAdapter} for one OpenAI-compatible vendor. `name` is the vendor's
  * attribution identity; `dialect` is always `"openai"`.
  *
- * Instance-local one-time-log latches (adapters are registry singletons, one per
- * profile): `#warnedMissingUsage` gates the WARNING logged the first time estimation
+ * Client-local one-time-log latches (one adapter per profile in a runtime scope):
+ * `#warnedMissingUsage` gates the WARNING logged the first time estimation
  * fires; `#notedPortHeuristic` gates the INFO logged the first time a local-port-based
  * detection fires. Node's single-threaded event loop makes these latches race-free — no
  * lock needed (stricter than Python's "rare double-log acceptable" note).
@@ -455,7 +462,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
   /** Explicit zero totals are trustworthy only if the completed stream emitted no content. */
   #zeroUsage: TokenDetails | null = null;
   /** Last non-null `service_tier` observed on any chunk. */
-  #serviceTier: string | null = null;
+  #serviceTier: BoundedServiceTier = boundServiceTier(null);
   /** Accumulated delta content character length across all observed chunks. */
   #contentChars = 0;
 
@@ -502,9 +509,10 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
         const details = extractOpenAIUsage({ usage: xGroqUsage });
         this.#zeroUsage = details.is_estimated ? null : details;
       }
-      const tier =
-        extractServiceTier(usageHolder, this.#logger) ?? extractServiceTier(chunk, this.#logger);
-      if (tier !== null) {
+      let tier = boundServiceTier(getProp(usageHolder, "service_tier"));
+      if (tier.value === null && usageHolder !== chunk)
+        tier = boundServiceTier(getProp(chunk, "service_tier"));
+      if (tier.value !== null) {
         this.#serviceTier = tier;
       }
     } catch {
@@ -534,7 +542,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
   }
 
   getServiceTier(): string | null {
-    return this.#serviceTier;
+    return settledServiceTier(this.#serviceTier, this.#logger);
   }
 }
 

@@ -264,10 +264,22 @@ export async function terminateCommandSupervisor(supervisor) {
   });
 }
 
+/** Labels let tests sequence grace periods independently of command startup. */
+const defaultTimers = {
+  set: (_label, ms, callback) => setTimeout(callback, ms),
+  clear: (handle) => clearTimeout(handle),
+};
+
 export function runBoundedCommand(
   binary,
   args,
-  { cwd, env: childEnv = process.env, timeout = 180_000, maxBuffer = 10 * 1024 * 1024 } = {},
+  {
+    cwd,
+    env: childEnv = process.env,
+    timeout = 180_000,
+    maxBuffer = 10 * 1024 * 1024,
+    timers = defaultTimers,
+  } = {},
 ) {
   assert.ok(Number.isFinite(timeout) && timeout > 0, "Command timeout must be positive");
   const started = Date.now();
@@ -299,9 +311,9 @@ export function runBoundedCommand(
     function finish() {
       if (settled) return;
       settled = true;
-      clearTimeout(deadline);
-      clearTimeout(pipeTimer);
-      clearTimeout(cleanupTimer);
+      timers.clear(deadline);
+      timers.clear(pipeTimer);
+      timers.clear(cleanupTimer);
       supervisor?.stdout?.destroy();
       supervisor?.stderr?.destroy();
       supervisor?.channel?.unref();
@@ -326,8 +338,8 @@ export function runBoundedCommand(
     function stop(code, message) {
       if (settled || stopping) return;
       stopping = true;
-      clearTimeout(deadline);
-      clearTimeout(pipeTimer);
+      timers.clear(deadline);
+      timers.clear(pipeTimer);
       result.error = Object.assign(new Error(message), { code });
       result.timedOut = code === "ETIMEDOUT" || code.includes("TIMEOUT");
       result.termination = {
@@ -375,11 +387,11 @@ export function runBoundedCommand(
             result.termination.completed = status === 0;
             conclude();
           });
-          cleanupTimer = setTimeout(() => {
+          cleanupTimer = timers.set("taskkill-cleanup", 500, () => {
             result.termination.cleanupTimedOut = true;
             if (killer.exitCode === null && killer.signalCode === null) killer.kill("SIGKILL");
             conclude();
-          }, 500);
+          });
         } catch (error) {
           result.termination.error = error.message;
           conclude();
@@ -416,20 +428,20 @@ export function runBoundedCommand(
           signal: message.signal,
           elapsedMs: Date.now() - started,
         };
-        clearTimeout(deadline);
+        timers.clear(deadline);
         if (!stopping)
-          pipeTimer = setTimeout(() => {
+          pipeTimer = timers.set("pipe-cleanup", 500, () => {
             result.pipeCleanupTimedOut = true;
             result.timeoutPhase = "pipe-cleanup";
             stop(
               "ERR_CHILD_PROCESS_PIPE_CLEANUP_TIMEOUT",
               "Command exited but inherited pipes did not close within 500 ms",
             );
-          }, 500);
+          });
       } else if (message.type === "closed" && !stopping) {
         commandClosed = true;
-        clearTimeout(deadline);
-        clearTimeout(pipeTimer);
+        timers.clear(deadline);
+        timers.clear(pipeTimer);
         try {
           supervisor.send({ type: "finish" }, (error) => {
             if (error && !settled)
@@ -445,13 +457,11 @@ export function runBoundedCommand(
           );
         }
         if (stopping || settled) return;
-        cleanupTimer = setTimeout(
-          () =>
-            stop(
-              "ERR_VERIFICATION_SUPERVISOR_SHUTDOWN_TIMEOUT",
-              "Supervisor did not finish within 500 ms",
-            ),
-          500,
+        cleanupTimer = timers.set("supervisor-shutdown", 500, () =>
+          stop(
+            "ERR_VERIFICATION_SUPERVISOR_SHUTDOWN_TIMEOUT",
+            "Supervisor did not finish within 500 ms",
+          ),
         );
       }
     });
@@ -462,12 +472,12 @@ export function runBoundedCommand(
     supervisor.once("exit", (status, signal) => {
       supervisorExited = true;
       result.supervisorExit = { status, signal, elapsedMs: Date.now() - started };
-      clearTimeout(deadline);
-      clearTimeout(pipeTimer);
+      timers.clear(deadline);
+      timers.clear(pipeTimer);
       // taskkill may terminate the anchor before it finishes traversing descendants.
       // Its own completion/deadline remains authoritative even after anchor exit/close.
       if (stopping && process.platform === "win32" && killer) return;
-      clearTimeout(cleanupTimer);
+      timers.clear(cleanupTimer);
       if (killer?.exitCode === null && killer.signalCode === null) killer.kill("SIGKILL");
       if (stopping) {
         finish();
@@ -478,7 +488,7 @@ export function runBoundedCommand(
           code: "ERR_VERIFICATION_SUPERVISOR_EXIT",
         });
       // The group leader is gone: only drain/close pipes, never signal its former identifier.
-      cleanupTimer = setTimeout(() => {
+      cleanupTimer = timers.set("supervisor-pipes", 500, () => {
         result.error ??= Object.assign(new Error("Exited supervisor pipes did not close"), {
           code: "ERR_VERIFICATION_SUPERVISOR_PIPE_TIMEOUT",
         });
@@ -490,15 +500,14 @@ export function runBoundedCommand(
             "supervisor exited; no former identifiers signaled; descendant containment unknown",
         };
         finish();
-      }, 500);
+      });
     });
     supervisor.once("close", () => {
       if (stopping && process.platform === "win32" && killer && !settled) return;
       finish();
     });
-    deadline = setTimeout(
-      () => stop("ETIMEDOUT", `Command exceeded ${timeout} ms wall deadline`),
-      timeout,
+    deadline = timers.set("deadline", timeout, () =>
+      stop("ETIMEDOUT", `Command exceeded ${timeout} ms wall deadline`),
     );
   });
 }

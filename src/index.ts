@@ -7,7 +7,7 @@
  * here — importing this entry must never pull in `node:*`.
  */
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 // Budget enforcement surface (pre-flight check + sans-I/O settlement builder).
 export {

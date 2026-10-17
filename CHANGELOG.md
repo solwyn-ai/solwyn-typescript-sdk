@@ -9,6 +9,13 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-10-17
+
+### Fixed
+
+- Reorganize the README so the npm package page shows it in full, with reference material
+  moved to `docs/`. There are no package behavior changes.
+
 ## [0.1.0] — 2026-10-17
 
 ### Added
@@ -561,6 +568,7 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0-rc.1...v0.1.0
 [0.1.0-rc.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/releases/tag/v0.1.0-rc.1

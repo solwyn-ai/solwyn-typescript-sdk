@@ -169,7 +169,9 @@ in the RC release notes; the stable trusted-published release must have its own 
 4. Review public-preview and breaking-change notes, supported runtime/compiler/provider claims,
    known limitations, outage policy, and privacy wording against the current source and tests.
 5. Confirm the package metadata, README links, repository URL, issue route, and release notes are
-   public and self-contained.
+   public and self-contained. Keep the README under 60,000 bytes to leave headroom below npm's
+   64 KiB metadata limit. Link reference material under `docs/` with absolute public GitHub URLs,
+   because those files are not included in the npm package.
 
 Release copy must preserve these data and outage boundaries:
 

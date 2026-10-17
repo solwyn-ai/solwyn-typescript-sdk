@@ -117,7 +117,13 @@ describe("node beforeExit reporter drain", () => {
         ingestBodies.push(body);
         order.push("ingest");
         return new Response(
-          JSON.stringify({ ingested: body.length - 1, rejected: [{ index: 1 }] }),
+          JSON.stringify({
+            ingested: body.length - 1,
+            rejected: [
+              { index: 1, code: "unknown_model", model: "synthetic", message: "Unknown model" },
+            ],
+            duplicates: [],
+          }),
           { status: 202 },
         );
       },
@@ -184,7 +190,9 @@ describe("node beforeExit reporter drain", () => {
     expect(firstFetch).toHaveBeenCalledTimes(1);
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect(globalFetch).not.toHaveBeenCalled();
-    firstGate.resolve(new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }));
+    firstGate.resolve(
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
+    );
     secondGate.resolve(new Response(null, { status: 204 }));
     await draining;
     expect(first.isShutdown).toBe(true);
@@ -225,7 +233,9 @@ describe("node beforeExit reporter drain", () => {
     expect(beforeExitListeners).toHaveLength(2);
     expect(secondFetch).not.toHaveBeenCalled();
 
-    firstGate.resolve(new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }));
+    firstGate.resolve(
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
+    );
     await firstDrain;
     expect(first.isShutdown).toBe(true);
     expect(second.isShutdown).toBe(false);
@@ -296,7 +306,7 @@ describe("node beforeExit reporter drain", () => {
     expect(surrenderFetch).toHaveBeenCalledTimes(1);
 
     reporterGate.resolve(
-      new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }),
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
     );
     await flushUntil(() => order.includes("lease"));
     await draining;
@@ -359,7 +369,7 @@ describe("node beforeExit reporter drain", () => {
     expect(beforeExitListeners).toHaveLength(2);
 
     reporterGate.resolve(
-      new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }),
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
     );
     await firstDrain;
     expect(holderClose).not.toHaveBeenCalled();

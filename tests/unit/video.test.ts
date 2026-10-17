@@ -39,7 +39,9 @@ function makeWireCapture(allowed = true) {
     }
     if (url.includes("/api/v1/metadata/ingest")) {
       events.push(...(body as Array<Record<string, unknown>>));
-      return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     }
     throw new Error(`unexpected test URL: ${url}`);
   };

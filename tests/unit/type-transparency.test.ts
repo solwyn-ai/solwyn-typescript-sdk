@@ -22,7 +22,9 @@ class FakeOpenAI {
 
 function noNetworkFetch(): ReturnType<typeof vi.fn<FetchLike>> {
   return vi.fn(async () =>
-    Promise.resolve(new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 })),
+    Promise.resolve(
+      new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), { status: 202 }),
+    ),
   );
 }
 

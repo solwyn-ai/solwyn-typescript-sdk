@@ -36,7 +36,9 @@ describe("settlement architecture parity", () => {
           return new Response(null, { status: 204 });
         }
         events.push(...(body as MetadataEvent[]));
-        return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+        return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+          status: 202,
+        });
       },
     });
     const callId = "00000000-0000-0000-0000-000000000002";

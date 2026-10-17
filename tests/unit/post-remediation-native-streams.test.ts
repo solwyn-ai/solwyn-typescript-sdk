@@ -96,7 +96,7 @@ function fixture(provider: "openai" | "anthropic", open = false, crossDialect = 
     }
     if (url.endsWith("/ingest")) {
       events.push(...(data as unknown as Record<string, unknown>[]));
-      return Response.json({ ingested: 1, rejected: [] }, { status: 202 });
+      return Response.json({ ingested: 1, rejected: [], duplicates: [] }, { status: 202 });
     }
     return new Response(null, { status: 204 });
   };

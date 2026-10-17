@@ -49,9 +49,12 @@ function makeWireCapture(reservationId: string | null = null): WireCapture {
     if (url.includes("/api/v1/metadata/ingest")) {
       const batch = body as Array<Record<string, unknown>>;
       events.push(...batch);
-      return new Response(JSON.stringify({ ingested: batch.length, rejected: [] }), {
-        status: 202,
-      });
+      return new Response(
+        JSON.stringify({ ingested: batch.length, rejected: [], duplicates: [] }),
+        {
+          status: 202,
+        },
+      );
     }
     throw new Error(`unexpected test URL: ${url}`);
   });

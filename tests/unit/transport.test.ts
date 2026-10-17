@@ -105,7 +105,7 @@ describe("Transport — URL + headers + body", () => {
     const transport = new Transport("https://api.solwyn.ai", API_KEY, {
       fetch: recordingFetch(
         [],
-        () => new Response('{"ingested":1,"rejected":[]}', { status: 202 }),
+        () => new Response('{"ingested":1,"rejected":[],"duplicates":[]}', { status: 202 }),
       ),
     });
     await expect(

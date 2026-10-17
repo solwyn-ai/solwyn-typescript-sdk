@@ -41,7 +41,9 @@ function confirm(index = 1): BudgetConfirmRequest {
 }
 
 function ingest(count: number): Response {
-  return new Response(JSON.stringify({ ingested: count, rejected: [] }), { status: 202 });
+  return new Response(JSON.stringify({ ingested: count, rejected: [], duplicates: [] }), {
+    status: 202,
+  });
 }
 
 function deferred<T>(): {
@@ -249,7 +251,8 @@ describe("MetadataReporter bounded shutdown", () => {
       new Response(
         JSON.stringify({
           ingested: 0,
-          rejected: [{ index: 0, code: "x", model: "m", message: "x" }],
+          rejected: [{ index: 0, code: "unknown_model", model: "m", message: "x" }],
+          duplicates: [],
         }),
         { status: 202 },
       ),

@@ -44,6 +44,8 @@ corresponding release notes before users upgrade.
 - **Run lifetime tracking starts on demand.** Importing the Node entry no longer enables a
   process-wide async hook. Tracking starts with the first callback run or detached handle and
   stops when the last run lifetime is collected. Active lifetimes still add promise overhead.
+  The owner registry is versioned so older installed copies can share run context without
+  breaking callback runs, detached handles, or their own lifetime tracking in either load order.
 - **Surface reflection is observational.** Key, membership, and descriptor inspection no longer
   applies untracked-spend posture. Configurable reflected operations enforce policy when used;
   their descriptor values are live guarded handles, and reflected callable identity can differ
@@ -170,11 +172,16 @@ corresponding release notes before users upgrade.
   outage checks use that shared spend, and a server's fail-open lease posture cannot relax a
   client's `failOpen: false` setting.
 - **Complete Anthropic usage.** Streaming input and cache totals now follow cumulative
-  `message_delta` counters, including server-tool usage. Buffered and streamed usage map
-  thinking tokens without adding them twice to output, and preserve reported service tiers.
+  `message_delta` counters, including server-tool usage. Aggregate-only deltas preserve the
+  initial five-minute/one-hour cache split and assign only additional writes to five minutes;
+  decreasing aggregates retain observed writes and mark usage estimated. Buffered and streamed
+  usage map thinking tokens without adding them twice to output, and preserve supported
+  `standard`/`priority` service tiers while omitting unsupported values such as `batch`.
 - **Google sizing and omitted zero counters.** Preflight estimates include Content `parts` and
   `config.systemInstruction`. A measured input total with omitted candidate output tokens is
-  treated as reported usage with zero candidate output, including thinking-only responses.
+  treated as reported usage with zero candidate output for buffered responses and streams with
+  an observed candidate finish reason, including thinking-only responses. Unfinished streams
+  remain estimated so cancellation cannot refund unobserved output.
 - **Client-local provider diagnostics.** Adapter warnings and local-port detection messages use
   the client's injected logger. Missing-usage warning latches are independent between clients,
   and compatible streams bound and warn about an overlong service tier only at settlement.
@@ -186,10 +193,19 @@ corresponding release notes before users upgrade.
   compatible clients, and Alibaba gateway models receive their own provider attribution.
 - **AI SDK run stops.** Middleware refuses dispatch after a concurrent run stop and aborts
   in-flight streams at the next chunk boundary. A stopped stream keeps its termination across
-  `clearRunTermination()`; local velocity detection remains unsupported by this integration.
+  `clearRunTermination()`. Run stops and caller aborts confirm observed stream usage, including
+  the part pulled at the stop boundary, and retain the reservation floor for estimated usage.
+  Caller `abortSignal` also reaches budget preflight. Local velocity detection remains
+  unsupported by this integration.
+- **AI SDK middleware shutdown (preview breaking).** Closing rejects new calls before budget or provider I/O,
+  drains buffered calls and stream setup within the shared reporting deadline, and settles
+  open streams once from observed usage before reporting closes. Calls beyond the drain
+  deadline produce a shutdown warning. Stream settlement registrations are weak so the handle
+  does not keep abandoned streams alive. Provider cleanup remains owned by the AI SDK.
 - **Shared coverage and explicit Node imports.** ESM and CommonJS builds share wrapper coverage
   registrations. Built Node entries preserve the `node:async_hooks` prefix; core entries remain
-  free of Node builtin imports. Surface-rule validation also avoids compiling a regular
+  free of Node builtin imports, checked across every emitted shared and provider chunk.
+  Surface-rule validation also avoids compiling a regular
   expression for every rule during import.
 
 - **Healthy control-plane refusals.** Confirmation 4xx and 503 responses count as reachability,

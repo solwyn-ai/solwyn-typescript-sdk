@@ -186,6 +186,18 @@ describe("VelocityMonitor repeat detection", () => {
     expect(warn).toHaveBeenCalledTimes(2);
   });
 
+  it("clamps an injected RNG value of one when evicting live history", () => {
+    const subject = monitor({ velocity_repeat_count: 2 }, () => 1);
+    for (let index = 0; index < 4096; index++) {
+      observe(subject, `run-${index}`, 100, 0);
+    }
+    expect(() => observe(subject, "overflow", 100, 1)).not.toThrow();
+    expect(subject.runCount()).toBe(4096);
+    expect(observe(subject, "run-0", 100, 2)).toContain("repeat_size");
+    expect(observe(subject, "run-4095", 100, 2)).not.toContain("repeat_size");
+    expect(subject.runCount()).toBe(4096);
+  });
+
   it("retains history through the longest configured rule horizon", () => {
     const subject = monitor({ velocity_repeat_count: 2, velocity_repeat_window_s: 600 });
     observe(subject, "run", 100, 0);

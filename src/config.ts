@@ -313,7 +313,9 @@ export const SolwynConfigSchema = z.strictObject({
     z.number().finite().int().positive(),
   ).default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_success_threshold),
   budget_check_cache_ttl: durationSchema(false, true).default(5),
-  budget_check_timeout: durationSchema(true).default(BUDGET_CHECK_TIMEOUT),
+  budget_check_timeout: numberFromNumberOrStringSchema(
+    z.number().finite().min(0.05).max(MAX_TIMER_SECONDS),
+  ).default(BUDGET_CHECK_TIMEOUT),
   control_plane_failure_threshold: numberFromNumberOrStringSchema(
     z.number().finite().int().positive(),
   ).default(3),
@@ -659,7 +661,14 @@ export function resolveConfigFromEnvSnapshot(
 
 /** Resolve configuration through the ambient environment snapshot. */
 export function resolveConfig(options: SolwynConfigOptions = {}): SolwynConfig {
-  return resolveConfigFromEnvSnapshot(options, getEnvSnapshot());
+  try {
+    return resolveConfigFromEnvSnapshot(options, getEnvSnapshot());
+  } catch (error) {
+    if (error instanceof ConfigurationError && error.field === "budget_check_timeout") {
+      throw new ConfigurationError(error.message, { field: "budgetCheckTimeout" });
+    }
+    throw error;
+  }
 }
 
 /**

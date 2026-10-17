@@ -150,9 +150,13 @@ function getProp(obj: unknown, key: string): unknown {
 }
 
 function callerAbortError(signal: AbortSignal): Error {
-  return signal.reason instanceof Error
-    ? signal.reason
-    : new DOMException("The operation was aborted", "AbortError");
+  if (signal.reason instanceof Error) return signal.reason;
+  if (typeof DOMException === "function") {
+    return new DOMException("The operation was aborted.", "AbortError");
+  }
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
 }
 
 /**

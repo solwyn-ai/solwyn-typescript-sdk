@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { OpenAIAdapter } from "../../src/providers/openai";
+import * as translation from "../../src/providers/translation/index";
 import type { FetchLike } from "../../src/transport";
 
 afterEach(() => vi.restoreAllMocks());
@@ -160,4 +161,66 @@ it("caller abort still settles when the stream usage extractor throws", async ()
     { token_details: { input_tokens: 2, output_tokens: 0, is_estimated: true } },
   ]);
   expect(control.events).toMatchObject([{ status: "success" }]);
+});
+
+it("keeps the served provider breaker neutral after a mid-stream translation failure", async () => {
+  const translate = translation.translateStreamChunk;
+  const failure = new Error("synthetic translation failure");
+  let chunks = 0;
+  const translateSpy = vi.spyOn(translation, "translateStreamChunk").mockImplementation((args) => {
+    if (++chunks === 2) throw failure;
+    return translate(args);
+  });
+  const create = async (_params: Record<string, unknown>): Promise<AsyncIterable<unknown>> => {
+    throw Object.assign(new Error("synthetic rate limit"), { status: 429 });
+  };
+  const anthropicCreate = vi.fn(async () =>
+    (async function* () {
+      yield { type: "message_start", message: { usage: { input_tokens: 11, output_tokens: 0 } } };
+      yield { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } };
+      yield { type: "message_delta", usage: { output_tokens: 2 } };
+      yield { type: "message_stop" };
+    })(),
+  );
+  const control = controlPlane();
+  const sdk = new Solwyn(
+    { chat: { completions: { create } } },
+    {
+      ...control.options,
+      circuitBreakerFailureThreshold: 1,
+      fallback: [[{ messages: { create: anthropicCreate } }, "claude-sonnet-4-20250514"]],
+    },
+  );
+  const call = () =>
+    sdk.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "synthetic" }],
+      max_tokens: 10,
+      stream: true,
+    });
+  const consume = async (stream: AsyncIterable<unknown>) => {
+    for await (const _chunk of stream) {
+      /* Drain the translated stream. */
+    }
+  };
+  try {
+    await expect(consume(await call())).rejects.toBe(failure);
+    translateSpy.mockRestore();
+    await consume(await call());
+    expect(anthropicCreate).toHaveBeenCalledTimes(2);
+  } finally {
+    await sdk.close();
+  }
+  expect(control.confirms).toHaveLength(2);
+  expect(control.events).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ provider: "anthropic", status: "error", input_tokens: 11 }),
+      expect.objectContaining({ provider: "anthropic", status: "success" }),
+    ]),
+  );
+  expect(
+    control.events.find(
+      (event) => event["provider"] === "anthropic" && event["status"] === "error",
+    )?.["possibly_succeeded"],
+  ).toBeUndefined();
 });

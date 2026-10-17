@@ -3,6 +3,7 @@ import { SolwynError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { MetadataReporter } from "../../src/reporter";
+import { LatencyTracker } from "../../src/routing";
 import type { FetchLike } from "../../src/transport";
 
 afterEach(() => {
@@ -131,6 +132,7 @@ describe("client shutdown", () => {
 
   it("settles an open stream's observed usage without waiting for its consumer", async () => {
     const control = fixture();
+    const latency = vi.spyOn(LatencyTracker.prototype, "recordLatency");
     const create = async (_params: Record<string, unknown>) =>
       (async function* () {
         yield { usage: { prompt_tokens: 13, completion_tokens: 5 } };
@@ -145,6 +147,7 @@ describe("client shutdown", () => {
     ]);
     await stream.return(undefined);
     expect(control.confirms).toHaveLength(1);
+    expect(latency).not.toHaveBeenCalled();
   });
 
   it("throws the closed-client error on the next provider chunk after close", async () => {

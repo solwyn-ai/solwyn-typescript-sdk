@@ -314,6 +314,7 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   #cacheRead = 0;
   #cache5m = 0;
   #cache1h = 0;
+  #initialCacheTtl: "5m" | "1h" | null = null;
   #output = 0;
   #reasoning = 0;
   #serviceTier: unknown = null;
@@ -346,6 +347,12 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
         this.#cacheRead = details.cached_input_tokens;
         this.#cache5m = details.cache_creation_5m_tokens;
         this.#cache1h = details.cache_creation_1h_tokens;
+        this.#initialCacheTtl =
+          this.#cache5m > 0 && this.#cache1h === 0
+            ? "5m"
+            : this.#cache1h > 0 && this.#cache5m === 0
+              ? "1h"
+              : null;
         this.#inputMeasured = !details.is_estimated;
         this.#invalidDetails ||= invalidAnthropicDetails(usage);
         this.#reasoning = details.reasoning_tokens;
@@ -375,11 +382,15 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
         } else {
           const aggregate = getProp(usage, "cache_creation_input_tokens");
           if (isUsageCount(aggregate)) {
-            // Real deltas carry only the aggregate; retain the start event's TTL split.
+            // Real deltas carry only the aggregate; preserve observed writes by TTL.
             const increment = aggregate - this.#cache5m - this.#cache1h;
-            if (increment >= 0) {
-              this.#cache5m += increment;
-            } else {
+            if (increment > 0) {
+              if (this.#initialCacheTtl === "5m") this.#cache5m += increment;
+              else this.#cache1h += increment;
+              // Mixed or absent initial TTLs cannot identify the new writes' TTL.
+              // Use the conservative one-hour bucket and disclose the inferred split.
+              if (this.#initialCacheTtl === null) this.#invalidDetails = true;
+            } else if (increment < 0) {
               // Cumulative usage cannot shrink. Keep observed writes conservatively.
               this.#invalidDetails = true;
             }

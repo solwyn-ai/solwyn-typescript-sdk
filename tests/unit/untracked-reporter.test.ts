@@ -473,6 +473,38 @@ describe("UntrackedSurfaceReporter", () => {
     await reporter.close();
   });
 
+  it.each([
+    { timeout: 0, leftover: 1 },
+    { timeout: 5000, leftover: 2 },
+  ])("logs remaining retry exhaustions once at close with a $timeout ms budget", async ({
+    timeout,
+    leftover,
+  }) => {
+    const warn = vi.fn();
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => 0,
+      maxSendAttempts: 1,
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() },
+      fetch: async () => new Response(null, { status: 500 }),
+    });
+    for (let index = 0; index < 101; index++) {
+      reporter.observe(observation({ surface: `resource.entry_${index}` }));
+    }
+    await reporter.flushDue();
+    reporter.observe(observation({ surface: "resource.onClose" }));
+    await reporter.close(timeout);
+    await reporter.close(timeout);
+    expect(
+      warn.mock.calls.filter(([message]) =>
+        String(message).startsWith("untracked.retry_exhausted"),
+      ),
+    ).toEqual([
+      ["untracked.retry_exhausted: reports=%d", 100],
+      ["untracked.retry_exhausted: reports=%d", leftover],
+    ]);
+  });
+
   it.each([400, 403, 422])("logs HTTP %d once and stops retrying refused keys", async (status) => {
     const warn = vi.fn();
     const fetch = vi.fn(async () => new Response(null, { status }));

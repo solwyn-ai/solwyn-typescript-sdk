@@ -180,14 +180,17 @@ estimate. The ordinary check path uses `POST /api/v1/budgets/check`; when it ret
 the reporter settles it through `POST /api/v1/budgets/confirm` with observed usage. Streaming
 settles once, at stream end. Eligible calls can reuse cached authority or a run lease. A hard
 deny throws before provider dispatch and reports a `budget_denied` event carrying the estimate.
-The budget preflight timeout is shared by a lease attempt and any per-call fallback. With less
-than 50 milliseconds remaining, preflight skips network I/O and applies local policy with a
-deadline warning, without recording a breaker failure or drawing lease headroom. A caller's
-request `AbortSignal` also cancels preflight; cancellation rejects without recording a
-control-plane breaker failure. Error abort reasons are preserved; other reasons become an
-`AbortError`. Direct `BudgetEnforcer.checkBudget()` callers can pass `signal`
-and use the returned `callId` to settle or release a lease reservation, including when the SDK
-generated the ID.
+`budgetCheckTimeout` must be at least `0.05` seconds, including when supplied through
+`SOLWYN_BUDGET_CHECK_TIMEOUT`; smaller values fail construction with
+`ConfigurationError(field: "budgetCheckTimeout")`. The timeout is shared by a lease attempt and
+any per-call fallback, and capped by the remaining failover deadline. With less than 50
+milliseconds remaining on that shared deadline, preflight skips network I/O and applies local
+policy, logging `budget.preflight_skipped_deadline` at most once per minute per client. This
+does not record a breaker failure or draw lease headroom. A caller's request `AbortSignal`
+also cancels preflight; cancellation rejects without recording a control-plane breaker
+failure. Error abort reasons are preserved; other reasons become an `AbortError`. Direct
+`BudgetEnforcer.checkBudget()` callers can pass `signal` and use the returned `callId` to
+settle or release a lease reservation, including when the SDK generated the ID.
 
 Settlement is automatic and private. Close the wrapped client to flush queued confirmations
 and events; your application does not need a separate confirmation call.
@@ -368,10 +371,12 @@ await client.messages.create({
 
 Streaming settles usage from cumulative `message_delta` counters, including input and cache
 totals updated by server tools. Aggregate-only deltas preserve the initial five-minute and
-one-hour cache split; additional writes enter the five-minute bucket. Decreasing aggregate
-counts retain observed cache writes and mark usage estimated. When supplied, thinking tokens
-are reported as a subset of the output total. Service tiers `standard` and `priority` are
-preserved; unsupported tiers such as `batch` are omitted.
+one-hour cache split. Additional writes use that TTL if the start used exactly one TTL; when
+the start used both TTLs or neither, additional writes use the conservative one-hour bucket
+and mark usage estimated. Decreasing aggregate counts retain observed cache writes and mark
+usage estimated. When supplied, thinking tokens are reported as a subset of the output total.
+Service tiers `standard` and `priority` are preserved; unsupported tiers such as `batch` are
+omitted.
 
 `messages.stream` and `messages.parse` are unmetered helpers. With the default
 `onUnmetered: "warn"`, each passes through after one warning, with no budget check or cost
@@ -543,6 +548,10 @@ try {
 ```
 
 The middleware handle owns the budget enforcer + reporter; call `solwyn.close()` (or use `await using`) to flush queued telemetry. Attribution is derived from the wrapped model's `provider`/`modelId`; there is no failover here (the AI SDK owns the single model), so every event is a primary hop.
+
+Consume or cancel middleware streams explicitly. Garbage collection does not settle abandoned
+middleware streams or release their funding; a per-call reservation can remain until expiry,
+and a lease claim can remain until the lease is surrendered.
 
 Run stops are cooperative: the middleware rechecks the captured run after preflight and
 aborts an active stream at its next chunk boundary with `RunStoppedError`. Clearing a stop
@@ -1074,11 +1083,11 @@ budget, so Solwyn's asynchronous shutdown work is bounded by `reporterShutdownDe
 seconds, plus the wrapped provider's own `close()` duration.
 
 Open streams settle once from usage observed so far, without waiting for the consumer to pull
-another chunk. A subsequent pull rejects with `SolwynError("client is closed")` at the next
-provider-chunk boundary. Finish or cancel streams before closing the client when you need their
-terminal usage included; provider stream cleanup still belongs to the consumer. Missing or
-malformed usage retains the reservation floor during settlement; correcting inconsistent cache
-totals settles the adjusted observed usage.
+another chunk. A pull that receives another provider chunk rejects with
+`SolwynError("client is closed")`. Finish or cancel streams before closing the client when you
+need their terminal usage included; provider stream cleanup still belongs to the consumer.
+Missing or malformed usage retains the reservation floor during settlement; correcting
+inconsistent cache totals settles the adjusted observed usage.
 
 When garbage collection finalizes an abandoned stream, it settles the usage observed so far
 and releases its run and lease ownership instead of retaining them until client shutdown.
@@ -1180,10 +1189,11 @@ Numeric settings reject booleans and empty strings. Breaker thresholds and repor
 be positive integers; `sameProviderRetries` permits zero. Timeout, cache, recovery, flush,
 backoff, and shutdown durations must be finite and no greater than `2147483.647` seconds, so
 their millisecond delays fit the runtime timer range. Cache TTLs and provider-breaker recovery
-waits remain integer seconds. `budgetCheckTimeout`, `failoverHopReadTimeout`, flush/backoff
-intervals, and heartbeats must be positive; cache TTLs, recovery waits, and shutdown deadlines
-permit zero. Direct `BudgetEnforcer` options apply the same duration limit to `cacheTtl` and
-per-call `timeout`, with zero allowed only for `cacheTtl`.
+waits remain integer seconds. `budgetCheckTimeout` must be at least `0.05` seconds;
+`failoverHopReadTimeout`, flush/backoff intervals, and heartbeats must be positive; cache TTLs,
+recovery waits, and shutdown deadlines permit zero. Direct `BudgetEnforcer` options apply the
+same duration limit to `cacheTtl` and per-call `timeout`, with zero allowed only for `cacheTtl`
+and a minimum of `0.05` seconds for `timeout`.
 
 Velocity repeat windows must be positive, and growth and acceleration factors must exceed
 one. These three velocity options also accept positive infinity to disable the corresponding

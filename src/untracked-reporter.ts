@@ -422,6 +422,7 @@ export class UntrackedSurfaceReporter {
       } finally {
         clearTimeout(timer);
         this.#shutdownController.abort();
+        this.#warnRetryExhausted(true);
       }
     });
     return this.#closePromise;
@@ -511,8 +512,13 @@ export class UntrackedSurfaceReporter {
       if (rateLimited) this.#rateLimitedUntil = Math.max(this.#rateLimitedUntil, now + delay);
     }
     this.#retryExhaustedSinceLog += exhausted;
+    this.#warnRetryExhausted();
+  }
+
+  #warnRetryExhausted(final = false): void {
+    const now = this.#monotonicClock();
     const last = this.#lastFailureLogAt.get("retry_exhausted");
-    if (this.#retryExhaustedSinceLog > 0 && (last === undefined || now - last >= 60_000)) {
+    if (this.#retryExhaustedSinceLog > 0 && (final || last === undefined || now - last >= 60_000)) {
       this.#lastFailureLogAt.set("retry_exhausted", now);
       this.#logger.warn("untracked.retry_exhausted: reports=%d", this.#retryExhaustedSinceLog);
       this.#retryExhaustedSinceLog = 0;

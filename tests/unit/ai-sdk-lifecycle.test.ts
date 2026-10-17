@@ -203,6 +203,35 @@ describe("AI SDK stream cancellation accounting", () => {
 
 describe("AI SDK preflight cancellation", () => {
   it.each([
+    [false, true],
+    [false, false],
+    [true, true],
+    [true, false],
+  ])("normalizes non-Error abort reasons (streaming=%s, DOMException=%s)", async (streaming, domExceptionAvailable) => {
+    const { plane, handle } = fixture();
+    const abort = new AbortController();
+    abort.abort("synthetic cancellation");
+    const doGenerate = vi.fn(async () => ({ content: [], usage }));
+    const doStream = vi.fn(async () => ({ stream: new ReadableStream() }));
+    if (!domExceptionAvailable) vi.stubGlobal("DOMException", undefined);
+    try {
+      const call = streaming
+        ? stream(handle, { prompt: [], abortSignal: abort.signal }, doStream)
+        : generate(handle, { prompt: [], abortSignal: abort.signal }, doGenerate);
+      await expect(call).rejects.toMatchObject({
+        name: "AbortError",
+        message: "The operation was aborted.",
+      });
+      expect(doGenerate).not.toHaveBeenCalled();
+      expect(doStream).not.toHaveBeenCalled();
+      expect(plane.checks).toHaveLength(0);
+    } finally {
+      vi.unstubAllGlobals();
+      await handle.close();
+    }
+  });
+
+  it.each([
     false,
     true,
   ])("rejects already-aborted calls before budget I/O (streaming=%s)", async (streaming) => {

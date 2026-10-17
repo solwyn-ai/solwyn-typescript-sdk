@@ -66,6 +66,7 @@ import {
   type ReleaseDropReason,
   type ReleaseOutcome,
 } from "./release-dispatcher";
+import type { Deadline } from "./routing";
 import type { CurrentRun } from "./run-context";
 import {
   clearServerTerminationBeforeRequest,
@@ -135,16 +136,19 @@ const DEFAULT_CHECK_TIMEOUT_MS = 5000;
 const MIN_PREFLIGHT_REQUEST_MS = 50;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-function validateDuration(value: number, field: string, allowZero: boolean): number {
+function validateDuration(value: number, field: string, minimum: number): number {
   if (
     typeof value !== "number" ||
     !Number.isFinite(value) ||
-    (allowZero ? value < 0 : value <= 0) ||
+    value < minimum ||
     value > MAX_TIMER_DELAY_MS / 1000
   ) {
-    throw new ConfigurationError(`${field} must be a finite duration within the timer range`, {
-      field,
-    });
+    throw new ConfigurationError(
+      `${field} must be a finite duration >= ${minimum} seconds within the timer range`,
+      {
+        field,
+      },
+    );
   }
   return value;
 }
@@ -398,8 +402,10 @@ export interface CheckBudgetOptions {
   fallbackProviders?: ProviderName[];
   /** Failover model chain (default `[]`); the caller's array is never mutated. */
   fallbackModels?: string[];
-  /** Per-call timeout override in SECONDS (Python parity); falls back to the 5s default. */
+  /** Per-call timeout in SECONDS, at least 0.05; falls back to the 5s default. */
   timeout?: number;
+  /** @internal Shared failover deadline; only caps the validated timeout. */
+  deadline?: Deadline;
   /** Caller cancellation; an abort rejects without changing control-plane breaker health. */
   signal?: AbortSignal;
   /** Active agent-run attribution. Scoped checks bypass the global allow cache. */
@@ -697,6 +703,7 @@ export class BudgetEnforcer {
   private readonly totalUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
   private lastUncountedWarnAt: number | null = null;
   private lastAlertOnlyWarnAt: number | null = null;
+  private lastDeadlineWarnAt: number | null = null;
   private uncountedWarnScheduled = false;
   private closeEpoch = 0;
   private closePromise: Promise<void> | null = null;
@@ -708,7 +715,7 @@ export class BudgetEnforcer {
     const cacheTtl = validateDuration(
       options.cacheTtl === undefined ? 5 : options.cacheTtl,
       "cacheTtl",
-      true,
+      0,
     );
     requireFetchLike(options.fetch);
     // A surrender attempt observes its underlying request so a request that ignores abort
@@ -981,14 +988,13 @@ export class BudgetEnforcer {
    */
   async checkBudget(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
     const signal = options.signal;
+    const timeout = validateDuration(
+      options.timeout === undefined ? DEFAULT_CHECK_TIMEOUT_MS / 1000 : options.timeout,
+      "timeout",
+      MIN_PREFLIGHT_REQUEST_MS / 1000,
+    );
     const deadlineMs =
-      this.monotonicNow() +
-      validateDuration(
-        options.timeout === undefined ? DEFAULT_CHECK_TIMEOUT_MS / 1000 : options.timeout,
-        "timeout",
-        false,
-      ) *
-        1000;
+      this.monotonicNow() + Math.min(timeout, options.deadline?.remaining() ?? timeout) * 1000;
     throwIfCheckAborted(signal);
     const callId = options.callId ?? crypto.randomUUID();
     const unmanagedRunId = options.runLifetime === undefined ? options.agentRunId : undefined;
@@ -1160,6 +1166,7 @@ export class BudgetEnforcer {
       const remainingMs = captured.deadlineMs - this.monotonicNow();
       if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
         this.logger.debug("budget.check_skipped_deadline");
+        this.warnPreflightDeadline();
         return this.withLeaseClaim(
           this.handleOutage(captured.estimatedInputTokens, captured.agentRunId, "deadline"),
           leaseClaimToken,
@@ -1681,6 +1688,7 @@ export class BudgetEnforcer {
       throwIfCheckAborted(captured.signal);
       if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
         this.logger.debug("lease.grant_skipped_deadline");
+        this.warnPreflightDeadline();
         return { kind: "legacy" };
       }
       if (admission !== null && !admission.allowed) {
@@ -2583,6 +2591,16 @@ export class BudgetEnforcer {
       denySource: "server",
       denyReason: stickyDenyReason(response, activeAgentRunId),
     });
+  }
+
+  private warnPreflightDeadline(): void {
+    const now = this.monotonicNow();
+    if (this.lastDeadlineWarnAt !== null && now - this.lastDeadlineWarnAt < 60_000) return;
+    this.lastDeadlineWarnAt = now;
+    this.logger.warn(
+      "budget.preflight_skipped_deadline: applying local policy (fail_open=%s)",
+      this.failOpen,
+    );
   }
 
   /**

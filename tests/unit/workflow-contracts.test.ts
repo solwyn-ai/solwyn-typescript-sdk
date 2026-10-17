@@ -39,6 +39,7 @@ interface WorkflowJob {
 
 interface WorkflowModel {
   readonly concurrency?: { readonly group?: string; readonly "cancel-in-progress"?: boolean };
+  readonly on: Readonly<Record<string, unknown>>;
   readonly jobs: Readonly<Record<string, WorkflowJob>>;
   readonly permissions?: Readonly<Record<string, string>>;
 }
@@ -288,6 +289,27 @@ describe("workflow YAML semantics", () => {
 });
 
 describe("CI workflow contract", () => {
+  it("accepts manual dispatches and keeps both provider canary jobs ungated", async () => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(model.on).toHaveProperty("workflow_dispatch", null);
+    expect(semanticJob(model, "provider-surface-matrix").if).toBeUndefined();
+    expect(semanticJob(model, "provider-surface-inventory").if).toBeUndefined();
+  });
+
+  it.each([
+    "quality",
+    "package-artifact",
+    "artifact-consumers",
+    "legacy-installed-core",
+  ])("skips %s for scheduled and manually dispatched canaries", async (id) => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(semanticJob(model, id).if).toBe(
+      "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
+    );
+  });
+
   it("runs every full source gate on exact Node 22 and 24 releases", async () => {
     const workflow = await readFile(ciPath, "utf8");
     const quality = job(workflow, "quality");
@@ -410,7 +432,9 @@ describe("CI workflow contract", () => {
     };
     const gate = namedStep(required, "Require every launch gate");
 
-    expect(required.if).toBe("always() && github.event_name != 'schedule'");
+    expect(required.if).toBe(
+      "always() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
+    );
     expect(required.needs).toEqual(expectedNeeds);
     expect(gate.env).toEqual(expectedEnvironment);
     expect(
@@ -651,6 +675,8 @@ describe("publish workflow contract", () => {
       ["wrong SHA", [{ ...valid, head_sha: "b".repeat(40) }], 1],
       ["wrong branch", [{ ...valid, head_branch: "release" }], 1],
       ["wrong event", [{ ...valid, event: "pull_request" }], 1],
+      ["scheduled canary", [{ ...valid, event: "schedule" }], 1],
+      ["manually dispatched canary", [{ ...valid, event: "workflow_dispatch" }], 1],
       ["wrong conclusion", [{ ...valid, conclusion: "failure" }], 1],
       [
         "conditions split across runs",

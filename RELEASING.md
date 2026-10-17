@@ -319,8 +319,8 @@ Use these exact CI check names when configuring the branch ruleset:
 - `Provider surface catalog` and every `Provider surface / <family> / <interval>` matrix cell.
 
 `Required / CI` must be required on `main`; do not require only a subset of its underlying jobs.
-The scheduled run selects all six latest provider cells, while pull requests and pushes run all 11
-reviewed floor/latest cells.
+Scheduled or manually dispatched CI runs select all six latest provider cells, while pull requests
+and pushes run all 11 reviewed floor/latest cells.
 
 ## Publish
 

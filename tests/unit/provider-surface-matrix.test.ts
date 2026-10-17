@@ -64,16 +64,19 @@ describe("provider surface matrix catalog command", () => {
     await expect(executeWorkflowCatalog("push")).resolves.toEqual(catalog.include);
   });
 
-  it("selects latest cells and rewrites every scoped or unscoped pin on schedule", async () => {
+  it.each([
+    "schedule",
+    "workflow_dispatch",
+  ])("selects latest cells and rewrites every scoped or unscoped pin on %s", async (eventName) => {
     const catalog = JSON.parse(await readFile(catalogPath, "utf8")) as SurfaceCatalog;
-    const scheduled = await executeWorkflowCatalog("schedule");
+    const canary = await executeWorkflowCatalog(eventName);
     const latestCatalogRows = catalog.include.filter((cell) => cell.interval === "latest");
 
-    expect(scheduled.map(({ family, interval }) => ({ family, interval }))).toEqual(
+    expect(canary.map(({ family, interval }) => ({ family, interval }))).toEqual(
       latestCatalogRows.map(({ family, interval }) => ({ family, interval })),
     );
-    expect(scheduled).toHaveLength(6);
-    expect(scheduled.flatMap((cell) => cell.packages)).toEqual([
+    expect(canary).toHaveLength(6);
+    expect(canary.flatMap((cell) => cell.packages)).toEqual([
       "@anthropic-ai/sdk@latest",
       "@aws-sdk/client-bedrock-runtime@latest",
       "@google/genai@latest",

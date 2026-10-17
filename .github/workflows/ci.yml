@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"
 
@@ -13,7 +14,7 @@ permissions:
 jobs:
   quality:
     name: Quality / Node ${{ matrix.node-major }}
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -66,7 +67,7 @@ jobs:
 
   package-artifact:
     name: Package artifact
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: quality
     runs-on: ubuntu-24.04
     env:
@@ -114,7 +115,7 @@ jobs:
 
   artifact-consumers:
     name: Consumers / Node ${{ matrix.node-major }}
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: package-artifact
     runs-on: ubuntu-24.04
     strategy:
@@ -186,7 +187,7 @@ jobs:
 
   legacy-installed-core:
     name: Legacy runtime / Node 20.20.2
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs: package-artifact
     runs-on: ubuntu-24.04
     env:
@@ -323,7 +324,7 @@ jobs:
 
   required:
     name: Required / CI
-    if: always() && github.event_name != 'schedule'
+    if: always() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     needs:
       - quality
       - package-artifact

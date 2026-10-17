@@ -11,7 +11,8 @@ if (outputPath === undefined)
 
 const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
 const include =
-  process.env.GITHUB_EVENT_NAME === "schedule"
+  process.env.GITHUB_EVENT_NAME === "schedule" ||
+  process.env.GITHUB_EVENT_NAME === "workflow_dispatch"
     ? catalog.include
         .filter((cell) => cell.interval === "latest")
         .map((cell) => ({

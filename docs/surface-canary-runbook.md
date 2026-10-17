@@ -1,9 +1,15 @@
 # Provider surface canary and drift runbook
 
-Use this runbook when a `provider-surface-inventory` cell or the scheduled Monday run
-fails. An unclassified provider surface is not an immediate runtime failure: it resolves
+Use this runbook when a `provider-surface-inventory` cell, the scheduled Monday run, or a manually
+dispatched run fails. An unclassified provider surface is not an immediate runtime failure: it resolves
 to `unknown` and follows the configured `onUnmetered` policy, which defaults to `"warn"`.
 The failing canary prevents unnoticed provider-SDK drift from reaching a release.
+
+To run the same six `@latest` provider canaries as the schedule on demand, dispatch CI on `main`:
+
+```bash
+gh workflow run CI --ref main
+```
 
 ## 1. Identify
 

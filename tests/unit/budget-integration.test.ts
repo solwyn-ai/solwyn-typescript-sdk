@@ -1220,7 +1220,7 @@ describe("client lease activation identity", () => {
       if (path === "/api/v1/metadata/ingest") {
         events.push(...(body as WireEvent[]));
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           {
             status: 202,
           },
@@ -1320,7 +1320,7 @@ describe("client fail-soft lease accounting", () => {
       }
       if (path === "/api/v1/metadata/ingest") {
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           { status: 202 },
         );
       }
@@ -1425,7 +1425,7 @@ describe("Responses unmeasured lease floor", () => {
       if (path === "/api/v1/metadata/ingest") {
         events.push(...(body as MetadataEvent[]));
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           { status: 202 },
         );
       }
@@ -1585,7 +1585,9 @@ describe("client run-control post-budget gate", () => {
           { status: 200 },
         );
       }
-      return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     };
     const solwyn = new Solwyn(provider, {
       apiKey: API_KEY,
@@ -1789,7 +1791,13 @@ describe("client run-control post-budget gate", () => {
     const release = vi.spyOn(BudgetEnforcer.prototype, "releaseReservation");
     const solwyn = new Solwyn(provider, {
       apiKey: API_KEY,
-      fetch: async () => new Response(null, { status: 204 }),
+      fetch: async (url, init) =>
+        url.endsWith("/metadata/ingest")
+          ? Response.json(
+              { ingested: JSON.parse(String(init?.body)).length, rejected: [], duplicates: [] },
+              { status: 202 },
+            )
+          : new Response(null, { status: 204 }),
       leaseEnabled: false,
       velocityMode: "off",
     });
@@ -1922,7 +1930,9 @@ describe("client run-control post-budget gate", () => {
         }
         throw new TypeError("offline");
       }
-      return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     };
     const provider = openAIClient(() => ({
       usage: { prompt_tokens: 2, completion_tokens: 1 },

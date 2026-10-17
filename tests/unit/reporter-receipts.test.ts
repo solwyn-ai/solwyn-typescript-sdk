@@ -9,6 +9,7 @@ import {
   MetadataEventSchema,
   serializeMetadataEvent,
 } from "../../src/validation";
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -60,7 +61,7 @@ function confirm(index: number): BudgetConfirmRequest {
 }
 
 function ingest(rejected: unknown[] = [], ingested = 0): Response {
-  return new Response(JSON.stringify({ ingested, rejected }), { status: 202 });
+  return new Response(JSON.stringify({ ingested, rejected, duplicates: [] }), { status: 202 });
 }
 
 function scriptedReporter(
@@ -258,7 +259,10 @@ describe("MetadataReporter denial receipt routing", () => {
   });
 
   it("refolds an exactly rejected replay and waits for a later clean proof", async () => {
-    const exactRejection = ingest([{ index: 0, code: "x", model: "m", message: "x" }], 0);
+    const exactRejection = ingest(
+      [{ index: 0, code: "unknown_model", model: "m", message: "x" }],
+      0,
+    );
     const { reporter, payloads } = scriptedReporter([
       new Response(null, { status: 400 }),
       ingest([], 1),
@@ -288,9 +292,10 @@ describe("MetadataReporter denial receipt routing", () => {
   });
 
   it("folds full legacy rejections but counts their non-denied neighbors once", async () => {
+    allowIngestContractDrift();
     const fullLegacy = ingest([
-      { code: "x", model: "m", message: "x" },
-      { code: "x", model: "m", message: "x" },
+      { code: "unknown_model", model: "m", message: "x" },
+      { code: "unknown_model", model: "m", message: "x" },
     ]);
     const { reporter, payloads } = scriptedReporter([fullLegacy, ingest([], 1), ingest([], 1)], {
       batchSize: 2,
@@ -312,7 +317,8 @@ describe("MetadataReporter denial receipt routing", () => {
   });
 
   it("counts a partial legacy rejection by the heaviest receipt weights and never folds it", async () => {
-    const partialLegacy = ingest([{ code: "x", model: "m", message: "x" }], 1);
+    allowIngestContractDrift();
+    const partialLegacy = ingest([{ code: "unknown_model", model: "m", message: "x" }], 1);
     const { reporter, payloads } = scriptedReporter([partialLegacy, ingest([], 1)], {
       batchSize: 2,
     });
@@ -333,7 +339,7 @@ describe("MetadataReporter denial receipt routing", () => {
     const { reporter, payloads } = scriptedReporter(
       [
         ingest([], 1),
-        ingest([{ index: 0, code: "x", model: "m", message: "x" }], 0),
+        ingest([{ index: 0, code: "unknown_model", model: "m", message: "x" }], 0),
         ingest([], 1),
         ingest([], 1),
         ingest([], 1),

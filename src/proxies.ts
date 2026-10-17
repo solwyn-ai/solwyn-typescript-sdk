@@ -48,7 +48,7 @@ import {
   type SolwynOptions,
 } from "./client";
 import { registerCoverageSource } from "./coverage";
-import { ConfigurationError, SolwynError } from "./errors";
+import { ConfigurationError } from "./errors";
 import {
   estimateEmbeddingInputTokens,
   estimateGoogleEmbeddingInputTokens,
@@ -67,6 +67,7 @@ import type {
 import { brandSolwynWrapper, isSolwynWrapper } from "./registry";
 import { snapshotRequestStructure } from "./request-options";
 import { observeEvaluatedProperty } from "./surface-graph";
+import { guardedSurfaceDescriptor } from "./surface-guard";
 import type { SurfaceDialect } from "./surfaces";
 import { buildReportedTokenDetails, buildTokenDetails, isUsageCount } from "./token-details";
 import type { MediaUsage } from "./types";
@@ -305,7 +306,7 @@ interface BoundGetter {
   invalidate(prop: string | symbol): void;
 }
 
-function makeBoundGetter(target: object): BoundGetter {
+function makeBoundGetter(target: object, core?: SolwynCore): BoundGetter {
   const boundMethods = new Map<
     string | symbol,
     {
@@ -335,54 +336,9 @@ function makeBoundGetter(target: object): BoundGetter {
   get.present = present;
   get.invalidate = (prop): void => {
     boundMethods.delete(prop);
+    core?.invalidateSurfaceRuntimes();
   };
   return get;
-}
-
-const UNSAFE_REFLECTED_SURFACE_DESCRIPTOR =
-  "provider descriptor cannot expose an unguarded fixed surface";
-
-function guardedSurfaceDescriptor(
-  descriptor: PropertyDescriptor,
-  property: PropertyKey,
-  read: () => unknown,
-  receiver: object,
-  onSet?: () => void,
-): PropertyDescriptor {
-  if (typeof property !== "string" || property === "constructor") {
-    return descriptor;
-  }
-  if (!("value" in descriptor) && descriptor.get === undefined && descriptor.set === undefined) {
-    return descriptor;
-  }
-  if (descriptor.configurable === false) {
-    if ("value" in descriptor) {
-      const guardedValue = read();
-      if (Object.is(guardedValue, descriptor.value)) return descriptor;
-    }
-    throw new SolwynError(UNSAFE_REFLECTED_SURFACE_DESCRIPTOR);
-  }
-  if ("value" in descriptor) {
-    return { ...descriptor, value: read() };
-  }
-  const setter = descriptor.set;
-  return {
-    ...descriptor,
-    get:
-      descriptor.get === undefined
-        ? undefined
-        : function guardedProviderGetter(): unknown {
-            return read();
-          },
-    set:
-      setter === undefined
-        ? undefined
-        : function guardedProviderSetter(value: unknown): unknown {
-            const result = Reflect.apply(setter, receiver, [value]);
-            onSet?.();
-            return result;
-          },
-  };
 }
 
 /** Keep namespace reflection guarded and mutations on the raw target, outside read posture. */
@@ -396,6 +352,7 @@ function createSurfaceProxy(
     if (updated) invalidate(property);
     return updated;
   };
+  const reflectedValues = new Map();
   let proxy: object;
   proxy = new Proxy(target, {
     ...handler,
@@ -418,6 +375,7 @@ function createSurfaceProxy(
         property,
         () => Reflect.get(proxy, property, proxy),
         current,
+        reflectedValues,
         () => invalidate(property),
       );
     },
@@ -638,7 +596,7 @@ function speechSpec(): MediaSurfaceSpec {
 /** `embeddings` sub-proxy: intercept `.create`, pass every other attribute through. */
 function makeEmbeddingsProxy(core: SolwynCore, resource: unknown, spec: MediaSurfaceSpec): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const create = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     core.enforceExplicitSurface("embeddings.create");
     return core.mediaCall(spec, kwargs ?? {}, rest);
@@ -656,7 +614,7 @@ function makeEmbeddingsProxy(core: SolwynCore, resource: unknown, spec: MediaSur
 /** `images` sub-proxy: generate/edit are tracked; every other method is transparent. */
 function makeImagesProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const generate = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     core.enforceExplicitSurface("images.generate");
     const request = kwargs ?? {};
@@ -687,7 +645,7 @@ function makeImagesProxy(core: SolwynCore, resource: unknown): object {
 /** OpenAI `videos` sub-proxy: create is tracked; every other method is transparent. */
 function makeVideosProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const create = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     core.enforceExplicitSurface("videos.create");
     return core.mediaCall(videoSpec("openai"), kwargs ?? {}, rest);
@@ -710,7 +668,7 @@ function makeAudioChildProxy(
   dialect: SurfaceDialect,
 ): object {
   const target = isObject(child) ? child : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const create = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     const request = kwargs ?? {};
     if (operation === "speech" && dialect === "openai") {
@@ -760,7 +718,7 @@ function makeAudioChildProxy(
 /** Audio posture proxy: tracked speech/transcriptions, warned translations, silent siblings. */
 function makeAudioProxy(core: SolwynCore, resource: unknown, dialect: SurfaceDialect): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   let transcriptionsProxy: object | undefined;
   let speechProxy: object | undefined;
   return createSurfaceProxy(target, boundGet.invalidate, {
@@ -807,7 +765,7 @@ function makeAudioProxy(core: SolwynCore, resource: unknown, dialect: SurfaceDia
 /** `chat.completions` sub-proxy: intercept `.create`, pass everything else through. */
 function makeCompletionsProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   // One stable intercept lambda per proxy (F23). It forwards the params bag AND every
   // trailing argument (OpenAI's RequestOptions: signal/headers/timeout/maxRetries)
   // verbatim into the pipeline, so per-request cancellation/headers still work (F13).
@@ -841,7 +799,7 @@ function makeCompletionsProxy(core: SolwynCore, resource: unknown): object {
  */
 function makeChatProxy(core: SolwynCore, resource: unknown, dialect: SurfaceDialect): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   let completionsProxy: object | undefined;
   return createSurfaceProxy(target, boundGet.invalidate, {
     get(_t, prop): unknown {
@@ -887,7 +845,7 @@ function hasExistingResponseSelector(value: unknown): boolean {
 /** `responses` sub-proxy: meter new responses; retain existing-response raw helpers. */
 function makeResponsesProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const create = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     core.enforceExplicitSurface("responses.create");
     return core.interceptedCall("responses", kwargs ?? {}, { responsesLeaf: "create" }, rest);
@@ -945,7 +903,7 @@ function makeResponsesProxy(core: SolwynCore, resource: unknown): object {
  */
 function makeMessagesProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const create = (kwargs?: Record<string, unknown>, ...rest: unknown[]): Promise<unknown> => {
     core.enforceExplicitSurface("messages.create");
     return core.interceptedCall("messages", kwargs ?? {}, {}, rest);
@@ -970,7 +928,7 @@ function makeMessagesProxy(core: SolwynCore, resource: unknown): object {
  */
 function makeModelsProxy(core: SolwynCore, resource: unknown): object {
   const target = isObject(resource) ? resource : {};
-  const boundGet = makeBoundGetter(target);
+  const boundGet = makeBoundGetter(target, core);
   const generateContent = (
     kwargs?: Record<string, unknown>,
     ...rest: unknown[]
@@ -1151,7 +1109,7 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
   // Two identity-stable getters (F23): one over the Solwyn core (lifecycle members),
   // one over the wrapped client (full passthrough surface).
   const boundCore = makeBoundGetter(core);
-  const boundWrapped = providerTarget === null ? null : makeBoundGetter(providerTarget);
+  const boundWrapped = providerTarget === null ? null : makeBoundGetter(providerTarget, core);
   const resolveTopLevel = (
     property: string,
     source: "raw" | "wrapper",
@@ -1170,6 +1128,7 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
     );
     return boundWrapped.present(property, value);
   };
+  const reflectedValues = new Map();
   const proxy = new Proxy(core, {
     get(target, prop): unknown {
       // Proxy invariants require these target-own descriptor values even though ordinary
@@ -1375,6 +1334,7 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
         prop,
         () => Reflect.get(proxy, prop, proxy),
         wrappedClient,
+        reflectedValues,
         () => boundWrapped?.invalidate(prop),
       );
     },

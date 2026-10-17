@@ -1133,6 +1133,7 @@ describe("BudgetEnforcer run-directive transaction", () => {
     const result = await budget.checkBudget(checkOptions());
 
     expect(result).toEqual({
+      callId: "00000000-0000-0000-0000-000000000001",
       allowed: false,
       remainingBudget: 0,
       projectId: null,
@@ -1351,6 +1352,7 @@ describe("BudgetEnforcer lease directive fences", () => {
     const result = await budget.checkBudget(checkOptions("run-a", 1));
 
     expect(result).toEqual({
+      callId: "00000000-0000-0000-0000-000000000001",
       allowed: false,
       remainingBudget: 175,
       projectId: PROJECT_ID,

@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { noopLogger } from "../../src/logging";
 import { VELOCITY_FLAGS, type VelocityFlag } from "../../src/types";
 import {
   DENY_ELIGIBLE_RULE_ORDER,
@@ -17,8 +18,18 @@ const BASE_CONFIG: VelocityConfig = Object.freeze({
   velocity_accel_factor: 3,
 });
 
-function monitor(overrides: Partial<VelocityConfig> = {}): VelocityMonitor {
-  return new VelocityMonitor({ ...BASE_CONFIG, ...overrides });
+function seededRandom(seed = 42): () => number {
+  return () => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed / 0x1_0000_0000;
+  };
+}
+
+function monitor(
+  overrides: Partial<VelocityConfig> = {},
+  random = seededRandom(),
+): VelocityMonitor {
+  return new VelocityMonitor({ ...BASE_CONFIG, ...overrides }, noopLogger, random);
 }
 
 function observe(
@@ -98,18 +109,100 @@ describe("VelocityMonitor repeat detection", () => {
     expect(observe(subject, "run", 100, 66)).not.toContain("repeat_size");
   });
 
-  it("bounds run histories at 128 and refreshes run recency on hits", () => {
+  it("drops stale histories before displacing active runs at the 4096-run bound", () => {
     const subject = monitor({ velocity_repeat_count: 2 });
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < 4096; index += 1) {
       observe(subject, `run-${index}`, 100, 0);
     }
-    expect(subject.runCount()).toBe(128);
+    expect(subject.runCount()).toBe(4096);
 
-    observe(subject, "run-0", 100, 1);
-    observe(subject, "run-128", 100, 1);
-    expect(subject.runCount()).toBe(128);
+    observe(subject, "run-0", 100, 211);
+    observe(subject, "new-run", 100, 212);
+    expect(subject.runCount()).toBe(2);
+    expect(observe(subject, "run-0", 100, 213)).toContain("repeat_size");
+  });
+
+  it.each([129, 4097])("detects repeating calls across %i round-robin runs", (runCount) => {
+    const subject = monitor({ velocity_mode: "deny" });
+    let repeats = 0;
+    for (let round = 0; round < 6; round += 1) {
+      for (let index = 0; index < runCount; index += 1) {
+        if (observe(subject, `run-${index}`, 100, round).includes("repeat_size")) {
+          repeats += 1;
+        }
+      }
+    }
+    expect(repeats).toBeGreaterThanOrEqual(runCount - 2);
+    expect(subject.runCount()).toBeLessThanOrEqual(4096);
+  });
+
+  it.each([
+    ["warn", 50],
+    ["warn", 100],
+    ["deny", 50],
+    ["deny", 100],
+  ] as const)("detects new loops in %s mode among %i new runs per second", (mode, rate) => {
+    const subject = monitor({ velocity_mode: mode });
+    let firstRepeat: number | undefined;
+    let firstGrowth: number | undefined;
+    for (let second = 0; second < 120; second += 1) {
+      for (let index = 0; index < rate; index += 1) {
+        observe(subject, `short-${second}-${index}`, 100, second + index / rate);
+      }
+      if (second < 100) continue;
+      // Both loops start only after one-call runs have filled the hard cap.
+      if (second === 100) expect(subject.runCount()).toBe(4096);
+      const now = second + 0.999;
+      if (observe(subject, "repeat-loop", 500, now).includes("repeat_size")) {
+        firstRepeat ??= second;
+      }
+      if (
+        observe(subject, "growth-loop", 100 * 1.25 ** (second - 100), now).includes(
+          "monotonic_growth",
+        )
+      ) {
+        firstGrowth ??= second;
+      }
+    }
+
+    expect(firstRepeat).toBe(104);
+    expect(firstGrowth).toBe(107);
+    expect(subject.runCount()).toBe(4096);
+  });
+
+  it("rate-limits warnings when the hard cap discards live history", () => {
+    const warn = vi.fn();
+    const subject = new VelocityMonitor(BASE_CONFIG, { ...noopLogger, warn });
+    for (let index = 0; index < 4096; index += 1) {
+      observe(subject, `run-${index}`, 100, 0);
+    }
+    expect(warn).not.toHaveBeenCalled();
+    observe(subject, "overflow-a", 100, 1);
+    observe(subject, "overflow-b", 100, 30.999);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("velocity.history_evicted");
+    observe(subject, "overflow-c", 100, 31);
+    expect(warn).toHaveBeenCalledTimes(2);
+    observe(subject, "after-idle", 100, 300);
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("clamps an injected RNG value of one when evicting live history", () => {
+    const subject = monitor({ velocity_repeat_count: 2 }, () => 1);
+    for (let index = 0; index < 4096; index++) {
+      observe(subject, `run-${index}`, 100, 0);
+    }
+    expect(() => observe(subject, "overflow", 100, 1)).not.toThrow();
+    expect(subject.runCount()).toBe(4096);
     expect(observe(subject, "run-0", 100, 2)).toContain("repeat_size");
-    expect(observe(subject, "run-1", 100, 2)).not.toContain("repeat_size");
+    expect(observe(subject, "run-4095", 100, 2)).not.toContain("repeat_size");
+    expect(subject.runCount()).toBe(4096);
+  });
+
+  it("retains history through the longest configured rule horizon", () => {
+    const subject = monitor({ velocity_repeat_count: 2, velocity_repeat_window_s: 600 });
+    observe(subject, "run", 100, 0);
+    observe(subject, "other-run", 100, 500);
+    expect(observe(subject, "run", 100, 600)).toContain("repeat_size");
   });
 });
 
@@ -218,12 +311,16 @@ describe("VelocityMonitor rate-acceleration detection", () => {
     expect(observe(subject, "run", 100, 120.001)).toContain("rate_acceleration");
   });
 
-  it("suppresses a returning LRU-evicted run through its live tombstone deadline", () => {
-    const subject = monitor({ velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 });
-    observe(subject, "victim", 100, 0);
-    for (let index = 0; index < 128; index += 1) {
-      observe(subject, `churn-${index}`, 100, 1);
+  it("suppresses a returning evicted run through its live tombstone deadline", () => {
+    const subject = monitor(
+      { velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 },
+      () => 1 - Number.EPSILON,
+    );
+    for (let index = 0; index < 4095; index += 1) {
+      observe(subject, `seed-${index}`, 100, 0);
     }
+    observe(subject, "victim", 100, 0);
+    observe(subject, "churn", 100, 1);
 
     expect(observe(subject, "victim", 100, 120)).not.toContain("rate_acceleration");
     expect(observe(subject, "victim", 100, 120.001)).toContain("rate_acceleration");
@@ -231,7 +328,7 @@ describe("VelocityMonitor rate-acceleration detection", () => {
 
   it("fails closed on tombstone overflow and recovers strictly after the global deadline", () => {
     const subject = monitor({ velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 });
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < 4096; index += 1) {
       observe(subject, `seed-${index}`, 100, 0);
     }
     for (let index = 0; index < 257; index += 1) {

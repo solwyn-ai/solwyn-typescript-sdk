@@ -116,7 +116,9 @@ function routingFetch(priceHints: Record<string, number> | null): FetchLike {
     if (url.includes("/api/v1/budgets/confirm")) {
       return new Response(null, { status: 204 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
 }
 
@@ -144,7 +146,9 @@ function routingFetchSequence(priceHints: readonly (Record<string, number> | nul
     if (url.includes("/api/v1/budgets/confirm")) {
       return new Response(null, { status: 204 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
 }
 
@@ -1433,11 +1437,12 @@ describe("disposition → breaker verdict (#22)", () => {
 });
 
 describe("idempotency-mode resolution (#23)", () => {
-  it("an explicit per-call boolean override wins over the client-level config", () => {
-    // Per-call true selects always; false selects safe.
-    expect(resolveIdempotencyMode(true, "safe")).toBe("always");
+  it("a per-call boolean can only tighten the client-level config", () => {
+    expect(resolveIdempotencyMode(true, "safe")).toBe("safe");
     expect(resolveIdempotencyMode(false, "always")).toBe("safe");
-    expect(resolveIdempotencyMode(true, "never")).toBe("always");
+    expect(resolveIdempotencyMode(true, "never")).toBe("never");
+    expect(resolveIdempotencyMode(false, "never")).toBe("never");
+    expect(resolveIdempotencyMode(true, "always")).toBe("always");
   });
 
   it("absent an override, the client-level setting applies (default safe)", () => {

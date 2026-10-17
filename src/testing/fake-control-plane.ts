@@ -84,6 +84,7 @@ interface LeaseRecord {
   readonly grantedTokens: number;
   declaredPairs: Array<readonly [ProviderName, string]>;
   readonly failOpen: boolean;
+  alertOverrun: boolean;
   frozenResponse: string;
   lastRenewedFromGeneration: number | null;
 }
@@ -155,7 +156,12 @@ export interface FakeControlPlaneOptions {
   remainingBudget?: number;
   projectId?: string;
   failoverTuningAllowed?: boolean;
+  /** Opted-in text hints default to { [provider]: 1 }; null returns an empty map. */
   priceHints?: Record<string, number> | null;
+  /** Effective scoped/run lease enforcement, independent of the project mode. */
+  postureMode?: BudgetMode;
+  /** Explicit synthetic run spend used by stopped-run verdicts; no local pricing. */
+  runUsage?: Record<string, number>;
   leaseEligible?: boolean;
   grantedTokens?: number;
   headroomShareTokens?: number | null;
@@ -172,6 +178,8 @@ const FakeControlPlaneOptionsSchema = z.strictObject({
   projectId: z.string().min(1).optional(),
   failoverTuningAllowed: z.boolean().optional(),
   priceHints: z.record(z.string(), z.number()).nullable().optional(),
+  postureMode: z.enum(["alert_only", "hard_deny"]).optional(),
+  runUsage: z.record(z.string(), z.number().nonnegative()).optional(),
   leaseEligible: z.boolean().optional(),
   grantedTokens: z.number().int().min(0).optional(),
   headroomShareTokens: z.number().int().min(0).nullable().optional(),
@@ -448,7 +456,9 @@ export class FakeControlPlane {
   private readonly remainingBudget: number;
   private readonly projectId: string;
   private readonly failoverTuningAllowed: boolean;
-  private readonly priceHints: Record<string, number> | null;
+  private readonly priceHints: Record<string, number> | null | undefined;
+  private readonly postureMode: BudgetMode | undefined;
+  private readonly runUsage: ReadonlyMap<string, number>;
 
   private readonly leaseEligible: boolean;
   private readonly grantedTokens: number;
@@ -483,8 +493,8 @@ export class FakeControlPlane {
       throw configurationError(parsed.error);
     }
     const value = parsed.data;
-    const leaseLengthS = value.leaseLengthS ?? 90;
-    const refreshIntervalS = value.refreshIntervalS ?? 30;
+    const leaseLengthS = value.leaseLengthS ?? 120;
+    const refreshIntervalS = value.refreshIntervalS ?? 15;
     if (refreshIntervalS >= leaseLengthS) {
       throw new ConfigurationError("refreshIntervalS must be less than leaseLengthS", {
         field: "refreshIntervalS",
@@ -497,7 +507,9 @@ export class FakeControlPlane {
     this.remainingBudget = value.remainingBudget ?? this.budgetLimit - this.currentUsage;
     this.projectId = value.projectId ?? "proj_fake";
     this.failoverTuningAllowed = value.failoverTuningAllowed ?? true;
-    this.priceHints = value.priceHints === undefined ? null : value.priceHints;
+    this.priceHints = value.priceHints;
+    this.postureMode = value.postureMode;
+    this.runUsage = new Map(Object.entries(value.runUsage ?? {}));
     this.leaseEligible = value.leaseEligible ?? true;
     this.grantedTokens = value.grantedTokens ?? 200_000;
     this.headroomShareTokens = value.headroomShareTokens ?? this.grantedTokens;
@@ -521,7 +533,11 @@ export class FakeControlPlane {
       }
       const method = (init?.method ?? "GET").toUpperCase();
       const path = new URL(input).pathname;
-      const prepared = this.prepareFetch(method, path, body, jsonInvalid);
+      const bodyBytes =
+        path === UNTRACKED_PATH && typeof init?.body === "string"
+          ? new TextEncoder().encode(init.body).byteLength
+          : 0;
+      const prepared = this.prepareFetch(method, path, body, jsonInvalid, bodyBytes);
       if (prepared.outage) {
         throw new TypeError("fetch failed");
       }
@@ -694,25 +710,12 @@ export class FakeControlPlane {
     this.deniedRuns.add(agentRunId);
   }
 
-  stopRun(agentRunId: string, options: { reason?: string } = {}): void {
+  stopRun(agentRunId: string, options: { reason?: "manual_kill" } = {}): void {
     const reason = options.reason ?? "manual_kill";
-    if (typeof reason !== "string" || reason.length === 0 || reason.length > 64) {
-      throw testingConfigurationError(
-        "stop reason must be a nonempty string of at most 64 characters",
-        "reason",
-      );
+    if (reason !== "manual_kill") {
+      throw testingConfigurationError("stop reason must be manual_kill", "reason");
     }
-    const existing = this.stoppedRunReasons.get(agentRunId);
-    if (existing === undefined) {
-      this.stoppedRunReasons.set(agentRunId, reason);
-      return;
-    }
-    if (existing !== reason) {
-      throw testingConfigurationError(
-        `run ${JSON.stringify(agentRunId)} is already stopped with reason ${JSON.stringify(existing)}; clearStop() before scripting reason ${JSON.stringify(reason)}`,
-        "reason",
-      );
-    }
+    this.stoppedRunReasons.set(agentRunId, reason);
   }
 
   clearStop(agentRunId: string): void {
@@ -793,6 +796,12 @@ export class FakeControlPlane {
       if (rejection !== undefined) rejection.consume();
       return this.handleIngest(body, rejection?.spec.rejectIngest);
     }
+    if (route === "breaker") {
+      const project = path.split("/")[4];
+      if (project === undefined || project !== encodeURIComponent(this.projectId)) {
+        return errorResponse(403, "Project does not match the project key");
+      }
+    }
     return this.routeHandler(route, body);
   }
 
@@ -815,6 +824,7 @@ export class FakeControlPlane {
     path: string,
     body: unknown,
     jsonInvalid: boolean,
+    bodyBytes: number,
   ): PreparedRequest {
     const outages = this.matchingScenarios("outage", path);
     if (outages.length > 0) {
@@ -826,6 +836,14 @@ export class FakeControlPlane {
     const delaySeconds = slows.reduce((sum, window) => sum + (window.spec.seconds ?? 0), 0);
     for (const window of slows) window.consume();
 
+    if (method === "POST" && path === UNTRACKED_PATH && bodyBytes > 256 * 1024) {
+      return {
+        outage: false,
+        delaySeconds,
+        delayMatched: slows.length > 0,
+        response: errorResponse(413, "Untracked surface batch exceeds 262144 bytes"),
+      };
+    }
     if (jsonInvalid) {
       return {
         outage: false,
@@ -869,6 +887,8 @@ export class FakeControlPlane {
   }
 
   private validateIngestBody(body: unknown): PlaneResponse | null {
+    if (Array.isArray(body) && body.length > 1000)
+      return errorResponse(400, "Metadata batches may contain at most 1000 events");
     const parsed = parseBodyList(MetadataEventSchema, body);
     return parsed.success ? null : parsed.response;
   }
@@ -961,45 +981,53 @@ export class FakeControlPlane {
 
     this.checks.push(request);
     const evaluation = this.evaluateChain(request.agent_run_id ?? null, models, "check");
-    const verdict = {
-      period: evaluation.period,
-      mode:
-        evaluation.period === "run_stopped"
-          ? "hard_deny"
-          : evaluation.trigger === "solwyn-test/deny-alert"
-            ? "alert_only"
-            : this.mode,
-    };
+    const projectMode = evaluation.trigger === "solwyn-test/deny-alert" ? "alert_only" : this.mode;
+    const alertOverrun = evaluation.period === "monthly" && projectMode === "alert_only";
+    const allowed = evaluation.period === null || alertOverrun;
+    const period = allowed ? null : evaluation.period;
+    const mode = allowed ? projectMode : "hard_deny";
     const excludeNullOptionals =
       request.failover_directive_version === "1" || request.run_directive_version === "1";
-    const reservationId =
-      verdict.period === null
-        ? `res_fake_${String(++this.reservationCounter).padStart(8, "0")}`
-        : null;
+    const reservationId = allowed
+      ? `res_fake_${String(++this.reservationCounter).padStart(8, "0")}`
+      : null;
+    const currentUsage =
+      period === "run_stopped"
+        ? (this.runUsage.get(request.agent_run_id ?? "") ?? 0)
+        : alertOverrun
+          ? Math.max(this.currentUsage, this.budgetLimit + 1)
+          : this.currentUsage;
     const runControl = this.runStopDirective(
       request.agent_run_id ?? null,
-      verdict.period,
+      period,
       request.run_directive_version === "1",
       CHECK_PATH,
     );
     const response: BudgetCheckResponse = {
-      allowed: verdict.period === null,
+      allowed,
       remaining_budget:
-        verdict.period === null
-          ? this.remainingBudget
-          : verdict.period === "run_stopped"
-            ? 0
-            : Math.max(0, this.remainingBudget),
-      mode: verdict.mode,
+        period === "run_stopped"
+          ? 0
+          : alertOverrun
+            ? Math.min(this.remainingBudget, this.budgetLimit - currentUsage)
+            : allowed
+              ? this.remainingBudget
+              : Math.max(0, this.remainingBudget),
+      mode,
       budget_limit: this.budgetLimit,
-      current_usage: this.currentUsage,
+      current_usage: currentUsage,
       project_id: this.projectId,
       ...(reservationId === null && excludeNullOptionals ? {} : { reservation_id: reservationId }),
-      ...(verdict.period === null && excludeNullOptionals
-        ? {}
-        : { denied_by_period: verdict.period }),
-      ...(request.price_hints_version === "1" && this.priceHints !== null
-        ? { price_hints: { ...this.priceHints } }
+      ...(period === null && excludeNullOptionals ? {} : { denied_by_period: period }),
+      ...(request.price_hints_version === "1"
+        ? {
+            price_hints:
+              request.modality === "text"
+                ? this.priceHints === null
+                  ? {}
+                  : { ...(this.priceHints ?? { [request.provider]: 1 }) }
+                : {},
+          }
         : excludeNullOptionals
           ? {}
           : { price_hints: null }),
@@ -1010,14 +1038,8 @@ export class FakeControlPlane {
               failover_tuning_allowed: this.failoverTuningAllowed,
             },
           }
-        : excludeNullOptionals
-          ? {}
-          : { failover_directive: null }),
-      ...(excludeNullOptionals
-        ? runControl === null
-          ? {}
-          : { run_control: runControl }
-        : { run_control: runControl }),
+        : {}),
+      ...(runControl === null ? {} : { run_control: runControl }),
     };
     if (reservationId !== null) {
       this.activeReservations.add(reservationId);
@@ -1041,8 +1063,7 @@ export class FakeControlPlane {
     path: string,
   ): RunControlDirective | null {
     if (!optedIn || agentRunId === null || period !== "run_stopped") return null;
-    const reason = this.stoppedRunReasons.get(agentRunId);
-    if (reason === undefined) return null;
+    const reason = this.stoppedRunReasons.get(agentRunId) ?? "manual_kill";
     const misroute = this.matchingScenarios("misroute_stops", path)[0];
     if (misroute !== undefined) misroute.consume();
     return {
@@ -1061,6 +1082,16 @@ export class FakeControlPlane {
     this.leaseGrants.push(request);
 
     const declaredPairs = this.grantDeclaredPairs(request);
+    if (this.stoppedRunReasons.has(request.agent_run_id)) {
+      const stopped = this.leaseVerdict(
+        request.agent_run_id,
+        [],
+        request.run_directive_version === "1",
+        LEASE_GRANT_PATH,
+      );
+      if (stopped !== null && stopped !== "alert_overrun")
+        return validatedResponse(200, LeaseGrantResponseSchema, stopped);
+    }
     const current = this.findLeaseForHolder(request.agent_run_id, request.holder_id);
     if (
       current !== undefined &&
@@ -1086,7 +1117,8 @@ export class FakeControlPlane {
       request.run_directive_version === "1",
       LEASE_GRANT_PATH,
     );
-    if (verdict !== null) return validatedResponse(200, LeaseGrantResponseSchema, verdict);
+    if (verdict !== null && verdict !== "alert_overrun")
+      return validatedResponse(200, LeaseGrantResponseSchema, verdict);
 
     const record: LeaseRecord = {
       agentRunId: request.agent_run_id,
@@ -1096,6 +1128,7 @@ export class FakeControlPlane {
       grantedTokens: this.grantedTokens,
       declaredPairs,
       failOpen: request.fail_open ?? true,
+      alertOverrun: verdict === "alert_overrun",
       frozenResponse: "",
       lastRenewedFromGeneration: null,
     };
@@ -1149,8 +1182,10 @@ export class FakeControlPlane {
     );
     record.lastRenewedFromGeneration = request.generation;
     record.generation++;
-    if (verdict !== null) return this.storeLeaseResponse(record, verdict);
+    if (verdict !== null && verdict !== "alert_overrun")
+      return this.storeLeaseResponse(record, verdict);
 
+    record.alertOverrun = verdict === "alert_overrun";
     record.declaredPairs = declaredPairs;
     return this.storeLeaseResponse(record, this.leaseResponse(record));
   }
@@ -1196,8 +1231,10 @@ export class FakeControlPlane {
     models: readonly string[],
     runOptedIn: boolean,
     path: string,
-  ): LeaseGrantResponse | null {
+  ): LeaseGrantResponse | "alert_overrun" | null {
     const evaluation = this.evaluateChain(agentRunId, models, "lease");
+    const projectMode = evaluation.trigger === "solwyn-test/deny-alert" ? "alert_only" : this.mode;
+    if (evaluation.period === "monthly" && projectMode === "alert_only") return "alert_overrun";
     if (evaluation.period === "tag") {
       return this.leaseVerdictResponse({
         eligible: false,
@@ -1214,6 +1251,10 @@ export class FakeControlPlane {
         mode: "hard_deny",
         remainingBudget:
           evaluation.period === "run_stopped" ? 0 : Math.max(0, this.remainingBudget),
+        currentUsage:
+          evaluation.period === "run_stopped"
+            ? (this.runUsage.get(agentRunId) ?? 0)
+            : this.currentUsage,
         ...(runControl === null ? {} : { runControl }),
       });
     }
@@ -1287,6 +1328,7 @@ export class FakeControlPlane {
     deniedByPeriod?: DenialPeriod;
     mode?: BudgetMode;
     remainingBudget?: number;
+    currentUsage?: number;
     runControl?: RunControlDirective | null;
   }): LeaseGrantResponse {
     return {
@@ -1300,7 +1342,7 @@ export class FakeControlPlane {
       project_id: this.projectId,
       mode: options.mode ?? this.mode,
       budget_limit: this.budgetLimit,
-      current_usage: this.currentUsage,
+      current_usage: options.currentUsage ?? this.currentUsage,
       remaining_budget: options.remainingBudget ?? this.remainingBudget,
     };
   }
@@ -1390,6 +1432,13 @@ export class FakeControlPlane {
   }
 
   private leaseResponse(record: LeaseRecord): LeaseGrantResponse {
+    const mode = record.declaredPairs.some(([, model]) => model === "solwyn-test/deny-alert")
+      ? "alert_only"
+      : this.mode;
+    const postureMode = mode === "hard_deny" ? mode : (this.postureMode ?? mode);
+    const currentUsage = record.alertOverrun
+      ? Math.max(this.currentUsage, this.budgetLimit + 1)
+      : this.currentUsage;
     return {
       eligible: true,
       allowed: true,
@@ -1400,15 +1449,17 @@ export class FakeControlPlane {
       lease_length_s: this.leaseLengthS,
       headroom_share_tokens: this.headroomShareTokens,
       posture: {
-        mode: this.mode,
+        mode: postureMode,
         on_unreachable: record.failOpen ? "fail_open" : "local_enforce",
       },
-      final_grant: this.finalGrant,
+      final_grant: postureMode === "hard_deny" && this.finalGrant,
       project_id: this.projectId,
-      mode: this.mode,
+      mode,
       budget_limit: this.budgetLimit,
-      current_usage: this.currentUsage,
-      remaining_budget: this.remainingBudget,
+      current_usage: currentUsage,
+      remaining_budget: record.alertOverrun
+        ? Math.min(this.remainingBudget, this.budgetLimit - currentUsage)
+        : this.remainingBudget,
     };
   }
 
@@ -1467,12 +1518,35 @@ export class FakeControlPlane {
   private handleIngest(body: unknown, rejection?: RejectIngestEffect): PlaneResponse {
     const parsed = parseBodyList(MetadataEventSchema, body);
     if (!parsed.success) return parsed.response;
-
+    if (rejection?.count !== undefined && rejection.count > parsed.data.length)
+      throw testingError("rejectIngest count exceeds the batch length");
+    const indices =
+      rejection?.count === undefined
+        ? [...(rejection?.indices ?? [])]
+        : Array.from({ length: rejection.count }, (_, index) => index);
+    if (indices.some((index) => index >= parsed.data.length))
+      throw testingError("rejectIngest index exceeds the batch length");
+    const rejectedIndexes = new Set(indices);
+    const rejected = indices.map((index) => ({
+      index,
+      code: rejection?.code ?? "invalid_tags",
+      model: (parsed.data[index]?.model ?? "").slice(0, 50),
+      message: `scripted ${rejection?.code ?? "invalid_tags"} rejection`,
+    }));
+    const duplicates: Array<{ index: number; reason: "legacy_key" | "call_id"; call_id: string }> =
+      [];
     let ingested = 0;
-    for (const event of parsed.data) {
+    for (const [index, event] of parsed.data.entries()) {
+      if (rejectedIndexes.has(index)) continue;
       const callIdentity = `${event.call_id}\u0000${event.attempt_index}`;
       const legacyIdentity = `${normalizedTimestamp(event.timestamp)}\u0000${event.sdk_instance_id}`;
-      if (this.ingestCallIds.has(callIdentity) || this.ingestLegacyIds.has(legacyIdentity)) {
+      const legacyDuplicate = this.ingestLegacyIds.has(legacyIdentity);
+      if (legacyDuplicate || this.ingestCallIds.has(callIdentity)) {
+        duplicates.push({
+          index,
+          reason: legacyDuplicate ? "legacy_key" : "call_id",
+          call_id: event.call_id,
+        });
         continue;
       }
       this.ingestCallIds.add(callIdentity);
@@ -1480,51 +1554,26 @@ export class FakeControlPlane {
       this.ingested.push(event);
       ingested++;
     }
-
-    if (rejection === undefined) {
-      return validatedResponse(202, IngestResponseSchema, { ingested, rejected: [] });
-    }
-    if (rejection.malformed === true) {
+    if (rejection?.malformed === true)
       return { status: 202, body: { rejected: "corrupt" }, headers: {} };
-    }
-    if (rejection.count !== undefined) {
-      if (rejection.count > parsed.data.length) {
-        throw testingError("rejectIngest count exceeds the batch length");
-      }
-      const rejected = Array.from({ length: rejection.count }, (_, index) => ({
-        code: rejection.code,
-        model: (parsed.data[index]?.model ?? "").slice(0, 50),
-        message: `scripted ${rejection.code} rejection`,
-      }));
-      return {
-        status: 202,
-        body: { ingested: Math.max(parsed.data.length - rejected.length, 0), rejected },
-        headers: {},
-      };
-    }
-
-    const indices = rejection.indices ?? [];
-    if (indices.some((index) => index >= parsed.data.length)) {
-      throw testingError("rejectIngest index exceeds the batch length");
-    }
-    const rejected = indices.map((index) => ({
-      index,
-      code: rejection.code,
-      model: (parsed.data[index]?.model ?? "").slice(0, 50),
-      message: `scripted ${rejection.code} rejection`,
-    }));
-    return validatedResponse(202, IngestResponseSchema, {
-      ingested: Math.max(parsed.data.length - rejected.length, 0),
-      rejected,
-    });
+    return validatedResponse(202, IngestResponseSchema, { ingested, rejected, duplicates });
   }
 
   private handleUntracked(body: unknown): PlaneResponse {
+    if (new TextEncoder().encode(JSON.stringify(body)).byteLength > 256 * 1024) {
+      return errorResponse(413, "Untracked surface batch exceeds 262144 bytes");
+    }
     if (Array.isArray(body) && body.length > 100) {
       return errorResponse(400, "untracked surface batches may contain at most 100 reports");
     }
     const parsed = parseBodyList(UntrackedSurfaceReportSchema, body);
     if (!parsed.success) return parsed.response;
+
+    const keys = parsed.data.map((report) =>
+      [report.provider, report.client_shape, report.mode, report.surface].join("\u0000"),
+    );
+    if (new Set(keys).size !== keys.length)
+      return errorResponse(400, "Untracked batch contains a duplicate observation key");
 
     for (const report of parsed.data) {
       const key = [report.provider, report.client_shape, report.mode, report.surface].join(

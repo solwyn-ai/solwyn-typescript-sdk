@@ -18,7 +18,8 @@ function logger() {
 }
 
 const fetchMock = vi.fn<FetchLike>(
-  async () => new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 }),
+  async () =>
+    new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), { status: 202 }),
 );
 
 function resetWarnings(): void {

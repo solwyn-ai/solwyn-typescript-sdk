@@ -66,6 +66,7 @@ import {
   type ReleaseDropReason,
   type ReleaseOutcome,
 } from "./release-dispatcher";
+import type { Deadline } from "./routing";
 import type { CurrentRun } from "./run-context";
 import {
   clearServerTerminationBeforeRequest,
@@ -131,6 +132,39 @@ export const DEFAULT_COST_PER_TOKEN = 0.00003;
 
 /** Default per-request timeout for the check POST (Python `httpx timeout=5.0`). */
 const DEFAULT_CHECK_TIMEOUT_MS = 5000;
+/** A nearly spent preflight deadline cannot provide a useful control-plane request window. */
+const MIN_PREFLIGHT_REQUEST_MS = 50;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function validateDuration(value: number, field: string, minimum: number): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value < minimum ||
+    value > MAX_TIMER_DELAY_MS / 1000
+  ) {
+    throw new ConfigurationError(
+      `${field} must be a finite duration >= ${minimum} seconds within the timer range`,
+      {
+        field,
+      },
+    );
+  }
+  return value;
+}
+
+function throwIfCheckAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    const reason: unknown = signal.reason;
+    if (reason instanceof Error) throw reason;
+    if (typeof DOMException === "function") {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    const error = new Error("The operation was aborted.");
+    error.name = "AbortError";
+    throw error;
+  }
+}
 
 /** Maximum distinct server-priced chains retained in the unscoped allow cache. */
 const ALLOW_CACHE_MAX_ENTRIES = 16;
@@ -146,6 +180,7 @@ const MAX_UNCOUNTED_EPISODES = 128;
  * aggregate release diagnostics (dropped surrenders, discarded uncounted tallies).
  */
 const UNCOUNTED_WARN_INTERVAL_MS = 30_000;
+const ALERT_ONLY_WARN_INTERVAL_MS = 30_000;
 
 /** Renewal I/O is always detached from admission and independently bounded. */
 const RENEWAL_TIMEOUT_MS = 5_000;
@@ -185,6 +220,8 @@ const SERVICE_TIER_VALUES: ReadonlySet<string> = new Set(SERVICE_TIERS);
  * proper typed structure, never a loose object literal (budget.md behavior 21).
  */
 export interface BudgetCheckResult {
+  /** Effective reconciliation identity, including an ID minted when the caller omitted one. */
+  callId?: string;
   /** Whether the call may proceed (an alert-only cloud deny still allows). */
   allowed: boolean;
   /** Remaining budget in the response's units (0 on the outage/fallback paths). */
@@ -278,6 +315,7 @@ function stickyDenyReason(
  */
 export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudgetCheckResult {
   return {
+    ...(init.callId === undefined ? {} : { callId: init.callId }),
     allowed: init.allowed,
     remainingBudget: init.remainingBudget,
     projectId: init.projectId ?? null,
@@ -325,7 +363,7 @@ export function buildBudgetExceededError(
 /**
  * Build the {@link BudgetExceededError} the client throws off a deny {@link
  * BudgetCheckResult}. This preserves the ordinary branch of the enforcer-owned typed denial
- * builder. `checkBudget` never throws (it returns a result), so the client turns an
+ * builder. `checkBudget` returns ordinary denials as results, so the client turns an
  * `allowed: false` result into an error. Fields are copied VERBATIM from the result's own `budgetLimit`/
  * `currentUsage`/`mode`/`projectId` (which the enforcer copied verbatim from the deny
  * response — Bug 1.1 guard), and `budgetPeriod` is resolved from the result's
@@ -364,8 +402,12 @@ export interface CheckBudgetOptions {
   fallbackProviders?: ProviderName[];
   /** Failover model chain (default `[]`); the caller's array is never mutated. */
   fallbackModels?: string[];
-  /** Per-call timeout override in SECONDS (Python parity); falls back to the 5s default. */
+  /** Per-call timeout in SECONDS, at least 0.05; falls back to the 5s default. */
   timeout?: number;
+  /** @internal Shared failover deadline; only caps the validated timeout. */
+  deadline?: Deadline;
+  /** Caller cancellation; an abort rejects without changing control-plane breaker health. */
+  signal?: AbortSignal;
   /** Active agent-run attribution. Scoped checks bypass the global allow cache. */
   agentRunId?: string;
   /** Internal ownership evidence; omitted by identity-only/direct callers. */
@@ -451,7 +493,8 @@ interface CapturedCheck {
   readonly fallbackModels: readonly string[];
   readonly modality: Modality;
   readonly hasEstimatedMedia: boolean;
-  readonly timeoutMs: number;
+  readonly deadlineMs: number;
+  readonly signal: AbortSignal | undefined;
 }
 
 type InitialGrantResult =
@@ -659,6 +702,8 @@ export class BudgetEnforcer {
   private readonly unreportedUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
   private readonly totalUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
   private lastUncountedWarnAt: number | null = null;
+  private lastAlertOnlyWarnAt: number | null = null;
+  private lastDeadlineWarnAt: number | null = null;
   private uncountedWarnScheduled = false;
   private closeEpoch = 0;
   private closePromise: Promise<void> | null = null;
@@ -667,6 +712,11 @@ export class BudgetEnforcer {
   private closed = false;
 
   constructor(options: BudgetEnforcerOptions) {
+    const cacheTtl = validateDuration(
+      options.cacheTtl === undefined ? 5 : options.cacheTtl,
+      "cacheTtl",
+      0,
+    );
     requireFetchLike(options.fetch);
     // A surrender attempt observes its underlying request so a request that ignores abort
     // keeps its dispatcher slot until it settles. Every other request is passed through; the
@@ -708,13 +758,14 @@ export class BudgetEnforcer {
     this.controlPlaneBreaker = options.controlPlaneBreaker ?? null;
     this.leaseLedger = new LeaseLedger({
       holderId: options.holderId ?? crypto.randomUUID(),
+      failOpen: options.failOpen ?? true,
       enabled: options.leaseEnabled ?? true,
       outputBoundDefault: options.leaseOutputBoundDefault,
     });
     this.terminationFor = options.terminationFor ?? outageTermination;
     this.budgetMode = options.budgetMode ?? "alert_only";
     this.failOpen = options.failOpen ?? true;
-    this.cacheTtl = options.cacheTtl ?? 5;
+    this.cacheTtl = cacheTtl;
 
     try {
       const register = Reflect.get(globalThis, NODE_LEASE_REGISTRATION);
@@ -931,11 +982,21 @@ export class BudgetEnforcer {
 
   /**
    * Ask the cloud whether a call is within budget. Returns a {@link BudgetCheckResult};
-   * it does NOT throw itself (the client raises the applicable typed error off a deny result).
+   * denial results become typed errors in the client. Caller aborts reject immediately.
    * On an outage it degrades per
    * the sticky-deny → fail-open → local-enforcement precedence.
    */
   async checkBudget(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
+    const signal = options.signal;
+    const timeout = validateDuration(
+      options.timeout === undefined ? DEFAULT_CHECK_TIMEOUT_MS / 1000 : options.timeout,
+      "timeout",
+      MIN_PREFLIGHT_REQUEST_MS / 1000,
+    );
+    const deadlineMs =
+      this.monotonicNow() + Math.min(timeout, options.deadline?.remaining() ?? timeout) * 1000;
+    throwIfCheckAborted(signal);
+    const callId = options.callId ?? crypto.randomUUID();
     const unmanagedRunId = options.runLifetime === undefined ? options.agentRunId : undefined;
     if (unmanagedRunId !== undefined) {
       this.preserveUnmanagedRun(unmanagedRunId);
@@ -945,7 +1006,17 @@ export class BudgetEnforcer {
       );
     }
     try {
-      return await this.checkBudgetWithOwnership(options);
+      const result = await this.checkBudgetWithOwnership(
+        { ...options, callId, signal },
+        deadlineMs,
+      );
+      try {
+        throwIfCheckAborted(signal);
+      } catch (error) {
+        this.releaseReservation(callId, result.leaseClaimToken ?? null);
+        throw error;
+      }
+      return { ...result, callId };
     } finally {
       // First direct admission creates the state during the call. Remember unmanaged
       // use on that state regardless of whether a managed owner was seen earlier.
@@ -958,7 +1029,10 @@ export class BudgetEnforcer {
     }
   }
 
-  private async checkBudgetWithOwnership(options: CheckBudgetOptions): Promise<BudgetCheckResult> {
+  private async checkBudgetWithOwnership(
+    options: CheckBudgetOptions,
+    deadlineMs: number,
+  ): Promise<BudgetCheckResult> {
     // Invariant 7 / D5: `provider` is required AT RUNTIME, even from untyped JS callers.
     if (!options.provider) {
       throw new ConfigurationError("provider is required for budget check", { field: "provider" });
@@ -1022,8 +1096,8 @@ export class BudgetEnforcer {
       modality: checkOptions.modality ?? "text",
       hasEstimatedMedia:
         checkOptions.estimatedMedia !== null && checkOptions.estimatedMedia !== undefined,
-      timeoutMs:
-        checkOptions.timeout !== undefined ? checkOptions.timeout * 1000 : DEFAULT_CHECK_TIMEOUT_MS,
+      deadlineMs,
+      signal: checkOptions.signal,
     });
     const cacheKey = this.allowCacheKey(stableOptions);
     let leaseCallId: string | null = null;
@@ -1031,137 +1105,159 @@ export class BudgetEnforcer {
 
     let widenAfterAllow = false;
 
-    if (this.leaseEntryEligible(captured)) {
-      leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
-      let leaseAdmission = this.admitLease(captured, leaseCallId, null);
-      leaseClaimToken = leaseAdmission.claimToken;
-      widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
+    try {
+      if (this.leaseEntryEligible(captured)) {
+        leaseCallId = this.canonicalLeaseCallId(captured.requestedCallId);
+        let leaseAdmission = this.admitLease(captured, leaseCallId, null);
+        leaseClaimToken = leaseAdmission.claimToken;
+        widenAfterAllow = leaseAdmission.reason === "model_outside_declared_set";
 
-      const immediate = this.localLeaseResult(captured, leaseAdmission);
-      if (immediate !== null) {
-        this.noteAdmissionUncounted(captured, leaseAdmission);
-        return immediate;
+        const immediate = this.localLeaseResult(captured, leaseAdmission);
+        if (immediate !== null) {
+          this.noteAdmissionUncounted(captured, leaseAdmission);
+          return immediate;
+        }
+
+        if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
+          const runId = captured.agentRunId;
+          if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
+            // Critical section: claim the run's grant slot before the first await.
+            this.initialGrantInFlight.add(runId);
+            const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
+            if (grant.kind === "admission") {
+              leaseAdmission = grant.admission;
+              leaseClaimToken = leaseAdmission.claimToken;
+              const granted = this.localLeaseResult(captured, leaseAdmission);
+              if (granted !== null) {
+                this.noteAdmissionUncounted(captured, leaseAdmission);
+                return granted;
+              }
+            } else if (grant.kind === "denied") {
+              return this.withLeaseClaim(grant.result, leaseClaimToken);
+            } else if (grant.kind === "outage") {
+              return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
+            }
+            // A grant loser, refused/malformed grant, or one-shot re-entry that still
+            // needs authority continues to the legacy per-call endpoint exactly once.
+          }
+        }
       }
 
-      if (leaseAdmission.decision === LeaseDecision.NeedGrant) {
-        const runId = captured.agentRunId;
-        if (runId !== undefined && !this.initialGrantInFlight.has(runId)) {
-          // Critical section: claim the run's grant slot before the first await.
-          this.initialGrantInFlight.add(runId);
-          const grant = await this.attemptInitialGrant(captured, leaseCallId, leaseClaimToken);
-          if (grant.kind === "admission") {
-            leaseAdmission = grant.admission;
-            leaseClaimToken = leaseAdmission.claimToken;
-            const granted = this.localLeaseResult(captured, leaseAdmission);
-            if (granted !== null) {
-              this.noteAdmissionUncounted(captured, leaseAdmission);
-              return granted;
-            }
-          } else if (grant.kind === "denied") {
-            return this.withLeaseClaim(grant.result, leaseClaimToken);
-          } else if (grant.kind === "outage") {
+      // --- Critical section: cache read + LRU touch (no `await` inside). ---
+      const cached = this.cachedAllow(cacheKey, stableOptions);
+      if (cached !== null) {
+        return this.withLeaseClaim(
+          budgetCheckResult({
+            allowed: true,
+            remainingBudget: cached.remaining_budget,
+            projectId: cached.project_id ?? null,
+            reservationId: null,
+            mode: cached.mode,
+            budgetLimit: cached.budget_limit,
+            currentUsage: cached.current_usage,
+            priceHints: cached.price_hints ?? null,
+            failoverTuningAllowed: null,
+          }),
+          leaseClaimToken,
+        );
+      }
+
+      throwIfCheckAborted(captured.signal);
+      const remainingMs = captured.deadlineMs - this.monotonicNow();
+      if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
+        this.logger.debug("budget.check_skipped_deadline");
+        this.warnPreflightDeadline();
+        return this.withLeaseClaim(
+          this.handleOutage(captured.estimatedInputTokens, captured.agentRunId, "deadline"),
+          leaseClaimToken,
+        );
+      }
+      const admission = this.controlPlaneBreaker?.admit() ?? null;
+      if (admission !== null && !admission.allowed) {
+        this.logger.debug("budget.check_skipped_breaker_open");
+        if (leaseCallId !== null && leaseClaimToken !== null) {
+          const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
+          const local = this.localLeaseResult(captured, reentry);
+          if (local !== null) {
+            this.noteAdmissionUncounted(captured, reentry);
+            return local;
+          }
+          if (reentry.decision === LeaseDecision.NeedGrant) {
             return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
           }
-          // A grant loser, refused/malformed grant, or one-shot re-entry that still
-          // needs authority continues to the legacy per-call endpoint exactly once.
         }
+        return this.withLeaseClaim(
+          this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+          leaseClaimToken,
+        );
       }
-    }
-
-    // --- Critical section: cache read + LRU touch (no `await` inside). ---
-    const cached = this.cachedAllow(cacheKey, stableOptions);
-    if (cached !== null) {
-      return this.withLeaseClaim(
-        budgetCheckResult({
-          allowed: true,
-          remainingBudget: cached.remaining_budget,
-          projectId: cached.project_id ?? null,
-          reservationId: null,
-          mode: cached.mode,
-          budgetLimit: cached.budget_limit,
-          currentUsage: cached.current_usage,
-          priceHints: cached.price_hints ?? null,
-          failoverTuningAllowed: null,
-        }),
-        leaseClaimToken,
-      );
-    }
-
-    const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
-    if (admission !== null && !admission.allowed) {
-      this.logger.debug("budget.check_skipped_breaker_open");
-      if (leaseCallId !== null && leaseClaimToken !== null) {
-        const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
-        const local = this.localLeaseResult(captured, reentry);
-        if (local !== null) {
-          this.noteAdmissionUncounted(captured, reentry);
-          return local;
-        }
-        if (reentry.decision === LeaseDecision.NeedGrant) {
-          return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
-        }
-      }
-      return this.withLeaseClaim(
-        this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-        leaseClaimToken,
-      );
-    }
-    try {
-      // Ordered response authority exists only for a real check POST. Capture and register
-      // its dispatch after lease/cache/breaker decisions and immediately before the POST.
-      const requestDispatch = this.captureAuthorityDispatch();
-      this.registerPendingOrderedRequest(requestDispatch);
       try {
-        let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+        // Ordered response authority exists only for a real check POST. Capture and register
+        // its dispatch after lease/cache/breaker decisions and immediately before the POST.
+        const requestDispatch = this.captureAuthorityDispatch();
+        this.registerPendingOrderedRequest(requestDispatch);
         try {
-          raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
-            timeoutMs: captured.timeoutMs,
-          });
-        } catch (error) {
-          if (isReadOnlyKeyError(error)) {
+          let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
+          try {
+            raw = await this.transport.postJsonAndReadJson(BUDGET_CHECK_PATH, request, {
+              timeoutMs: remainingMs,
+              signal: captured.signal,
+            });
+          } catch (error) {
+            throwIfCheckAborted(captured.signal);
+            if (isReadOnlyKeyError(error)) {
+              this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+              handleReadOnlyKeyError(error, this.logger);
+            } else {
+              this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+              this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            }
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
+          }
+
+          throwIfCheckAborted(captured.signal);
+          let response: BudgetCheckResponse;
+          try {
+            if (!raw.parsed) {
+              throw raw.error;
+            }
+            response = BudgetCheckResponseSchema.parse(raw.value);
+          } catch (error) {
             this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-            handleReadOnlyKeyError(error, this.logger);
-          } else {
-            this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-            this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+            this.logger.error(
+              "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
+              exceptionName(error),
+              this.failOpen,
+            );
+            return this.withLeaseClaim(
+              this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
+              leaseClaimToken,
+            );
           }
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
-        }
 
-        let response: BudgetCheckResponse;
-        try {
-          if (!raw.parsed) {
-            throw raw.error;
-          }
-          response = BudgetCheckResponseSchema.parse(raw.value);
-        } catch (error) {
           this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-          this.logger.error(
-            "budget.check_response_unreadable: %s — possible server contract drift; enforcement degraded (fail_open=%s)",
-            exceptionName(error),
-            this.failOpen,
+          const result = this.applyCheckResponse(
+            response,
+            stableOptions,
+            cacheKey,
+            requestDispatch,
           );
-          return this.withLeaseClaim(
-            this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
-            leaseClaimToken,
-          );
+          // Only a live allow for this run widens; denied, unreadable and outage paths never do.
+          if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
+            this.scheduleWidening(captured);
+          }
+          return this.withLeaseClaim(result, leaseClaimToken);
+        } finally {
+          this.unregisterPendingOrderedRequest(requestDispatch);
         }
-
-        this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-        const result = this.applyCheckResponse(response, stableOptions, cacheKey, requestDispatch);
-        // Only a live allow for this run widens; denied, unreadable and outage paths never do.
-        if (widenAfterAllow && response.allowed && result.allowed && !response.run_control) {
-          this.scheduleWidening(captured);
-        }
-        return this.withLeaseClaim(result, leaseClaimToken);
       } finally {
-        this.unregisterPendingOrderedRequest(requestDispatch);
+        this.controlPlaneBreaker?.releaseProbe(admission);
       }
     } finally {
-      this.controlPlaneBreaker?.releaseProbe(admission);
+      if (leaseCallId !== null) this.leaseLedger.forgetClaim(leaseCallId, leaseClaimToken);
     }
   }
 
@@ -1252,6 +1348,12 @@ export class BudgetEnforcer {
     }
     this.scheduleRenewal(captured, admission);
     if (!admission.admitted) return null;
+    if (
+      admission.decision === LeaseDecision.AdmitOutageMetered ||
+      admission.decision === LeaseDecision.AdmitUncounted
+    ) {
+      this.trackLocalCost(DEFAULT_COST_PER_TOKEN * captured.estimatedInputTokens);
+    }
     return this.leaseResultFromSnapshot(snapshot, {
       allowed: true,
       leaseId: admission.leaseId,
@@ -1579,8 +1681,16 @@ export class BudgetEnforcer {
     const runId = captured.agentRunId;
     if (runId === undefined) return { kind: "legacy" };
     const closeDispatchEpoch = this.closeEpoch;
-    const admission: CircuitBreakerAdmission | null = this.controlPlaneBreaker?.admit() ?? null;
+    const remainingMs = captured.deadlineMs - this.monotonicNow();
+    const admission: CircuitBreakerAdmission | null =
+      remainingMs >= MIN_PREFLIGHT_REQUEST_MS ? (this.controlPlaneBreaker?.admit() ?? null) : null;
     try {
+      throwIfCheckAborted(captured.signal);
+      if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
+        this.logger.debug("lease.grant_skipped_deadline");
+        this.warnPreflightDeadline();
+        return { kind: "legacy" };
+      }
       if (admission !== null && !admission.allowed) {
         this.logger.debug("lease.grant_skipped_breaker_open");
         return { kind: "outage" };
@@ -1593,9 +1703,10 @@ export class BudgetEnforcer {
         raw = await this.transport.postJsonAndReadJson(
           LEASE_GRANT_PATH,
           serializeLeaseGrantRequest(request),
-          { timeoutMs: captured.timeoutMs },
+          { timeoutMs: remainingMs, signal: captured.signal },
         );
       } catch (error) {
+        throwIfCheckAborted(captured.signal);
         const status = error instanceof TransportHttpError ? error.status : null;
         const responded =
           isReadOnlyKeyError(error) ||
@@ -1618,6 +1729,7 @@ export class BudgetEnforcer {
         return closeDispatchEpoch === this.closeEpoch ? { kind: "outage" } : { kind: "legacy" };
       }
 
+      throwIfCheckAborted(captured.signal);
       if (!raw.parsed) {
         this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         if (closeDispatchEpoch === this.closeEpoch) {
@@ -1968,7 +2080,10 @@ export class BudgetEnforcer {
     response: BudgetCheckResponse,
     activeAgentRunId: string | undefined,
   ): MaterializedBudgetCheckResult {
-    if (response.allowed) {
+    if (
+      response.allowed &&
+      !(response.mode === "alert_only" && response.current_usage >= response.budget_limit)
+    ) {
       return budgetCheckResult({
         allowed: true,
         remainingBudget: response.remaining_budget,
@@ -1988,9 +2103,16 @@ export class BudgetEnforcer {
 
     const limitUsd = money(response.budget_limit);
     const usageUsd = money(response.current_usage);
-    this.logger.warn(
-      `Budget limit reached (alert_only mode): limit=$${limitUsd}, usage=$${usageUsd}`,
-    );
+    const now = this.monotonicNow();
+    if (
+      this.lastAlertOnlyWarnAt === null ||
+      now - this.lastAlertOnlyWarnAt >= ALERT_ONLY_WARN_INTERVAL_MS
+    ) {
+      this.lastAlertOnlyWarnAt = now;
+      this.logger.warn(
+        `Budget limit reached (alert_only mode): limit=$${limitUsd}, usage=$${usageUsd}`,
+      );
+    }
     return budgetCheckResult({
       allowed: true,
       remainingBudget: response.remaining_budget,
@@ -2471,8 +2593,19 @@ export class BudgetEnforcer {
     });
   }
 
+  private warnPreflightDeadline(): void {
+    const now = this.monotonicNow();
+    if (this.lastDeadlineWarnAt !== null && now - this.lastDeadlineWarnAt < 60_000) return;
+    this.lastDeadlineWarnAt = now;
+    this.logger.warn(
+      "budget.preflight_skipped_deadline: applying local policy (fail_open=%s)",
+      this.failOpen,
+    );
+  }
+
   /**
-   * The cloud-unreachable decision tree. Precedence (behaviors 8–12):
+   * Local decisions when cloud authority is unavailable or the preflight deadline expires.
+   * Precedence (behaviors 8–12):
    *   1. A remembered hard deny wins FIRST — never re-opened, regardless of `failOpen`
    *      or the configured `budgetMode` (invariant 9, the milestone's soul).
    *   2. `failOpen` → allow, accruing the fallback estimate into local spend.
@@ -2482,22 +2615,26 @@ export class BudgetEnforcer {
   private handleOutage(
     estimatedInputTokens: number,
     agentRunId: string | undefined,
+    cause: "unreachable" | "deadline" = "unreachable",
   ): MaterializedBudgetCheckResult {
+    const unavailable =
+      cause === "deadline" ? "Budget preflight deadline exhausted" : "Cloud API unreachable";
+    const shortUnavailable = cause === "deadline" ? unavailable : "Cloud unreachable";
     // 1. Sticky hard deny — checked BEFORE fail-open / local enforcement.
     const globalSticky = this.lastHardDenyResponse;
     if (globalSticky !== null) {
-      return this.priorHardDenyUnavailableResult(globalSticky, agentRunId);
+      return this.priorHardDenyUnavailableResult(globalSticky, agentRunId, unavailable);
     }
     if (agentRunId !== undefined) {
       const runSticky = this.runHardDenyResponses.get(agentRunId);
       if (runSticky !== undefined) {
         this.runHardDenyResponses.delete(agentRunId);
         this.runHardDenyResponses.set(agentRunId, runSticky);
-        return this.priorHardDenyUnavailableResult(runSticky.response, agentRunId);
+        return this.priorHardDenyUnavailableResult(runSticky.response, agentRunId, unavailable);
       }
       const retained = this.readTermination(agentRunId);
       if (retained.isPresent) {
-        const warning = "Cloud API unreachable; preserving retained run stop";
+        const warning = `${unavailable}; preserving retained run stop`;
         this.logger.warn(warning);
         const budgetLimit = this.lastKnownBudgetLimit ?? 0;
         const currentUsage = this.lastKnownCurrentUsage ?? 0;
@@ -2525,7 +2662,7 @@ export class BudgetEnforcer {
         allowed: true,
         remainingBudget: 0,
         mode: this.budgetMode,
-        warning: "Cloud API unreachable; proceeding in fail-open mode",
+        warning: `${unavailable}; proceeding in fail-open mode`,
       });
     }
 
@@ -2537,7 +2674,7 @@ export class BudgetEnforcer {
         allowed: false,
         remainingBudget: 0,
         mode: this.budgetMode,
-        warning: "Cloud unreachable and no prior budget limit known; denying request (fail-closed)",
+        warning: `${shortUnavailable} and no prior budget limit known; denying request (fail-closed)`,
         denySource: "local_enforcement",
         denyReason: "no_prior_budget_limit",
       });
@@ -2552,7 +2689,7 @@ export class BudgetEnforcer {
         allowed: false,
         remainingBudget: Math.max(0, limit - current),
         mode: this.budgetMode,
-        warning: `Cloud unreachable; local enforcement denies: $${money(current)} + $${money(estimatedCost)} > $${money(limit)}`,
+        warning: `${shortUnavailable}; local enforcement denies: $${money(current)} + $${money(estimatedCost)} > $${money(limit)}`,
         budgetLimit: limit,
         currentUsage: current,
         denySource: "local_enforcement",
@@ -2566,7 +2703,7 @@ export class BudgetEnforcer {
       allowed: true,
       remainingBudget: Math.max(0, limit - current - estimatedCost),
       mode: this.budgetMode,
-      warning: "Cloud API unreachable; enforcing locally",
+      warning: `${unavailable}; enforcing locally`,
       budgetLimit: limit,
       currentUsage: current + estimatedCost,
     });
@@ -2576,8 +2713,9 @@ export class BudgetEnforcer {
   private priorHardDenyUnavailableResult(
     response: BudgetCheckResponse,
     activeAgentRunId: string | undefined,
+    unavailable: string,
   ): MaterializedBudgetCheckResult {
-    const warning = `Cloud API unreachable; preserving prior hard deny: $${money(response.current_usage)}/$${money(response.budget_limit)} used`;
+    const warning = `${unavailable}; preserving prior hard deny: $${money(response.current_usage)}/$${money(response.budget_limit)} used`;
     this.logger.warn(warning);
     return budgetCheckResult({
       allowed: false,

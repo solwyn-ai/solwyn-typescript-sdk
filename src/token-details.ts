@@ -5,7 +5,8 @@
  * It is a pure data struct with a single wire-serialization quirk: `is_estimated`
  * is OMITTED from the serialized JSON entirely when `false` (key-absent means
  * provider-reported), and only emitted (`true`) when the counts are SDK-side
- * length-based estimates. It carries zero prompt/response content.
+ * estimates or inconsistent cache totals needed normalization. It carries zero
+ * prompt/response content.
  *
  * Ported from `solwyn/_token_details.py`. Per D1 / wire-contract, every numeric
  * field is bounded `0 <= n <= 100_000_000` (the API's canonical model bound; the
@@ -43,25 +44,42 @@ const counter = () => z.number().int().min(0).max(TOKEN_DETAILS_MAX).default(0);
  * Note: the schema always includes `is_estimated` after parsing — the
  * omit-when-false wire quirk lives in {@link serializeTokenDetails}, not here.
  */
-export const TokenDetailsSchema = z.strictObject({
-  input_tokens: counter(),
-  output_tokens: counter(),
-  cached_input_tokens: counter(),
-  cache_creation_5m_tokens: counter(),
-  cache_creation_1h_tokens: counter(),
-  reasoning_tokens: counter(),
-  audio_input_tokens: counter(),
-  audio_output_tokens: counter(),
-  image_input_tokens: counter(),
-  image_output_tokens: counter(),
-  accepted_prediction_tokens: counter(),
-  rejected_prediction_tokens: counter(),
-  tool_use_input_tokens: counter(),
-  is_estimated: z.boolean().default(false),
-});
+export const TokenDetailsSchema = z
+  .strictObject({
+    input_tokens: counter(),
+    output_tokens: counter(),
+    cached_input_tokens: counter(),
+    cache_creation_5m_tokens: counter(),
+    cache_creation_1h_tokens: counter(),
+    reasoning_tokens: counter(),
+    audio_input_tokens: counter(),
+    audio_output_tokens: counter(),
+    image_input_tokens: counter(),
+    image_output_tokens: counter(),
+    accepted_prediction_tokens: counter(),
+    rejected_prediction_tokens: counter(),
+    tool_use_input_tokens: counter(),
+    is_estimated: z.boolean().default(false),
+  })
+  .refine(
+    (details) =>
+      details.cached_input_tokens +
+        details.cache_creation_5m_tokens +
+        details.cache_creation_1h_tokens <=
+      details.input_tokens,
+    { message: "cache buckets must be included in input_tokens", path: ["input_tokens"] },
+  );
 
 /** Parsed TokenDetails shape (all fields present, defaults applied). */
 export type TokenDetails = z.infer<typeof TokenDetailsSchema>;
+
+/** Cache-only corrections keep measured usage without adding a wire field or retaining it. */
+const measuredCacheAdjustments = new WeakSet<TokenDetails>();
+
+/** Missing/malformed usage needs a reservation floor; cache-only normalization does not. */
+export function isUsageUnmeasured(details: TokenDetails): boolean {
+  return details.is_estimated && !measuredCacheAdjustments.has(details);
+}
 
 /**
  * Construct a validated TokenDetails from a partial set of counters.
@@ -90,7 +108,7 @@ export function createTokenDetails(partial: Partial<TokenDetails> = {}): TokenDe
  * is caught at that boundary, matching Python's unbounded vendored model.
  */
 export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDetails {
-  return {
+  return normalizeCacheInput({
     input_tokens: partial.input_tokens ?? 0,
     output_tokens: partial.output_tokens ?? 0,
     cached_input_tokens: partial.cached_input_tokens ?? 0,
@@ -105,7 +123,25 @@ export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDet
     rejected_prediction_tokens: partial.rejected_prediction_tokens ?? 0,
     tool_use_input_tokens: partial.tool_use_input_tokens ?? 0,
     is_estimated: partial.is_estimated ?? false,
-  };
+  });
+}
+
+/** Input includes all cache reads/writes; preserve those buckets and raise a deficient total. */
+function normalizeCacheInput(details: TokenDetails): TokenDetails {
+  const fields = [
+    "cached_input_tokens",
+    "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens",
+  ] as const;
+  if (!isUsageCount(details.input_tokens) || fields.some((field) => !isUsageCount(details[field])))
+    return details;
+  const cacheTotal = fields.reduce((total, field) => total + details[field], 0);
+  if (cacheTotal > details.input_tokens) {
+    if (!details.is_estimated) measuredCacheAdjustments.add(details);
+    details.input_tokens = cacheTotal;
+    details.is_estimated = true;
+  }
+  return details;
 }
 
 /** A provider counter must be an explicit non-negative integer; zero is valid. */
@@ -134,7 +170,7 @@ export function buildReportedTokenDetails(
     if (isUsageCount(value)) details[field] = value;
     else if (value !== undefined && value !== null) details.is_estimated = true;
   }
-  return details;
+  return normalizeCacheInput(details);
 }
 
 /**

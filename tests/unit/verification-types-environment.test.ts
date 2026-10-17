@@ -443,7 +443,7 @@ it.each([
   ["native-type-consumer", "ERESOLVE", "command-failure", false],
   ["ai-type-consumer", "ENOTFOUND", "network", true],
   ["ai-type-consumer", "ERESOLVE", "command-failure", false],
-])("%s classifies SDK install %s evidence", async (probe, code, kind, retryable) => {
+])("%s keeps SDK installs locked while classifying %s evidence", async (probe, code, kind, retryable) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-sdk-install-"));
   try {
     const state = join(directory, "invocations");
@@ -452,6 +452,8 @@ it.each([
       `const fs=require("node:fs");const path=require("node:path");const state=${JSON.stringify(state)};const count=fs.existsSync(state)?Number(fs.readFileSync(state,"utf8"))+1:1;fs.writeFileSync(state,String(count));if(count===1){const packageRoot=path.join(process.cwd(),"node_modules/sentinel");fs.mkdirSync(packageRoot,{recursive:true});fs.writeFileSync(path.join(packageRoot,"package.json"),JSON.stringify({name:"sentinel",version:"1.0.0"}));}else{process.stderr.write("npm error code ${code}\\n");process.exitCode=1;}\n`,
     );
     const report = await failedProbeReport(probe, directory, fakeNpmEnvironment(directory, cli));
+    expect(report.details.sdkInstall.args).toContain("--no-save");
+    expect(report.details.sdkInstall.args).toContain("--package-lock=true");
     expect(report.failure).toEqual({
       phase: "dependency-setup",
       kind,

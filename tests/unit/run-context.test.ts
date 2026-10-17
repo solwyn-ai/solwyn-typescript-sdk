@@ -406,7 +406,9 @@ function makeClient() {
       }
     }
     // The valid ingest response keeps the console-backed default logger quiet.
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   const fetchMock = vi.fn(impl);
   const create = vi.fn(async (_kwargs: Record<string, unknown>) => ({

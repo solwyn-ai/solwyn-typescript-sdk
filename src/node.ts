@@ -207,13 +207,16 @@ let constructRunHandle!: (identity: RunIdentity) => RunHandle;
 
 /** A detached run identity that can be activated explicitly in later call stacks. */
 export class RunHandle {
-  #lifetime: object | undefined = {};
+  #lifetime: object | undefined;
   readonly runId!: string;
   readonly #identity: RunIdentity;
   #activeActivations = 0;
   #finished = false;
 
   private constructor(identity: RunIdentity) {
+    const lifetime = {};
+    this.#lifetime = lifetime;
+    runOwners.register(lifetime);
     this.#identity = identity;
     Object.defineProperty(this, "runId", {
       configurable: false,
@@ -322,11 +325,13 @@ export interface RunContext {
 // The store itself must be shared: replacing only a global reader would hide runs
 // created by the previously loaded format. Keep Node-specific state in this entry.
 const RUN_STORE_KEY = Symbol.for("@solwyn/sdk.node.runStore");
-const RUN_OWNERS_KEY = Symbol.for("@solwyn/sdk.node.runOwners");
+const RUN_OWNERS_KEY = Symbol.for("@solwyn/sdk.node.runOwners.v2");
 interface RunOwners {
   readonly resources: Map<number, object>;
   readonly synchronous: Set<object>;
   readonly hook: AsyncHook;
+  liveCount: number;
+  register(owner: object): void;
 }
 interface GlobalWithRunStore {
   [RUN_STORE_KEY]?: AsyncLocalStorage<RunFrame>;
@@ -355,8 +360,24 @@ function installRunOwners(): RunOwners {
       resources.delete(asyncId);
     },
   });
-  hook.enable();
-  return { resources, synchronous, hook };
+  const registered = new WeakSet<object>();
+  const collected = new FinalizationRegistry<void>(() => {
+    owners.liveCount -= 1;
+    if (owners.liveCount === 0) hook.disable();
+  });
+  const owners: RunOwners = {
+    resources,
+    synchronous,
+    hook,
+    liveCount: 0,
+    register(owner): void {
+      if (registered.has(owner)) return;
+      registered.add(owner);
+      collected.register(owner, undefined);
+      if (owners.liveCount++ === 0) hook.enable();
+    },
+  };
+  return owners;
 }
 sharedRunState[RUN_OWNERS_KEY] ??= installRunOwners();
 const runOwners = sharedRunState[RUN_OWNERS_KEY];
@@ -367,6 +388,7 @@ const runOwners = sharedRunState[RUN_OWNERS_KEY];
  * and active call snapshots own it. Keeping a completed promise is not continuing a run.
  */
 function inRunFrame<T>(frame: RunFrame, owner: object, fn: () => T): T {
+  runOwners.register(owner);
   const alreadyPinned = runOwners.synchronous.has(owner);
   runOwners.synchronous.add(owner);
   try {

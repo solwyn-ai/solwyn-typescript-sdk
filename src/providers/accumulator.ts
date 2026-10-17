@@ -167,14 +167,14 @@ export function extractServiceTier(
 }
 
 /** A bounded tier label plus whether bounding truncated it (the warning is the caller's). */
-interface BoundedServiceTier {
+export interface BoundedServiceTier {
   readonly value: string | null;
   readonly truncated: boolean;
 }
 
 const NO_SERVICE_TIER: BoundedServiceTier = { value: null, truncated: false };
 
-function boundServiceTier(tier: unknown): BoundedServiceTier {
+export function boundServiceTier(tier: unknown): BoundedServiceTier {
   if (typeof tier !== "string") {
     return NO_SERVICE_TIER;
   }
@@ -234,7 +234,7 @@ export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
 }
 
 /** The retained tier label, warning (once per call) when bounding truncated it. */
-function settledServiceTier(tier: BoundedServiceTier, logger: Logger): string | null {
+export function settledServiceTier(tier: BoundedServiceTier, logger: Logger): string | null {
   if (tier.truncated) warnServiceTierTruncated(logger);
   return tier.value;
 }

@@ -914,7 +914,10 @@ describe("SurfaceNamespaceGuardCache", () => {
     expect((callable as () => string)()).toBe("provider result");
     expect(reads).toBe(1);
     expect(getterReads).toBe(kind === "data" ? 0 : 1);
-    expect(callable).toBe(Reflect.get(guarded, "paid"));
+    if (kind === "data") {
+      expect(callable).toBe(Object.getOwnPropertyDescriptor(guarded, "paid")?.value);
+      expect((Reflect.get(guarded, "paid") as () => string)()).toBe("provider result");
+    } else expect(callable).toBe(Reflect.get(guarded, "paid"));
   });
 
   it.each([
@@ -1037,7 +1040,7 @@ describe("SurfaceNamespaceGuardCache", () => {
   it.each([
     "getter-setter",
     "setter-only",
-  ] as const)("fails closed for reflected fixed %s accessors while direct writes still forward", (kind) => {
+  ] as const)("preserves reflected fixed %s accessors while direct writes still forward", (kind) => {
     let getterReads = 0;
     class ProviderResource {
       #value = "before";
@@ -1069,7 +1072,9 @@ describe("SurfaceNamespaceGuardCache", () => {
     });
     const guarded = new SurfaceNamespaceGuardCache().getOrCreate(raw, "models", OPENAI, readGuard);
 
-    expect(() => Object.getOwnPropertyDescriptor(guarded, "setting")).toThrow(SolwynError);
+    expect(Object.getOwnPropertyDescriptor(guarded, "setting")).toEqual(
+      Object.getOwnPropertyDescriptor(raw, "setting"),
+    );
     expect(Reflect.set(guarded, "setting", "after", {})).toBe(true);
     expect(raw.value()).toBe("after");
     expect(getterReads).toBe(0);
@@ -1097,7 +1102,7 @@ describe("SurfaceNamespaceGuardCache", () => {
   it.each([
     "data",
     "accessor",
-  ] as const)("fails closed when a reflected fixed %s capability cannot be safely represented", (kind) => {
+  ] as const)("preserves fixed %s descriptors as required by Proxy reflection invariants", (kind) => {
     const resource = { paid: () => "paid" };
     const target = Object.defineProperty({}, "resource", {
       configurable: false,
@@ -1110,7 +1115,9 @@ describe("SurfaceNamespaceGuardCache", () => {
       (_surface, execute) => new Proxy(execute() as object, {}),
     );
 
-    expect(() => Object.getOwnPropertyDescriptor(guarded, "resource")).toThrow(SolwynError);
+    expect(Object.getOwnPropertyDescriptor(guarded, "resource")).toEqual(
+      Object.getOwnPropertyDescriptor(target, "resource"),
+    );
   });
 
   it("runs raise posture before consulting an effectful own-property descriptor trap", () => {
@@ -1191,7 +1198,7 @@ describe("SurfaceNamespaceGuardCache", () => {
     expect(readGuard).not.toHaveBeenCalled();
   });
 
-  it("fails closed on Symbol.iterator before descriptor or property lookup", () => {
+  it("permits an absent Symbol.iterator without provider property lookup", () => {
     const cache = new SurfaceNamespaceGuardCache();
     let descriptorReads = 0;
     let valueReads = 0;
@@ -1211,10 +1218,8 @@ describe("SurfaceNamespaceGuardCache", () => {
     const readGuard = vi.fn<SurfaceReadGuard>((_surface, execute) => execute());
     const guarded = cache.getOrCreate(target, "models", OPENAI, readGuard);
 
-    expect(() => guarded[Symbol.iterator]).toThrow(
-      "symbol-keyed provider surfaces are not supported",
-    );
-    expect(descriptorReads).toBe(0);
+    expect(guarded[Symbol.iterator]).toBeUndefined();
+    expect(descriptorReads).toBeGreaterThan(0);
     expect(valueReads).toBe(0);
     expect(readGuard).not.toHaveBeenCalled();
   });
@@ -1244,7 +1249,7 @@ describe("SurfaceNamespaceGuardCache", () => {
     expect(inspected).toEqual([raw.operation, raw.operation, raw.operation]);
   });
 
-  it("keeps permitted classes raw through direct and reflected resource reads", () => {
+  it("keeps permitted classes raw on direct reads and guards reflected construction", () => {
     class Capability {}
     const raw = { Capability };
     const inspected: unknown[] = [];
@@ -1259,7 +1264,9 @@ describe("SurfaceNamespaceGuardCache", () => {
       },
     );
     expect(guarded.Capability).toBe(Capability);
-    expect(Object.getOwnPropertyDescriptor(guarded, "Capability")?.value).toBe(Capability);
+    const reflected = Object.getOwnPropertyDescriptor(guarded, "Capability")?.value;
+    expect(inspected).toEqual([Capability]);
+    expect(Reflect.construct(reflected, [])).toBeInstanceOf(Capability);
     expect(inspected).toEqual([Capability, Capability]);
   });
 

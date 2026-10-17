@@ -13,6 +13,7 @@ import { buildRuntimes } from "../../src/registry";
 import { MetadataReporter } from "../../src/reporter";
 import type { FetchLike } from "../../src/transport";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
+import { installIngestContractGuard } from "../helpers/ingest-contract";
 
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const MODEL = "gpt-4o-mini";
@@ -31,6 +32,7 @@ interface SurfaceOptionOverrides {
   readonly onUnmetered?: "warn" | "raise" | "allow";
   readonly acknowledgeUntracked?: string[];
   readonly reportUntrackedSurfaces?: boolean;
+  readonly reporterShutdownDeadline?: number;
 }
 
 interface WireCall {
@@ -48,7 +50,9 @@ function wireRecorder() {
       const accepted = Array.isArray(body) ? body.length : 0;
       return new Response(JSON.stringify({ accepted }), { status: 202 });
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   });
   return { calls, fetch };
 }
@@ -178,7 +182,7 @@ describe("public surface controls", () => {
         });
       }
       if (path === "/api/v1/budgets/confirm") return new Response(null, { status: 204 });
-      return Response.json({ ingested: 1, rejected: [] }, { status: 202 });
+      return Response.json({ ingested: 1, rejected: [], duplicates: [] }, { status: 202 });
     };
     const log = recordingLogger();
     const wrapped = new Solwyn(raw, {
@@ -278,6 +282,7 @@ describe("public surface controls", () => {
     });
     vi.resetModules();
     const secondSdk = await import("../../src/index");
+    installIngestContractGuard((await import("../../src/reporter")).MetadataReporter);
     const secondClientModule = await import("../../src/client");
     const second = new secondSdk.Solwyn(fakeOpenAI().client, {
       ...PUBLIC_SURFACE_OPTIONS,
@@ -298,7 +303,7 @@ describe("public surface controls", () => {
     expect(wire.calls).toEqual([]);
   });
 
-  it("bounds advisory shutdown to ten seconds and leaves no later batches or timers", async () => {
+  it("bounds advisory shutdown to the configured deadline without later batches or timers", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
     const raw = fakeOpenAI();
     let providerClosed = false;
@@ -316,7 +321,10 @@ describe("public surface controls", () => {
       // A hostile transport ignores cancellation; Transport must still settle.
       return new Promise<Response>(() => {});
     };
-    const wrapped = wrap(client, fetch, recordingLogger().logger, { onUnmetered: "allow" });
+    const wrapped = wrap(client, fetch, recordingLogger().logger, {
+      onUnmetered: "allow",
+      reporterShutdownDeadline: 0.25,
+    });
     for (let index = 0; index < 512; index += 1) Reflect.get(wrapped, `future_${index}`);
     const closing = wrapped.close();
     let settled = false;
@@ -325,7 +333,7 @@ describe("public surface controls", () => {
     });
     try {
       await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(9_999);
+      await vi.advanceTimersByTimeAsync(249);
       expect(providerClosed).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(settled).toBe(true);
@@ -720,6 +728,8 @@ describe("raw evaluated values precede presentation binding", () => {
           let caught: unknown;
           try {
             exposed = read();
+            if (access === "descriptor" && shape === "resource")
+              Reflect.get(exposed as object, "constructor");
             if (shape === "class" || shape === "command-class") {
               if (typeof exposed !== "function") throw new TypeError("Expected a constructor");
               Reflect.construct(exposed, []);
@@ -734,7 +744,7 @@ describe("raw evaluated values precede presentation binding", () => {
           } else {
             expect(caught).toBeUndefined();
             if (shape === "class" || shape === "command-class") {
-              expect(Object.is(exposed, returned)).toBe(true);
+              expect(Object.is(exposed, returned)).toBe(access === "get");
               expect(operations).toBe(1);
             } else if (shape === "function") {
               expect(exposed).toBe(initial);
@@ -1087,11 +1097,18 @@ describe("runtime surface guard", () => {
             const descriptor = Object.getOwnPropertyDescriptor(wrapped.models, method);
             if (descriptor && !("value" in descriptor)) descriptor.get?.call(wrapped.models);
           }
-          expect.soft(count("google", "google_genai", `models.${method}`)).toBe(reads);
+          const reflectedOnly = access === "descriptor" && !shape.startsWith("getter");
+          expect
+            .soft(count("google", "google_genai", `models.${method}`))
+            .toBe(reflectedOnly ? 0 : reads);
         }
         await flushAfterInterval(wrapped);
-        expect(reportTotal(wire, `models.${method}`)).toBe(3);
-        expect(log.warn).toHaveBeenCalledTimes(posture === "warn" ? 1 : 0);
+        expect(reportTotal(wire, `models.${method}`)).toBe(
+          access === "descriptor" && !shape.startsWith("getter") ? 0 : 3,
+        );
+        expect(log.warn).toHaveBeenCalledTimes(
+          posture === "warn" && !(access === "descriptor" && !shape.startsWith("getter")) ? 1 : 0,
+        );
         expect(wire.calls.every(({ path }) => path === UNTRACKED_REPORT_PATH)).toBe(true);
       });
     });
@@ -1122,11 +1139,13 @@ describe("runtime surface guard", () => {
       for (let reads = 1; reads <= 3; reads += 1) {
         const resource = Reflect.get(wrapped, property) as { child(): string };
         expect(resource.child()).toBe("allowed");
-        expect.soft(count("openai", "openai_sdk", property)).toBe(reads);
+        expect
+          .soft(count("openai", "openai_sdk", property))
+          .toBe(property === "future" ? 0 : reads);
         expect.soft(count("openai", "openai_sdk", `${property}.child`)).toBe(reads);
       }
       await flushAfterInterval(wrapped);
-      expect(reportTotal(wire, property)).toBe(3);
+      expect(reportTotal(wire, property)).toBe(property === "future" ? 0 : 3);
       expect(reportTotal(wire, `${property}.child`)).toBe(3);
     });
 
@@ -1338,21 +1357,24 @@ describe("runtime surface guard", () => {
       });
       let caught: unknown;
       try {
-        const operation = read(wrapped, property) as () => unknown;
-        operation();
+        const operation = read(wrapped, property);
+        if (access === "get") (operation as () => unknown)();
+        else expect(operation).toBe(property === "baseURL" ? "local" : 2);
       } catch (error) {
         caught = error;
       }
 
       expect(operations).toBe(0);
-      expect(reads).toBe(1);
-      expect(caught).toBeInstanceOf(UntrackedSpendSurfaceError);
-      expect(caught).toMatchObject({
-        surface: property,
-        kind: "unknown",
-        capabilityScope: null,
-        driftedFromRuleId: expect.stringContaining("surface."),
-      });
+      expect(reads).toBe(access === "get" ? 1 : 0);
+      if (access === "get") {
+        expect(caught).toBeInstanceOf(UntrackedSpendSurfaceError);
+        expect(caught).toMatchObject({
+          surface: property,
+          kind: "unknown",
+          capabilityScope: null,
+          driftedFromRuleId: expect.stringContaining("surface."),
+        });
+      } else expect(caught).toBeUndefined();
       await wrapped.close();
       expect(wire.calls).toEqual([]);
     });
@@ -1398,7 +1420,7 @@ describe("runtime surface guard", () => {
       let exposed: unknown;
       try {
         exposed = read(wrappedOwner, property);
-        const operation = read(exposed as object, "child") as () => unknown;
+        const operation = Reflect.get(exposed as object, "child") as () => unknown;
         operation();
       } catch (error) {
         caught = error;
@@ -1443,7 +1465,9 @@ describe("runtime surface guard", () => {
         acknowledgeUntracked: ["post"],
       });
 
-      expect(read(wrapped, "maxRetries")).toBe(metadata);
+      const reflectedMetadata = read(wrapped, "maxRetries");
+      if (access === "get") expect(reflectedMetadata).toBe(metadata);
+      else expect(reflectedMetadata).toEqual(metadata);
       expect(read(wrapped, "baseURL")).toBe("local");
       expect(read(wrapped, "timeout")).toBe(1000);
       const operation = read(wrapped, "post") as () => unknown;
@@ -1718,15 +1742,13 @@ describe("runtime surface guard", () => {
     const log = recordingLogger();
     const wrapped = wrap(raw.client, wire.fetch, log.logger, { onUnmetered: "raise" });
 
-    expect(() => Object.getOwnPropertyDescriptor(wrapped, "post")).toThrowError(
-      UntrackedSpendSurfaceError,
-    );
+    const postDescriptor = Object.getOwnPropertyDescriptor(wrapped, "post");
+    expect(() => postDescriptor?.value()).toThrowError(UntrackedSpendSurfaceError);
     const responses = wrapped.responses;
-    expect(() => Object.getOwnPropertyDescriptor(responses, "retrieve")).toThrowError(
-      UntrackedSpendSurfaceError,
-    );
+    const retrieveDescriptor = Object.getOwnPropertyDescriptor(responses, "retrieve");
+    expect(() => retrieveDescriptor?.value()).toThrowError(UntrackedSpendSurfaceError);
     const createDescriptor = Object.getOwnPropertyDescriptor(responses, "create");
-    expect(createDescriptor).toMatchObject({ value: responses.create });
+    expect(createDescriptor?.value).toBeTypeOf("function");
     expect(createDescriptor?.value).not.toBe(raw.operations.responsesCreate);
 
     expect(post).not.toHaveBeenCalled();
@@ -1917,7 +1939,10 @@ describe("runtime surface guard", () => {
 
     expect(raw.operations.retrieve).toHaveBeenCalledTimes(hits);
     expect(log.warn).toHaveBeenCalledTimes(warnings);
-    expect(wire.calls.map((call) => call.path)).toEqual([UNTRACKED_REPORT_PATH]);
+    expect(wire.calls.map((call) => call.path)).toEqual([
+      UNTRACKED_REPORT_PATH,
+      UNTRACKED_REPORT_PATH,
+    ]);
     expect(wire.calls[0]?.body).toEqual([
       expect.objectContaining({
         provider: "openai",
@@ -1930,6 +1955,7 @@ describe("runtime surface guard", () => {
         occurrences: 1,
       }),
     ]);
+    expect(wire.calls[1]?.body).toEqual([expect.objectContaining({ occurrences: hits - 1 })]);
   });
 
   it("allows an exact responses.retrieve acknowledgment while keeping the namespace and sibling guarded", async () => {
@@ -2098,7 +2124,7 @@ describe("public coverage integration", () => {
     });
     expect(Object.isFrozen(first)).toBe(true);
     expect(Object.isFrozen(first.entries)).toBe(true);
-    expect(() => coverage(raw.client)).toThrowError(TypeError);
+    expect(() => coverage(raw.client)).toThrowError(ConfigurationError);
     for (const operation of Object.values(raw.operations)) {
       expect(operation).not.toHaveBeenCalled();
     }

@@ -54,7 +54,10 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
       if (url.endsWith("/metadata/ingest")) {
         const batch = JSON.parse(init?.body as string) as Record<string, unknown>[];
         events.push(...batch);
-        return Response.json({ ingested: batch.length, rejected: [] }, { status: 202 });
+        return Response.json(
+          { ingested: batch.length, rejected: [], duplicates: [] },
+          { status: 202 },
+        );
       }
       if (url.includes("/breaker-reports")) return new Response(null, { status: 204 });
       throw new Error("unexpected offline control route");
@@ -158,7 +161,11 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
       await sdk.close();
       expect(confirms).toHaveLength(1);
       expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({ status: "success", input_tokens: 0, output_tokens: 0 });
+      expect(events[0]).toMatchObject({
+        status: "success",
+        input_tokens: firstBoundary ? 0 : 18,
+        output_tokens: firstBoundary ? 0 : 7,
+      });
       expect([...active.values()].reduce((count, listeners) => count + listeners.size, 0)).toBe(0);
       expect(native?.controller.signal.aborted).toBe(true);
     } finally {

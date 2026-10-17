@@ -126,6 +126,9 @@ live budget check is authoritative:
 | `alert_only` | Log a warning and allow the provider call |
 | `hard_deny` | Throw `BudgetExceededError` before provider dispatch |
 
+Alert-only budget-limit logs emit at most once every 30 seconds per enforcer. Each affected
+budget result retains its warning and reservation ID.
+
 The constructor's `budgetMode` option is not sent in `BudgetCheckRequest` and does not enable live
 Cloud blocking. It supplies the mode attached to SDK-local outage decisions. `failOpen` controls
 whether those local decisions allow or deny when the budget service cannot be reached.
@@ -177,9 +180,38 @@ estimate. The ordinary check path uses `POST /api/v1/budgets/check`; when it ret
 the reporter settles it through `POST /api/v1/budgets/confirm` with observed usage. Streaming
 settles once, at stream end. Eligible calls can reuse cached authority or a run lease. A hard
 deny throws before provider dispatch and reports a `budget_denied` event carrying the estimate.
+`budgetCheckTimeout` must be at least `0.05` seconds, including when supplied through
+`SOLWYN_BUDGET_CHECK_TIMEOUT`; smaller values fail construction with
+`ConfigurationError(field: "budgetCheckTimeout")`. The timeout is shared by a lease attempt and
+any per-call fallback, and capped by the remaining failover deadline. With less than 50
+milliseconds remaining on that shared deadline, preflight skips network I/O and applies local
+policy, logging `budget.preflight_skipped_deadline` at most once per minute per client. This
+does not record a breaker failure or draw lease headroom. A caller's request `AbortSignal`
+also cancels preflight; cancellation rejects without recording a control-plane breaker
+failure. Error abort reasons are preserved; other reasons become an `AbortError`. Direct
+`BudgetEnforcer.checkBudget()` callers can pass `signal` and use the returned `callId` to
+settle or release a lease reservation, including when the SDK generated the ID.
 
 Settlement is automatic and private. Close the wrapped client to flush queued confirmations
 and events; your application does not need a separate confirmation call.
+
+Confirmations run concurrently up to `reporterMaxInFlight` (default `3`), with independent
+idempotent call IDs. Metadata batches remain serial. Retryable failures park the FIFO head;
+already-active confirmations can finish. Retries honor `Retry-After` (seconds or HTTP-date, up to
+one hour) and use exponential backoff with half-to-full jitter. HTTP 429 has a separate cap of
+20 responses per pending item. Final confirmation and metadata flushes wait for a server's retry
+deadline when it fits within the remaining close budget. Longer holds are counted as `rate_limited` losses;
+an unsent settlement confirmation still releases its metadata event for ingestion.
+
+Persistent confirmation failures reach ERROR after ten consecutive failing delivery rounds.
+A round uses its last non-neutral confirmation verdict in dispatch order, so completion order
+cannot change the count. A success resets it; held admissions and read-only skips do not count.
+Lease-funded metadata includes the same `lease_id` as its confirmation. Cache reads and creation
+buckets must fit within input tokens; wrapped provider clients preserve those buckets and raise an
+inconsistent input total to their sum, marking it estimated. This correction settles the adjusted
+observed usage without retaining the lease reservation floor. Ingest responses require `ingested`,
+`rejected`, and `duplicates`; malformed responses produce contract-drift diagnostics while usable
+rejection dispositions are still logged.
 
 **Run-scoped leases.** With `leaseEnabled: true` (the default), an untagged text call inside a
 Node `run(...)` or `RunHandle.activate(...)` scope can reserve estimated input plus an output bound
@@ -317,6 +349,11 @@ for await (const chunk of stream) {
 
 > Note: an intercepted `create(...)` returns a plain `Promise`, not OpenAI's `APIPromise`. The response-envelope helpers `.withResponse()` / `.asResponse()` are unavailable on an intercepted call — a deliberate divergence surfaced as a **compile** error rather than a runtime crash. Every non-intercepted path keeps OpenAI's exact types.
 
+The Chat Completions helpers `chat.completions.stream`, `chat.completions.parse`, and
+`chat.completions.runTools` are unmetered. With the default `onUnmetered: "warn"`, each
+surface passes through after one warning, with no budget check or cost event. Use
+`chat.completions.create` for metered calls, including streaming with `stream: true`.
+
 ### Anthropic
 
 ```ts
@@ -332,7 +369,18 @@ await client.messages.create({
 });
 ```
 
-Streaming settles usage from the terminal `message_delta` event.
+Streaming settles usage from cumulative `message_delta` counters, including input and cache
+totals updated by server tools. Aggregate-only deltas preserve the initial five-minute and
+one-hour cache split. Additional writes use that TTL if the start used exactly one TTL; when
+the start used both TTLs or neither, additional writes use the conservative one-hour bucket
+and mark usage estimated. Decreasing aggregate counts retain observed cache writes and mark
+usage estimated. When supplied, thinking tokens are reported as a subset of the output total.
+Service tiers `standard` and `priority` are preserved; unsupported tiers such as `batch` are
+omitted.
+
+`messages.stream` and `messages.parse` are unmetered helpers. With the default
+`onUnmetered: "warn"`, each passes through after one warning, with no budget check or cost
+event. Use `messages.create`, with `stream: true` for streaming, for metered calls.
 
 ### Google Gemini
 
@@ -354,6 +402,10 @@ for await (const chunk of stream) {
   process.stdout.write(chunk.text ?? "");
 }
 ```
+
+If a Google stream omits the candidate output count, its usage remains estimated until a
+candidate finish reason is observed. Cancelling an unfinished stream retains the reservation
+floor. Buffered responses and finished streams can report omitted candidate output as zero.
 
 ### Amazon Bedrock
 
@@ -497,6 +549,23 @@ try {
 
 The middleware handle owns the budget enforcer + reporter; call `solwyn.close()` (or use `await using`) to flush queued telemetry. Attribution is derived from the wrapped model's `provider`/`modelId`; there is no failover here (the AI SDK owns the single model), so every event is a primary hop.
 
+Consume or cancel middleware streams explicitly. Garbage collection does not settle abandoned
+middleware streams or release their funding; a per-call reservation can remain until expiry,
+and a lease claim can remain until the lease is surrendered.
+
+Run stops are cooperative: the middleware rechecks the captured run after preflight and
+aborts an active stream at its next chunk boundary with `RunStoppedError`. Clearing a stop
+allows future work; an already stopped stream retains its stop. Local velocity detection
+is not supported by the AI SDK middleware. Cache writes are reported in the default
+five-minute bucket, and missing usage totals fall back to length estimates for that side
+of the call while preserving reported totals. The middleware limits cache reads to input tokens
+and cache writes to the remaining input. Clamped or malformed counters mark usage estimated
+and retain the lease reservation floor.
+
+The call's `abortSignal` also cancels budget preflight. Run stops and caller cancellation
+settle stream usage observed so far, including the part pulled at the cancellation boundary;
+estimated usage retains the reservation floor.
+
 > **Gateway attribution.** When a model id is resolved through the Vercel AI Gateway (a bare string model like `generateText({ model: "anthropic/claude-sonnet-4.5" })`), the AI SDK stamps `provider: "gateway"`. Solwyn derives the true vendor from the `vendor/model` prefix of the model id, so per-vendor budgets and metadata are attributed correctly instead of collapsing onto `openai_compatible`.
 
 ## Media surfaces
@@ -550,6 +619,11 @@ Native OpenAI and Azure OpenAI `responses.create`, `responses.parse`, and `respo
 tracked. Other OpenAI-compatible clients retain their native Responses managers under the
 unmetered posture because their wire behavior is not assumed to match OpenAI's native client.
 
+Untracked-surface advisories coalesce occurrences for fifteen minutes per key. Retries keep the
+same report ID and occurrence snapshot; later observations wait for a separate report. Closing
+flushes unsent occurrences within `reporterShutdownDeadline`, bypassing local retry backoff while
+respecting `Retry-After`. Exhausted reports produce aggregated warnings at most once per minute.
+
 `coverage(client)` computes a local structural report without calling a provider operation or
 transmitting data. For CI, pin an independently reviewed literal. This exhaustive strict,
 unacknowledged example is reviewed against `openai@6.45.0`:
@@ -587,7 +661,9 @@ different graph and needs its own reviewed fingerprint.
 
 Strict mode is a cooperative pre-call guard, not a sandbox. Retaining the raw provider client,
 reaching private wrapper state, acknowledging a scoped raw escape, or invoking behavior on a
-returned response, page, stream, job, or operation object can bypass this guard; keep those
+returned response, page, stream, job, or operation object can bypass this guard. Fixed
+non-configurable descriptors retain their native values and accessors to preserve JavaScript
+Proxy invariants, and can also expose raw capabilities; keep those
 capabilities out of code that relies on strict enforcement or review their use explicitly.
 
 </details>
@@ -614,6 +690,29 @@ On a failover-eligible error the router walks `[primary, ...fallbacks]` in healt
 JavaScript provider SDKs expose one per-request timeout rather than separate connect/read controls. OpenAI, compatible clients, and Anthropic receive it in their request options. Google receives it as `config.httpOptions.timeout` with native retries disabled; on a `@google/genai` version whose request-signal support Solwyn has verified, Solwyn disables that native timeout and arms its own `AbortSignal` timer instead, which stays armed until the buffered response or the stream finishes. Bedrock receives AWS SDK v3 `requestTimeout`, but that carrier is not a universal hard abort for every Converse stream handler. When Solwyn can read no finite-positive socket timeout from a Bedrock client's `requestHandler`, it warns so the handler can be bounded explicitly.
 
 Circuit breakers, latency signals, and failover labeling key off the provider **name** — so give distinct endpoints distinct identities (via `provider` or the 4th fallback element) when you want them tracked separately.
+
+Caller cancellation never advances to another provider or counts as a provider failure. A
+cancelled established stream settles the usage observed so far, using the reservation floor
+when usage is missing or malformed. Cancellation of a dispatched request before connection, including
+deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
+funding, and does not confirm usage or record latency. Already-aborted requests skip velocity
+detection and budget I/O.
+SDK request-deadline aborts still count as provider failures. A half-open streaming
+probe is held for at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second
+minimum. Expiry or finalization releases it neutrally, so an unread stream cannot block later
+recovery indefinitely. Its later outcome cannot affect a newer probe.
+
+For established streams, non-429 HTTP 4xx errors are health-neutral; errors without an HTTP
+status count as provider failures unless caused by caller cancellation.
+
+`failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
+known to be eligible for failover, and `"always"` also permits ambiguous failures after send.
+The per-call request field `solwynIdempotent: false` tightens `"always"` to `"safe"` and keeps
+`"never"` unchanged; `true` preserves the configured policy. Solwyn strips this field before
+every intercepted provider dispatch, including media and Bedrock command input. It never
+changes the caller's params or command. When a plan suppresses custom failover tuning, the SDK
+uses the stricter requested/default idempotency policy, fewer retries, and smaller total window;
+a requested zero window still prevents dispatch.
 
 **Selection policy.** Attempt order is chosen by an injectable `selectionPolicy` (the drop-in seam — swapping it changes ordering with zero changes to dispatch, translation, or budgets):
 
@@ -675,6 +774,12 @@ await run("nightly-batch", async () => {
 ```
 
 `run(name, fn)` is callback-based and returns whatever `fn` returns. Ordinary async work (`await`, `setTimeout`, promises) propagates the active run automatically, including streaming calls drained later within the same async flow. Concurrent async tasks each in their own `run(...)` are fully isolated. Calls made outside any `run(...)` scope are still tracked; the API groups them automatically.
+
+Importing the Node entry leaves its extra lifetime-tracking async hook disabled. The hook
+is enabled while callback runs, unfinished detached handles, or their async work retain a
+run lifetime, and adds process-wide promise overhead during that time. It is disabled once
+the last lifetime is garbage-collected; ending a callback or finishing a handle can
+therefore precede hook shutdown. Finish detached handles when their work is complete.
 
 For a stable run identity that crosses separately scheduled call stacks, create a detached handle
 and activate it explicitly:
@@ -741,6 +846,10 @@ The same cooperative mechanism can stop runaway work locally. It observes only r
 timestamps, and estimated input-token counts — never prompts or responses. In `"warn"` mode it
 adds structural `velocity_flags` and rate-limited warnings; in `"deny"` mode only
 `repeat_size` and `monotonic_growth` can terminate a run. `rate_acceleration` is advisory.
+The detector retains up to 64 observations per run for at most 4096 runs. Stale run histories
+are discarded first; at the hard cap, a random live history is displaced to avoid systematically
+resetting loops under run churn or round-robin traffic. `velocity.history_evicted` warns at most
+once every 30 seconds. A displaced run can lose observations needed to detect a loop.
 
 | Option | Env var | Default | Meaning |
 |--------|---------|---------|---------|
@@ -843,7 +952,7 @@ try {
     await run("operator-kill-example", async () => {
       const runId = currentRun()?.agentRunId;
       if (runId === undefined) throw new Error("missing run scope");
-      plane.stopRun(runId, { reason: "operator_stop" });
+      plane.stopRun(runId, { reason: "manual_kill" });
       await client.chat.completions.create();
     });
     throw new Error("expected the operator kill");
@@ -860,13 +969,27 @@ means a denial response omits lease-authority fields.
 
 | Model | Check | Lease | Run scope |
 |-------|-------|-------|-----------|
-| `solwyn-test/deny` | Monthly denial in the plane's configured mode | `hard_deny` monthly denial; no lease block | no |
-| `solwyn-test/deny-alert` | Monthly denial forced to `alert_only`; dispatch continues | `hard_deny` monthly denial; no lease block | no |
-| `solwyn-test/deny-tag` | Tag denial in the configured mode | `eligible=false`, `allowed=true`, `ineligible_reason="scoped_rules_present"` | no |
-| `solwyn-test/deny-stopped` | `run_stopped`, forced `hard_deny`, remaining budget 0; no run-control directive | Same `run_stopped` denial; no lease block | yes |
-| `solwyn-test/runaway` | First sighting per run is allowed; later sightings deny `agent_run` | Same | yes |
+| `solwyn-test/deny` | Monthly denial under `hard_deny`; allowed overrun under `alert_only` | Same project-mode behavior | no |
+| `solwyn-test/deny-alert` | Allowed overrun forced to `alert_only`, with a reservation and negative remaining budget | Allowed lease with alert-only posture and negative remaining budget | no |
+| `solwyn-test/deny-tag` | Tag denial in `hard_deny` mode | `eligible=false`, `allowed=true`, `ineligible_reason="scoped_rules_present"` | no |
+| `solwyn-test/deny-stopped` | `run_stopped`, `hard_deny`, remaining budget 0; opted-in `manual_kill` directive | Same stopped-run verdict; no lease block | yes |
+| `solwyn-test/runaway` | First sighting per run is allowed; later sightings deny `agent_run` in `hard_deny` mode | Same | yes |
 | `solwyn-test/kill` | First sighting per run is allowed; later sightings stop the run with `run_stopped` | Same, including the run-control directive when opted in | yes |
 | `solwyn-test/lease-ineligible` | Transparent and allowed | `eligible=false`, `allowed=true`, `ineligible_reason="zero_rate_model"`; no lease block | no |
+
+`FakeControlPlane` leases default to a 120-second lifetime and a 15-second refresh. Use
+`postureMode: "hard_deny"` to model scoped or run enforcement on an alert-only project; only a
+hard posture can produce `final_grant`. `runUsage: { "synthetic-run": 7.5 }` supplies explicit
+synthetic spend for stopped-run checks, independently of project `currentUsage`. Stop reasons
+are limited to `"manual_kill"`. Legacy checks omit directive keys, and opted-in text checks return
+a price-hint map (by default `{ [provider]: 1 }`; non-text or unpriceable checks return `{}`).
+Set `priceHints: null` to return an empty map on opted-in text checks; this does not omit the
+`price_hints` field.
+
+The fake stores only accepted ingest events and returns indexed `rejected` and `duplicates`
+arrays. It enforces the server's 1,000-event metadata batch limit, 100-report untracked batch
+limit, 256 KiB untracked body limit, unique untracked keys within a batch, and project matching
+for breaker reports. Contract probes preserve any gateway prefix in `apiUrl`.
 
 ### Vitest fixtures (explicit opt-in)
 
@@ -946,6 +1069,31 @@ try {
 }
 ```
 
+Once `close()` begins, new intercepted calls reject with `SolwynError("client is closed")`
+before a budget check or provider request. Deferred `responses.stream()` helpers issued earlier
+also reject if first activated after closing begins. Repeated `close()` and async disposal share
+the same shutdown promise.
+
+Buffered calls and stream setup already in flight drain within `reporterShutdownDeadline`;
+settlement delivery and the advisory reporter use the time remaining in that same deadline.
+A call that outlasts it can finish after reporting closes, and the SDK logs a shutdown warning
+with the number still active. The settlement reporter closes first, followed by the advisory
+reporter, budget/lease holder, and wrapped provider. Lease cleanup has a separate one-second
+budget, so Solwyn's asynchronous shutdown work is bounded by `reporterShutdownDeadline + 1`
+seconds, plus the wrapped provider's own `close()` duration.
+
+Open streams settle once from usage observed so far, without waiting for the consumer to pull
+another chunk. A pull that receives another provider chunk rejects with
+`SolwynError("client is closed")`. Finish or cancel streams before closing the client when you
+need their terminal usage included; provider stream cleanup still belongs to the consumer.
+Missing or malformed usage retains the reservation floor during settlement; correcting
+inconsistent cache totals settles the adjusted observed usage.
+
+When garbage collection finalizes an abandoned stream, it settles the usage observed so far
+and releases its run and lease ownership instead of retaining them until client shutdown.
+Missing or malformed usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
+or cancel streams explicitly for deterministic settlement.
+
 Or let `await using` do it:
 
 ```ts
@@ -953,15 +1101,28 @@ await using client = new Solwyn(new OpenAI(), { apiKey: process.env.SOLWYN_API_K
 // close() runs at scope exit.
 ```
 
-The AI SDK middleware handle exposes the same `close()` / `Symbol.asyncDispose` contract.
+The AI SDK middleware handle also rejects new calls once closing begins, drains buffered
+calls and stream setup within the shared reporting deadline, and settles open streams from
+observed usage. Its `close()` and `Symbol.asyncDispose` share one shutdown promise. The handle
+closes its reporter before its budget/lease holder; the AI SDK owns provider cleanup.
 
 <details>
 <summary>Wrapper compatibility</summary>
 
-The wrapper preserves `instanceof`, `.constructor`, stable method identity, own keys and property
-descriptors, and property writes, deletes, and definitions. Solwyn-owned lifecycle members such
+The wrapper preserves `instanceof`, `.constructor`, stable method identity across repeated
+direct reads, key and descriptor reflection, and property writes, deletes, and definitions. Solwyn-owned lifecycle members such
 as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails synchronously with
 `ConfigurationError(field: "client")`.
+
+Key, membership, and descriptor inspection do not count as use of an untracked surface.
+Configurable reflected callables and resources enforce the surface policy when used. These
+descriptor values are live guarded handles: they follow later replacement of the property,
+and a reflected callable can have a different identity from a direct method read.
+Traversing an unknown data namespace records the terminal child rather than the container;
+a namespace read with no traversal is recorded on the next microtask under `warn` or `allow`.
+Native serialization limits, including circular `_client` references, still apply.
+`coverage()` accepts wrappers created through either ESM or CommonJS and throws
+`ConfigurationError(field: "client")` for an unregistered object.
 
 </details>
 
@@ -986,12 +1147,12 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `reportUntrackedSurfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `true` | Send content-free untracked-surface advisories |
 | `leaseEnabled` | `SOLWYN_LEASE_ENABLED` | `true` | Enable local run-scoped token leases |
 | `leaseOutputBoundDefault` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token reservation when a request has no usable cap |
-| `selectionPolicy` | — | `HealthBasedPolicy` | Injectable candidate-ordering policy |
+| `selectionPolicy` | — | `HealthBasedPolicy` | Injectable candidate-ordering policy with an `order()` method |
 | `failoverIdempotency` | — | `"safe"` | Cross-provider failover idempotency policy |
 | `sameProviderRetries` | — | `0` | Same-provider `Retry-After` retries |
 | `failoverTotalTimeout` | — | `30` | Failover-window seconds; does not cap an in-flight provider read |
-| `failoverHopReadTimeout` | — | `600` | Constant provider request bound in seconds |
-| `circuitBreakerRecoveryTimeoutJitter` | — | `0.2` | Provider-breaker recovery jitter fraction |
+| `failoverHopReadTimeout` | — | `600` | Per-attempt timeout in seconds; covered phases vary by provider (see below) |
+| `circuitBreakerRecoveryTimeoutJitter` | — | `0.2` | Provider-breaker recovery jitter fraction (0–1) |
 | `circuitBreakerFailureThreshold` | `SOLWYN_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive failures before a provider breaker opens |
 | `circuitBreakerRecoveryTimeout` | `SOLWYN_CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `60` | Provider-breaker recovery timeout in seconds |
 | `circuitBreakerSuccessThreshold` | `SOLWYN_CIRCUIT_BREAKER_SUCCESS_THRESHOLD` | `2` | Half-open successes required to close a provider breaker |
@@ -1002,28 +1163,44 @@ as `close()` take precedence. Wrapping an existing Solwyn wrapper again fails sy
 | `controlPlaneFailureThreshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive outages before the shared control-plane breaker opens |
 | `controlPlaneRecoveryTimeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30` | Control-plane breaker recovery timeout in seconds |
 | `breakerReportingEnabled` | `SOLWYN_BREAKER_REPORTING_ENABLED` | `true` | Publish provider-breaker snapshots |
-| `reporterBatchSize` | `SOLWYN_REPORTER_BATCH_SIZE` | `50` | Events per ingest batch |
+| `reporterBatchSize` | `SOLWYN_REPORTER_BATCH_SIZE` | `50` | Events per ingest batch (1–1000) |
 | `reporterFlushInterval` | `SOLWYN_REPORTER_FLUSH_INTERVAL` | `5` | Background flush interval in seconds |
 | `reporterMaxQueueSize` | `SOLWYN_REPORTER_MAX_QUEUE_SIZE` | `10000` | Reporter queue cap; overflow drops oldest |
-| `reporterMaxInFlight` | `SOLWYN_REPORTER_MAX_IN_FLIGHT` | `3` | Accepted but currently has no effect: reporter sends are serial, one request at a time |
-| `reporterMaxSendAttempts` | `SOLWYN_REPORTER_MAX_SEND_ATTEMPTS` | `5` | Attempts before retryable telemetry is disposed |
-| `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Retry backoff base in seconds |
+| `reporterMaxInFlight` | `SOLWYN_REPORTER_MAX_IN_FLIGHT` | `3` | Maximum concurrent confirmation POSTs; ingest batches remain serial |
+| `reporterMaxSendAttempts` | `SOLWYN_REPORTER_MAX_SEND_ATTEMPTS` | `5` | Ordinary retryable send attempts; HTTP 429 has a separate 20-response cap |
+| `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Exponential retry base in seconds, with half-to-full jitter |
 | `reporterRetryBackoffCap` | `SOLWYN_REPORTER_RETRY_BACKOFF_CAP` | `60` | Retry backoff cap in seconds |
-| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Final reporter deadline in seconds; `0` is valid |
-| `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds |
+| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Shared deadline for in-flight calls, settlement, and advisory delivery in seconds; `0` is valid |
+| `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds (greater than 0, at most 60) |
 | `velocityMode` | `SOLWYN_VELOCITY_MODE` | `"warn"` | Local velocity posture: `"off"`, `"warn"`, or `"deny"` |
 | `velocityRepeatCount` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required (2–64) |
 | `velocityRepeatWindowS` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60` | Repeat detection window in seconds |
 | `velocityGrowthStreak` | `SOLWYN_VELOCITY_GROWTH_STREAK` | `8` | Successive calls whose estimated input sizes must strictly increase (3–64) |
 | `velocityGrowthFactor` | `SOLWYN_VELOCITY_GROWTH_FACTOR` | `3` | Latest/first estimated-input ratio |
-| `velocityAccelFloorPerMin` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-minute call count |
+| `velocityAccelFloorPerMin` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-minute call count (1–64) |
 | `velocityAccelFactor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3` | Current/prior-minute call-count ratio |
 
 Env fallback is a **presence check**: an env var is consulted only when the corresponding option is `undefined`. An explicitly-passed `false`, `0`, or `""` always wins over the env var. Client objects, request defaults, routing policies, injected transports, and failover-only knobs remain code-only. Unknown option keys and a present non-function `fetch` fail synchronously with `ConfigurationError`.
 
-Both failover timeout values must be finite, non-boolean numbers;
-`failoverHopReadTimeout` must also be positive. A zero `failoverTotalTimeout` is valid and prevents
-new work from starting after call entry. JavaScript provider SDKs expose a single per-request
+An injected `logger` must provide all four `debug`, `info`, `warn`, and `error` methods;
+`selectionPolicy` must provide `order()`. Partial objects are rejected synchronously.
+
+Numeric settings reject booleans and empty strings. Breaker thresholds and reporter counts must
+be positive integers; `sameProviderRetries` permits zero. Timeout, cache, recovery, flush,
+backoff, and shutdown durations must be finite and no greater than `2147483.647` seconds, so
+their millisecond delays fit the runtime timer range. Cache TTLs and provider-breaker recovery
+waits remain integer seconds. `budgetCheckTimeout` must be at least `0.05` seconds;
+`failoverHopReadTimeout`, flush/backoff intervals, and heartbeats must be positive; cache TTLs,
+recovery waits, and shutdown deadlines permit zero. Direct `BudgetEnforcer` options apply the
+same duration limit to `cacheTtl` and per-call `timeout`, with zero allowed only for `cacheTtl`
+and a minimum of `0.05` seconds for `timeout`.
+
+Velocity repeat windows must be positive, and growth and acceleration factors must exceed
+one. These three velocity options also accept positive infinity to disable the corresponding
+bound. The acceleration floor must be an integer from 1 through 64.
+
+`failoverTotalTimeout` must be non-negative. A zero value prevents new work from starting after
+call entry. JavaScript provider SDKs expose a single per-request
 timeout carrier rather than separate connect and read phases, and what it covers differs by SDK.
 For the OpenAI, OpenAI-compatible, and Anthropic SDKs, `failoverHopReadTimeout` covers only
 connecting and receiving response headers: a response body or stream that stalls after its first
@@ -1063,7 +1240,7 @@ the metadata-event fields; it is not the complete control-plane wire inventory:
 | `model` | Model name (e.g. `gpt-4o`) |
 | `provider` | Provider identifier (`openai`, `anthropic`, `google`, `bedrock`, `groq`, …) |
 | `input_tokens` / `output_tokens` | Token counts |
-| `token_details` | Breakdown: cached, reasoning, audio, and image input/output tokens; `is_estimated` flags length-based estimates |
+| `token_details` | Breakdown: cached, reasoning, audio, and image input/output tokens; `is_estimated` flags estimates and corrected inconsistent cache totals |
 | `media_usage` | Observable media quantities and selectors (counts, characters, seconds, resolution, quality), with estimates explicitly flagged |
 | `modality` | `text`, `embedding`, `image`, `audio`, or `video` |
 | `latency_ms` | Call duration in milliseconds |
@@ -1118,7 +1295,12 @@ cardinality rather than silently counting the aggregate as one event.
 pnpm check   # biome lint + format check, tsc --noEmit
 pnpm test    # unit tests (vitest, fully offline, mocked fetch)
 pnpm build   # dual ESM + CJS + .d.ts
+pnpm test:live # opt-in local control-plane checks with fake providers; build first
 ```
+
+The [verification guide](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/scripts/verification/README.md) documents package/runtime checks and
+the live harness. Live checks require a disposable control plane and explicit credentials;
+they skip when the required URL or key is unset and remain separate from `pnpm test`.
 
 See the public [contributor guide](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/CONTRIBUTING.md)
 for the full workflow and public-content policy. Report vulnerabilities through the

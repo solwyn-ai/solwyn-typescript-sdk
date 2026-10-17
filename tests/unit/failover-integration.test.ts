@@ -109,7 +109,9 @@ function makeCapture(directives: readonly (boolean | null | "unreachable")[] = [
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       events.push(...(raw as Array<Record<string, unknown>>));
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), checks, confirms, events };
 }
@@ -133,6 +135,85 @@ function compatClient(
 function statusError(message: string, status: number): Error {
   return Object.assign(new Error(message), { status });
 }
+
+describe("per-call idempotency limits", () => {
+  it.each([true, false])("preserves never when a call supplies %s", async (solwynIdempotent) => {
+    const primary = openaiClient(() => {
+      throw statusError("busy", 429);
+    });
+    const fallback = compatClient("https://api.deepseek.com/v1", () => ({
+      usage: { prompt_tokens: 2, completion_tokens: 1 },
+    }));
+    const { fetchMock } = makeCapture();
+    const solwyn = new Solwyn(primary, {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      failoverIdempotency: "never",
+      fallback: [[fallback, "deepseek-chat"]],
+    });
+    try {
+      await expect(
+        solwyn.chat.completions.create({ model: "gpt-4o", solwynIdempotent }),
+      ).rejects.toThrow("busy");
+      expect(fallback.chat.completions.create).not.toHaveBeenCalled();
+      expect(primary.chat.completions.create.mock.calls[0]?.[0]).not.toHaveProperty(
+        "solwynIdempotent",
+      );
+    } finally {
+      await solwyn.close();
+    }
+  });
+
+  it("strips the option from chat, Responses, and media without mutating caller params", async () => {
+    const create = vi.fn(async (_params: Record<string, unknown>) => ({
+      usage: { prompt_tokens: 2, completion_tokens: 1, input_tokens: 2, output_tokens: 1 },
+    }));
+    const raw = {
+      chat: { completions: { create } },
+      responses: { create },
+      embeddings: { create },
+    };
+    const { fetchMock } = makeCapture();
+    const solwyn = new Solwyn(raw, { apiKey: API_KEY, fetch: fetchMock });
+    const params = { model: "gpt-4o", solwynIdempotent: false };
+    try {
+      await solwyn.chat.completions.create(params);
+      await solwyn.responses.create(params);
+      await solwyn.embeddings.create({ ...params, model: "text-embedding-3-small", input: [] });
+      expect(create).toHaveBeenCalledTimes(3);
+      for (const [sent] of create.mock.calls) expect(sent).not.toHaveProperty("solwynIdempotent");
+      expect(params.solwynIdempotent).toBe(false);
+    } finally {
+      await solwyn.close();
+    }
+  });
+
+  it("strips the option from native Bedrock command input without mutating the command", async () => {
+    class ConverseCommand {
+      constructor(readonly input: Record<string, unknown>) {}
+    }
+    const send = vi.fn(async (_command: ConverseCommand) => ({
+      usage: { inputTokens: 2, outputTokens: 1 },
+    }));
+    class BedrockRuntimeClient {
+      readonly send = send;
+    }
+    const raw = new BedrockRuntimeClient();
+    const { fetchMock } = makeCapture();
+    const solwyn = new Solwyn(raw, { apiKey: API_KEY, fetch: fetchMock });
+    const command = new ConverseCommand({
+      modelId: "anthropic.claude-3-5-sonnet",
+      solwynIdempotent: false,
+    });
+    try {
+      await solwyn.send(command);
+      expect(send.mock.calls[0]?.[0].input).not.toHaveProperty("solwynIdempotent");
+      expect(command.input).toHaveProperty("solwynIdempotent", false);
+    } finally {
+      await solwyn.close();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Package-root export surface for the routing subsystem.
@@ -251,7 +332,8 @@ describe("failover — tuning entitlement directives", () => {
       expect(
         warn.mock.calls.filter(
           ([message]) =>
-            message === "Custom failover tuning is unavailable for this plan; SDK defaults applied",
+            message ===
+            "Custom failover tuning is unavailable for this plan; SDK defaults applied while preserving stricter idempotency, retry, and total-timeout limits",
         ),
       ).toHaveLength(1);
     } finally {
@@ -261,7 +343,7 @@ describe("failover — tuning entitlement directives", () => {
     }
   });
 
-  it("suppression uses safe/no-retry defaults and restoration re-enables never/one-retry", async () => {
+  it("suppression preserves never with no retries and restoration re-enables one retry", async () => {
     let primaryCalls = 0;
     const retryable = () =>
       Object.assign(new Error("rate limited"), {
@@ -285,22 +367,39 @@ describe("failover — tuning entitlement directives", () => {
       failoverHopReadTimeout: 42,
     });
 
-    await solwyn.chat.completions.create({ model: "first", messages: [] });
+    await expect(solwyn.chat.completions.create({ model: "first", messages: [] })).rejects.toThrow(
+      "rate limited",
+    );
     await expect(solwyn.chat.completions.create({ model: "second", messages: [] })).rejects.toThrow(
       "rate limited",
     );
     await solwyn.close();
 
     expect(primaryCalls).toBe(3);
-    expect(fallback.chat.completions.create).toHaveBeenCalledTimes(1);
+    expect(fallback.chat.completions.create).not.toHaveBeenCalled();
     expect(
       primary.chat.completions.create.mock.calls.map(
         (call) => (call[1] as Record<string, unknown>)["timeout"],
       ),
     ).toEqual([600_000, 42_000, 42_000]);
-    expect(
-      (fallback.chat.completions.create.mock.calls[0]?.[1] as Record<string, unknown>)["timeout"],
-    ).toBe(600_000);
+  });
+
+  it("suppression preserves a zero total window and never dispatches", async () => {
+    const primary = openaiClient(() => ({ usage: { prompt_tokens: 2, completion_tokens: 1 } }));
+    const { fetchMock } = makeCapture([false]);
+    const solwyn = new Solwyn(primary, {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      failoverTotalTimeout: 0,
+    });
+    try {
+      await expect(solwyn.chat.completions.create({ model: "gpt-4o" })).rejects.toMatchObject({
+        name: "ProviderUnavailableError",
+      });
+      expect(primary.chat.completions.create).not.toHaveBeenCalled();
+    } finally {
+      await solwyn.close();
+    }
   });
 
   it("snapshots current tuning and replaces the deadline for live null, fail-open, and cache results", async () => {
@@ -378,7 +477,7 @@ describe("failover — tuning entitlement directives", () => {
         },
         {
           totalTimeout: 30,
-          idempotency: "safe",
+          idempotency: "never",
           sameProviderRetries: 0,
           hopReadTimeout: 600,
         },

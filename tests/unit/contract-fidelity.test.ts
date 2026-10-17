@@ -23,6 +23,7 @@ import {
   CircuitStateSchema,
   FailoverDirectiveSchema,
   FailoverReasonSchema,
+  IngestDuplicateSchema,
   IngestRejectionCodeSchema,
   IngestRejectionSchema,
   IngestResponseSchema,
@@ -107,6 +108,7 @@ const wireSchemas = [
   { name: "MediaUsage", schema: MediaUsageSchema },
   { name: "IngestResponse", schema: IngestResponseSchema },
   { name: "IngestRejection", schema: IngestRejectionSchema },
+  { name: "IngestDuplicate", schema: IngestDuplicateSchema },
   { name: "RateLimitErrorResponse", schema: RateLimitErrorResponseSchema },
   { name: "UntrackedSurfaceReport", schema: UntrackedSurfaceReportObjectSchema },
   { name: "UntrackedSurfaceAccepted", schema: UntrackedSurfaceAcceptedSchema },
@@ -118,7 +120,13 @@ describe("field-set parity with the OpenAPI snapshot", () => {
   for (const { name, schema } of wireSchemas) {
     it(`${name}: property key set matches the spec`, () => {
       const zodKeys = Object.keys(schema.shape).sort();
-      const specKeys = Object.keys(specSchema(name).properties ?? {}).sort();
+      // Check tallies remain renewal-only until per-call reconciliation is supported.
+      const specKeys = Object.keys(specSchema(name).properties ?? {})
+        .filter(
+          (key) =>
+            name !== "BudgetCheckRequest" || !["uncounted_calls", "uncounted_tokens"].includes(key),
+        )
+        .sort();
       expect(zodKeys).toEqual(specKeys);
     });
 
@@ -128,6 +136,9 @@ describe("field-set parity with the OpenAPI snapshot", () => {
         .map(([key]) => key)
         .sort();
       const specRequired = [...(specSchema(name).required ?? [])].sort();
+      // The API always emits duplicates, despite its defaulted OpenAPI declaration.
+      if (name === "IngestResponse") specRequired.push("duplicates");
+      specRequired.sort();
       expect(zodRequired).toEqual(specRequired);
     });
   }

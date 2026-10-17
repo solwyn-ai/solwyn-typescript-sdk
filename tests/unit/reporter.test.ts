@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CircuitBreaker } from "../../src/circuit-breaker";
 import type { Logger } from "../../src/logging";
 import { MetadataReporter } from "../../src/reporter";
@@ -6,6 +6,7 @@ import { createTokenDetails, zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.ai";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -63,7 +64,7 @@ function makeFetch(records: FetchRecord[], responder: Responder): FetchLike {
 }
 
 function ingest202(rejected: unknown[] = [], ingested = 0): Response {
-  return new Response(JSON.stringify({ ingested, rejected }), { status: 202 });
+  return new Response(JSON.stringify({ ingested, rejected, duplicates: [] }), { status: 202 });
 }
 
 interface CapturedLogger {
@@ -198,6 +199,7 @@ describe("MetadataReporter — throwing diagnostic containment", () => {
   });
 
   it("throwing reporter diagnostic: unparseable warning does not stop a later batch", async () => {
+    allowIngestContractDrift();
     const records: FetchRecord[] = [];
     let attempt = 0;
     const reporter = new MetadataReporter(API_URL, API_KEY, {
@@ -214,6 +216,7 @@ describe("MetadataReporter — throwing diagnostic containment", () => {
   });
 
   it("throwing reporter diagnostic: persistent parse error cannot reject final close", async () => {
+    allowIngestContractDrift();
     const records: FetchRecord[] = [];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       batchSize: 1,
@@ -342,6 +345,7 @@ describe("MetadataReporter — consecutive-failure counters", () => {
   });
 
   it("unparseable-response counter escalates at 10 then resets on a parseable response", () => {
+    allowIngestContractDrift();
     const { reporter, log } = healthyReporter([]);
     for (let i = 0; i < 9; i++) {
       reporter._recordUnparseableResponse(new TypeError("nope"));
@@ -431,6 +435,7 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
   });
 
   it("logs an unrecognized/future rejection code without crashing", async () => {
+    allowIngestContractDrift();
     const log = capturingLogger();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger: log.logger,
@@ -439,7 +444,8 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
       ),
     });
     await expect(reporter._sendBatch([makeEvent()])).resolves.toMatchObject({ outcome: "sent" });
-    expect(log.warn[0]).toContain("code=some_future_code");
+    expect(log.warn.some((line) => line.includes("code=some_future_code"))).toBe(true);
+    expect(log.warn).toContain("reporter.ingest_response_unparseable: exc_type=ZodError");
   });
 
   it("escapes raw control bytes in echoed values (raw byte never in the log line)", async () => {
@@ -465,6 +471,7 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
 // ---------------------------------------------------------------------------
 
 describe("MetadataReporter — malformed 202 bodies fail open", () => {
+  beforeEach(allowIngestContractDrift);
   const cases: Array<[string, string]> = [
     ["missing 'rejected' key", JSON.stringify({ ingested: 1 })],
     ["'rejected' is null", JSON.stringify({ ingested: 1, rejected: null })],
@@ -496,7 +503,7 @@ describe("MetadataReporter — malformed 202 bodies fail open", () => {
     expect(log.warn[0]).toContain("reporter.ingest_response_unparseable: exc_type=");
   });
 
-  it("a 'rejected' array longer than the submitted batch fails open (contract violation)", async () => {
+  it("an oversized rejection array fails open while logging available rejections", async () => {
     const rejected = [
       { index: 0, code: "unknown_model", model: "m", message: "a" },
       { index: 1, code: "unknown_model", model: "m", message: "b" },
@@ -507,9 +514,15 @@ describe("MetadataReporter — malformed 202 bodies fail open", () => {
       fetch: makeFetch([], () => ingest202(rejected)),
     });
     // Only ONE event submitted, but TWO rejections echoed back.
-    await reporter._sendBatch([makeEvent()]);
-    expect(log.warn).toHaveLength(1);
+    await expect(reporter._sendBatch([makeEvent()])).resolves.toEqual({
+      outcome: "sent",
+      rejections: { kind: "malformed", indexes: [], count: 0 },
+    });
+    expect(log.warn).toHaveLength(2);
     expect(log.warn[0]).toContain("reporter.ingest_response_unparseable");
+    expect(log.warn[1]).toContain(
+      "reporter.ingest_events_rejected: code=unknown_model model=m count=2",
+    );
   });
 
   it("consecutive unparseable 202 bodies escalate to ERROR at the 10th", async () => {
@@ -1290,7 +1303,7 @@ describe("MetadataReporter — confirm sending", () => {
     expect(JSON.parse(ingestCalls[1]?.body ?? "null")).toHaveLength(2);
   });
 
-  it("preserves maxInFlight while strict FIFO dispatch remains serial", async () => {
+  it("keeps ingest batches serial while confirmation concurrency is configured", async () => {
     let active = 0;
     let maxActive = 0;
     let requestCount = 0;

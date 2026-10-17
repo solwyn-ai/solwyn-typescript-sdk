@@ -423,6 +423,34 @@ describe("StreamWrapper — close / early abandonment", () => {
     expect((onComplete.mock.calls[0] as [TokenDetails, number])[0].input_tokens).toBe(2);
   });
 
+  it("consumer throw settles observed usage and forwards the throw without a provider error", async () => {
+    const error = new Error("consumer stopped");
+    const details = createTokenDetails({ input_tokens: 11, output_tokens: 3 });
+    const source = {
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      next: vi.fn(async () => ({ done: false as const, value: { usage: 1 } })),
+      throw: vi.fn(async (value: unknown) => {
+        throw value;
+      }),
+      return: vi.fn(async () => ({ done: true as const, value: undefined })),
+    };
+    const onComplete = vi.fn();
+    const onError = vi.fn();
+    const wrapper = wrapStream(
+      baseOptions({ stream: source, accumulator: fakeAccumulator(details), onComplete, onError }),
+    );
+    await wrapper.next();
+    await expect(wrapper.throw(error)).rejects.toBe(error);
+    await wrapper.close();
+    expect(onComplete.mock.calls[0]?.[0]).toEqual(details);
+    expect(onComplete).toHaveBeenCalledOnce();
+    expect(onError).not.toHaveBeenCalled();
+    expect(source.throw).toHaveBeenCalledExactlyOnceWith(error);
+    expect(source.return).toHaveBeenCalledOnce();
+  });
+
   it("close() forwards to the inner stream's aclose() (preferred over close())", async () => {
     const aclose = vi.fn();
     const close = vi.fn();
@@ -504,6 +532,29 @@ describe("StreamWrapper — close / early abandonment", () => {
 // ---------------------------------------------------------------------------
 
 describe("StreamWrapper — cooperative abort", () => {
+  it("observes a usage-bearing item before a latched stop discards delivery", async () => {
+    const details = createTokenDetails({ input_tokens: 19, output_tokens: 8 });
+    let observed = false;
+    const onComplete = vi.fn();
+    const stop = new Error("stopped");
+    const wrapper = wrapStream(
+      baseOptions({
+        stream: fromArray([{ usage: { prompt_tokens: 19, completion_tokens: 8 } }]),
+        accumulator: {
+          observe() {
+            observed = true;
+          },
+          finalize: () => (observed ? details : zeroTokenDetails()),
+          getServiceTier: () => null,
+        },
+        abortCheck: () => stop,
+        onComplete,
+      }),
+    );
+    await expect(wrapper.next()).rejects.toBe(stop);
+    expect(onComplete.mock.calls[0]?.[0]).toEqual(details);
+  });
+
   it("pulls and discards the third raw item, settles prior usage as success, closes, and latches the stop", async () => {
     const chunks = [{ raw: 1 }, { raw: 2 }, { raw: 3 }, { raw: 4 }];
     let pulled = 0;
@@ -537,7 +588,7 @@ describe("StreamWrapper — cooperative abort", () => {
     await expect(wrapper.next()).rejects.toBe(stop);
 
     expect(pulled).toBe(3);
-    expect(accumulator.observed).toEqual(chunks.slice(0, 2));
+    expect(accumulator.observed).toEqual(chunks.slice(0, 3));
     expect(onComplete).toHaveBeenCalledTimes(1);
     expect((onComplete.mock.calls[0] as [TokenDetails, number])[0]).toBe(partialDetails);
     expect(onError).not.toHaveBeenCalled();
@@ -560,7 +611,7 @@ describe("StreamWrapper — cooperative abort", () => {
     stopped = false;
     await expect(wrapper.next()).rejects.toBe(stop);
 
-    expect(accumulator.observed).toEqual([]);
+    expect(accumulator.observed).toEqual([first]);
     expect(onComplete).toHaveBeenCalledTimes(1);
     const settled = (onComplete.mock.calls[0] as [TokenDetails, number])[0];
     expect(settled.input_tokens).toBe(0);
@@ -826,7 +877,7 @@ describe("StreamWrapper — explicit iterator lifecycle", () => {
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
 
-  it("wrapper-owned throw settles an injected iterator error instead of delegating past lifecycle", async () => {
+  it("wrapper-owned throw settles observed usage before delegating consumer termination", async () => {
     const providerCleanup = vi.fn();
     const provider = (async function* () {
       try {
@@ -849,8 +900,8 @@ describe("StreamWrapper — explicit iterator lifecycle", () => {
     await expect(wrapper.throw?.(injected)).rejects.toBe(injected);
     await wrapper.close();
 
-    expect(onError.mock.calls).toEqual([[injected]]);
-    expect(onComplete).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+    expect(onComplete).toHaveBeenCalledOnce();
     expect(providerCleanup).toHaveBeenCalledTimes(1);
     expect(abortRelease).toHaveBeenCalledTimes(1);
   });

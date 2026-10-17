@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, LeaseGrantResponse, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { installIngestContractGuard } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -102,6 +103,7 @@ describe("node beforeExit reporter drain", () => {
     }) as typeof process.once);
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const order: string[] = [];
     const ingestBodies: MetadataEvent[][] = [];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
@@ -117,7 +119,13 @@ describe("node beforeExit reporter drain", () => {
         ingestBodies.push(body);
         order.push("ingest");
         return new Response(
-          JSON.stringify({ ingested: body.length - 1, rejected: [{ index: 1 }] }),
+          JSON.stringify({
+            ingested: body.length - 1,
+            rejected: [
+              { index: 1, code: "unknown_model", model: "synthetic", message: "Unknown model" },
+            ],
+            duplicates: [],
+          }),
           { status: 202 },
         );
       },
@@ -162,6 +170,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const firstGate = deferred<Response>();
     const secondGate = deferred<Response>();
     const firstFetch = vi.fn(() => firstGate.promise);
@@ -184,7 +193,9 @@ describe("node beforeExit reporter drain", () => {
     expect(firstFetch).toHaveBeenCalledTimes(1);
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect(globalFetch).not.toHaveBeenCalled();
-    firstGate.resolve(new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }));
+    firstGate.resolve(
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
+    );
     secondGate.resolve(new Response(null, { status: 204 }));
     await draining;
     expect(first.isShutdown).toBe(true);
@@ -205,6 +216,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
 
     const firstGate = deferred<Response>();
     const firstFetch = vi.fn(() => firstGate.promise);
@@ -225,7 +237,9 @@ describe("node beforeExit reporter drain", () => {
     expect(beforeExitListeners).toHaveLength(2);
     expect(secondFetch).not.toHaveBeenCalled();
 
-    firstGate.resolve(new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }));
+    firstGate.resolve(
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
+    );
     await firstDrain;
     expect(first.isShutdown).toBe(true);
     expect(second.isShutdown).toBe(false);
@@ -255,6 +269,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const { BudgetEnforcer } = await import("../../src/budget");
     const order: string[] = [];
     const reporterGate = deferred<Response>();
@@ -296,7 +311,7 @@ describe("node beforeExit reporter drain", () => {
     expect(surrenderFetch).toHaveBeenCalledTimes(1);
 
     reporterGate.resolve(
-      new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }),
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
     );
     await flushUntil(() => order.includes("lease"));
     await draining;
@@ -346,6 +361,7 @@ describe("node beforeExit reporter drain", () => {
     }) as typeof process.once);
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const reporterGate = deferred<Response>();
     const reporterFetch = vi.fn(() => reporterGate.promise);
     const reporter = new MetadataReporter(API_URL, API_KEY, { fetch: reporterFetch });
@@ -359,7 +375,7 @@ describe("node beforeExit reporter drain", () => {
     expect(beforeExitListeners).toHaveLength(2);
 
     reporterGate.resolve(
-      new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 }),
+      new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), { status: 202 }),
     );
     await firstDrain;
     expect(holderClose).not.toHaveBeenCalled();

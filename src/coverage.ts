@@ -1,4 +1,4 @@
-import { CoverageMismatchError } from "./errors";
+import { ConfigurationError, CoverageMismatchError } from "./errors";
 import {
   MAX_SURFACE_INSPECTION_DEPTH,
   observePublicSurface,
@@ -128,7 +128,12 @@ interface CoverageRegistration {
   readonly refresh: (() => CoverageSource) | null;
 }
 
-const coverageSources = new WeakMap<object, CoverageRegistration>();
+const COVERAGE_SOURCES_KEY = Symbol.for("@solwyn/sdk.coverageSources.v1");
+const sharedCoverage = globalThis as typeof globalThis & {
+  [COVERAGE_SOURCES_KEY]?: WeakMap<object, CoverageRegistration>;
+};
+sharedCoverage[COVERAGE_SOURCES_KEY] ??= new WeakMap<object, CoverageRegistration>();
+const coverageSources = sharedCoverage[COVERAGE_SOURCES_KEY];
 const PROVIDER_LABEL_PATTERN = /^[a-z][a-z0-9_]{0,127}$/;
 const ROUTED_CHAT_SURFACES = new Set([
   "chat.completions.create",
@@ -1025,7 +1030,9 @@ export class CoverageReport {
 export function coverage(client: object): CoverageReport {
   const registration = isObjectLike(client) ? coverageSources.get(client) : undefined;
   if (registration === undefined) {
-    throw new TypeError("coverage requires a registered Solwyn wrapper");
+    throw new ConfigurationError("coverage requires a registered Solwyn wrapper", {
+      field: "client",
+    });
   }
   const source =
     registration.refresh === null

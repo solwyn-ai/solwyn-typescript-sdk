@@ -105,7 +105,7 @@ describe("Transport — URL + headers + body", () => {
     const transport = new Transport("https://api.solwyn.ai", API_KEY, {
       fetch: recordingFetch(
         [],
-        () => new Response('{"ingested":1,"rejected":[]}', { status: 202 }),
+        () => new Response('{"ingested":1,"rejected":[],"duplicates":[]}', { status: 202 }),
       ),
     });
     await expect(
@@ -124,6 +124,74 @@ describe("Transport — URL + headers + body", () => {
 });
 
 describe("Transport — non-2xx surfacing (D10 generic handling)", () => {
+  it.each([
+    "missing",
+    "throwing headers",
+    "throwing get",
+  ])("preserves HTTP failures and discards the body with %s from a custom fetch", async (shape) => {
+    const response = new Response("synthetic failure", { status: 503 });
+    Object.defineProperty(
+      response,
+      "headers",
+      shape === "missing"
+        ? { value: undefined }
+        : shape === "throwing headers"
+          ? {
+              get() {
+                throw new TypeError("unavailable headers");
+              },
+            }
+          : {
+              value: {
+                get() {
+                  throw new TypeError("unavailable header");
+                },
+              },
+            },
+    );
+    const transport = new Transport("https://api.solwyn.test", API_KEY, {
+      fetch: async () => response,
+    });
+
+    const error = await transport
+      .postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 })
+      .catch((error: unknown) => error);
+
+    expect(error).toBeInstanceOf(TransportHttpError);
+    expect(error).toMatchObject({ status: 503, retryAfterMs: undefined });
+    expect(response.bodyUsed).toBe(true);
+  });
+
+  it.each([
+    ["60", 60_000],
+    ["Thu, 01 Jan 2026 00:01:00 GMT", 60_000],
+    ["Wed, 31 Dec 2025 23:59:00 GMT", 0],
+    ["999999999999999999999", 3_600_000],
+    ["-1", undefined],
+    ["1.5", undefined],
+    ["invalid", undefined],
+    [null, undefined],
+  ])("preserves bounded Retry-After timing for %s", async (header, expected) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      const transport = new Transport("https://api.solwyn.test", API_KEY, {
+        fetch: async () =>
+          new Response(null, {
+            status: 429,
+            headers: header === null ? {} : { "Retry-After": header },
+          }),
+      });
+      const error = await transport
+        .postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 })
+        .catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(TransportHttpError);
+      expect((error as TransportHttpError).retryAfterMs).toBe(expected);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     400, 403, 404, 422, 429, 500, 503,
   ])("throws a privacy-safe TransportHttpError for status %i", async (status) => {

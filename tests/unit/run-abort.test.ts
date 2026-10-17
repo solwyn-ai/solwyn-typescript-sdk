@@ -25,19 +25,19 @@ const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 
-const PRE_STOP_TOKEN_DETAILS = {
-  input_tokens: 11,
-  output_tokens: 7,
-  cached_input_tokens: 3,
-  cache_creation_5m_tokens: 2,
+const LAST_OBSERVED_TOKEN_DETAILS = {
+  input_tokens: 999,
+  output_tokens: 999,
+  cached_input_tokens: 999,
+  cache_creation_5m_tokens: 0,
   cache_creation_1h_tokens: 0,
-  reasoning_tokens: 4,
-  audio_input_tokens: 1,
-  audio_output_tokens: 1,
+  reasoning_tokens: 999,
+  audio_input_tokens: 0,
+  audio_output_tokens: 0,
   image_input_tokens: 0,
   image_output_tokens: 0,
-  accepted_prediction_tokens: 2,
-  rejected_prediction_tokens: 1,
+  accepted_prediction_tokens: 0,
+  rejected_prediction_tokens: 0,
   tool_use_input_tokens: 0,
 } as const;
 
@@ -118,7 +118,7 @@ afterEach(() => {
 });
 
 describe("public run-abort acceptance", () => {
-  it("applies an independent directive after a served chunk and settles only pre-stop usage once", async () => {
+  it("applies an independent directive after a served chunk and settles the last pulled usage once", async () => {
     const breakerFailure = vi.spyOn(CircuitBreaker.prototype, "recordFailure");
     const checkBudgetCalls = vi.spyOn(BudgetEnforcer.prototype, "checkBudget");
     const publicChecks: BudgetCheckRequest[] = [];
@@ -138,7 +138,7 @@ describe("public run-abort acceptance", () => {
       if (path === "/api/v1/metadata/ingest") {
         const events = body as MetadataEvent[];
         ingestCalls.push(events);
-        return response({ ingested: events.length, rejected: [] }, 202);
+        return response({ ingested: events.length, rejected: [], duplicates: [] }, 202);
       }
       throw new Error(`unexpected public control-plane path ${path}`);
     };
@@ -315,7 +315,7 @@ describe("public run-abort acceptance", () => {
       model: "gpt-4o",
       is_provider_fallback: false,
     });
-    expect(confirms[0]?.token_details).toEqual(PRE_STOP_TOKEN_DETAILS);
+    expect(confirms[0]?.token_details).toEqual(LAST_OBSERVED_TOKEN_DETAILS);
     expect(ingestCalls).toHaveLength(1);
     expect(ingestCalls[0]).toHaveLength(1);
     const event = ingestCalls[0]?.[0];
@@ -323,12 +323,12 @@ describe("public run-abort acceptance", () => {
       status: "success",
       provider: "openai",
       model: "gpt-4o",
-      input_tokens: 11,
-      output_tokens: 7,
+      input_tokens: 999,
+      output_tokens: 999,
       agent_run_id: runId,
       agent_run_name: "task-11-public-stream",
     });
-    expect(event?.token_details).toEqual(PRE_STOP_TOKEN_DETAILS);
+    expect(event?.token_details).toEqual(LAST_OBSERVED_TOKEN_DETAILS);
     expect(confirms[0]?.call_id).toBe(checkBudgetCalls.mock.calls[0]?.[0].callId);
     expect(confirms[0]?.call_id).toBe(event?.call_id);
     expect(ingestCalls.flat().filter((item) => item.status === "error")).toEqual([]);
@@ -360,7 +360,7 @@ describe("public run-abort acceptance", () => {
       if (path === "/api/v1/metadata/ingest") {
         const events = body as MetadataEvent[];
         ingestCalls.push(events);
-        return response({ ingested: events.length, rejected: [] }, 202);
+        return response({ ingested: events.length, rejected: [], duplicates: [] }, 202);
       }
       throw new Error(`unexpected public control-plane path ${path}`);
     };

@@ -48,13 +48,14 @@ describe("FakeControlPlane metadata ingest", () => {
     });
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [first, second])).toEqual({
       status: 202,
-      body: { ingested: 2, rejected: [] },
+      body: { ingested: 2, rejected: [], duplicates: [] },
       headers: {},
     });
     expect(plane.ingested).toHaveLength(2);
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [first, second]).body).toEqual({
       ingested: 0,
       rejected: [],
+      duplicates: expect.any(Array),
     });
     expect(plane.ingested).toHaveLength(2);
   });
@@ -68,7 +69,10 @@ describe("FakeControlPlane metadata ingest", () => {
 
     const response = plane.handle("POST", "/api/v1/metadata/ingest", [event({ tags })]);
 
-    expect(response).toMatchObject({ status: 202, body: { ingested: 1, rejected: [] } });
+    expect(response).toMatchObject({
+      status: 202,
+      body: { ingested: 1, rejected: [], duplicates: [] },
+    });
     expect(plane.ingested).toHaveLength(1);
     const recordedTags = plane.ingested[0]?.tags;
     expect(recordedTags).toBeDefined();
@@ -87,6 +91,7 @@ describe("FakeControlPlane metadata ingest", () => {
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [legacyReplay]).body).toEqual({
       ingested: 0,
       rejected: [],
+      duplicates: expect.any(Array),
     });
 
     const fresh = event({
@@ -110,6 +115,7 @@ describe("FakeControlPlane metadata ingest", () => {
       {
         ingested: 2,
         rejected: [],
+        duplicates: [],
       },
     );
 
@@ -120,6 +126,7 @@ describe("FakeControlPlane metadata ingest", () => {
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [attemptZero, fresh]).body).toEqual({
       ingested: 1,
       rejected: [],
+      duplicates: expect.any(Array),
     });
 
     const offset = event({
@@ -138,6 +145,7 @@ describe("FakeControlPlane metadata ingest", () => {
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [sameInstant]).body).toEqual({
       ingested: 0,
       rejected: [],
+      duplicates: expect.any(Array),
     });
     expect(plane.ingested).toHaveLength(4);
   });
@@ -158,6 +166,7 @@ describe("FakeControlPlane metadata ingest", () => {
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [first, later]).body).toEqual({
       ingested: 2,
       rejected: [],
+      duplicates: [],
     });
     expect(plane.ingested).toHaveLength(2);
   });
@@ -171,6 +180,7 @@ describe("FakeControlPlane metadata ingest", () => {
     expect(plane.handle("POST", "/api/v1/metadata/ingest", [first]).body).toEqual({
       ingested: 0,
       rejected: [],
+      duplicates: expect.any(Array),
     });
     expect(plane.ingested).toEqual([]);
   });

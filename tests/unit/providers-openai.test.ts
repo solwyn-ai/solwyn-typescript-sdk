@@ -893,10 +893,11 @@ describe("OpenAIResponsesStreamAccumulator", () => {
       },
     });
     const details = acc.finalize();
-    expect(details.input_tokens).toBe(30);
+    expect(details.input_tokens).toBe(87);
     expect(details.output_tokens).toBe(9);
     expect(details.cached_input_tokens).toBe(12);
     expect(details.cache_creation_5m_tokens).toBe(75);
+    expect(details.is_estimated).toBe(true);
     expect(details.reasoning_tokens).toBe(4);
     expect(acc.getServiceTier()).toBe("default");
   });

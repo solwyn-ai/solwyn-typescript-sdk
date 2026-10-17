@@ -92,7 +92,11 @@ function setupLeasePlane() {
 describe("public testing contract helpers", () => {
   it("checks all five verdicts through the injected fetch with absolute authenticated JSON requests", async () => {
     const plane = setupCheckPlane({ priceHints: { "future-provider": 1.25 } });
-    const captured = captureFetch(plane.fetch);
+    const captured = captureFetch((input, init) => {
+      const url = new URL(input);
+      url.pathname = url.pathname.replace(/^\/base(?=\/)/, "");
+      return plane.fetch(url.toString(), init);
+    });
 
     await assertCheckContract(captured.fetch, {
       apiUrl: `${plane.apiUrl}/base/`,
@@ -101,7 +105,7 @@ describe("public testing contract helpers", () => {
 
     expect(captured.requests).toHaveLength(5);
     expect(captured.requests.map(({ url }) => url)).toEqual(
-      Array.from({ length: 5 }, () => `${plane.apiUrl}/api/v1/budgets/check`),
+      Array.from({ length: 5 }, () => `${plane.apiUrl}/base/api/v1/budgets/check`),
     );
     for (const request of captured.requests) {
       expect(request.init?.method).toBe("POST");
@@ -200,7 +204,7 @@ describe("public testing contract helpers", () => {
 
   it("validates opted-in, legacy, and unstopped run-control responses", async () => {
     const plane = new FakeControlPlane();
-    plane.stopRun("contract-stopped-by-caller", { reason: "operator_stop" });
+    plane.stopRun("contract-stopped-by-caller", { reason: "manual_kill" });
 
     await assertRunControlContract(plane.fetch, {
       apiUrl: plane.apiUrl,

@@ -27,11 +27,13 @@ import {
   createSolwynMiddleware,
   FALLBACK_PROVIDER_NAME,
   resolveProviderName,
+  usageToTokenDetails,
 } from "../../src/ai-sdk/index";
 import { BudgetEnforcer, budgetCheckResult } from "../../src/budget";
 import { BudgetExceededError, RunStoppedError } from "../../src/errors";
 import { currentRun, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
+import { clearRunTermination, markTerminated, resetRunControlForTest } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
 import type {
   BudgetCheckResponse,
@@ -43,6 +45,191 @@ const API_KEY = `sk_proj_${"a".repeat(64)}`;
 
 afterEach(() => {
   vi.restoreAllMocks();
+  resetRunControlForTest();
+});
+
+describe("middleware usage and run control", () => {
+  it.each([
+    ["vertex.anthropic.messages", undefined, "anthropic"],
+    ["lmstudio.chat", undefined, "lmstudio"],
+    ["vllm.chat", undefined, "vllm"],
+    ["openai-compatible.chat", undefined, "openai_compatible"],
+    ["openai.chat", undefined, "openai"],
+    ["openai-other.chat", undefined, "openai_compatible"],
+    ["gateway", "alibaba/qwen-synthetic", "qwen"],
+  ])("attributes %s (%s) to %s", (provider, model, expected) => {
+    expect(resolveProviderName(provider, model)).toBe(expected);
+  });
+
+  it("maps aggregate cache writes and bounds cache buckets by total input", () => {
+    const ctx = { provider: "anthropic" as const, estimatedInputTokens: 100, outputChars: 0 };
+    expect(
+      usageToTokenDetails(
+        { inputTokens: { total: 100, cacheRead: 20, cacheWrite: 30 }, outputTokens: { total: 10 } },
+        ctx,
+      ),
+    ).toMatchObject({
+      input_tokens: 100,
+      cached_input_tokens: 20,
+      cache_creation_5m_tokens: 30,
+      is_estimated: false,
+    });
+    const malformed = usageToTokenDetails(
+      { inputTokens: { total: 100, cacheWrite: "bad" }, outputTokens: { total: 10 } },
+      ctx,
+    );
+    expect(malformed).toMatchObject({ cache_creation_5m_tokens: 0, is_estimated: true });
+    const excessive = usageToTokenDetails(
+      { inputTokens: { total: 100, cacheRead: 80, cacheWrite: 50 }, outputTokens: { total: 10 } },
+      ctx,
+    );
+    expect(excessive.cached_input_tokens + excessive.cache_creation_5m_tokens).toBeLessThanOrEqual(
+      100,
+    );
+    expect(excessive.is_estimated).toBe(true);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("fills partial usage from measured lengths (streaming=%s)", async (streaming) => {
+    const { fetchMock, captured } = makeFetch(() => allow());
+    const handle = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      leaseEnabled: false,
+    });
+    const params = {
+      prompt: [{ role: "user", content: [{ type: "text", text: "x".repeat(400) }] }],
+    };
+    const model = { provider: "openai", modelId: "gpt-4o" };
+    const reported = { inputTokens: { total: undefined }, outputTokens: { total: 7 } };
+    if (streaming) {
+      const { stream } = await wrapStreamDirect(handle, {
+        model,
+        params,
+        doStream: async () => ({ stream: streamOf([{ type: "finish", usage: reported }]) }),
+      });
+      expect(await drain(stream)).toBeUndefined();
+    } else
+      await wrapGenerateDirect(handle, {
+        model,
+        params,
+        doGenerate: async () => ({ content: [], usage: reported }),
+      });
+    await handle.close();
+    expect(captured.events).toEqual([
+      expect.objectContaining({
+        input_tokens: 100,
+        output_tokens: 7,
+        token_details: expect.objectContaining({ is_estimated: true }),
+      }),
+    ]);
+    expect(
+      usageToTokenDetails(
+        { inputTokens: { total: 5 } },
+        {
+          provider: "openai",
+          estimatedInputTokens: 100,
+          outputChars: 40,
+        },
+      ),
+    ).toMatchObject({ input_tokens: 5, output_tokens: 10, is_estimated: true });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("blocks a concurrent stop after budget preflight (streaming=%s)", async (streaming) => {
+    const { fetchMock, captured } = makeFetch(() => {
+      const runId = currentRun()?.agentRunId;
+      if (!runId) throw new Error("missing current run");
+      markTerminated(runId, { reason: "synthetic-stop", source: "local_velocity" });
+      return allow();
+    });
+    const handle = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      leaseEnabled: false,
+    });
+    const dispatch = vi.fn();
+    await expect(
+      run("middleware-stop", () =>
+        streaming
+          ? wrapStreamDirect(handle, {
+              model: { provider: "openai", modelId: "gpt-4o" },
+              params: { prompt: [] },
+              doStream: async () => {
+                dispatch();
+                return { stream: streamOf([]) };
+              },
+            })
+          : wrapGenerateDirect(handle, {
+              model: { provider: "openai", modelId: "gpt-4o" },
+              params: { prompt: [] },
+              doGenerate: async () => {
+                dispatch();
+                return { content: [], usage: usage(1, 1) };
+              },
+            }),
+      ),
+    ).rejects.toBeInstanceOf(RunStoppedError);
+    await handle.close();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(captured.confirms).toEqual([]);
+    expect(captured.events).toEqual([expect.objectContaining({ status: "budget_denied" })]);
+  });
+
+  it("aborts at the next chunk and retains the stop across clear", async () => {
+    const { fetchMock, captured } = makeFetch(() => allow());
+    const handle = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      leaseEnabled: false,
+    });
+    const cancel = vi.fn();
+    let controller!: ReadableStreamDefaultController<unknown>;
+    let runId = "";
+    const result = await run("middleware-stream", () => {
+      runId = currentRun()?.agentRunId ?? "";
+      return wrapStreamDirect(handle, {
+        model: { provider: "openai", modelId: "gpt-4o" },
+        params: { prompt: [] },
+        doStream: async () => ({
+          stream: new ReadableStream({
+            start(current) {
+              controller = current;
+            },
+            cancel,
+          }),
+        }),
+      });
+    });
+    const reader = result.stream.getReader();
+    const next = reader.read();
+    markTerminated(runId, { reason: "synthetic-stop", source: "server" });
+    clearRunTermination(runId);
+    controller.enqueue({ type: "text-delta", delta: "synthetic" });
+    await expect(next).rejects.toMatchObject({
+      name: "RunStoppedError",
+      agentRunId: runId,
+      reason: "synthetic-stop",
+      source: "server",
+    });
+    await handle.close();
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(captured.confirms).toEqual([
+      expect.objectContaining({
+        token_details: expect.objectContaining({ output_tokens: 2, is_estimated: true }),
+      }),
+    ]);
+    expect(captured.events).toEqual([
+      expect.objectContaining({ status: "success", input_tokens: 0, output_tokens: 2 }),
+    ]);
+  });
 });
 
 describe("remediation: explicit AI run tags", () => {
@@ -250,6 +437,25 @@ describe("remediation: AI paid usage bookkeeping", () => {
 });
 
 describe("ai-sdk middleware options", () => {
+  it.each(["option", "env"])("rejects a sub-50ms budget timeout from %s", (source) => {
+    vi.stubEnv("SOLWYN_BUDGET_CHECK_TIMEOUT", "0.04");
+    const fetch = vi.fn();
+    try {
+      expect(() =>
+        createSolwynMiddleware({
+          apiKey: API_KEY,
+          fetch,
+          ...(source === "option" ? { budgetCheckTimeout: 0.04 } : {}),
+        }),
+      ).toThrow(
+        expect.objectContaining({ name: "ConfigurationError", field: "budgetCheckTimeout" }),
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("rejects unknown options while admitting control-plane configuration", async () => {
     expect(() =>
       createSolwynMiddleware({
@@ -261,7 +467,9 @@ describe("ai-sdk middleware options", () => {
     const handle = createSolwynMiddleware({
       apiKey: API_KEY,
       fetch: async () =>
-        new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 }),
+        new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+          status: 202,
+        }),
       budgetCheckTimeout: 0.25,
       controlPlaneFailureThreshold: 1,
       controlPlaneRecoveryTimeout: 30,
@@ -430,7 +638,9 @@ function makeFetch(budget: (call: number) => BudgetCheckResponse | "unreachable"
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       captured.events.push(...(raw as WireEvent[]));
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), captured };
 }
@@ -2125,7 +2335,7 @@ describe("ai-sdk middleware — lease activation identity", () => {
       if (path === "/api/v1/metadata/ingest") {
         events.push(...(body as WireEvent[]));
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           {
             status: 202,
           },

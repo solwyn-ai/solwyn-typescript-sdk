@@ -187,7 +187,11 @@ const PositiveIntegerFromNumberOrStringSchema = z.preprocess(
 );
 
 function numberFromNumberOrStringSchema(schema: z.ZodNumber) {
-  return z.preprocess((value) => (typeof value === "string" ? Number(value) : value), schema);
+  return z.preprocess(
+    (value) =>
+      typeof value === "string" ? (value.trim().length === 0 ? Number.NaN : Number(value)) : value,
+    schema,
+  );
 }
 
 /** Pydantic float coercion accepts positive infinity; keep that parity velocity-local. */
@@ -218,19 +222,23 @@ function velocityFloatFromNumberOrStringSchema(schema: z.ZodNumber) {
 }
 
 const TIMEOUT_BOOLEAN_MESSAGE = "timeout bounds must be numbers, not booleans";
+const MAX_TIMER_SECONDS = 2_147_483_647 / 1000;
+
+function durationSchema(positive: boolean, integer = false) {
+  let schema = z.number().finite().max(MAX_TIMER_SECONDS);
+  schema = positive ? schema.positive() : schema.nonnegative();
+  return numberFromNumberOrStringSchema(integer ? schema.int() : schema);
+}
 
 /** Timeout bounds accept numeric env-style strings but reject booleans before coercion. */
 function timeoutBoundSchema(positive: boolean) {
-  return z.preprocess(
-    (value, context) => {
-      if (typeof value === "boolean") {
-        context.addIssue({ code: "custom", message: TIMEOUT_BOOLEAN_MESSAGE });
-        return z.NEVER;
-      }
-      return typeof value === "string" ? Number(value) : value;
-    },
-    positive ? z.number().finite().positive() : z.number().finite(),
-  );
+  return z.preprocess((value, context) => {
+    if (typeof value === "boolean") {
+      context.addIssue({ code: "custom", message: TIMEOUT_BOOLEAN_MESSAGE });
+      return z.NEVER;
+    }
+    return typeof value === "string" && value.trim().length === 0 ? Number.NaN : value;
+  }, durationSchema(positive));
 }
 
 /** Exact eight-field snapshot governed by failover-tuning entitlement. */
@@ -264,9 +272,9 @@ export const FAILOVER_TUNING_DEFAULTS: FailoverTuningConfig = Object.freeze({
 /**
  * Strict `SolwynConfig` schema with every field's exact default from the spec.
  *
- * Numeric fields use `z.coerce.number()` so env-sourced raw strings (e.g. `"5"`)
- * coerce to numbers at the schema layer, while real numeric options pass through
- * unchanged. `api_key` is a plain string here — its FORMAT is validated separately
+ * Numeric fields accept env-sourced raw strings (e.g. `"5"`) while rejecting booleans,
+ * empty strings, and unsafe values. Real numeric options pass through unchanged.
+ * `api_key` is a plain string here — its FORMAT is validated separately
  * (via {@link validateProjectKeyFormat}) so a bad key surfaces as `field="api_key"`
  * rather than a generic string issue. The non-empty `providers` invariant is NOT
  * enforced here (the field defaults to `[]` and validates "after construction" — see
@@ -289,30 +297,29 @@ export const SolwynConfigSchema = z.strictObject({
   failover_idempotency: FailoverIdempotencySchema.default(
     FAILOVER_TUNING_DEFAULTS.failover_idempotency,
   ),
-  same_provider_retries: z.coerce
-    .number()
-    .int()
-    .nonnegative()
-    .default(FAILOVER_TUNING_DEFAULTS.same_provider_retries),
-  circuit_breaker_recovery_timeout_jitter: z.coerce
-    .number()
-    .default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_recovery_timeout_jitter),
-  circuit_breaker_failure_threshold: z.coerce
-    .number()
-    .int()
-    .default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_failure_threshold),
-  circuit_breaker_recovery_timeout: z.coerce
-    .number()
-    .int()
-    .default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_recovery_timeout),
-  circuit_breaker_success_threshold: z.coerce
-    .number()
-    .int()
-    .default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_success_threshold),
-  budget_check_cache_ttl: z.coerce.number().int().default(5),
-  budget_check_timeout: z.coerce.number().default(BUDGET_CHECK_TIMEOUT),
-  control_plane_failure_threshold: z.coerce.number().int().default(3),
-  control_plane_recovery_timeout: z.coerce.number().default(30.0),
+  same_provider_retries: numberFromNumberOrStringSchema(
+    z.number().finite().int().nonnegative(),
+  ).default(FAILOVER_TUNING_DEFAULTS.same_provider_retries),
+  circuit_breaker_recovery_timeout_jitter: numberFromNumberOrStringSchema(
+    z.number().finite().min(0).max(1),
+  ).default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_recovery_timeout_jitter),
+  circuit_breaker_failure_threshold: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_failure_threshold),
+  circuit_breaker_recovery_timeout: durationSchema(false, true).default(
+    FAILOVER_TUNING_DEFAULTS.circuit_breaker_recovery_timeout,
+  ),
+  circuit_breaker_success_threshold: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(FAILOVER_TUNING_DEFAULTS.circuit_breaker_success_threshold),
+  budget_check_cache_ttl: durationSchema(false, true).default(5),
+  budget_check_timeout: numberFromNumberOrStringSchema(
+    z.number().finite().min(0.05).max(MAX_TIMER_SECONDS),
+  ).default(BUDGET_CHECK_TIMEOUT),
+  control_plane_failure_threshold: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(3),
+  control_plane_recovery_timeout: durationSchema(false).default(30.0),
   breaker_reporting_enabled: z.boolean().default(true),
   lease_enabled: z.boolean().default(true),
   lease_output_bound_default: PositiveIntegerFromNumberOrStringSchema.default(DEFAULT_OUTPUT_BOUND),
@@ -320,15 +327,25 @@ export const SolwynConfigSchema = z.strictObject({
   // spins the background flush loop (batchSize=0 → i+=0 infinite loop; maxInFlight=0
   // → Promise.race over an empty set never settles), so reject it as a typed
   // ConfigurationError at construction rather than hanging at runtime.
-  reporter_batch_size: z.coerce.number().int().positive().default(50),
-  reporter_flush_interval: z.coerce.number().positive().default(5.0),
-  reporter_max_queue_size: z.coerce.number().int().positive().default(10_000),
-  reporter_max_in_flight: z.coerce.number().int().positive().default(3),
-  reporter_max_send_attempts: z.coerce.number().int().min(1).default(5),
-  reporter_retry_backoff_base: z.coerce.number().finite().positive().default(1.0),
-  reporter_retry_backoff_cap: z.coerce.number().finite().positive().default(60.0),
-  reporter_shutdown_deadline: z.coerce.number().finite().nonnegative().default(5.0),
-  breaker_report_heartbeat: z.coerce.number().finite().positive().default(60.0),
+  reporter_batch_size: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive().max(1000),
+  ).default(50),
+  reporter_flush_interval: durationSchema(true).default(5.0),
+  reporter_max_queue_size: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(10_000),
+  reporter_max_in_flight: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(3),
+  reporter_max_send_attempts: numberFromNumberOrStringSchema(
+    z.number().finite().int().positive(),
+  ).default(5),
+  reporter_retry_backoff_base: durationSchema(true).default(1.0),
+  reporter_retry_backoff_cap: durationSchema(true).default(60.0),
+  reporter_shutdown_deadline: durationSchema(false).default(5.0),
+  breaker_report_heartbeat: numberFromNumberOrStringSchema(
+    z.number().finite().positive().max(60),
+  ).default(60.0),
   on_unmetered: OnUnmeteredPostureSchema.default("warn"),
   acknowledge_untracked: AcknowledgeUntrackedSchema,
   report_untracked_surfaces: z.boolean().default(true),
@@ -644,7 +661,14 @@ export function resolveConfigFromEnvSnapshot(
 
 /** Resolve configuration through the ambient environment snapshot. */
 export function resolveConfig(options: SolwynConfigOptions = {}): SolwynConfig {
-  return resolveConfigFromEnvSnapshot(options, getEnvSnapshot());
+  try {
+    return resolveConfigFromEnvSnapshot(options, getEnvSnapshot());
+  } catch (error) {
+    if (error instanceof ConfigurationError && error.field === "budget_check_timeout") {
+      throw new ConfigurationError(error.message, { field: "budgetCheckTimeout" });
+    }
+    throw error;
+  }
 }
 
 /**

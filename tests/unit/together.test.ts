@@ -57,7 +57,9 @@ function makeCapture(): Capture {
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(body)) {
       events.push(...(body as Array<Record<string, unknown>>));
     }
-    return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), checks, confirms, events };
 }
@@ -527,7 +529,7 @@ describe("Together unmetered spend posture", () => {
         WARNING,
         "together",
         "native_together",
-        "code_interpreter",
+        "code_interpreter.run",
         null,
       ),
     );
@@ -535,7 +537,7 @@ describe("Together unmetered spend posture", () => {
       WARNING,
       "together",
       "native_together",
-      "code_interpreter",
+      "code_interpreter.run",
       null,
     );
     expect(fetchMock).not.toHaveBeenCalled();

@@ -230,7 +230,9 @@ describe("Z.ai end-to-end attribution", () => {
       if (url.includes("/api/v1/metadata/ingest") && Array.isArray(body)) {
         events.push(...(body as Array<Record<string, unknown>>));
       }
-      return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     };
     const create = vi.fn((_kwargs: Record<string, unknown>) => ({
       usage: {
@@ -758,7 +760,7 @@ describe("extractUsage — non-streaming", () => {
     expect(adapter.extractServiceTier({})).toBeNull();
   });
 
-  it("extracts Z.ai cache reads and writes through the shared OpenAI path", () => {
+  it("preserves Z.ai cache reads and writes while raising an inconsistent input total", () => {
     const td = adapterNamed("zai").extractUsage({
       usage: {
         prompt_tokens: 12,
@@ -766,8 +768,10 @@ describe("extractUsage — non-streaming", () => {
         prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 9 },
       },
     });
+    expect(td.input_tokens).toBe(13);
     expect(td.cached_input_tokens).toBe(4);
     expect(td.cache_creation_5m_tokens).toBe(9);
+    expect(td.is_estimated).toBe(true);
     expect(td.cache_creation_1h_tokens).toBe(0);
     expect(td.reasoning_tokens).toBe(0);
   });

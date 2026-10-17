@@ -6,7 +6,7 @@ import {
   safeExtractServiceTier,
 } from "../../src/fail-soft";
 import type { Logger } from "../../src/logging";
-import { buildTokenDetails } from "../../src/token-details";
+import { buildReportedTokenDetails, buildTokenDetails } from "../../src/token-details";
 
 function recordingLogger(): { logger: Logger; warnings: unknown[][] } {
   const warnings: unknown[][] = [];
@@ -56,6 +56,37 @@ describe("fail-soft usage ladder", () => {
     });
 
     expect(result.tokenDetails).toBe(estimated);
+    expect(result.usageUnmeasured).toBe(true);
+  });
+
+  it.each([
+    buildTokenDetails,
+    buildReportedTokenDetails,
+  ])("keeps cache-only normalization measured for lease settlement with %s", (build) => {
+    const extracted = build({ input_tokens: 10, output_tokens: 2, cached_input_tokens: 12 });
+    const result = extractUsageFailSoft({
+      extract: () => extracted,
+      estimate: () => null,
+      estimatedInputTokens: 100,
+      logger: recordingLogger().logger,
+    });
+    expect(result.tokenDetails).toBe(extracted);
+    expect(result.tokenDetails.is_estimated).toBe(true);
+    expect(result.usageUnmeasured).toBe(false);
+  });
+
+  it.each([
+    { input_tokens: 10, cached_input_tokens: 12 },
+    { input_tokens: 10, output_tokens: 2, cached_input_tokens: 12, reasoning_tokens: -1 },
+  ])("keeps missing or malformed usage unmeasured after cache normalization: %j", (reported) => {
+    const extracted = buildReportedTokenDetails(reported);
+    const result = extractUsageFailSoft({
+      extract: () => extracted,
+      estimate: () => null,
+      estimatedInputTokens: 100,
+      logger: recordingLogger().logger,
+    });
+    expect(result.tokenDetails.is_estimated).toBe(true);
     expect(result.usageUnmeasured).toBe(true);
   });
 
@@ -164,9 +195,8 @@ describe("fail-soft usage ladder", () => {
     });
   });
 
-  it("treats zero main counters as empty even when subsidiary counters are nonzero", () => {
+  it("treats zero main counters as empty even when reasoning counters are nonzero", () => {
     const extracted = buildTokenDetails({
-      cached_input_tokens: 17,
       reasoning_tokens: 9,
     });
 

@@ -1,3 +1,4 @@
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 /**
  * Exercises `Solwyn` client wrapping/passthrough, usage extraction wiring into the metadata
  * event, rich
@@ -118,7 +119,9 @@ function makeFetch(): {
     }
     // Valid ingest 202 body (never the malformed `[]`): the default logger is now
     // console-backed, so a malformed body would print an unparseable warning.
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), ingested, confirms };
 }
@@ -149,7 +152,9 @@ function stoppedRunFetch(): {
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       ingested.push(...(raw as WireEvent[]));
     }
-    return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), ingested };
 }
@@ -788,16 +793,17 @@ describe("SolwynCore — streaming settlement", () => {
     expect(event.service_tier).toBe("flex");
   });
 
-  it("does not report before the stream is drained (settlement is at stream end)", async () => {
+  it("settles an unread stream's observed usage when the client closes", async () => {
     const client = openAIClient(() => fakeStream());
     const { fetchMock, ingested } = makeFetch();
     const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch: fetchMock });
 
-    // Obtain the stream but never drain it; the client shuts down without a settlement.
+    // No stream chunk is read; shutdown still emits a conservative settlement receipt.
     await solwyn.chat.completions.create({ model: "gpt-4o", messages: [], stream: true });
     await solwyn.close();
 
-    expect(ingested).toHaveLength(0);
+    expect(ingested).toHaveLength(1);
+    expect(ingested[0]).toMatchObject({ status: "success", input_tokens: 0, output_tokens: 0 });
   });
 });
 
@@ -1692,7 +1698,7 @@ describe("SolwynCore — local run-control admission", () => {
     expect(postcheckTermination(runId)).toBeUndefined();
   });
 
-  it("settles a same-provider stopped stream once from usage observed before the discarded item", async () => {
+  it("settles a same-provider stopped stream once including usage on the discarded item", async () => {
     let rawPulls = 0;
     let closed = 0;
     async function* rawStream(): AsyncGenerator<unknown> {
@@ -1773,15 +1779,15 @@ describe("SolwynCore — local run-control admission", () => {
         call_id: expect.any(String),
         provider: "openai",
         model: "gpt-4o",
-        token_details: { input_tokens: 6, output_tokens: 2 },
+        token_details: { input_tokens: 900, output_tokens: 900 },
       },
       event: {
         status: "success",
         provider: "openai",
         model: "gpt-4o",
-        input_tokens: 6,
-        output_tokens: 2,
-        token_details: { input_tokens: 6, output_tokens: 2 },
+        input_tokens: 900,
+        output_tokens: 900,
+        token_details: { input_tokens: 900, output_tokens: 900 },
         agent_run_id: runId,
       },
     });
@@ -2273,7 +2279,9 @@ describe("SolwynCore — options validation", () => {
         checkCalls += 1;
         return new Response("", { status: 500 });
       }
-      return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     });
     const client = openAIClient(() => ({}));
     const solwyn = new Solwyn(client, {
@@ -2735,6 +2743,31 @@ describe("SolwynCore — fail-soft post-success bookkeeping", () => {
     vi.restoreAllMocks();
   });
 
+  it("preserves lease attribution when confirmation construction fails", async () => {
+    const adapter = new FailSoftAdapter();
+    adapter.extractUsageImpl = () => createTokenDetails({ input_tokens: 13, output_tokens: 5 });
+    __setAdapterLoadersForTesting({ openai: async () => adapter });
+    const funding = installFailSoftFundingDecision();
+    funding.buildConfirmRequest.mockImplementation(() => {
+      throw new Error("synthetic confirm construction failure");
+    });
+    const { fetchMock, ingested, confirms } = makeFetch();
+    const solwyn = new Solwyn(
+      openAIClient(() => ({ id: "paid" })),
+      {
+        apiKey: API_KEY,
+        fetch: fetchMock,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+      },
+    );
+    await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
+    await solwyn.close();
+    expect(confirms).toHaveLength(0);
+    expect(ingested).toMatchObject([
+      { status: "success", input_tokens: 13, output_tokens: 5, lease_id: "lease-fail-soft" },
+    ]);
+  });
+
   it.each([
     "chat",
     "responses",
@@ -2974,6 +3007,7 @@ describe("SolwynCore — fail-soft post-success bookkeeping", () => {
 
 describe("SolwynCore — default logger is console-backed (D6/F7)", () => {
   it("routes reporter warnings to the console by default when no logger is injected", async () => {
+    allowIngestContractDrift();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const client = openAIClient(() => ({ usage: { prompt_tokens: 1, completion_tokens: 1 } }));

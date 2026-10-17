@@ -20,6 +20,24 @@ const temporary: string[] = [];
 // Native Windows console-event semantics are NOT RUN; taskkill/IPC simulations live separately.
 const posixSignal = it.skipIf(process.platform === "win32");
 const repository = fileURLToPath(new URL("../../", import.meta.url));
+
+async function expectProcessExit(pid: number): Promise<void> {
+  await expect
+    .poll(
+      () => {
+        try {
+          process.kill(pid, 0);
+          return false;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+          throw error;
+        }
+      },
+      { timeout: 2000, interval: 20 },
+    )
+    .toBe(true);
+}
+
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -246,7 +264,7 @@ posixSignal.each(["SIGINT", "SIGTERM"] as const)(
       expect(existsSync(result.cleanup.roots[0].path)).toBe(false);
       expect(existsSync(launched.root)).toBe(false);
       expect(existsSync(scratch)).toBe(true);
-      expect(() => process.kill(launched.pid, 0)).toThrow();
+      await expectProcessExit(launched.pid);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
@@ -309,7 +327,7 @@ posixSignal.each(["SIGINT", "SIGTERM"] as const)(
       expect(existsSync(scratch)).toBe(true);
       const pid = Number(/READY:(\d+)/.exec(stdout)?.[1]);
       expect(pid).toBeGreaterThan(0);
-      expect(() => process.kill(pid, 0)).toThrow();
+      await expectProcessExit(pid);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }

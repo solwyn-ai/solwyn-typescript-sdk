@@ -352,7 +352,8 @@ export function openaiChunkToDeltas(
 ): StreamDelta[] {
   const choice = asArray(get(chunk, "choices"))[0];
   const delta = get(choice, "delta");
-  if (get(delta, "tool_calls") != null) {
+  const toolCalls = get(delta, "tool_calls");
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
     raise(served, requested, "cross_provider_tool_stream");
   }
   const deltas: StreamDelta[] = [];

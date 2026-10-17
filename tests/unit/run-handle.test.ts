@@ -49,9 +49,12 @@ function makeWireCapture(reservationId: string | null = null): WireCapture {
     if (url.includes("/api/v1/metadata/ingest")) {
       const batch = body as Array<Record<string, unknown>>;
       events.push(...batch);
-      return new Response(JSON.stringify({ ingested: batch.length, rejected: [] }), {
-        status: 202,
-      });
+      return new Response(
+        JSON.stringify({ ingested: batch.length, rejected: [], duplicates: [] }),
+        {
+          status: 202,
+        },
+      );
     }
     throw new Error(`unexpected test URL: ${url}`);
   });
@@ -1234,8 +1237,8 @@ describe("detached run handles", () => {
     expect(wire.events).toHaveLength(1);
     expect(wire.events[0]).toMatchObject({
       status: "success",
-      input_tokens: 3,
-      output_tokens: 2,
+      input_tokens: 99,
+      output_tokens: 99,
       agent_run_id: detached.runId,
       agent_run_name: "detached-stream",
       parent_agent_run_id: creationParentId,

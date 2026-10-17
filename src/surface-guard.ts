@@ -391,6 +391,111 @@ export function applySurfacePosture<T>(options: ApplySurfacePostureOptions<T>): 
 
 export type SurfaceReadGuard = (surface: string, execute: () => unknown) => unknown;
 
+interface ReflectedValue {
+  readonly raw: object;
+  readonly guarded: object;
+}
+
+/** Reflect without executing read posture; reflected operations cross it when used. */
+export function guardedSurfaceDescriptor(
+  descriptor: PropertyDescriptor,
+  property: PropertyKey,
+  read: () => unknown,
+  receiver: object,
+  cache: Map<PropertyKey, ReflectedValue>,
+  onSet?: () => void,
+): PropertyDescriptor {
+  if (
+    typeof property !== "string" ||
+    property === "constructor" ||
+    property.startsWith("_") ||
+    descriptor.configurable === false
+  )
+    return descriptor;
+  if ("value" in descriptor) {
+    const raw: unknown = descriptor.value;
+    if ((typeof raw !== "object" || raw === null) && typeof raw !== "function") return descriptor;
+    let value = cache.get(property);
+    if (value?.raw !== raw) {
+      const reflected = new Map<PropertyKey, ReflectedValue>();
+      const guarded = new Proxy(raw, {
+        get(target, key): unknown {
+          const fixed = Reflect.getOwnPropertyDescriptor(target, key);
+          if (fixed?.configurable === false && "value" in fixed && fixed.writable === false) {
+            return fixed.value;
+          }
+          return Reflect.get(read() as object, key);
+        },
+        apply(_target, _thisArg, args): unknown {
+          const callable = read();
+          if (typeof callable !== "function")
+            throw new SolwynError("reflected provider method is no longer callable");
+          return Reflect.apply(callable, receiver, args);
+        },
+        construct(_target, args, newTarget): object {
+          const callable = read();
+          if (typeof callable !== "function")
+            throw new SolwynError("reflected provider class is no longer callable");
+          return Reflect.construct(callable, args, newTarget === guarded ? callable : newTarget);
+        },
+        getOwnPropertyDescriptor(target, key): PropertyDescriptor | undefined {
+          const child = Reflect.getOwnPropertyDescriptor(target, key);
+          return child === undefined
+            ? undefined
+            : guardedSurfaceDescriptor(
+                child,
+                key,
+                () => Reflect.get(read() as object, key),
+                target,
+                reflected,
+                onSet,
+              );
+        },
+        set(target, key, next): boolean {
+          const updated = Reflect.set(target, key, next, target);
+          if (updated) {
+            reflected.delete(key);
+            onSet?.();
+          }
+          return updated;
+        },
+        deleteProperty(target, key): boolean {
+          const deleted = Reflect.deleteProperty(target, key);
+          if (deleted) {
+            reflected.delete(key);
+            onSet?.();
+          }
+          return deleted;
+        },
+        defineProperty(target, key, next): boolean {
+          const defined = Reflect.defineProperty(target, key, next);
+          if (defined) {
+            reflected.delete(key);
+            onSet?.();
+          }
+          return defined;
+        },
+      });
+      value = { raw, guarded };
+      cache.set(property, value);
+    }
+    return { ...descriptor, value: value.guarded };
+  }
+  const setter = descriptor.set;
+  return {
+    ...descriptor,
+    get: descriptor.get === undefined ? undefined : () => read(),
+    set:
+      setter === undefined
+        ? undefined
+        : (value: unknown): unknown => {
+            const result = Reflect.apply(setter, receiver, [value]);
+            onSet?.();
+            return result;
+          },
+  };
+}
+
 function contextKey(path: string, context: SurfaceContext): string {
   return JSON.stringify([path, context.provider, context.dialect, context.clientShape]);
 }
@@ -398,12 +503,28 @@ function contextKey(path: string, context: SurfaceContext): string {
 /** Weak target cache for identity-stable fake/unit namespace guards. */
 export class SurfaceNamespaceGuardCache {
   readonly #targets = new WeakMap<object, Map<string, object>>();
+  readonly #pending = new WeakMap<object, Set<() => void>>();
+
+  /** A namespace is terminal only if no child or reflection is used this turn. */
+  observeTerminal(namespace: object, observe: () => void): void {
+    let pending = this.#pending.get(namespace);
+    if (pending === undefined) {
+      pending = new Set();
+      this.#pending.set(namespace, pending);
+    }
+    pending.add(observe);
+    const observations = pending;
+    queueMicrotask(() => {
+      if (observations.delete(observe)) observe();
+    });
+  }
 
   getOrCreate<T extends object>(
     target: T,
     path: string,
     context: SurfaceContext,
     guardRead: SurfaceReadGuard,
+    onMutation?: () => void,
   ): T {
     const validatedPath = validateSurfacePath(path);
     validateClientShape(context.clientShape);
@@ -428,15 +549,46 @@ export class SurfaceNamespaceGuardCache {
         readonly bound: (...args: unknown[]) => unknown;
       }
     >();
+    const reflectedValues = new Map<PropertyKey, ReflectedValue>();
+    const traversed = (): void => {
+      this.#pending.get(guarded)?.clear();
+    };
     const guarded = new Proxy(target, {
       get(current, property): unknown {
+        traversed();
         if (typeof property !== "string") {
+          if (property === Symbol.iterator) {
+            let owner: object | null = current;
+            while (owner !== null) {
+              const descriptor = Reflect.getOwnPropertyDescriptor(owner, property);
+              if (descriptor !== undefined) {
+                if ("value" in descriptor && typeof descriptor.value !== "function")
+                  return descriptor.value;
+                throw new SolwynError(SYMBOL_SURFACE_ERROR);
+              }
+              owner = Reflect.getPrototypeOf(owner);
+            }
+            return undefined;
+          }
+          if (
+            property === Symbol.toStringTag ||
+            property === Symbol.toPrimitive ||
+            property === Symbol.for("nodejs.util.inspect.custom")
+          ) {
+            const value = Reflect.get(current, property, current);
+            return typeof value === "function" ? value.bind(current) : value;
+          }
           throw new SolwynError(SYMBOL_SURFACE_ERROR);
         }
         // JavaScript tooling and assertion libraries read `constructor` for identity and
         // formatting. It is intrinsic metadata, never a provider operation or spend surface.
-        if (property === "constructor") {
+        if (property === "constructor" || property.startsWith("_")) {
           return Reflect.get(current, property, current);
+        }
+        if (property === "toJSON" && !Reflect.has(current, property)) return undefined;
+        if (property === "toString" || property === "valueOf" || property === "toLocaleString") {
+          const value = Reflect.get(current, property, current);
+          if (value === Reflect.get(Object.prototype, property)) return value.bind(current);
         }
         const surface = validateSurfacePath(`${validatedPath}.${property}`);
         let fixedResult: { readonly value: unknown } | undefined;
@@ -474,55 +626,53 @@ export class SurfaceNamespaceGuardCache {
         return result;
       },
       getOwnPropertyDescriptor(current, property): PropertyDescriptor | undefined {
-        if (typeof property !== "string") {
-          throw new SolwynError(SYMBOL_SURFACE_ERROR);
-        }
-        if (property === "constructor") {
-          return Reflect.getOwnPropertyDescriptor(current, property);
-        }
-        validateSurfacePath(`${validatedPath}.${property}`);
+        traversed();
         const descriptor = Reflect.getOwnPropertyDescriptor(current, property);
         if (descriptor === undefined) return undefined;
-        if ("value" in descriptor) {
-          return { ...descriptor, value: Reflect.get(guarded, property) };
-        }
-        if (descriptor.get === undefined && descriptor.set === undefined) return descriptor;
-        if (descriptor.configurable === false) {
-          // Proxy invariants forbid replacing a fixed getter or setter with its wrapper.
-          throw new SolwynError(FIXED_SURFACE_RESULT_ERROR);
-        }
-        const setter = descriptor.set;
-        return {
-          ...descriptor,
-          get: descriptor.get === undefined ? undefined : () => Reflect.get(guarded, property),
-          set:
-            setter === undefined
-              ? undefined
-              : (value: unknown): unknown => {
-                  const result = Reflect.apply(setter, current, [value]);
-                  boundMethods.delete(property);
-                  return result;
-                },
-        };
+        return guardedSurfaceDescriptor(
+          descriptor,
+          property,
+          () => Reflect.get(guarded, property),
+          current,
+          reflectedValues,
+          () => {
+            boundMethods.delete(property);
+            onMutation?.();
+          },
+        );
+      },
+      ownKeys(current): ArrayLike<string | symbol> {
+        traversed();
+        return Reflect.ownKeys(current);
+      },
+      has(current, property): boolean {
+        traversed();
+        return Reflect.has(current, property);
       },
       set(current, property, value): boolean {
+        traversed();
         const updated = Reflect.set(current, property, value, current);
         if (updated) {
           boundMethods.delete(property);
+          onMutation?.();
         }
         return updated;
       },
       deleteProperty(current, property): boolean {
+        traversed();
         const deleted = Reflect.deleteProperty(current, property);
         if (deleted) {
           boundMethods.delete(property);
+          onMutation?.();
         }
         return deleted;
       },
       defineProperty(current, property, descriptor): boolean {
+        traversed();
         const defined = Reflect.defineProperty(current, property, descriptor);
         if (defined) {
           boundMethods.delete(property);
+          onMutation?.();
         }
         return defined;
       },

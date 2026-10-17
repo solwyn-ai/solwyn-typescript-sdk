@@ -28,7 +28,7 @@
  * allowlist and must stay that way.
  */
 
-import { ConfigurationError, UnsupportedSurfaceError } from "../errors";
+import { ConfigurationError, markCallerAbort, UnsupportedSurfaceError } from "../errors";
 import type { TokenDetails } from "../token-details";
 import { buildReportedTokenDetails, isUsageCount } from "../token-details";
 import { detectGoogleClient } from "./detection";
@@ -117,7 +117,8 @@ function extractGoogleUsage(usageMetadata: unknown): TokenDetails {
       audio_output_tokens: outputModalities.audio,
       // Google exposes no cache-creation-split / prediction token fields — all 0.
     },
-    !isUsageCount(getProp(usageMetadata, "candidatesTokenCount")) ||
+    (getProp(usageMetadata, "candidatesTokenCount") !== undefined &&
+      !isUsageCount(getProp(usageMetadata, "candidatesTokenCount"))) ||
       inputModalities.unmeasured ||
       outputModalities.unmeasured,
   );
@@ -269,7 +270,7 @@ function googleDispatch(
         isObject(result) &&
         typeof Reflect.get(result, Symbol.asyncIterator) === "function"
       ) {
-        return deadlineStream(result as unknown as AsyncIterable<unknown>, dispose);
+        return deadlineStream(result as unknown as AsyncIterable<unknown>, dispose, caller);
       }
       dispose();
       return result;
@@ -288,13 +289,13 @@ function googleDispatch(
           .then(finish)
           .catch((error: unknown) => {
             dispose();
-            throw error;
+            throw markCallerAbort(error, caller);
           });
       }
       return finish(result);
     } catch (error) {
       dispose();
-      throw error;
+      throw markCallerAbort(error, caller);
     }
   };
 }
@@ -303,6 +304,7 @@ function googleDispatch(
 function deadlineStream(
   source: AsyncIterable<unknown>,
   dispose: () => void,
+  caller: AbortSignal | undefined,
 ): AsyncIterableIterator<unknown> {
   const iterator = source[Symbol.asyncIterator]();
   let closed = false;
@@ -322,7 +324,7 @@ function deadlineStream(
       } catch (error) {
         closed = true;
         dispose();
-        throw error;
+        throw markCallerAbort(error, caller);
       }
     },
     async return(value?: unknown) {
@@ -510,6 +512,7 @@ export class GoogleAdapter implements ProviderAdapter {
  */
 export class GoogleStreamAccumulator implements StreamUsageAccumulator {
   #lastUsageMetadata: unknown = null;
+  #sawFinishReason = false;
 
   /**
    * Retain the chunk's `usageMetadata` iff present (non-`null`/`undefined`). A later chunk
@@ -517,6 +520,15 @@ export class GoogleStreamAccumulator implements StreamUsageAccumulator {
    * not last-chunk-unconditionally).
    */
   observe(chunk: unknown): void {
+    const candidates = getProp(chunk, "candidates");
+    if (Array.isArray(candidates)) {
+      this.#sawFinishReason ||= candidates.some((candidate) => {
+        const reason = getProp(candidate, "finishReason");
+        return (
+          typeof reason === "string" && reason.length > 0 && reason !== "FINISH_REASON_UNSPECIFIED"
+        );
+      });
+    }
     const usageMetadata = getProp(chunk, "usageMetadata");
     if (usageMetadata != null) {
       this.#lastUsageMetadata = usageMetadata;
@@ -528,7 +540,14 @@ export class GoogleStreamAccumulator implements StreamUsageAccumulator {
    * {@link TokenDetails} if no chunk ever carried usage. Never throws.
    */
   finalize(): TokenDetails {
-    return extractGoogleUsage(this.#lastUsageMetadata);
+    const details = extractGoogleUsage(this.#lastUsageMetadata);
+    if (
+      !this.#sawFinishReason &&
+      getProp(this.#lastUsageMetadata, "candidatesTokenCount") == null
+    ) {
+      return { ...details, is_estimated: true };
+    }
+    return details;
   }
 
   /** ALWAYS `null` — Google streams expose no service-tier concept. */

@@ -67,6 +67,10 @@ function numberOrZero(value: unknown): number {
   return isUsageCount(value) ? value : 0;
 }
 
+function anthropicServiceTier(tier: unknown): string | null {
+  return tier === "standard" || tier === "priority" ? tier : null;
+}
+
 /**
  * Shared cache-parsing helper (`_parse_anthropic_cache` in Python). Given a `usage`
  * object, returns the per-TTL cache-creation buckets.
@@ -96,6 +100,20 @@ function parseAnthropicCache(usage: unknown): { cache5m: unknown; cache1h: unkno
   };
 }
 
+function invalidAnthropicDetails(usage: unknown): boolean {
+  const { cache5m, cache1h } = parseAnthropicCache(usage);
+  const outputDetails = getProp(usage, "output_tokens_details");
+  return (
+    [
+      getProp(usage, "cache_read_input_tokens"),
+      cache5m,
+      cache1h,
+      getProp(outputDetails, "thinking_tokens"),
+    ].some((value) => value != null && !isUsageCount(value)) ||
+    (outputDetails != null && !isObject(outputDetails))
+  );
+}
+
 /**
  * Normalize an Anthropic `usage` object into {@link TokenDetails}. Never throws.
  *
@@ -104,15 +122,15 @@ function parseAnthropicCache(usage: unknown): { cache5m: unknown; cache1h: unkno
  * None of these overlap on Anthropic's wire; they are all summed. `cache_read` also
  * maps 1:1 to `cached_input_tokens` at the output.
  *
- * All OpenAI/Google-only fields (`reasoning_tokens`, audio, prediction,
- * `tool_use_input_tokens`) stay at their `0` default — Anthropic never reports them
- * (extended-thinking tokens are folded into `output_tokens`, a permanent blind spot).
+ * Thinking tokens are a subset of the inclusive output total. Audio, prediction,
+ * and `tool_use_input_tokens` stay at their `0` default.
  */
 function extractAnthropicUsage(usage: unknown): TokenDetails {
   const baseInput = getProp(usage, "input_tokens");
   const output = getProp(usage, "output_tokens");
   const cacheRead = getProp(usage, "cache_read_input_tokens");
   const { cache5m, cache1h } = parseAnthropicCache(usage);
+  const outputDetails = getProp(usage, "output_tokens_details");
   // Plain build (never validates): an out-of-bound garbage count must not throw out
   // of extraction — it is caught fail-open at the reporter's wire boundary (F10).
   return buildReportedTokenDetails(
@@ -126,8 +144,9 @@ function extractAnthropicUsage(usage: unknown): TokenDetails {
       cached_input_tokens: cacheRead,
       cache_creation_5m_tokens: cache5m,
       cache_creation_1h_tokens: cache1h,
+      reasoning_tokens: getProp(outputDetails, "thinking_tokens"),
     },
-    !isUsageCount(baseInput),
+    !isUsageCount(baseInput) || (outputDetails != null && !isObject(outputDetails)),
   );
 }
 
@@ -193,9 +212,9 @@ export class AnthropicAdapter implements ProviderAdapter {
     return null;
   }
 
-  /** ALWAYS `null` — Anthropic responses expose no service-tier concept. */
-  extractServiceTier(_response: unknown): string | null {
-    return null;
+  /** Anthropic carries its service tier inside `usage`. */
+  extractServiceTier(response: unknown): string | null {
+    return anthropicServiceTier(getProp(getProp(response, "usage"), "service_tier"));
   }
 
   /** ALWAYS `null` — Anthropic pricing is not regional. */
@@ -283,7 +302,7 @@ export class AnthropicAdapter implements ProviderAdapter {
  *   - `message_start.message.usage` → input side (base + cache_read + cache-creation),
  *     parsed by the same additive-sum + presence-priority rules as the non-streaming
  *     path ({@link parseAnthropicCache}).
- *   - `message_delta.usage.output_tokens` → output side.
+ *   - `message_delta.usage` → cumulative totals, replacing counters when supplied.
  * Every other event type (`content_block_delta`, `message_stop`, `ping`, …) is a
  * complete no-op. This accumulator never reads `delta.text` or any content field.
  *
@@ -295,7 +314,11 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   #cacheRead = 0;
   #cache5m = 0;
   #cache1h = 0;
+  #initialCacheTtl: "5m" | "1h" | null = null;
   #output = 0;
+  #reasoning = 0;
+  #serviceTier: unknown = null;
+  #invalidDetails = false;
   #sawMessageStart = false;
   #sawMessageDelta = false;
   #inputMeasured = false;
@@ -318,12 +341,22 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
           cache_read_input_tokens: getProp(usage, "cache_read_input_tokens"),
           cache_creation: getProp(usage, "cache_creation"),
           cache_creation_input_tokens: getProp(usage, "cache_creation_input_tokens"),
+          output_tokens_details: getProp(usage, "output_tokens_details"),
         });
         this.#baseInput = numberOrZero(getProp(usage, "input_tokens"));
         this.#cacheRead = details.cached_input_tokens;
         this.#cache5m = details.cache_creation_5m_tokens;
         this.#cache1h = details.cache_creation_1h_tokens;
+        this.#initialCacheTtl =
+          this.#cache5m > 0 && this.#cache1h === 0
+            ? "5m"
+            : this.#cache1h > 0 && this.#cache5m === 0
+              ? "1h"
+              : null;
         this.#inputMeasured = !details.is_estimated;
+        this.#invalidDetails ||= invalidAnthropicDetails(usage);
+        this.#reasoning = details.reasoning_tokens;
+        this.#serviceTier = getProp(usage, "service_tier");
       } else {
         this.#inputMeasured = false;
       }
@@ -333,9 +366,49 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
       this.#sawMessageDelta = true;
       const usage = getProp(chunk, "usage");
       if (usage !== undefined && usage !== null) {
+        this.#invalidDetails ||= invalidAnthropicDetails(usage);
+        const input = getProp(usage, "input_tokens");
+        if (isUsageCount(input)) {
+          this.#baseInput = input;
+          this.#inputMeasured = true;
+        }
+        const cacheRead = getProp(usage, "cache_read_input_tokens");
+        if (isUsageCount(cacheRead)) this.#cacheRead = cacheRead;
+        const cacheCreation = getProp(usage, "cache_creation");
+        if (cacheCreation != null) {
+          const { cache5m, cache1h } = parseAnthropicCache(usage);
+          if (isUsageCount(cache5m)) this.#cache5m = cache5m;
+          if (isUsageCount(cache1h)) this.#cache1h = cache1h;
+        } else {
+          const aggregate = getProp(usage, "cache_creation_input_tokens");
+          if (isUsageCount(aggregate)) {
+            // Real deltas carry only the aggregate; preserve observed writes by TTL.
+            const increment = aggregate - this.#cache5m - this.#cache1h;
+            if (increment > 0) {
+              if (this.#initialCacheTtl === "5m") this.#cache5m += increment;
+              else this.#cache1h += increment;
+              // Mixed or absent initial TTLs cannot identify the new writes' TTL.
+              // Use the conservative one-hour bucket and disclose the inferred split.
+              if (this.#initialCacheTtl === null) this.#invalidDetails = true;
+            } else if (increment < 0) {
+              // Cumulative usage cannot shrink. Keep observed writes conservatively.
+              this.#invalidDetails = true;
+            }
+          }
+        }
         const output = getProp(usage, "output_tokens");
-        this.#output = numberOrZero(output);
-        this.#outputMeasured = isUsageCount(output);
+        if (isUsageCount(output)) {
+          this.#output = output;
+          this.#outputMeasured = true;
+        }
+        if ([input, cacheRead, output].some((count) => count != null && !isUsageCount(count))) {
+          this.#invalidDetails = true;
+        }
+        const outputDetails = getProp(usage, "output_tokens_details");
+        const thinking = getProp(outputDetails, "thinking_tokens");
+        if (isUsageCount(thinking)) this.#reasoning = thinking;
+        const tier = getProp(usage, "service_tier");
+        if (typeof tier === "string") this.#serviceTier = tier;
       } else {
         this.#outputMeasured = false;
       }
@@ -366,13 +439,13 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
         cached_input_tokens: this.#cacheRead,
         cache_creation_5m_tokens: this.#cache5m,
         cache_creation_1h_tokens: this.#cache1h,
+        reasoning_tokens: this.#reasoning,
       },
-      !this.#inputMeasured || !this.#outputMeasured,
+      !this.#inputMeasured || !this.#outputMeasured || this.#invalidDetails,
     );
   }
 
-  /** ALWAYS `null` — Anthropic has no service-tier concept. */
   getServiceTier(): string | null {
-    return null;
+    return anthropicServiceTier(this.#serviceTier);
   }
 }

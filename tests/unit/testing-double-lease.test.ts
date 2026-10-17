@@ -264,11 +264,11 @@ describe("FakeControlPlane lease grant and renewal", () => {
         lease_id: "lse_fake1",
         generation: 1,
         granted_tokens: 0,
-        refresh_interval_s: 30,
-        lease_length_s: 90,
+        refresh_interval_s: 15,
+        lease_length_s: 120,
         headroom_share_tokens: 0,
         posture: { mode: "alert_only", on_unreachable: "local_enforce" },
-        final_grant: true,
+        final_grant: false,
         project_id: "proj-test",
         mode: "alert_only",
         budget_limit: 50,
@@ -337,7 +337,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
     });
   });
 
-  it("unions complete renewal declarations in order and ignores incomplete redeclarations", () => {
+  it("unions complete renewal declarations in order and rejects incomplete redeclarations", () => {
     const plane = new FakeControlPlane();
     plane.handle(
       "POST",
@@ -356,8 +356,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
     expect(
       plane.handle("POST", RENEW_PATH, renew({ generation: 2, model: "gpt-4.1" })),
     ).toMatchObject({
-      status: 200,
-      body: { generation: 3 },
+      status: 422,
     });
     expect(plane.handle("POST", GRANT_PATH, grant())).toMatchObject({ status: 409 });
   });
@@ -751,10 +750,11 @@ describe("FakeControlPlane lease grant and renewal", () => {
       expect(
         plane.handle("POST", RENEW_PATH, { ...scenario.renewRequest, spent_tokens: 99 }),
       ).toEqual({ status: 200, body: frozenTerminalBody, headers: {} });
-      expect(plane.handle("POST", GRANT_PATH, grant())).toMatchObject({
-        status: 409,
-        body: { detail: { code: "lease_generation_conflict" } },
-      });
+      expect(plane.handle("POST", GRANT_PATH, grant())).toMatchObject(
+        "run_control" in scenario.expectedBody
+          ? { status: 200, body: { allowed: false, denied_by_period: "run_stopped" } }
+          : { status: 409, body: { detail: { code: "lease_generation_conflict" } } },
+      );
       scenario.recover(plane);
       expect(plane.handle("POST", RENEW_PATH, renew({ generation: 2 }))).toMatchObject({
         status: 200,

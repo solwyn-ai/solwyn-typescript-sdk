@@ -93,7 +93,9 @@ function makeFetch(
     }
     if (url.includes("/api/v1/metadata/ingest")) {
       wire.events.push(...(body as Array<Record<string, unknown>>));
-      return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     }
     throw new Error(`unexpected test URL: ${url}`);
   };
@@ -1219,18 +1221,21 @@ describe("mediaCall lifecycle", () => {
     const client = declaredMediaClient(vi.fn());
     const adapter = new MediaAdapter();
     __setAdapterLoadersForTesting({ openai: async () => adapter });
-    const { fetch } = makeFetch(false);
+    const { fetch, wire } = makeFetch(false);
     const core = new SolwynCore(client, {
       apiKey: API_KEY,
       fetch,
       failoverTotalTimeout: 0.25,
     });
-    const now = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(1_000);
+    const now = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => (wire.checks.length === 0 ? 0 : 1_000));
 
     try {
       await expect(
         (core as unknown as MediaCallableCore).mediaCall(mediaSpec(), { model: "embed-model" }),
       ).rejects.toMatchObject({ name: "BudgetExceededError" });
+      expect(wire.checks).toHaveLength(1);
       expect(adapter.prepareMediaCalls).toHaveLength(0);
       expect(client.media.create).not.toHaveBeenCalled();
     } finally {

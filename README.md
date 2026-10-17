@@ -204,7 +204,7 @@ Persistent confirmation failures reach ERROR after ten consecutive failing deliv
 A round uses its last non-neutral confirmation verdict in dispatch order, so completion order
 cannot change the count. A success resets it; held admissions and read-only skips do not count.
 Lease-funded metadata includes the same `lease_id` as its confirmation. Cache reads and creation
-buckets must fit within input tokens; normalization preserves those buckets and raises an
+buckets must fit within input tokens; wrapped provider clients preserve those buckets and raise an
 inconsistent input total to their sum, marking it estimated. This correction settles the adjusted
 observed usage without retaining the lease reservation floor. Ingest responses require `ingested`,
 `rejected`, and `duplicates`; malformed responses produce contract-drift diagnostics while usable
@@ -549,9 +549,9 @@ aborts an active stream at its next chunk boundary with `RunStoppedError`. Clear
 allows future work; an already stopped stream retains its stop. Local velocity detection
 is not supported by the AI SDK middleware. Cache writes are reported in the default
 five-minute bucket, and missing usage totals fall back to length estimates for that side
-of the call while preserving reported totals. If cache reads and writes exceed reported
-input, Solwyn preserves those buckets, raises input to their sum, and marks usage estimated.
-That cache-only correction settles observed usage without retaining the reservation floor.
+of the call while preserving reported totals. The middleware limits cache reads to input tokens
+and cache writes to the remaining input. Clamped or malformed counters mark usage estimated
+and retain the lease reservation floor.
 
 The call's `abortSignal` also cancels budget preflight. Run stops and caller cancellation
 settle stream usage observed so far, including the part pulled at the cancellation boundary;
@@ -684,7 +684,7 @@ Circuit breakers, latency signals, and failover labeling key off the provider **
 
 Caller cancellation never advances to another provider or counts as a provider failure. A
 cancelled established stream settles the usage observed so far, using the reservation floor
-when usage is estimated. Cancellation of a dispatched request before connection, including
+when usage is missing or malformed. Cancellation of a dispatched request before connection, including
 deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
 funding, and does not confirm usage or record latency. Already-aborted requests skip velocity
 detection and budget I/O.
@@ -1082,7 +1082,7 @@ totals settles the adjusted observed usage.
 
 When garbage collection finalizes an abandoned stream, it settles the usage observed so far
 and releases its run and lease ownership instead of retaining them until client shutdown.
-Estimated usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
+Missing or malformed usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
 or cancel streams explicitly for deterministic settlement.
 
 Or let `await using` do it:

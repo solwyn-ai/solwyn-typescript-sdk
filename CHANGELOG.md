@@ -63,8 +63,8 @@ corresponding release notes before users upgrade.
 - **Breaking:** **Public token details require consistent cache totals.** `createTokenDetails()`
   and `TokenDetailsSchema.parse()` now throw `ZodError` when cache reads plus five-minute and
   one-hour writes exceed `input_tokens`. Include all three buckets in the input total before
-  calling these validating helpers. Provider usage extraction instead preserves the buckets and
-  raises a deficient input total, as described below.
+  calling these validating helpers. Core provider usage extraction instead preserves the buckets
+  and raises a deficient input total, as described below.
 - **Breaking:** **Velocity history survives higher run concurrency.** Structural loop detection
   now keeps compact histories for up to 4096 runs and discards stale histories first. At the
   hard cap, randomized eviction avoids systematically resetting loops under run churn or
@@ -166,13 +166,14 @@ corresponding release notes before users upgrade.
   rejections and keep fixture batches and project attribution within these limits.
 - **Breaking:** **Caller cancellation preserves observed usage.** Buffered and stream setup
   aborts never fail over or count as provider failures. Mid-stream cancellation settles observed
-  usage once, using the reservation floor when usage is estimated, including Google reader
-  errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts remain
-  provider failures. Failing usage extractors during caller cancellation fall back to estimated
-  usage and still settle. Cancellation of a dispatched request before connection, including
-  deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
-  funding without confirming usage, and contributes no latency sample. Expect established-stream
-  cancellation to confirm observed usage rather than refunding the entire reservation.
+  usage once, using the reservation floor when usage is missing or malformed, including Google
+  reader errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts
+  remain provider failures. Failing usage extractors during caller cancellation fall back to
+  estimated usage and still settle. Cancellation of a dispatched request before connection,
+  including deferred Responses helpers, reports an error with `possibly_succeeded: true`,
+  releases local funding without confirming usage, and contributes no latency sample. Expect
+  established-stream cancellation to confirm observed usage rather than refunding the entire
+  reservation.
 - **Breaking:** **Established stream failures update provider health.** Non-429 HTTP 4xx errors
   release recovery probes without a health penalty; status-less provider errors after connection
   count toward the breaker unless caused by caller cancellation. Account for these failures when
@@ -196,9 +197,10 @@ corresponding release notes before users upgrade.
 ### Fixed
 
 - **Abandoned streams release settlement ownership.** Garbage-collection finalization settles
-  observed usage once, retaining the reservation floor for estimated usage, and releases run
-  lifetimes, caller signals, lease authority, and recovery probes before client shutdown.
-  Finalization timing remains runtime-dependent; explicit stream cleanup is deterministic.
+  observed usage once, retaining the reservation floor for missing or malformed usage, and
+  releases run lifetimes, caller signals, lease authority, and recovery probes before client
+  shutdown. Finalization timing remains runtime-dependent; explicit stream cleanup is
+  deterministic.
 - **Already-aborted calls skip velocity detection.** Chat, Responses, and media calls whose
   signal is already aborted reject before observing velocity or starting budget I/O, so
   cancelled retries cannot stop a run without dispatching work.
@@ -242,7 +244,8 @@ corresponding release notes before users upgrade.
 - **Cross-dialect stream compatibility.** Bedrock results retain only the metered `stream` when
   served by another dialect, and empty OpenAI `tool_calls` arrays no longer abort translation.
 - **AI SDK accounting and attribution.** Middleware maps aggregate cache writes to the
-  five-minute bucket and estimates a missing usage total while retaining its reported
+  five-minute bucket, clamps cache reads to input and writes to the remaining input, and marks
+  corrections estimated. It estimates a missing usage total while retaining its reported
   counterpart. Vertex Anthropic, LM Studio, vLLM, generic compatible clients, and Alibaba
   gateway models receive their own provider attribution.
 - **AI SDK run stops.** Middleware refuses dispatch after a concurrent run stop and aborts
@@ -282,11 +285,11 @@ corresponding release notes before users upgrade.
   explicitly logged fallback still surfaces usable per-event rejections.
 - **Lease reconciliation and cache usage.** Every lease-funded settlement's metadata now carries
   its confirmation's lease ID, including when the confirmation is abandoned or local
-  confirmation construction fails. Cache normalization preserves reported read/write buckets and
-  raises an inconsistent input total to their sum, including AI SDK usage, marking the
-  correction estimated without retaining the lease reservation floor. Missing or malformed usage
-  still retains that floor. Unnormalized invalid cache breakdowns are rejected locally before
-  they can invalidate a whole ingest batch.
+  confirmation construction fails. Core provider cache normalization preserves reported
+  read/write buckets and raises an inconsistent input total to their sum, marking the correction
+  estimated without retaining the lease reservation floor. Missing or malformed usage still
+  retains that floor. Unnormalized invalid cache breakdowns are rejected locally before they can
+  invalidate a whole ingest batch.
 - **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
   now produces the budget warning while retaining the reservation for settlement. Alert-only
   budget-limit logs emit at most once every 30 seconds per enforcer; every affected result

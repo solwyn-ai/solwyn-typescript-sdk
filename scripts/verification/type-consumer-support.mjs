@@ -254,7 +254,7 @@ export async function runTypeConsumerProbe(config, verify) {
         "--no-audit",
         "--no-fund",
         "--no-save",
-        "--package-lock=false",
+        "--package-lock=true",
         tarball,
       ],
       { timeout: 180_000 },

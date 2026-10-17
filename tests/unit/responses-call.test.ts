@@ -585,7 +585,11 @@ describe("Responses effective request and budget preflight", () => {
 
 const bufferedSettlementCases = (["openai", "azure_openai"] as const).flatMap((provider) =>
   (["create", "parse"] as const).flatMap((leaf) =>
-    (["missing", "zero", "measured"] as const).map((usage) => ({ provider, leaf, usage })),
+    (["missing", "zero", "cache_only", "measured"] as const).map((usage) => ({
+      provider,
+      leaf,
+      usage,
+    })),
   ),
 );
 
@@ -600,13 +604,13 @@ describe("Responses buffered settlement", () => {
     const response =
       usage === "missing"
         ? { id: "resp-missing" }
-        : usage === "zero"
+        : usage === "zero" || usage === "cache_only"
           ? {
               id: "resp-zero",
               usage: {
                 input_tokens: 0,
                 output_tokens: 0,
-                input_tokens_details: { cached_tokens: 5 },
+                input_tokens_details: { cached_tokens: usage === "cache_only" ? 5 : 0 },
                 output_tokens_details: { reasoning_tokens: 3 },
               },
             }
@@ -645,6 +649,7 @@ describe("Responses buffered settlement", () => {
     expect(traffic.events).toHaveLength(1);
     const confirm = traffic.confirms[0] as Record<string, unknown>;
     const event = traffic.events[0] as Record<string, unknown>;
+    const expectedInput = usage === "measured" ? 120 : usage === "cache_only" ? 5 : 2;
     const expectedDetails =
       usage === "measured"
         ? expect.objectContaining({
@@ -654,7 +659,7 @@ describe("Responses buffered settlement", () => {
             reasoning_tokens: 6,
           })
         : expect.objectContaining({
-            input_tokens: 2,
+            input_tokens: expectedInput,
             output_tokens: 0,
             is_estimated: true,
           });
@@ -666,7 +671,7 @@ describe("Responses buffered settlement", () => {
     expect(event).toMatchObject({
       status: "success",
       provider,
-      input_tokens: usage === "measured" ? 120 : 2,
+      input_tokens: expectedInput,
       output_tokens: usage === "measured" ? 45 : 0,
       token_details: expectedDetails,
     });
@@ -681,7 +686,7 @@ describe("Responses buffered settlement", () => {
 });
 
 const streamingSettlementCases = (["openai", "azure_openai"] as const).flatMap((provider) =>
-  (["missing", "zero", "measured"] as const).map((usage) => ({ provider, usage })),
+  (["missing", "zero", "cache_only", "measured"] as const).map((usage) => ({ provider, usage })),
 );
 
 describe("Responses streaming settlement", () => {
@@ -693,14 +698,14 @@ describe("Responses streaming settlement", () => {
   }) => {
     async function* rawStream(): AsyncGenerator<unknown> {
       yield { type: "response.in_progress", response: { usage: null } };
-      if (usage === "zero") {
+      if (usage === "zero" || usage === "cache_only") {
         yield {
           type: "response.completed",
           response: {
             usage: {
               input_tokens: 0,
               output_tokens: 0,
-              input_tokens_details: { cached_tokens: 5 },
+              input_tokens_details: { cached_tokens: usage === "cache_only" ? 5 : 0 },
               output_tokens_details: { reasoning_tokens: 3 },
             },
             service_tier: "flex",
@@ -747,14 +752,19 @@ describe("Responses streaming settlement", () => {
     expect(traffic.events).toHaveLength(1);
     const confirm = traffic.confirms[0] as Record<string, unknown>;
     const event = traffic.events[0] as Record<string, unknown>;
+    const expectedInput = usage === "measured" ? 18 : usage === "cache_only" ? 5 : 2;
     const expectedDetails =
       usage === "measured"
         ? expect.objectContaining({ input_tokens: 18, output_tokens: 7 })
-        : expect.objectContaining({ input_tokens: 2, output_tokens: 0, is_estimated: true });
+        : expect.objectContaining({
+            input_tokens: expectedInput,
+            output_tokens: 0,
+            is_estimated: true,
+          });
     expect(confirm).toMatchObject({ provider, token_details: expectedDetails });
     expect(event).toMatchObject({
       provider,
-      input_tokens: usage === "measured" ? 18 : 2,
+      input_tokens: expectedInput,
       output_tokens: usage === "measured" ? 7 : 0,
       token_details: expectedDetails,
     });

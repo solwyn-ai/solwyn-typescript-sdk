@@ -156,6 +156,7 @@ export interface FakeControlPlaneOptions {
   remainingBudget?: number;
   projectId?: string;
   failoverTuningAllowed?: boolean;
+  /** Opted-in text hints default to { [provider]: 1 }; null returns an empty map. */
   priceHints?: Record<string, number> | null;
   /** Effective scoped/run lease enforcement, independent of the project mode. */
   postureMode?: BudgetMode;

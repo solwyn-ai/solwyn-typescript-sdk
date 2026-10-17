@@ -33,7 +33,7 @@ describe("settlement wire contract", () => {
   it.each([
     buildTokenDetails,
     buildReportedTokenDetails,
-  ])("clamps overlapping cache buckets during %s normalization", (build) => {
+  ])("raises an inconsistent input total without discarding cache buckets during %s normalization", (build) => {
     expect(
       build({
         input_tokens: 100,
@@ -43,11 +43,11 @@ describe("settlement wire contract", () => {
         cache_creation_1h_tokens: 60,
       }),
     ).toMatchObject({
-      input_tokens: 100,
+      input_tokens: 180,
       output_tokens: 5,
       cached_input_tokens: 60,
-      cache_creation_5m_tokens: 40,
-      cache_creation_1h_tokens: 0,
+      cache_creation_5m_tokens: 60,
+      cache_creation_1h_tokens: 60,
       is_estimated: true,
     });
     expect(

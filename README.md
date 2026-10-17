@@ -190,15 +190,19 @@ Confirmations run concurrently up to `reporterMaxInFlight` (default `3`), with i
 idempotent call IDs. Metadata batches remain serial. Retryable failures park the FIFO head;
 already-active confirmations can finish. Retries honor `Retry-After` (seconds or HTTP-date, up to
 one hour) and use exponential backoff with half-to-full jitter. HTTP 429 has a separate cap of
-20 responses per pending item. A shutdown flush respects a server's retry deadline.
+20 responses per pending item. Final confirmation and metadata flushes wait for a server's retry
+deadline when it fits within the remaining close budget. Longer holds are counted as `rate_limited` losses;
+an unsent settlement confirmation still releases its metadata event for ingestion.
 
 Persistent confirmation failures reach ERROR after ten consecutive failing delivery rounds.
 A round uses its last non-neutral confirmation verdict in dispatch order, so completion order
 cannot change the count. A success resets it; held admissions and read-only skips do not count.
 Lease-funded metadata includes the same `lease_id` as its confirmation. Cache reads and creation
-buckets must fit within input tokens; normalization clamps inconsistent provider breakdowns and
-marks them estimated. Ingest responses require `ingested`, `rejected`, and `duplicates`; malformed
-responses produce contract-drift diagnostics while usable rejection dispositions are still logged.
+buckets must fit within input tokens; normalization preserves those buckets and raises an
+inconsistent input total to their sum, marking it estimated. This correction settles the adjusted
+observed usage without retaining the lease reservation floor. Ingest responses require `ingested`,
+`rejected`, and `duplicates`; malformed responses produce contract-drift diagnostics while usable
+rejection dispositions are still logged.
 
 **Run-scoped leases.** With `leaseEnabled: true` (the default), an untagged text call inside a
 Node `run(...)` or `RunHandle.activate(...)` scope can reserve estimated input plus an output bound
@@ -589,7 +593,8 @@ unmetered posture because their wire behavior is not assumed to match OpenAI's n
 
 Untracked-surface advisories coalesce occurrences for fifteen minutes per key. Retries keep the
 same report ID and occurrence snapshot; later observations wait for a separate report. Closing
-flushes unsent occurrences within `reporterShutdownDeadline`, while respecting `Retry-After`.
+flushes unsent occurrences within `reporterShutdownDeadline`, bypassing local retry backoff while
+respecting `Retry-After`. Exhausted reports produce aggregated warnings at most once per minute.
 
 `coverage(client)` computes a local structural report without calling a provider operation or
 transmitting data. For CI, pin an independently reviewed literal. This exhaustive strict,
@@ -943,6 +948,8 @@ hard posture can produce `final_grant`. `runUsage: { "synthetic-run": 7.5 }` sup
 synthetic spend for stopped-run checks, independently of project `currentUsage`. Stop reasons
 are limited to `"manual_kill"`. Legacy checks omit directive keys, and opted-in text checks return
 a price-hint map (by default `{ [provider]: 1 }`; non-text or unpriceable checks return `{}`).
+Set `priceHints: null` to return an empty map on opted-in text checks; this does not omit the
+`price_hints` field.
 
 The fake stores only accepted ingest events and returns indexed `rejected` and `duplicates`
 arrays. It enforces the server's 1,000-event metadata batch limit, 100-report untracked batch
@@ -1041,8 +1048,8 @@ and wrapped provider.
 Open streams settle once from usage observed so far, without waiting for the consumer to pull
 another chunk. Further chunks are withheld at the next provider-chunk boundary. Finish or
 cancel streams before closing the client when you need their terminal usage included; provider
-stream cleanup still belongs to the consumer. Usage that is estimated retains the reservation
-floor during settlement.
+stream cleanup still belongs to the consumer. Missing or malformed usage retains the reservation
+floor during settlement; correcting inconsistent cache totals settles the adjusted observed usage.
 
 Or let `await using` do it:
 
@@ -1179,7 +1186,7 @@ the metadata-event fields; it is not the complete control-plane wire inventory:
 | `model` | Model name (e.g. `gpt-4o`) |
 | `provider` | Provider identifier (`openai`, `anthropic`, `google`, `bedrock`, `groq`, …) |
 | `input_tokens` / `output_tokens` | Token counts |
-| `token_details` | Breakdown: cached, reasoning, audio, and image input/output tokens; `is_estimated` flags length-based estimates |
+| `token_details` | Breakdown: cached, reasoning, audio, and image input/output tokens; `is_estimated` flags estimates and corrected inconsistent cache totals |
 | `media_usage` | Observable media quantities and selectors (counts, characters, seconds, resolution, quality), with estimates explicitly flagged |
 | `modality` | `text`, `embedding`, `image`, `audio`, or `video` |
 | `latency_ms` | Call duration in milliseconds |

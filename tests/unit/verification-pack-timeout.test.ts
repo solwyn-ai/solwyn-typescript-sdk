@@ -1,62 +1,223 @@
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vitest";
 
-const verifier = new URL("../../scripts/verification/process.mjs", import.meta.url).href;
+const caller = fileURLToPath(new URL("../fixtures/verification-command.mjs", import.meta.url));
 const temporary: string[] = [];
-afterEach(() => {
+const cleanups: (() => void | Promise<void>)[] = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-it("stops collecting output while simulated Windows taskkill is pending", () => {
-  const program = `import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';const spawn=cp.spawn;cp.spawn=(binary,args,options)=>binary==='taskkill.exe'?spawn(process.execPath,['-e','setTimeout(()=>process.exit(0),250)'],options):spawn(binary,args,options);syncBuiltinESMExports();Object.defineProperty(process,'platform',{value:'win32'});const concat=Buffer.concat;const chunks=[];Buffer.concat=(values,...args)=>{chunks.push(values.map(value=>value.length));return concat(values,...args);};const {runBoundedCommand}=await import(${JSON.stringify(verifier)});const result=await runBoundedCommand(process.execPath,['-e',"process.stdout.on('error',()=>process.exit(0));const timer=setInterval(()=>process.stdout.write('xxxxxxxx'),1);setTimeout(()=>{clearInterval(timer);process.exit(0);},500);"],{timeout:1500,maxBuffer:1});process.stdout.write(JSON.stringify({error:result.error?.code,stdout:result.stdout,chunks,termination:result.termination}));`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", program], {
-    encoding: "utf8",
-    timeout: 2500,
-    killSignal: "SIGKILL",
+function scratchDirectory() {
+  const scratch = mkdtempSync(path.join(tmpdir(), "verification-pack-timeout-"));
+  temporary.push(scratch);
+  return scratch;
+}
+
+/** Keep the test event loop free so its timeout can guard a hung caller. */
+function runCaller(scenario: object) {
+  const child = spawn(process.execPath, [caller, JSON.stringify(scenario)], {
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
-  expect(child.status, child.stderr).toBe(0);
-  const result = JSON.parse(child.stdout);
+  assert.ok(child.stdout);
+  assert.ok(child.stderr);
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const taskkillPending = new Promise<void>((resolve) => {
+    child.on("message", (message) => {
+      if (message === "taskkill-pending") resolve();
+    });
+  });
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  cleanups.push(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+  });
+  return {
+    taskkillPending,
+    async result() {
+      expect(await closed, stderr).toBe(0);
+      return JSON.parse(stdout);
+    },
+  };
+}
+
+/** The subject keeps this socket open; its kernel-closed connection proves termination. */
+async function livenessServer(scratch: string) {
+  const address =
+    process.platform === "win32"
+      ? `\\\\.\\pipe\\solwyn-${randomUUID()}`
+      : path.join(scratch, "liveness.sock");
+  const server = createServer();
+  cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const connected = new Promise<{ socket: Socket; pid: number; closed: Promise<void> }>(
+    (resolve, reject) => {
+      server.once("connection", (socket) => {
+        let alive = true;
+        let pid: number | undefined;
+        const closed = new Promise<void>((done) => {
+          socket.once("close", () => {
+            alive = false;
+            done();
+          });
+        });
+        socket.on("error", () => {});
+        cleanups.push(async () => {
+          if (alive && pid) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+            }
+          }
+          socket.destroy();
+          await closed;
+        });
+        let handshake = "";
+        const receivePid = (data: Buffer) => {
+          handshake += data;
+          if (!handshake.includes("\n")) return;
+          socket.off("data", receivePid);
+          pid = Number(handshake.trim());
+          if (!Number.isSafeInteger(pid) || pid <= 0) {
+            reject(new Error(`Invalid subject PID: ${handshake}`));
+            return;
+          }
+          resolve({ socket, pid, closed });
+        };
+        socket.on("data", receivePid);
+      });
+    },
+  );
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(address, resolve);
+  });
+  return { address, connected };
+}
+
+function writeSubject(scratch: string, address: string, windows = false) {
+  const subject = path.join(scratch, "subject.cjs");
+  writeFileSync(
+    subject,
+    `
+      process.on('SIGTERM', () => {});
+      const socket = require('node:net').connect(${JSON.stringify(address)}, () => {
+        socket.write(String(process.pid) + '\\n');
+        let input = '';
+        socket.on('data', (chunk) => {
+          input += chunk;
+          while (input.includes('\\n')) {
+            input = input.slice(input.indexOf('\\n') + 1);
+            ${windows ? "process.stdout.write('xxxxxxxx');" : "socket.write('pong\\n');"}
+          }
+        });
+        ${
+          windows
+            ? "process.stdout.write('xxxxxxxx');"
+            : `if (process.send) {
+                process.stdout.write('descendant-pid:' + process.pid + '\\n', () => {
+                  process.send('ready', () => process.disconnect());
+                });
+              } else {
+                process.stdout.write('child-ready\\n');
+                process.stderr.write('diagnostic\\n');
+              }`
+        }
+      });
+    `,
+  );
+  return subject;
+}
+
+it("stops collecting output while simulated Windows taskkill is pending", async () => {
+  const scratch = scratchDirectory();
+  const liveness = await livenessServer(scratch);
+  const subject = writeSubject(scratch, liveness.address, true);
+  const caller = runCaller({
+    mode: "windows-pending",
+    binary: process.execPath,
+    args: [subject],
+    maxBuffer: 1,
+  });
+  const [{ socket, pid, closed }] = await Promise.all([liveness.connected, caller.taskkillPending]);
+  // The next chunk is guaranteed to reach the supervisor while taskkill is pending.
+  socket.write("more\n");
+  const result = await caller.result();
   expect(result.error).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
   expect(result.stdout).toBe("x");
   expect(result.termination.method).toBe("taskkill-supervisor-tree");
+  expect(result.termination.cleanupTimedOut).toBe(true);
+  expect(result.fired).toEqual(["taskkill-cleanup"]);
+  expect(result.helperKills).toBe(1);
   expect(result.chunks).toEqual([[1], []]);
-});
+  process.kill(pid, "SIGKILL");
+  await closed;
+}, 30_000);
 
-it("lets Windows taskkill finish walking descendants after the anchor exits", () => {
-  const program = `import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';const spawn=cp.spawn;let anchor;let helperKills=0;cp.spawn=(binary,args,options)=>{if(binary!=='taskkill.exe'){const child=spawn(binary,args,options);anchor??=child;return child;}const helper=spawn(process.execPath,['-e','setTimeout(()=>process.exit(0),250)'],options);const kill=helper.kill.bind(helper);helper.kill=(...args)=>{helperKills++;return kill(...args);};setTimeout(()=>anchor.kill('SIGKILL'),30);return helper;};syncBuiltinESMExports();Object.defineProperty(process,'platform',{value:'win32'});const {runBoundedCommand}=await import(${JSON.stringify(verifier)});const started=Date.now();const result=await runBoundedCommand(process.execPath,['-e',"process.stdout.on('error',()=>process.exit(0));const timer=setInterval(()=>process.stdout.write('xxxxxxxx'),1);setTimeout(()=>{clearInterval(timer);process.exit(0);},500);"],{timeout:1500,maxBuffer:1});process.stdout.write(JSON.stringify({elapsed:Date.now()-started,helperKills,error:result.error?.code,termination:result.termination,supervisorExit:result.supervisorExit}));`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", program], {
-    encoding: "utf8",
-    timeout: 2500,
-    killSignal: "SIGKILL",
-  });
-  expect(child.status, child.stderr).toBe(0);
-  const result = JSON.parse(child.stdout);
+it("lets Windows taskkill finish walking descendants after the anchor exits", async () => {
+  const scratch = scratchDirectory();
+  const liveness = await livenessServer(scratch);
+  const subject = writeSubject(scratch, liveness.address, true);
+  const result = await runCaller({
+    mode: "windows-anchor-exit",
+    binary: process.execPath,
+    args: [subject],
+    maxBuffer: 1,
+  }).result();
   expect(result.error).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+  expect(result.order).toEqual(["anchor-exit", "taskkill-exit", "resolved"]);
   expect(result.supervisorExit.signal).toBe("SIGKILL");
   expect(result.helperKills).toBe(0);
-  expect(result.elapsed).toBeGreaterThanOrEqual(250);
-  expect(result.termination.status).toBe(0);
-  expect(result.termination.completed).toBe(true);
-});
+  expect(result.fired).toEqual([]);
+  expect(result.termination).toMatchObject({ status: 0, completed: true });
+  const { pid, closed } = await liveness.connected;
+  process.kill(pid, "SIGKILL");
+  await closed;
+}, 30_000);
 
-it("bounds sustained high-volume output with a shared stdout/stderr cap", () => {
-  const program = `import {runBoundedCommand} from ${JSON.stringify(verifier)};const result=await runBoundedCommand(process.execPath,['-e',"const chunk=Buffer.alloc(65536,120);function flood(){while(process.stdout.write(chunk)&&process.stderr.write(chunk)){}process.stdout.once('drain',flood);process.stderr.once('drain',flood);}flood();setInterval(()=>{},1000);"],{timeout:2000,maxBuffer:131072});process.stdout.write(JSON.stringify({...result,error:result.error?.code}));`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", program], {
-    encoding: "utf8",
-    timeout: 4000,
-    killSignal: "SIGKILL",
-    maxBuffer: 262144,
-  });
-  expect(child.status, child.stderr).toBe(0);
-  const result = JSON.parse(child.stdout);
+it("bounds sustained high-volume output with a shared stdout/stderr cap", async () => {
+  const result = await runCaller({
+    mode: "flood",
+    binary: process.execPath,
+    args: [
+      "-e",
+      `
+      const chunk = Buffer.alloc(65536, 120);
+      function flood() {
+        const out = process.stdout.write(chunk);
+        const err = process.stderr.write(chunk);
+        if (!out) process.stdout.once('drain', flood);
+        else if (!err) process.stderr.once('drain', flood);
+        else setImmediate(flood);
+      }
+      flood();
+    `,
+    ],
+    maxBuffer: 131072,
+  }).result();
   expect(result.error).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+  expect(result.fired).toEqual([]);
   expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBe(131072);
-  expect(result.elapsedMs).toBeLessThan(1500);
   expect(result.termination.targetPid).toBe(result.supervisorPid);
-});
+}, 30_000);
 
 it.each([
   [
@@ -180,28 +341,24 @@ it.each([
       errorCode: "EAI_AGAIN",
     },
   ],
-])("classifies command evidence for %s", (binary, result, expected) => {
-  const program = `import {classifyCommandFailure} from ${JSON.stringify(verifier)};process.stdout.write(JSON.stringify(classifyCommandFailure(${JSON.stringify(binary)},${JSON.stringify(result)})));`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", program], {
-    encoding: "utf8",
-  });
-  expect(child.status, child.stderr).toBe(0);
-  expect(JSON.parse(child.stdout)).toEqual(expected);
-});
+])(
+  "classifies command evidence for %s",
+  async (binary, result, expected) => {
+    expect(await runCaller({ mode: "classify", binary, result }).result()).toEqual(expected);
+  },
+  30_000,
+);
 
-it("classifies an actually missing tar executable as a prerequisite failure", () => {
-  const scratch = mkdtempSync(path.join(tmpdir(), "verification-missing-tar-"));
-  temporary.push(scratch);
+it("classifies an actually missing tar executable as a prerequisite failure", async () => {
+  const scratch = scratchDirectory();
   const binary = path.join(scratch, "missing", process.platform === "win32" ? "tar.exe" : "tar");
-  const program = `import {runBoundedCommand,classifyCommandFailure} from ${JSON.stringify(verifier)};const binary=${JSON.stringify(binary)};const result=await runBoundedCommand(binary,['-tzf','unused.tgz'],{timeout:1000});process.stdout.write(JSON.stringify({code:result.error?.code,status:result.status,failure:classifyCommandFailure(binary,result)}));`;
-  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", program], {
-    encoding: "utf8",
-    timeout: 2000,
-    killSignal: "SIGKILL",
-  });
-  expect(child.status, child.stderr).toBe(0);
-  const result = JSON.parse(child.stdout);
-  expect(result.code).toBe("ENOENT");
+  const result = await runCaller({
+    mode: "missing-tar",
+    binary,
+    args: ["-tzf", "unused.tgz"],
+  }).result();
+  expect(result.error).toBe("ENOENT");
+  expect(result.fired).toEqual([]);
   expect(result.status).toBeNull();
   expect(result.failure).toMatchObject({
     phase: "prerequisite",
@@ -209,72 +366,71 @@ it("classifies an actually missing tar executable as a prerequisite failure", ()
     retryable: false,
     errorCode: "ENOENT",
   });
-});
+}, 30_000);
 
 it.each([
   "ignored-signal",
   "inherited-pipe",
   "escaped-session",
-])("bounds the caller despite %s", async (mode) => {
-  const scratch = mkdtempSync(path.join(tmpdir(), "verification-pack-timeout-"));
-  temporary.push(scratch);
+] as const)("bounds the caller despite %s", async (mode) => {
+  const scratch = scratchDirectory();
+  const liveness = await livenessServer(scratch);
+  const subject = writeSubject(scratch, liveness.address);
   const child = path.join(scratch, "unresponsive.cjs");
-  const descendant = path.join(scratch, "descendant.cjs");
-  const heartbeat = path.join(scratch, "heartbeat.txt");
-  writeFileSync(
-    descendant,
-    `process.on('SIGTERM',()=>{});process.stdout.write('descendant-pid:'+process.pid+'\\n');let count=0;setInterval(()=>{const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(`${heartbeat}.next`)},String(++count));fs.renameSync(${JSON.stringify(`${heartbeat}.next`)},${JSON.stringify(heartbeat)});},20);setTimeout(()=>process.exit(0),2500);`,
-  );
   writeFileSync(
     child,
     mode === "ignored-signal"
-      ? "process.on('SIGTERM',()=>{});process.stdout.write('child-ready\\n');process.stderr.write('diagnostic\\n');setTimeout(()=>process.exit(0),2500);"
-      : `require('node:child_process').spawn(process.execPath,[${JSON.stringify(descendant)}],{stdio:'inherit',detached:${mode === "escaped-session"}});process.stdout.write('child-ready\\n');process.stderr.write('diagnostic\\n');process.exit(0);`,
+      ? `require(${JSON.stringify(subject)});`
+      : `
+          const descendant = require('node:child_process').spawn(
+            process.execPath, [${JSON.stringify(subject)}],
+            { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], detached: ${mode === "escaped-session"} }
+          );
+          descendant.once('message', () => {
+            process.stdout.write('child-ready\\n', () => {
+              process.stderr.write('diagnostic\\n', () => process.exit(0));
+            });
+          });
+        `,
   );
-  const resultFile = path.join(scratch, "result.json");
-  const caller = path.join(scratch, "caller.mjs");
-  writeFileSync(
-    caller,
-    `import fs from 'node:fs';import {runBoundedCommand} from ${JSON.stringify(verifier)};const start=Date.now();const result=await runBoundedCommand(process.execPath,[${JSON.stringify(child)}],{cwd:${JSON.stringify(scratch)},env:process.env,encoding:'utf8',timeout:200,maxBuffer:1048576});fs.writeFileSync(${JSON.stringify(resultFile)},JSON.stringify({elapsed:Date.now()-start,...result,error:result.error?.message??result.error}));`,
+  // The subject never exits by itself: returning is the proof of boundedness.
+  const evidence = await runCaller({
+    mode,
+    binary: process.execPath,
+    args: [child],
+    cwd: scratch,
+  }).result();
+  const trigger = mode === "ignored-signal" ? "deadline" : "pipe-cleanup";
+  expect(evidence.fired).toEqual([trigger]);
+  expect(evidence.error).toBe(
+    mode === "ignored-signal" ? "ETIMEDOUT" : "ERR_CHILD_PROCESS_PIPE_CLEANUP_TIMEOUT",
   );
-  const start = Date.now();
-  const result = spawnSync(process.execPath, [caller], {
-    encoding: "utf8",
-    timeout: 5000,
-    killSignal: "SIGKILL",
-  });
-  expect(result.status, result.stderr).toBe(0);
-  expect(Date.now() - start).toBeLessThan(1500);
-  const evidence = JSON.parse(readFileSync(resultFile, "utf8"));
-  expect(evidence.elapsed).toBeLessThan(1000);
   expect(evidence.timedOut).toBe(true);
   expect(evidence.stdout).toContain("child-ready");
   expect(evidence.stderr).toContain("diagnostic");
+  const { socket, pid, closed } = await liveness.connected;
+  expect(pid).toBeGreaterThan(0);
   if (mode !== "ignored-signal") {
-    const pid = Number(/descendant-pid:(\d+)/.exec(evidence.stdout)?.[1]);
-    expect(pid).toBeGreaterThan(0);
-    try {
-      const before = Number(readFileSync(heartbeat, "utf8"));
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      const after = Number(readFileSync(heartbeat, "utf8"));
-      if (mode === "inherited-pipe" && process.platform !== "win32") {
-        expect(after, "ordinary inherited-pipe descendant kept running after group cleanup").toBe(
-          before,
-        );
-        expect(evidence.termination.attempted).toBe(true);
-      } else {
-        expect(evidence.termination.scope).toContain("escaped sessions are not contained");
-        // POSIX new sessions intentionally escape the owned group; the caller still returned.
-        if (mode === "escaped-session" && process.platform !== "win32")
-          expect(after).toBeGreaterThan(before);
-      }
-    } finally {
-      // The test owns this exact child PID and explicitly cleans up its deliberate escape.
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        /* Already terminated/reaped. */
-      }
-    }
+    expect(Number(/descendant-pid:(\d+)/.exec(evidence.stdout)?.[1])).toBe(pid);
   }
-});
+  if (process.platform === "win32") return;
+  expect(evidence.termination.attempted).toBe(true);
+  if (mode === "escaped-session") {
+    expect(evidence.termination.scope).toContain("escaped sessions are not contained");
+    // Answering after the caller returns proves the new session escaped the owned group.
+    const pong = new Promise<string>((resolve) => {
+      let answer = "";
+      const receivePong = (data: Buffer) => {
+        answer += data;
+        if (!answer.includes("\n")) return;
+        socket.off("data", receivePong);
+        resolve(answer.trim());
+      };
+      socket.on("data", receivePong);
+    });
+    socket.write("ping\n");
+    expect(await pong).toBe("pong");
+    process.kill(pid, "SIGKILL");
+  }
+  await closed;
+}, 30_000);

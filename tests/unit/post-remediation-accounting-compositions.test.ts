@@ -177,21 +177,9 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
         await client.close();
       }
       expect(fallbackCalls).toBe(2);
-      expect(plane.confirms).toHaveLength(1);
-      expect(plane.confirms[0]?.token_details).toMatchObject({
-        input_tokens: 30,
-        output_tokens: outcome === "stop" ? 20 : 0,
-      });
-      const paidEvent = plane.ingested.find(
-        (event) => event.call_id === plane.confirms[0]?.call_id && event.provider === "anthropic",
-      );
-      expect(paidEvent).toMatchObject({
-        status: outcome === "stop" ? "success" : "error",
-        input_tokens: 30,
-        output_tokens: outcome === "stop" ? 20 : 0,
-      });
+      expect(plane.confirms).toHaveLength(outcome === "stop" ? 1 : 0);
       expect(plane.leaseSurrenders).toHaveLength(1);
-      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(outcome === "stop" ? 50 : 128);
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(outcome === "stop" ? 50 : 0);
       if (outcome === "stop") expect(signal?.aborted).toBe(true);
     });
   }

@@ -3722,15 +3722,17 @@ export class SolwynCore {
                 failedBreakerProviders,
                 admission,
               );
-            // Only observed provider counters authorize settlement after a provider error.
-            const usage = deferredResponses
-              ? null
-              : extractUsageFailSoft({
-                  extract: () => accumulator.finalize({ estimateMissingUsage: false }),
-                  estimate: () => null,
-                  estimatedInputTokens: 0,
-                  logger: this.#logger,
-                });
+            // Cloud lease netting currently covers only success events with a receipt.
+            // Pairing a lease confirmation with an error event would count the spend twice.
+            const usage =
+              deferredResponses || settlement.funding.leaseId !== null
+                ? null
+                : extractUsageFailSoft({
+                    extract: () => accumulator.finalize({ estimateMissingUsage: false }),
+                    estimate: () => null,
+                    estimatedInputTokens: 0,
+                    logger: this.#logger,
+                  });
             const observedUsage =
               usage !== null &&
               (usage.tokenDetails.input_tokens > 0 || usage.tokenDetails.output_tokens > 0);

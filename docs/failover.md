@@ -39,11 +39,13 @@ recovery indefinitely. Its later outcome cannot affect a newer probe.
 For established streams, non-429 HTTP 4xx errors are health-neutral; errors without an HTTP
 status count as provider failures unless caused by caller cancellation.
 For ordinary provider streams, mid-stream errors never trigger failover or record a latency
-sample. Solwyn settles provider-reported usage observed before the error, including partial
-usage, and reports an `error` event with those tokens and `possibly_succeeded: true`. If no
-usage was observed, the event carries zero tokens and no usage confirmation is sent.
-Deferred `responses.stream`
-helpers retain their existing error settlement behavior.
+sample. Streams using per-call budget checks settle provider-reported usage observed before
+the error, including partial usage, and report an `error` event with those tokens and
+`possibly_succeeded: true`. If no usage was observed, the event carries zero tokens and no
+usage confirmation is sent. Lease-funded streams, the default for untagged run-scoped text
+calls, still report zero usage on mid-stream provider errors, release the local claim, and send
+no confirmation. Deferred `responses.stream` helpers retain their existing error settlement
+behavior.
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.

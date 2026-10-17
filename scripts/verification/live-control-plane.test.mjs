@@ -216,76 +216,107 @@ test("a Solwyn control plane with fake providers", {
     },
   );
 
-  await t.test("mid-stream provider errors settle observed usage and reconcile spend", async () => {
-    const before = await totals();
-    const beforeBudget = await budget();
-    let runCost = 0;
-    for (const provider of ["openai", "anthropic", "google", "bedrock"]) {
-      for (const leased of [false, true]) {
-        for (const plane of [null, new probes.FakeControlPlane()]) {
-          const wire = captureControlPlane(plane?.apiUrl ?? apiUrl, plane?.fetch);
-          const failure = new Error("synthetic mid-stream provider failure");
-          const fixture = providerFixture(provider, { streamError: failure });
-          const client = wrap(fixture, wire, provider, {
-            leaseEnabled: leased,
-            ...(plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {}),
-          });
-          const name = `sdk-live-stream-error-${provider}-${crypto.randomUUID()}`;
-          let runId;
-          try {
-            await sdk.run(name, async () => {
-              runId = sdk.currentRun().agentRunId;
-              await assert.rejects(
-                async () => consume(await fixture.invoke(client, true)),
-                (error) => error === failure,
-              );
+  await t.test(
+    "mid-stream provider errors settle per-call usage and preserve lease behavior",
+    async () => {
+      const before = await totals();
+      const beforeBudget = await budget();
+      let runCost = 0;
+      for (const provider of ["openai", "anthropic", "google", "bedrock"]) {
+        for (const leased of [false, true]) {
+          for (const plane of [null, new probes.FakeControlPlane()]) {
+            const beforeCase = plane ? null : { budget: await budget(), totals: await totals() };
+            const wire = captureControlPlane(plane?.apiUrl ?? apiUrl, plane?.fetch);
+            const failure = new Error("synthetic mid-stream provider failure");
+            const fixture = providerFixture(provider, { streamError: failure });
+            const client = wrap(fixture, wire, provider, {
+              leaseEnabled: leased,
+              ...(plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {}),
             });
-          } finally {
-            await client.close();
+            const name = `sdk-live-stream-error-${provider}-${crypto.randomUUID()}`;
+            let runId;
+            try {
+              await sdk.run(name, async () => {
+                runId = sdk.currentRun().agentRunId;
+                await assert.rejects(
+                  async () => consume(await fixture.invoke(client, true)),
+                  (error) => error === failure,
+                );
+              });
+            } finally {
+              await client.close();
+            }
+            assertDelivery(wire);
+            assert.equal(fixture.calls, 1);
+            assert.equal(fixture.ended, 1);
+            const confirms = at(wire, "/budgets/confirm");
+            assert.equal(confirms.length, leased ? 0 : 1);
+            const events = metadata(wire);
+            assert.equal(events.length, 1);
+            assert.equal(events[0].status, "error");
+            assert.equal(events[0].input_tokens, leased ? 0 : INPUT_TOKENS);
+            assert.equal(events[0].output_tokens, leased ? 0 : OUTPUT_TOKENS);
+            assert.equal(events[0].possibly_succeeded, true);
+            assert.equal(events[0].failover_error_class, undefined);
+            if (leased) {
+              const leaseId = at(wire, "/budgets/lease")[0]?.response.lease_id;
+              assert.equal(typeof leaseId, "string");
+              assert.equal(at(wire, "/budgets/check").length, 0);
+              assert.equal(events[0].token_details, undefined);
+              assert.equal(events[0].lease_id, undefined);
+              const surrenders = at(wire, "/lease/surrender");
+              assert.equal(surrenders.length, 1);
+              assert.equal(surrenders[0].request.lease_id, leaseId);
+              assert.equal(surrenders[0].request.spent_tokens, 0);
+            } else {
+              assert.equal(at(wire, "/budgets/check").length, 1);
+              assert.equal(at(wire, "/budgets/lease").length, 0);
+              assert.equal(events[0].call_id, confirms[0].request.call_id);
+              assert.equal(confirms[0].request.lease_id, undefined);
+              assert.equal(
+                confirms[0].request.reservation_id,
+                at(wire, "/budgets/check")[0].response.reservation_id,
+              );
+              assert.equal(confirms[0].request.token_details.input_tokens, INPUT_TOKENS);
+              assert.equal(confirms[0].request.token_details.output_tokens, OUTPUT_TOKENS);
+            }
+            if (!plane) {
+              const caseCost = await assertRollup(runId, name, events);
+              runCost += caseCost;
+              const afterCase = { budget: await budget(), totals: await totals() };
+              const budgetDelta = afterCase.budget.current_usage - beforeCase.budget.current_usage;
+              const costDelta = afterCase.totals.total_cost - beforeCase.totals.total_cost;
+              assert.equal(afterCase.totals.call_count - beforeCase.totals.call_count, 1);
+              assert.ok(Math.abs(costDelta - caseCost) < 0.000001);
+              assert.ok(Math.abs(budgetDelta - caseCost) < 0.000002);
+              if (leased) {
+                assert.equal(caseCost, 0);
+                assert.equal(budgetDelta, 0);
+              } else {
+                assert.ok(caseCost > 0, "observed per-call usage must be billable exactly once");
+              }
+              t.diagnostic(
+                `${provider} ${leased ? "lease" : "per-call"}: confirms=${confirms.length}, ` +
+                  `tokens=${events[0].input_tokens}/${events[0].output_tokens}, ` +
+                  `event cost=${caseCost.toFixed(8)}, budget delta=${budgetDelta.toFixed(8)}`,
+              );
+            }
           }
-          assertDelivery(wire);
-          assert.equal(fixture.calls, 1);
-          assert.equal(fixture.ended, 1);
-          const confirms = at(wire, "/budgets/confirm");
-          assert.equal(confirms.length, 1);
-          const events = metadata(wire);
-          assert.equal(events.length, 1);
-          assert.equal(events[0].call_id, confirms[0].request.call_id);
-          assert.equal(events[0].status, "error");
-          assert.equal(events[0].input_tokens, INPUT_TOKENS);
-          assert.equal(events[0].output_tokens, OUTPUT_TOKENS);
-          assert.equal(events[0].possibly_succeeded, true);
-          assert.equal(events[0].failover_error_class, undefined);
-          assert.equal(confirms[0].request.token_details.input_tokens, INPUT_TOKENS);
-          assert.equal(confirms[0].request.token_details.output_tokens, OUTPUT_TOKENS);
-          if (leased) {
-            const leaseId = at(wire, "/budgets/lease")[0]?.response.lease_id;
-            assert.equal(typeof leaseId, "string");
-            assert.equal(confirms[0].request.lease_id, leaseId);
-            assert.equal(events[0].lease_id, leaseId);
-            const surrenders = at(wire, "/lease/surrender");
-            assert.equal(surrenders.length, 1);
-            assert.equal(surrenders[0].request.spent_tokens, INPUT_TOKENS + OUTPUT_TOKENS);
-          } else {
-            assert.equal(at(wire, "/budgets/check").length, 1);
-            assert.equal(at(wire, "/budgets/lease").length, 0);
-          }
-          if (!plane) runCost += await assertRollup(runId, name, events);
         }
       }
-    }
-    const after = await totals();
-    const afterBudget = await budget();
-    assert.ok(runCost > 0, "observed usage on failed streams must be billable");
-    assert.equal(after.call_count - before.call_count, 8);
-    assert.equal(after.total_input_tokens - before.total_input_tokens, 8 * INPUT_TOKENS);
-    assert.equal(after.total_output_tokens - before.total_output_tokens, 8 * OUTPUT_TOKENS);
-    assert.ok(Math.abs(after.total_cost - before.total_cost - runCost) < 0.000001);
-    assert.ok(
-      Math.abs(afterBudget.current_usage - beforeBudget.current_usage - runCost) < 0.000002,
-      `budget spend delta ${afterBudget.current_usage - beforeBudget.current_usage} differs from event spend ${runCost}`,
-    );
-  });
+      const after = await totals();
+      const afterBudget = await budget();
+      assert.ok(runCost > 0, "observed usage on failed streams must be billable");
+      assert.equal(after.call_count - before.call_count, 8);
+      assert.equal(after.total_input_tokens - before.total_input_tokens, 4 * INPUT_TOKENS);
+      assert.equal(after.total_output_tokens - before.total_output_tokens, 4 * OUTPUT_TOKENS);
+      assert.ok(Math.abs(after.total_cost - before.total_cost - runCost) < 0.000001);
+      assert.ok(
+        Math.abs(afterBudget.current_usage - beforeBudget.current_usage - runCost) < 0.000002,
+        `budget spend delta ${afterBudget.current_usage - beforeBudget.current_usage} differs from event spend ${runCost}`,
+      );
+    },
+  );
 
   await t.test(
     "run-scoped lease grant, renewal on the next call, settlement attribution, and surrender",

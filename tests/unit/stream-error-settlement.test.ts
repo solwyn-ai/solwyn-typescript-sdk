@@ -140,7 +140,7 @@ describe("provider usage observed before a stream error", () => {
     expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
   });
 
-  it("trues up a Google lease claim and uses the remaining grant for the next admission", async () => {
+  it("keeps Google lease-funded errors at zero usage and releases the claim", async () => {
     const plane = new FakeControlPlane({ grantedTokens: 20, finalGrant: true });
     const fixture = googleContinuationFailure("http");
     const client = plane.wrap(fixture.raw, {
@@ -154,32 +154,27 @@ describe("provider usage observed before a stream error", () => {
         ).rejects.toBeInstanceOf(ApiError);
         expect(plane.leaseGrants).toHaveLength(1);
         expect(plane.checks).toHaveLength(0);
-        // Fifteen paid tokens leave five of the twenty-token grant. A second ten-token
-        // reservation must check the control plane instead of reusing refunded authority.
+        // Releasing the first ten-token claim preserves the grant for the next admission.
         await expect(client.models.generateContentStream(googleParams)).rejects.toBeInstanceOf(
           ApiError,
         );
-        expect(plane.checks).toHaveLength(1);
+        expect(plane.checks).toHaveLength(0);
       });
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(1);
-    expect(plane.confirms[0]).toMatchObject({
-      lease_id: expect.any(String),
-      token_details: observedGoogleUsage,
-    });
+    expect(plane.confirms).toHaveLength(0);
     expect(plane.ingested).toHaveLength(2);
-    const paidEvent = plane.ingested.find((event) => event.call_id === plane.confirms[0]?.call_id);
-    expect(paidEvent).toMatchObject({
+    expect(plane.ingested[0]).toMatchObject({
       status: "error",
-      input_tokens: 10,
-      output_tokens: 5,
-      lease_id: plane.confirms[0]?.lease_id,
+      input_tokens: 0,
+      output_tokens: 0,
       possibly_succeeded: true,
     });
+    expect(plane.ingested[0]?.token_details).toBeUndefined();
+    expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
     expect(plane.leaseSurrenders).toHaveLength(1);
-    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(15);
+    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
   });
 
   it("keeps a dropped OpenAI stream unconfirmed before include_usage arrives", async () => {
@@ -217,9 +212,14 @@ describe("provider usage observed before a stream error", () => {
   });
 
   it.each([
-    false,
-    true,
-  ])("does not settle compatible fallback estimates (chunk=%s)", async (chunk) => {
+    { chunk: false, leased: false },
+    { chunk: true, leased: false },
+    { chunk: false, leased: true },
+    { chunk: true, leased: true },
+  ])("does not settle compatible fallback estimates (chunk=$chunk, lease=$leased)", async ({
+    chunk,
+    leased,
+  }) => {
     const plane = new FakeControlPlane();
     const failure = new Error("synthetic compatible stream failure");
     const client = plane.wrap(
@@ -237,7 +237,7 @@ describe("provider usage observed before a stream error", () => {
       { breakerReportingEnabled: false, logger: noopLogger },
     );
     try {
-      await run("compatible-stream-error", async () => {
+      const call = async () => {
         await expect(
           consume(
             await client.chat.completions.create({
@@ -248,7 +248,9 @@ describe("provider usage observed before a stream error", () => {
             }),
           ),
         ).rejects.toBe(failure);
-      });
+      };
+      if (leased) await run("compatible-stream-error", call);
+      else await call();
     } finally {
       await client.close();
     }
@@ -260,16 +262,20 @@ describe("provider usage observed before a stream error", () => {
       output_tokens: 0,
       possibly_succeeded: true,
     });
-    expect(plane.leaseSurrenders).toHaveLength(1);
-    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+    expect(plane.leaseSurrenders).toHaveLength(leased ? 1 : 0);
+    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
   });
 
-  it("preserves the provider error and releases funding when finalization throws", async () => {
+  it.each([
+    false,
+    true,
+  ])("preserves the provider error when finalization throws (lease=%s)", async (leased) => {
+    const finalize = vi.fn(() => {
+      throw new Error("synthetic usage extraction failure");
+    });
     vi.spyOn(OpenAIAdapter.prototype, "createStreamAccumulator").mockReturnValue({
       observe() {},
-      finalize() {
-        throw new Error("synthetic usage extraction failure");
-      },
+      finalize,
       getServiceTier: () => null,
     });
     const plane = new FakeControlPlane();
@@ -288,7 +294,7 @@ describe("provider usage observed before a stream error", () => {
       { breakerReportingEnabled: false, logger: noopLogger },
     );
     try {
-      await run("unreadable-stream-usage", async () => {
+      const call = async () => {
         await expect(
           consume(
             await client.chat.completions.create({
@@ -299,17 +305,23 @@ describe("provider usage observed before a stream error", () => {
             }),
           ),
         ).rejects.toBe(failure);
-      });
+      };
+      if (leased) await run("unreadable-stream-usage", call);
+      else await call();
     } finally {
       await client.close();
     }
     expect(plane.confirms).toHaveLength(0);
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({ status: "error", input_tokens: 0, output_tokens: 0 });
-    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+    expect(finalize).toHaveBeenCalledTimes(leased ? 0 : 1);
+    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
   });
 
-  it.each([false, true])("settles partial Anthropic input usage (lease=%s)", async (leased) => {
+  it.each([
+    false,
+    true,
+  ])("settles partial Anthropic input only without lease funding (lease=%s)", async (leased) => {
     const plane = new FakeControlPlane();
     const failure = new Error("synthetic Anthropic stream failure");
     const client = plane.wrap(
@@ -341,26 +353,31 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(1);
-    expect(plane.confirms[0]?.token_details).toMatchObject({
-      input_tokens: 12,
-      output_tokens: 0,
-      is_estimated: true,
-    });
+    expect(plane.confirms).toHaveLength(leased ? 0 : 1);
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",
-      input_tokens: 12,
+      input_tokens: leased ? 0 : 12,
       output_tokens: 0,
-      token_details: { input_tokens: 12, output_tokens: 0, is_estimated: true },
       possibly_succeeded: true,
     });
     expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
     if (leased) {
-      expect(plane.confirms[0]?.lease_id).toEqual(expect.any(String));
-      // Missing output usage retains the twenty-token reservation floor locally.
+      expect(plane.ingested[0]?.token_details).toBeUndefined();
       expect(plane.leaseSurrenders).toHaveLength(1);
-      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(20);
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+    } else {
+      expect(plane.checks).toHaveLength(1);
+      expect(plane.confirms[0]?.token_details).toMatchObject({
+        input_tokens: 12,
+        output_tokens: 0,
+        is_estimated: true,
+      });
+      expect(plane.ingested[0]?.token_details).toMatchObject({
+        input_tokens: 12,
+        output_tokens: 0,
+        is_estimated: true,
+      });
     }
   });
 

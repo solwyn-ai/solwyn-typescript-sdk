@@ -3,6 +3,7 @@ import { setImmediate } from "node:timers/promises";
 import { debuglog } from "node:util";
 
 const forceGc = globalThis.gc;
+const realNow = performance.now.bind(performance);
 assert.ok(forceGc, "run with --expose-gc");
 // NODE_DEBUG=solwyn-gc reports each wait's cycle count without changing probe output.
 const debug = debuglog("solwyn-gc");
@@ -22,9 +23,9 @@ export async function settle(cycles) {
 
 /** Wait for release; allow at least one second for timers before exhausting the cycle budget. */
 export async function collectUntil(predicate, describe, maxCycles = 100) {
-  const earliestFailure = performance.now() + 1000;
+  const earliestFailure = realNow() + 1000;
   let cycle = 0;
-  while (cycle < maxCycles || performance.now() < earliestFailure) {
+  while (cycle < maxCycles || realNow() < earliestFailure) {
     cycle++;
     await settle(1);
     if (predicate()) {

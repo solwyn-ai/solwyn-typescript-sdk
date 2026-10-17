@@ -13,6 +13,18 @@ import { alive, collectUntil } from "./gc.mjs";
 const forceGc = (globalThis as { gc?: () => void }).gc;
 assert.ok(forceGc, "run with --expose-gc");
 
+/** Wait for delivery without forcing collection of the clients being exercised. */
+async function waitForDelivery(predicate: () => boolean, describe: () => string): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  while (!predicate()) {
+    assert.ok(
+      performance.now() < deadline,
+      `Delivery condition unmet after 5 seconds: ${describe()}`,
+    );
+    await sleep(10);
+  }
+}
+
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const PROJECT = `proj_${"0".repeat(24)}`;
 const REPORTER_HOOK = Symbol.for("@solwyn/sdk/node-reporter-registration");
@@ -283,7 +295,10 @@ async function heartbeat() {
   }
   const reporters = reporterRefs.slice(firstReporter);
   // Let dropped clients deliver their settlement and start heartbeating before the drop.
-  await sleep(150);
+  await waitForDelivery(
+    () => droppedCount.breaker > 0,
+    () => `dropped clients: breakerPosts=${droppedCount.breaker}, ingests=${droppedCount.ingests}`,
+  );
   const droppedBreakerBeforeDrop = droppedCount.breaker;
   await collectUntil(
     () => alive(providers) === 0 && alive(reporters) === 0,
@@ -342,7 +357,11 @@ async function heartbeatEveryTick(failBreaker: boolean) {
   }
   const reporters = reporterRefs.slice(firstReporter);
   // Let dropped clients deliver their settlement and start breaker reporting before the drop.
-  await sleep(150);
+  await waitForDelivery(
+    () => droppedCount.breaker > 0,
+    () =>
+      `dropped clients: failBreaker=${failBreaker}, breakerPosts=${droppedCount.breaker}, ingests=${droppedCount.ingests}`,
+  );
   const droppedBreakerBeforeDrop = droppedCount.breaker;
   await collectUntil(
     () => alive(providers) === 0 && alive(reporters) === 0,
@@ -566,7 +585,10 @@ async function middleware() {
   for (let index = 0; index < 10; index++) await dropOne(index % 2 === 1);
   const reporters = reporterRefs.slice(firstReporter);
   const holders = leaseRefs.slice(firstLease);
-  await sleep(100); // deliver the dropped handles' queued events first
+  await waitForDelivery(
+    () => droppedCount.ingests === 5,
+    () => `dropped middleware: ingests=${droppedCount.ingests}/5`,
+  );
   const ingestedBeforeDrop = droppedCount.ingests;
   await collectUntil(
     () =>

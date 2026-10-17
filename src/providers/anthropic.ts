@@ -240,8 +240,8 @@ export class AnthropicAdapter implements ProviderAdapter {
    * is accepted (protocol-required) but ignored — Anthropic streams always carry real
    * usage, so no estimate fallback is ever needed.
    */
-  createStreamAccumulator(_options?: CreateStreamAccumulatorOptions): StreamUsageAccumulator {
-    return new AnthropicStreamAccumulator(this.#logger);
+  createStreamAccumulator(options?: CreateStreamAccumulatorOptions): StreamUsageAccumulator {
+    return new AnthropicStreamAccumulator(this.#logger, options?.requestedCacheTtl);
   }
 
   /**
@@ -314,7 +314,7 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   #cacheRead = 0;
   #cache5m = 0;
   #cache1h = 0;
-  #initialCacheTtl: "5m" | "1h" | null = null;
+  #cacheGrowthTtl: "5m" | "1h" | null = null;
   #output = 0;
   #reasoning = 0;
   #serviceTier: unknown = null;
@@ -324,9 +324,14 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   #inputMeasured = false;
   #outputMeasured = false;
   readonly #logger: Logger;
+  readonly #requestedCacheTtl: CreateStreamAccumulatorOptions["requestedCacheTtl"];
 
-  constructor(logger: Logger = consoleLogger) {
+  constructor(
+    logger: Logger = consoleLogger,
+    requestedCacheTtl?: CreateStreamAccumulatorOptions["requestedCacheTtl"],
+  ) {
     this.#logger = logger;
+    this.#requestedCacheTtl = requestedCacheTtl;
   }
 
   observe(chunk: unknown): void {
@@ -347,12 +352,16 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
         this.#cacheRead = details.cached_input_tokens;
         this.#cache5m = details.cache_creation_5m_tokens;
         this.#cache1h = details.cache_creation_1h_tokens;
-        this.#initialCacheTtl =
-          this.#cache5m > 0 && this.#cache1h === 0
-            ? "5m"
-            : this.#cache1h > 0 && this.#cache5m === 0
-              ? "1h"
-              : null;
+        const requestedCacheTtl = this.#requestedCacheTtl;
+        this.#cacheGrowthTtl =
+          (requestedCacheTtl === "5m" && this.#cache1h === 0) ||
+          (requestedCacheTtl === "1h" && this.#cache5m === 0)
+            ? requestedCacheTtl
+            : this.#cache5m > 0 && this.#cache1h === 0
+              ? "5m"
+              : this.#cache1h > 0 && this.#cache5m === 0
+                ? "1h"
+                : null;
         this.#inputMeasured = !details.is_estimated;
         this.#invalidDetails ||= invalidAnthropicDetails(usage);
         this.#reasoning = details.reasoning_tokens;
@@ -385,11 +394,13 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
             // Real deltas carry only the aggregate; preserve observed writes by TTL.
             const increment = aggregate - this.#cache5m - this.#cache1h;
             if (increment > 0) {
-              if (this.#initialCacheTtl === "5m") this.#cache5m += increment;
+              if (this.#cacheGrowthTtl === "5m") this.#cache5m += increment;
               else this.#cache1h += increment;
-              // Mixed or absent initial TTLs cannot identify the new writes' TTL.
-              // Use the conservative one-hour bucket and disclose the inferred split.
-              if (this.#initialCacheTtl === null) this.#invalidDetails = true;
+              // A compatible single request TTL identifies growth even with no initial
+              // writes. Mixed requests or ambiguous starts still disclose an inferred split.
+              if (this.#cacheGrowthTtl === null || this.#requestedCacheTtl === "mixed") {
+                this.#invalidDetails = true;
+              }
             } else if (increment < 0) {
               // Cumulative usage cannot shrink. Keep observed writes conservatively.
               this.#invalidDetails = true;

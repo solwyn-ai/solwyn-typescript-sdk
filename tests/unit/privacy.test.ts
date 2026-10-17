@@ -11,7 +11,202 @@ import {
   measureOpenAIVideoMedia,
   measureSpeechMedia,
   measureVideoMedia,
+  requestedAnthropicCacheTtls,
 } from "../../src/privacy";
+
+describe("requestedAnthropicCacheTtls", () => {
+  it.each<{ name: string; kwargs: Record<string, unknown>; expected: string }>([
+    { name: "no markers", kwargs: {}, expected: "none" },
+    { name: "null marker", kwargs: { cache_control: null }, expected: "none" },
+    { name: "undefined marker", kwargs: { cache_control: undefined }, expected: "none" },
+    {
+      name: "default TTL",
+      kwargs: { cache_control: { type: "ephemeral" } },
+      expected: "5m",
+    },
+    {
+      name: "explicit five-minute TTL",
+      kwargs: { cache_control: { type: "ephemeral", ttl: "5m" } },
+      expected: "5m",
+    },
+    {
+      name: "top-level one-hour TTL",
+      kwargs: { cache_control: { type: "ephemeral", ttl: "1h" } },
+      expected: "1h",
+    },
+    {
+      name: "system blocks",
+      kwargs: {
+        system: [
+          { type: "text", text: "synthetic", cache_control: { type: "ephemeral", ttl: "1h" } },
+        ],
+      },
+      expected: "1h",
+    },
+    {
+      name: "message content blocks",
+      kwargs: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "synthetic", cache_control: { type: "ephemeral", ttl: "1h" } },
+            ],
+          },
+        ],
+      },
+      expected: "1h",
+    },
+    {
+      name: "nested tool results",
+      kwargs: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "synthetic-tool",
+                content: [
+                  {
+                    type: "text",
+                    text: "synthetic",
+                    cache_control: { type: "ephemeral", ttl: "1h" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      expected: "1h",
+    },
+    {
+      name: "tool definitions",
+      kwargs: {
+        tools: [
+          {
+            name: "synthetic_tool",
+            input_schema: { type: "object" },
+            cache_control: { type: "ephemeral", ttl: "1h" },
+          },
+        ],
+      },
+      expected: "1h",
+    },
+    {
+      name: "mixed explicit and default TTLs",
+      kwargs: {
+        cache_control: { type: "ephemeral", ttl: "1h" },
+        system: [{ cache_control: { type: "ephemeral" } }],
+      },
+      expected: "mixed",
+    },
+    {
+      name: "unsupported TTL",
+      kwargs: { cache_control: { type: "ephemeral", ttl: "24h" } },
+      expected: "unknown",
+    },
+    {
+      name: "null TTL",
+      kwargs: { cache_control: { type: "ephemeral", ttl: null } },
+      expected: "unknown",
+    },
+    {
+      name: "unsupported type",
+      kwargs: { cache_control: { type: "persistent", ttl: "1h" } },
+      expected: "unknown",
+    },
+    { name: "missing type", kwargs: { cache_control: { ttl: "1h" } }, expected: "unknown" },
+    { name: "non-object marker", kwargs: { cache_control: "1h" }, expected: "unknown" },
+    { name: "array marker", kwargs: { cache_control: [] }, expected: "unknown" },
+    {
+      name: "invalid marker after mixed TTLs",
+      kwargs: {
+        system: [
+          { cache_control: { type: "ephemeral" } },
+          { cache_control: { type: "ephemeral", ttl: "1h" } },
+          { cache_control: { type: "ephemeral", ttl: "24h" } },
+        ],
+      },
+      expected: "unknown",
+    },
+    {
+      name: "tool inputs and schemas are not cache markers",
+      kwargs: {
+        messages: [
+          { content: [{ type: "tool_use", input: { cache_control: { type: "persistent" } } }] },
+        ],
+        tools: [{ input_schema: { cache_control: { type: "ephemeral", ttl: "1h" } } }],
+      },
+      expected: "none",
+    },
+  ])("returns $expected for $name", ({ kwargs, expected }) => {
+    expect(requestedAnthropicCacheTtls(kwargs)).toBe(expected);
+  });
+
+  it.each([
+    "cache_control",
+    "type",
+    "ttl",
+    "content",
+  ])("treats a throwing %s getter as unknown", (key) => {
+    const marker = { type: "ephemeral" };
+    const kwargs = key === "type" || key === "ttl" ? { cache_control: marker } : {};
+    Object.defineProperty(key === "type" || key === "ttl" ? marker : kwargs, key, {
+      enumerable: true,
+      get() {
+        throw new Error("unreadable selector");
+      },
+    });
+    expect(requestedAnthropicCacheTtls(kwargs)).toBe("unknown");
+  });
+
+  it("reads only type and ttl from a cache marker and skips input/schema getters", () => {
+    const kwargs = {
+      cache_control: {
+        type: "ephemeral",
+        ttl: "1h",
+        get content() {
+          throw new Error("unused marker property");
+        },
+      },
+      get input() {
+        throw new Error("tool input");
+      },
+      get input_schema() {
+        throw new Error("tool schema");
+      },
+    };
+    expect(requestedAnthropicCacheTtls(kwargs)).toBe("1h");
+  });
+
+  it("skips large text and base64 strings without interpreting their contents", () => {
+    const data = `${"a".repeat(2_000_000)}{"cache_control":{"type":"ephemeral","ttl":"5m"}}`;
+    expect(
+      requestedAnthropicCacheTtls({
+        cache_control: { type: "ephemeral", ttl: "1h" },
+        messages: [{ content: [data, { type: "image", source: { type: "base64", data } }] }],
+      }),
+    ).toBe("1h");
+  });
+
+  it("visits shared or cyclic objects only once", () => {
+    const kwargs: Record<string, unknown> = { cache_control: { type: "ephemeral", ttl: "1h" } };
+    kwargs["self"] = kwargs;
+    kwargs["copies"] = [kwargs, kwargs];
+    expect(requestedAnthropicCacheTtls(kwargs)).toBe("1h");
+  });
+
+  it("returns unknown when a request exceeds the traversal bound", () => {
+    let kwargs: Record<string, unknown> = { cache_control: { type: "ephemeral", ttl: "1h" } };
+    for (let i = 0; i < 20_000; i++) kwargs = { nested: kwargs };
+    expect(requestedAnthropicCacheTtls(kwargs)).toBe("unknown");
+    expect(
+      requestedAnthropicCacheTtls({ blocks: Array.from({ length: 20_000 }, () => ({})) }),
+    ).toBe("unknown");
+  });
+});
 
 describe("estimateContentLength — content-field char walking", () => {
   it("sums plain-string content across OpenAI-style messages (additive)", () => {

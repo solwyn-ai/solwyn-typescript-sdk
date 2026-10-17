@@ -9,6 +9,13 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Fixed
+
+- Attribute additional Anthropic streaming cache writes using the served request's TTL when
+  it agrees with the initial usage split, including streams that start without cache writes.
+  Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
+  and conservative handling of unknown TTLs or decreasing totals are preserved.
+
 ## [0.1.1] — 2026-10-17
 
 ### Fixed

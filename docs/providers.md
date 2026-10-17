@@ -67,10 +67,14 @@ not copied into Responses calls.
 
 Streaming settles usage from cumulative `message_delta` counters, including input and cache
 totals updated by server tools. Aggregate-only deltas preserve the initial five-minute and
-one-hour cache split. Additional writes use that TTL if the start used exactly one TTL; when
-the start used both TTLs or neither, additional writes use the conservative one-hour bucket
-and mark usage estimated. Decreasing aggregate counts retain observed cache writes and mark
-usage estimated. When supplied, thinking tokens are reported as a subset of the output total.
+one-hour cache split. When the served request's `cache_control` markers specify one TTL
+(omitted `ttl` means `5m`) and the initial split has no writes in the other bucket, additional
+writes use the requested TTL without marking usage estimated. Otherwise, additional writes
+use the initial TTL when exactly one was observed; a known mixed-TTL request marks this split
+estimated. If neither signal identifies a single TTL, additional writes use the conservative
+one-hour bucket and mark usage estimated. Explicit per-TTL delta counts remain authoritative.
+Decreasing aggregate counts retain observed cache writes and mark usage estimated.
+When supplied, thinking tokens are reported as a subset of the output total.
 Service tiers `standard` and `priority` are preserved; unsupported tiers such as `batch` are
 omitted.
 

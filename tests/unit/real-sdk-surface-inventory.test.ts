@@ -494,35 +494,39 @@ async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
 
-function documentedOpenAIStrictFingerprint(readme: string): CoverageFingerprint {
-  const fences = [...readme.matchAll(/```(?:ts|typescript)\n([\s\S]*?)```/g)]
+function documentedOpenAIStrictFingerprint(guide: string): CoverageFingerprint {
+  const fences = [...guide.matchAll(/```(?:ts|typescript)\n([\s\S]*?)```/g)]
     .map((match) => match[1] ?? "")
     .filter((fence) => fence.includes("OPENAI_STRICT_FINGERPRINT"));
   if (fences.length !== 1) {
-    throw new Error("README requires one TypeScript OPENAI_STRICT_FINGERPRINT example");
+    throw new Error("Coverage guide requires one TypeScript OPENAI_STRICT_FINGERPRINT example");
   }
   const fence = fences[0] ?? "";
   if (/\.fingerprint\b/.test(fence)) {
-    throw new Error("README strict coverage example must use an independently reviewed literal");
+    throw new Error(
+      "Coverage guide strict coverage example must use an independently reviewed literal",
+    );
   }
   const directExpectCalls = fence.match(
     /^coverage\(client\)\.expect\(OPENAI_STRICT_FINGERPRINT\);$/gm,
   );
   if (directExpectCalls?.length !== 1) {
     throw new Error(
-      "README strict coverage example must call coverage(client).expect(OPENAI_STRICT_FINGERPRINT)",
+      "Coverage guide strict coverage example must call coverage(client).expect(OPENAI_STRICT_FINGERPRINT)",
     );
   }
   const literal =
     /const OPENAI_STRICT_FINGERPRINT:\s*CoverageFingerprint\s*=\s*\{([\s\S]*?)\n\};/.exec(fence);
   if (literal === null || fence.indexOf(literal[0]) > fence.indexOf(directExpectCalls[0])) {
-    throw new Error("README strict coverage literal must be assigned before it is asserted");
+    throw new Error(
+      "Coverage guide strict coverage literal must be assigned before it is asserted",
+    );
   }
   const fieldRows = [
     ...(literal[1] ?? "").matchAll(/^\s*([a-z_]+):\s*"(sha256:[a-f0-9]{64})",?$/gm),
   ].map((match) => [match[1], match[2]] as const);
   if (fieldRows.length !== new Set(fieldRows.map(([name]) => name)).size) {
-    throw new Error("README strict coverage literal must not repeat categories");
+    throw new Error("Coverage guide strict coverage literal must not repeat categories");
   }
   const fields = Object.fromEntries(fieldRows);
   return coverageFingerprintSchema.parse(fields) as CoverageFingerprint;
@@ -684,14 +688,18 @@ describe("committed provider surface interval evidence", () => {
     }
   });
 
-  test("README pins the reviewed strict OpenAI coverage contract without provider I/O", async () => {
+  test("coverage guide pins the reviewed strict OpenAI contract without provider I/O", async () => {
     const guard = installOfflineGuard();
     const attemptsAtStart = guard.socketAttempts();
     const readme = await readFile("README.md", "utf8");
+    expect(readme).toContain(
+      "https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/coverage.md#strict-coverage-controls",
+    );
+    const guide = await readFile("docs/coverage.md", "utf8");
     const manifest = fixtureManifestSchema.parse(
       await readJson("tests/provider-surface-fingerprints.json"),
     );
-    const expected = documentedOpenAIStrictFingerprint(readme);
+    const expected = documentedOpenAIStrictFingerprint(guide);
     const client = new Solwyn(new OpenAI({ apiKey: "sk-offline" }), {
       apiKey: `sk_proj_${"a".repeat(64)}`,
       acknowledgeUntracked: [],
@@ -700,7 +708,7 @@ describe("committed provider surface interval evidence", () => {
     });
 
     try {
-      expect(readme).toContain(`openai@${latestOpenAIVersion(manifest)}`);
+      expect(guide).toContain(`openai@${latestOpenAIVersion(manifest)}`);
       expect(() => coverage(client).expect(expected)).not.toThrow();
     } finally {
       await client.close();

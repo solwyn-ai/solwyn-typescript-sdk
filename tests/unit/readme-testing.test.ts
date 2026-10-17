@@ -5,6 +5,8 @@ import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const README = readFileSync(join(process.cwd(), "README.md"), "utf8");
+const TESTING_GUIDE = readFileSync(join(process.cwd(), "docs/testing.md"), "utf8");
+const PROVIDER_REFERENCE = readFileSync(join(process.cwd(), "docs/providers.md"), "utf8");
 const PACKAGE_JSON = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as {
   version: string;
   dependencies?: Record<string, string>;
@@ -47,8 +49,10 @@ function expectReleaseCompatibility(readme: string, version: string): void {
 }
 
 function testingSection(): string {
-  const match = README.match(/^## Testing budget enforcement\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m);
-  expect(match, "README must include a Testing budget enforcement section").not.toBeNull();
+  const match = TESTING_GUIDE.match(
+    /^# Testing budget enforcement\s*$([\s\S]*?)(?=^# |(?![\s\S]))/m,
+  );
+  expect(match, "Testing reference must include the budget enforcement guide").not.toBeNull();
   return match?.[1] ?? "";
 }
 
@@ -93,6 +97,10 @@ describe("README testing guide", () => {
   it("documents the fake control-plane boundaries and supported workflows", () => {
     const section = testingSection();
 
+    expect(README).toContain(
+      "https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/testing.md#testing-budget-enforcement",
+    );
+    expect(README).toContain("plane.wrap(denialOnlyOpenAIClient()");
     expect(section).toMatch(/zero[- ]network/i);
     expect(section).toMatch(/live `fetch` or URL[\s\S]*caller/i);
     expect(section).toMatch(/never computes? prices?/i);
@@ -207,6 +215,9 @@ describe("README release compatibility guide", () => {
   });
 
   it("publishes bounded peer intervals without promoting the legacy Google surface to a peer", () => {
+    expect(README).toContain(
+      "https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/providers.md#compatibility",
+    );
     for (const [packageName, peerRange] of [
       ["@anthropic-ai/sdk", ">=0.30.0 <1"],
       ["@aws-sdk/client-bedrock-runtime", ">=3.422.0 <4"],
@@ -215,10 +226,12 @@ describe("README release compatibility guide", () => {
       ["openai", ">=4.41.0 <8"],
       ["together-ai", ">=0.16.0 <1"],
     ]) {
-      expect(README).toContain(`\`${packageName}\` | \`${peerRange}\``);
+      expect(PROVIDER_REFERENCE).toContain(`\`${packageName}\` | \`${peerRange}\``);
     }
-    expect(README).toMatch(/`@google\/generative-ai`[^\n]*0\.24\.1[^\n]*not an optional peer/i);
-    expect(README).toMatch(/boundary cells[^.]*not continuous-version coverage/i);
-    expect(README).not.toMatch(/AI SDK (?:5|6)\b/i);
+    expect(PROVIDER_REFERENCE).toMatch(
+      /`@google\/generative-ai`[^\n]*0\.24\.1[^\n]*not an optional peer/i,
+    );
+    expect(PROVIDER_REFERENCE).toMatch(/boundary cells[^.]*not continuous-version coverage/i);
+    expect(`${README}\n${PROVIDER_REFERENCE}`).not.toMatch(/AI SDK (?:5|6)\b/i);
   });
 });

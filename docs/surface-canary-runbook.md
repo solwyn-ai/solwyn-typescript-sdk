@@ -63,8 +63,8 @@ request review before assigning a stronger classification.
    release graph. The reinstall restores dependencies; it does not update the lockfile.
 5. Update the expected digests in
    [`tests/unit/surface-context-pins.test.ts`](../tests/unit/surface-context-pins.test.ts).
-   If the OpenAI graph moved, refresh the [README](../README.md) strict-fingerprint
-   example. Review each delta before updating an expectation.
+   If the OpenAI graph moved, refresh the [coverage reference](coverage.md#strict-coverage-controls)
+   strict-fingerprint example. Review each delta before updating an expectation.
 6. Run `pnpm check && pnpm test` only on the restored latest graph.
 
 ## 4. PR

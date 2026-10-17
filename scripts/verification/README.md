@@ -186,6 +186,12 @@ must remain unchanged. Evidence retains `ai-smoke-package.json`, `ai-smoke-packa
 the lock SHA-256, and all resolved package versions/paths even after consumer cleanup. Dependency
 updates require an explicit reviewed fixture-lock update; ordinary runs never regenerate it.
 
+The native and AI type probes likewise keep their reviewed lockfiles authoritative. After
+`npm ci`, they add the supplied SDK with `--no-save --package-lock=true`: lockfile reads stay
+enabled while manifest and lockfile writes stay disabled. Both copies must remain byte-identical
+to the fixtures, and the complete installed dependency tree must remain unchanged except for the
+SDK itself. New transitive registry releases do not refresh the reviewed fixture versions.
+
 Package inventory is a complete reviewed 88-file shape, not just a shipping allowlist: four
 metadata files; four public entries in both runtime, declaration and sourcemap formats; six
 provider chunks in both runtime formats with maps; eight shared chunks per runtime format with

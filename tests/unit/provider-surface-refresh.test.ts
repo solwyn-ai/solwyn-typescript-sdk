@@ -9,6 +9,14 @@ import { FakeControlPlane } from "../../src/testing";
 import { installOfflineGuard } from "../helpers/offline-guard";
 
 const OPENAI_GAPS = [
+  "getAPIList",
+  "requestAPIList",
+  "methodRequest",
+  "makeRequest",
+  "retryRequest",
+  "fetchWithTimeout",
+  "fetch",
+  "fetchWithAuth",
   "responsePromise",
   "parseResponseWithTimeout",
   "audio.voices.create",
@@ -29,10 +37,17 @@ const OPENAI_GAPS = [
   "live.sessions.accept",
   "live.sessions.fork",
   "realtime.calls.create",
+  "realtime.calls.accept",
+  "realtime.clientSecrets.create",
   "realtime.translations.clientSecrets.create",
+  "beta.realtime.sessions.create",
+  "beta.realtime.transcriptionSessions.create",
 ] as const;
 
 const TOGETHER_GAPS = [
+  "post",
+  "getAPIList",
+  "withOptions",
   "beta.jig.rollback",
   "clusters.create",
   "clusters.update",
@@ -48,27 +63,13 @@ const GOOGLE_GAPS = [
   "chats.modelsModule.generateContentWithContinuation",
   "chats.modelsModule.generateContentStreamWithContinuation",
   "credentials.getClient",
-  "credentials.parentClient.apiCall",
-  "credentials.parentClient.request",
-  "credentials.parentClient.requestStream",
-  "credentials.parentClient.streamApiCall",
-  "credentials.parentClient.unaryApiCall",
-  "credentials.parentClient.fetchUploadUrl",
-  "credentials.parentClient.uploadFile",
-  "credentials.parentClient.uploadFileToFileSearchStore",
   "voices.create",
   "voices.getClient",
-  "voices.parentClient.apiCall",
-  "voices.parentClient.request",
-  "voices.parentClient.requestStream",
-  "voices.parentClient.streamApiCall",
-  "voices.parentClient.unaryApiCall",
-  "voices.parentClient.fetchUploadUrl",
-  "voices.parentClient.uploadFile",
-  "voices.parentClient.uploadFileToFileSearchStore",
+  "live.connect",
+  "live.music.connect",
 ] as const;
 
-const GOOGLE_FETCH_PARENTS = [
+const GOOGLE_API_CLIENT_PARENTS = [
   "apiClient",
   "authTokens.apiClient",
   "batches.apiClient",
@@ -87,12 +88,32 @@ const GOOGLE_FETCH_PARENTS = [
   "voices.parentClient",
 ] as const;
 
+const GOOGLE_API_CLIENT_METHODS = [
+  "apiCall",
+  "downloadFile",
+  "fetchUploadUrl",
+  "getFetch",
+  "request",
+  "requestStream",
+  "streamApiCall",
+  "unaryApiCall",
+  "uploadFile",
+  "uploadFileToFileSearchStore",
+] as const;
+
 const families = [
   {
     name: "openai",
     build: () => new OpenAI({ apiKey: "offline" }),
     paths: OPENAI_GAPS,
-    unknownPaths: ["beta.agents.create", "webhooks.create"],
+    unknownPaths: [
+      "beta.agents.create",
+      "webhooks.create",
+      "realtime.calls.hangup",
+      "realtime.calls.refer",
+      "realtime.calls.reject",
+      "live.sessions.downloadRecording",
+    ],
   },
   {
     name: "azure",
@@ -103,12 +124,19 @@ const families = [
         apiVersion: "2024-06-01",
       }),
     paths: OPENAI_GAPS,
-    unknownPaths: ["beta.agents.create", "webhooks.create"],
+    unknownPaths: [
+      "beta.agents.create",
+      "webhooks.create",
+      "realtime.calls.hangup",
+      "realtime.calls.refer",
+      "realtime.calls.reject",
+      "live.sessions.downloadRecording",
+    ],
   },
   {
     name: "anthropic",
     build: () => new Anthropic({ apiKey: "offline" }),
-    paths: ["makeTracedRequest"],
+    paths: ["makeTracedRequest", "post", "getAPIList", "withOptions"],
     unknownPaths: ["organization.workspaces.create"],
   },
   {
@@ -120,7 +148,12 @@ const families = [
   {
     name: "google",
     build: () => new GoogleGenAI({ apiKey: "offline" }),
-    paths: [...GOOGLE_GAPS, ...GOOGLE_FETCH_PARENTS.map((parent) => `${parent}.getFetch`)],
+    paths: [
+      ...GOOGLE_GAPS,
+      ...GOOGLE_API_CLIENT_PARENTS.flatMap((parent) =>
+        GOOGLE_API_CLIENT_METHODS.map((method) => `${parent}.${method}`),
+      ),
+    ],
     unknownPaths: ["credentials.create", "credentials.list", "voices.list"],
   },
 ] as const;
@@ -149,11 +182,16 @@ describe.each(families)("reviewed $name coverage gaps", ({ build, paths, unknown
           kind: "unmetered_spend",
           token: path,
         });
-        expect(() => {
+        let caught: unknown;
+        try {
           let current: object = client;
           for (const segment of path.split(".")) current = Reflect.get(current, segment);
           if (typeof current === "function") Reflect.apply(current, undefined, []);
-        }, path).toThrow(UntrackedSpendSurfaceError);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught, path).toBeInstanceOf(UntrackedSpendSurfaceError);
+        expect(caught, path).toMatchObject({ surface: path, kind: "unmetered_spend" });
       }
       for (const path of unknownPaths) {
         let caught: unknown;
@@ -175,6 +213,73 @@ describe.each(families)("reviewed $name coverage gaps", ({ build, paths, unknown
     expect(plane.ingested).toEqual([]);
     expect(guard.socketAttempts() - attempts).toBe(0);
   });
+
+  it("preserves existing exact acknowledgment tokens in strict mode", async () => {
+    const guard = installOfflineGuard();
+    const attempts = guard.socketAttempts();
+    const plane = new FakeControlPlane();
+    const client = new Solwyn(build(), {
+      apiKey: plane.apiKey,
+      apiUrl: plane.apiUrl,
+      fetch: plane.fetch,
+      logger: noopLogger,
+      onUnmetered: "raise",
+      acknowledgeUntracked: [...paths],
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+    });
+    try {
+      const entries = coverage(client).entries;
+      for (const path of paths) {
+        expect(
+          entries.find((entry) => entry.surface === path),
+          path,
+        ).toMatchObject({
+          token: path,
+          policyAction: "acknowledged",
+          dispatchAction: "return",
+        });
+      }
+    } finally {
+      await client.close();
+    }
+    expect(plane.checks).toEqual([]);
+    expect(plane.confirms).toEqual([]);
+    expect(guard.socketAttempts() - attempts).toBe(0);
+  });
+});
+
+it("classifies every Google ApiClient parent and transport method with the same scope", () => {
+  const context: SurfaceContext = {
+    provider: "google",
+    dialect: "google",
+    clientShape: "google_genai",
+  };
+  for (const parent of GOOGLE_API_CLIENT_PARENTS) {
+    for (const method of GOOGLE_API_CLIENT_METHODS) {
+      const path = `${parent}.${method}`;
+      const rule = resolveSurfaceRule({ context, path, source: "raw" });
+      expect(rule, path).toMatchObject({
+        kind: "unmetered_spend",
+        capabilityScope: "arbitrary_endpoint",
+        acknowledgmentToken: path,
+        source: "raw",
+      });
+      expect(
+        rule?.acceptsShape({ path, descriptorCategory: "method", returnShape: "function" }),
+        path,
+      ).toBe(true);
+      expect(
+        rule?.acceptsShape({ path, descriptorCategory: "field", returnShape: "function" }),
+        path,
+      ).toBe(true);
+      expect(
+        rule?.acceptsShape({ path, descriptorCategory: "field", returnShape: "scalar" }),
+        path,
+      ).toBe(false);
+      expect(resolveSurfaceRule({ context, path, source: "wrapper" }), path).toBeUndefined();
+    }
+  }
 });
 
 it("keeps Anthropic organization traversal distinct from scalar OpenAI attribution", () => {

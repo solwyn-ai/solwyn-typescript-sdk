@@ -18,13 +18,13 @@ const PINNED_CONTEXTS = [
   },
   {
     context: { provider: "openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "64c3617e2e074597b34d36aeb7bd19f67fd08ef2ebc95ba1459de188c31fdb0f", // 100 rules
-    count: 100,
+    digest: "3834b95553047914a73d5e70187658a135f6a10ef3f6a5f84e356646bad70eda", // 117 rules
+    count: 117,
   },
   {
     context: { provider: "azure_openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "c3ba73238c888bf8d12febe2af6a96f63d756cf72fd91405e87f6cd019f45a01", // 99 rules
-    count: 99,
+    digest: "da92f4e8f28d90b405c91c612bcb4701c972a693c31fcc219e1d053ad891c29e", // 116 rules
+    count: 116,
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "openai_sdk" },
@@ -33,18 +33,18 @@ const PINNED_CONTEXTS = [
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "native_together" },
-    digest: "2e0345b53bfcd56aa7a4b4d600d209a49bc6f4cc76121bdc6373deeac4cd59c9", // 59 rules
-    count: 59,
+    digest: "0a1e92c3cac0c9dd5af7ac02d4045bba0a51f71b9afae20782228cf9ce996c56", // 74 rules
+    count: 74,
   },
   {
     context: { provider: "anthropic", dialect: "anthropic", clientShape: "anthropic_sdk" },
-    digest: "a52d02879b19a3be4111c199c8a518a9c69a8e64f2a3e71a3f90ba7ea114a2d0", // 77 rules
-    count: 77,
+    digest: "c0fe7741e4f1e172157b5856698992fa4329bd1fddf9da5949fa47583788e247", // 92 rules
+    count: 92,
   },
   {
     context: { provider: "google", dialect: "google", clientShape: "google_genai" },
-    digest: "ac5f7bc6809c988957b0c3b8433300b9178f62a39aefde53fdd5b1d2e08d7f4d", // 101 rules
-    count: 101,
+    digest: "05ddefc7992f0c73f6d202b7cb6cf78315f93a1e9c55161c0fbc43305d29800b", // 233 rules
+    count: 233,
   },
   {
     context: {
@@ -57,8 +57,8 @@ const PINNED_CONTEXTS = [
   },
   {
     context: { provider: "bedrock", dialect: "bedrock", clientShape: "bedrock_v3" },
-    digest: "ec2244e35bacabce9d7788dcc9d6d846528afaa2d782e49b92b6448664661918", // 42 rules
-    count: 42,
+    digest: "6c1c5c2e68f511abd15ee9f5ece9155a30388a4cff86fc5a2e8e1c6fa9a5a3a7", // 43 rules
+    count: 43,
   },
 ] as const satisfies readonly {
   readonly context: SurfaceContext;
@@ -70,7 +70,7 @@ describe("per-context surface contract data", () => {
   it("includes selector-applicable rules in the stable contract data form", () => {
     const data = contextContractData(OPENAI) as readonly Record<string, unknown>[];
 
-    expect(data).toHaveLength(100);
+    expect(data).toHaveLength(117);
     expect(
       data.find((row) => row["id"] === "surface.audio-speech-create.unmetered_spend.tts-model"),
     ).toEqual({

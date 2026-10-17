@@ -106,7 +106,10 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "tsup>esbuild": "$esbuild"
+    }
   },
   "dependencies": {
     "zod": "^4.4.3"
@@ -154,7 +157,7 @@
     "tsup": "^8.5.1",
     "tsx": "^4.23.13",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9",
+    "vitest": "^4.1.11",
     "yaml": "2.9.0"
   }
 }

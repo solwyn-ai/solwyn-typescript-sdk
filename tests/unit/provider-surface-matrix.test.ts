@@ -22,7 +22,10 @@ interface SurfaceCatalog {
   readonly include: readonly CatalogCell[];
 }
 
-async function executeWorkflowCatalog(eventName: string): Promise<readonly CatalogCell[]> {
+async function executeWorkflowCatalog(
+  eventName: string,
+  ref = "refs/heads/main",
+): Promise<readonly CatalogCell[]> {
   const outputDirectory = await mkdtemp(join(tmpdir(), "provider-surface-matrix-"));
   const scriptsDirectory = join(outputDirectory, "scripts");
   const testsDirectory = join(outputDirectory, "tests");
@@ -42,6 +45,7 @@ async function executeWorkflowCatalog(eventName: string): Promise<readonly Catal
       env: {
         ...process.env,
         GITHUB_EVENT_NAME: eventName,
+        GITHUB_REF: ref,
         GITHUB_OUTPUT: outputPath,
       },
     });
@@ -57,6 +61,18 @@ async function executeWorkflowCatalog(eventName: string): Promise<readonly Catal
 }
 
 describe("provider surface matrix catalog command", () => {
+  it.each([
+    "refs/heads/feature",
+    "refs/heads/Main",
+    "refs/heads/main-canary",
+    "refs/tags/main",
+    "",
+  ])("rejects a manual canary dispatch outside main: %s", async (ref) => {
+    await expect(executeWorkflowCatalog("workflow_dispatch", ref)).rejects.toThrow(
+      "Manual CI canary dispatches must target refs/heads/main",
+    );
+  });
+
   it("preserves every reviewed catalog cell for pull requests and pushes", async () => {
     const catalog = JSON.parse(await readFile(catalogPath, "utf8")) as SurfaceCatalog;
 
@@ -64,16 +80,19 @@ describe("provider surface matrix catalog command", () => {
     await expect(executeWorkflowCatalog("push")).resolves.toEqual(catalog.include);
   });
 
-  it("selects latest cells and rewrites every scoped or unscoped pin on schedule", async () => {
+  it.each([
+    "schedule",
+    "workflow_dispatch",
+  ])("selects latest cells and rewrites every scoped or unscoped pin on %s", async (eventName) => {
     const catalog = JSON.parse(await readFile(catalogPath, "utf8")) as SurfaceCatalog;
-    const scheduled = await executeWorkflowCatalog("schedule");
+    const canary = await executeWorkflowCatalog(eventName);
     const latestCatalogRows = catalog.include.filter((cell) => cell.interval === "latest");
 
-    expect(scheduled.map(({ family, interval }) => ({ family, interval }))).toEqual(
+    expect(canary.map(({ family, interval }) => ({ family, interval }))).toEqual(
       latestCatalogRows.map(({ family, interval }) => ({ family, interval })),
     );
-    expect(scheduled).toHaveLength(6);
-    expect(scheduled.flatMap((cell) => cell.packages)).toEqual([
+    expect(canary).toHaveLength(6);
+    expect(canary.flatMap((cell) => cell.packages)).toEqual([
       "@anthropic-ai/sdk@latest",
       "@aws-sdk/client-bedrock-runtime@latest",
       "@google/genai@latest",

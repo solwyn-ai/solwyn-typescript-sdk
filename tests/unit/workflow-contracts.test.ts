@@ -12,6 +12,7 @@ import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { parseDocument } from "yaml";
 
@@ -39,6 +40,7 @@ interface WorkflowJob {
 
 interface WorkflowModel {
   readonly concurrency?: { readonly group?: string; readonly "cancel-in-progress"?: boolean };
+  readonly on: Readonly<Record<string, unknown>>;
   readonly jobs: Readonly<Record<string, WorkflowJob>>;
   readonly permissions?: Readonly<Record<string, string>>;
 }
@@ -63,6 +65,22 @@ function semanticJob(workflow: WorkflowModel, id: string): WorkflowJob {
   const value = workflow.jobs[id];
   expect(value, `missing semantic workflow job ${id}`).toBeDefined();
   return value ?? {};
+}
+
+function jobConditionMatches(
+  workflowJob: WorkflowJob,
+  eventName: string,
+  ref: string,
+  matrixResult = "success",
+): boolean {
+  return (
+    runInNewContext(workflowJob.if ?? "true", {
+      // Actions compares strings case-insensitively against these lowercase literals.
+      github: { event_name: eventName.toLowerCase(), ref: ref.toLowerCase() },
+      needs: { "provider-surface-matrix": { result: matrixResult } },
+      always: () => true,
+    }) === true
+  );
 }
 
 function namedStep(workflowJob: WorkflowJob, name: string): WorkflowStep {
@@ -288,6 +306,71 @@ describe("workflow YAML semantics", () => {
 });
 
 describe("CI workflow contract", () => {
+  it("accepts manual dispatches and keeps both provider canary jobs ungated", async () => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(model.on).toHaveProperty("workflow_dispatch", null);
+    expect(semanticJob(model, "provider-surface-matrix").if).toBeUndefined();
+    expect(semanticJob(model, "provider-surface-inventory").if).toBeUndefined();
+  });
+
+  it.each([
+    "quality",
+    "package-artifact",
+    "artifact-consumers",
+    "legacy-installed-core",
+  ])("skips %s for scheduled and manually dispatched canaries", async (id) => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(semanticJob(model, id).if).toBe(
+      "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
+    );
+  });
+
+  it.each([
+    ["schedule", "refs/heads/main", "success", false, false],
+    ["workflow_dispatch", "refs/heads/main", "success", false, false],
+    ["workflow_dispatch", "refs/heads/main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/Main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/feature", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/main-canary", "failure", true, false],
+    ["workflow_dispatch", "refs/tags/main", "failure", true, false],
+    ["pull_request", "refs/pull/11/merge", "success", true, true],
+    ["push", "refs/heads/main", "success", true, true],
+  ] as const)("allows only validated main dispatches to skip Required / CI: %s on %s (catalog %s)", async (eventName, ref, matrixResult, requiredRuns, fullCiRuns) => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(jobConditionMatches(semanticJob(model, "required"), eventName, ref, matrixResult)).toBe(
+      requiredRuns,
+    );
+    for (const id of [
+      "quality",
+      "package-artifact",
+      "artifact-consumers",
+      "legacy-installed-core",
+    ]) {
+      expect(jobConditionMatches(semanticJob(model, id), eventName, ref), id).toBe(fullCiRuns);
+    }
+  });
+
+  it("fails Required / CI when a non-main dispatch skips full CI even if both canary jobs pass", async () => {
+    const { model } = await parseWorkflow(ciPath);
+    const required = semanticJob(model, "required");
+    const gate = namedStep(required, "Require every launch gate");
+
+    expect(jobConditionMatches(required, "workflow_dispatch", "refs/heads/feature")).toBe(true);
+    expect(
+      runBash(gate.run ?? "", {
+        QUALITY: "skipped",
+        PACKAGE_ARTIFACT: "skipped",
+        ARTIFACT_CONSUMERS: "skipped",
+        LEGACY_INSTALLED_CORE: "skipped",
+        PROVIDER_SURFACE_MATRIX: "success",
+        PROVIDER_SURFACE_INVENTORY: "success",
+      }).status,
+    ).toBe(1);
+  });
+
   it("runs every full source gate on exact Node 22 and 24 releases", async () => {
     const workflow = await readFile(ciPath, "utf8");
     const quality = job(workflow, "quality");
@@ -410,7 +493,9 @@ describe("CI workflow contract", () => {
     };
     const gate = namedStep(required, "Require every launch gate");
 
-    expect(required.if).toBe("always() && github.event_name != 'schedule'");
+    expect(required.if).toBe(
+      "always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-matrix'].result == 'success')",
+    );
     expect(required.needs).toEqual(expectedNeeds);
     expect(gate.env).toEqual(expectedEnvironment);
     expect(
@@ -651,6 +736,8 @@ describe("publish workflow contract", () => {
       ["wrong SHA", [{ ...valid, head_sha: "b".repeat(40) }], 1],
       ["wrong branch", [{ ...valid, head_branch: "release" }], 1],
       ["wrong event", [{ ...valid, event: "pull_request" }], 1],
+      ["scheduled canary", [{ ...valid, event: "schedule" }], 1],
+      ["manually dispatched canary", [{ ...valid, event: "workflow_dispatch" }], 1],
       ["wrong conclusion", [{ ...valid, conclusion: "failure" }], 1],
       [
         "conditions split across runs",

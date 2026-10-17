@@ -59,6 +59,7 @@ it.each([
     `
     import {spawn} from 'node:child_process';import fs from 'node:fs';import {once} from 'node:events';
     process.on('SIGTERM',()=>{});
+    if(process.env.VERSION_SCENARIO==='inherited-pipe')await new Promise(resolve=>setTimeout(resolve,250));
     const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});process.send('ready');setInterval(()=>{},20);"],{stdio:['ignore','inherit','inherit','ipc']});
     await once(child,'message');child.disconnect();child.unref();
     fs.writeFileSync(process.env.VERSION_PROCESS_RECORD,JSON.stringify({pid:process.pid,descendant:child.pid}));
@@ -66,14 +67,25 @@ it.each([
     setInterval(()=>{},20);
   `,
   );
+  // Start the short hung-command clock after readiness. The inherited-pipe case must
+  // instead reach a successful root exit and exercise the separate pipe-cleanup bound.
   writeFileSync(
     hooks,
     `
-    import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+    import cp from 'node:child_process';import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
     const spawn=cp.spawn,spawnSync=cp.spawnSync;
     cp.spawn=(binary,args,options)=>args[0]==='--version'?spawn(process.execPath,[process.env.VERSION_FIXTURE],options):spawn(binary,args,options);
     cp.spawnSync=(binary,args,options)=>args[0]==='--version'?spawnSync(process.execPath,[process.env.VERSION_FIXTURE],{...options,timeout:150}):spawnSync(binary,args,options);
-    const timeout=globalThis.setTimeout;globalThis.setTimeout=(fn,ms,...args)=>timeout(fn,ms===10000?150:ms,...args);
+    const timeout=globalThis.setTimeout;
+    globalThis.setTimeout=(fn,ms,...args)=>{
+      if(ms!==10000||process.env.VERSION_SCENARIO!=='term-ignored')return timeout(fn,ms,...args);
+      const started=Date.now();let readyAt;
+      const timer=setInterval(()=>{
+        if(readyAt===undefined&&fs.existsSync(process.env.VERSION_PROCESS_RECORD))readyAt=Date.now();
+        if((readyAt!==undefined&&Date.now()-readyAt>=150)||Date.now()-started>=10000){clearInterval(timer);fn(...args);}
+      },10);
+      return timer;
+    };
     syncBuiltinESMExports();
   `,
   );
@@ -131,4 +143,14 @@ it.each([
     state: "finished",
     termination: { attempted: true },
   });
+  if (scenario === "inherited-pipe") {
+    expect(report.details.commands[0]).toMatchObject({
+      rootExit: { status: 0, signal: null },
+      pipeCleanupTimedOut: true,
+      timeoutPhase: "pipe-cleanup",
+      errorCode: "ERR_CHILD_PROCESS_PIPE_CLEANUP_TIMEOUT",
+    });
+  } else {
+    expect(report.details.commands[0]).toMatchObject({ errorCode: "ETIMEDOUT" });
+  }
 }, 5000);

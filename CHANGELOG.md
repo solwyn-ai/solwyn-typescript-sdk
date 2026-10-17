@@ -25,10 +25,10 @@ corresponding release notes before users upgrade.
   `@anthropic-ai/sdk@0.135.0`, `openai@7.36.0`, `together-ai@0.58.0`, and
   `@google/genai@2.30.0`. Newly reviewed OpenAI Agents, beta Responses, Decisions, Live,
   voice/provenance operations, Together cluster/storage allocation and Jig rollback, Google
-  continuation/voice helpers, and raw request escapes are explicitly unmetered. They follow
-  `onUnmetered`; use `"raise"` to refuse them. No new metering adapters are added. Existing
-  strict coverage fingerprints must be reviewed and refreshed when upgrading `@solwyn/sdk`,
-  even if the provider SDK versions stay pinned.
+  continuation/voice helpers, credential client escapes, and raw request escapes are explicitly
+  unmetered. They follow `onUnmetered`; use `"raise"` to refuse them. No new metering adapters
+  are added. Review and refresh strict coverage fingerprints when upgrading `@solwyn/sdk`, even
+  if the provider SDK versions stay pinned.
 - **OpenAI 7 compatibility.** The optional `openai` peer range is now `>=4.41.0 <8`, with
   current integration checks at `7.36.0`. OpenAI 7 itself requires Node 22 or later; Solwyn's
   provider-free core remains compatible with Node 20 and compatible older provider releases.

@@ -332,6 +332,14 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   for (const path of ["chats", "chats.modelsModule", "voices"]) {
     rows.push(namespaceRow(path, [GOOGLE_GENAI], "google", "raw"));
   }
+  rows.push({
+    ...namespaceRow("credentials", [GOOGLE_GENAI], "google", "raw"),
+    // Retain the prior unevaluated observation; runtime still validates the returned value.
+    expectedShapes: [
+      ...RESOURCE_SHAPES,
+      { descriptorCategory: "getter", returnShape: "unevaluated_accessor" },
+    ],
+  });
   for (const path of [
     "models.generateContentWithContinuation",
     "models.generateContentStreamWithContinuation",
@@ -341,8 +349,18 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   ]) {
     rows.push(unmeteredRow(path, [GOOGLE_GENAI], "operation"));
   }
-  rows.push(unmeteredRow("voices.getClient", [GOOGLE_GENAI], "client"));
+  for (const path of ["credentials.getClient", "voices.getClient"]) {
+    rows.push(unmeteredRow(path, [GOOGLE_GENAI], "client"));
+  }
   for (const path of [
+    "credentials.parentClient.apiCall",
+    "credentials.parentClient.request",
+    "credentials.parentClient.requestStream",
+    "credentials.parentClient.streamApiCall",
+    "credentials.parentClient.unaryApiCall",
+    "credentials.parentClient.fetchUploadUrl",
+    "credentials.parentClient.uploadFile",
+    "credentials.parentClient.uploadFileToFileSearchStore",
     "voices.parentClient.apiCall",
     "voices.parentClient.request",
     "voices.parentClient.requestStream",
@@ -361,6 +379,7 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "caches.apiClient",
     "chats.apiClient",
     "chats.modelsModule.apiClient",
+    "credentials.parentClient",
     "fileSearchStores.apiClient",
     "fileSearchStores.documents.apiClient",
     "files.apiClient",
@@ -476,10 +495,11 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     rows.push({
       ruleId: rowId(path, "metadata"),
       surface: path,
-      selectors:
-        path === "organization"
-          ? ALL_CLIENTS.filter((selector) => selector !== ANTHROPIC)
-          : ALL_CLIENTS,
+      selectors: ALL_CLIENTS.filter(
+        (selector) =>
+          !(path === "organization" && selector === ANTHROPIC) &&
+          !(path === "credentials" && selector === GOOGLE_GENAI),
+      ),
       kind: "metadata",
       source: "raw",
       expectedShapes: INERT_METADATA_SHAPES,

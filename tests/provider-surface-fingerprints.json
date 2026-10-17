@@ -77,12 +77,12 @@
           "version": "0.3.1"
         }
       ],
-      "namespace_count": 33,
+      "namespace_count": 35,
       "observation_count": 236,
       "provider": "google",
       "shape_key": "google-genai",
       "structural_interval": "floor",
-      "structure_sha256": "ea69ae245c1a2c478f7c67d39bb23afb688b3cc2fb8b84ec5c3432cef2d37353",
+      "structure_sha256": "16769942c2fc74a8f8334080d550ac21cdf3d99bb8249fcdc2fd2e0615e6cdd4",
       "variant": "native"
     },
     {
@@ -94,12 +94,12 @@
           "version": "2.30.0"
         }
       ],
-      "namespace_count": 33,
-      "observation_count": 703,
+      "namespace_count": 35,
+      "observation_count": 745,
       "provider": "google",
       "shape_key": "google-genai",
       "structural_interval": "latest",
-      "structure_sha256": "d188cf7e3a8218e7d404402a241f4be174007e3baff384c20be59a645d438e09",
+      "structure_sha256": "bbde5c55fe1186fc7a7b4f35fcc96886b0e028c2537bf7c8e82206e3c09c56b5",
       "variant": "native"
     },
     {

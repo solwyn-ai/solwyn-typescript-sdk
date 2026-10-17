@@ -632,14 +632,14 @@ Native OpenAI and Azure OpenAI `responses.create`, `responses.parse`, and `respo
 tracked. Other OpenAI-compatible clients retain their native Responses managers under the
 unmetered posture because their wire behavior is not assumed to match OpenAI's native client.
 
-The reviewed latest provider SDKs also expose these unmetered operations:
+The newly reviewed provider capabilities include these unmetered operations:
 
 | Provider | Unmetered surfaces |
 |----------|--------------------|
 | OpenAI / Azure | Voice creation; beta Responses creation, compaction and retrieval; Agents hosted environments, file staging and session execution/event streams; Decisions, content-provenance checks, Live session creation/acceptance/forking, Realtime call creation and translation client secrets; raw response/request helpers (`responsePromise`, `parseResponseWithTimeout`). |
 | Anthropic | `makeTracedRequest`, a raw request escape that bypasses metered `messages.create`. |
 | Together | Jig rollback; cluster creation/resizing, remediation creation/approval, and shared-storage creation/resizing. |
-| Google GenAI | Direct continuation helpers on `models` and `chats.modelsModule`; `voices.create`; `voices.getClient`; raw `getFetch` accessors and the voice manager's underlying request/upload methods. |
+| Google GenAI | Direct continuation helpers on `models` and `chats.modelsModule`; `voices.create`; `voices.getClient` and `credentials.getClient`; raw `getFetch` accessors and the voice and credential managers' underlying request/upload methods. |
 
 These operations have no Solwyn budget check or settlement event. Use `onUnmetered: "raise"`
 to refuse them, or explicitly review each exact acknowledgment token before permitting one.
@@ -689,7 +689,7 @@ coverage(client).expect(OPENAI_STRICT_FINGERPRINT);
 await client.close();
 ```
 
-When the provider SDK changes, inspect `coverage(client).entries`, review every category
+When upgrading Solwyn or a provider SDK, inspect `coverage(client).entries`, review every category
 change, and then paste a new literal. Do not derive the expected fingerprint from the same
 report used by the assertion; that would make the check tautological. Azure OpenAI has a
 different graph and needs its own reviewed fingerprint.

@@ -47,6 +47,15 @@ const GOOGLE_GAPS = [
   "models.generateContentStreamWithContinuation",
   "chats.modelsModule.generateContentWithContinuation",
   "chats.modelsModule.generateContentStreamWithContinuation",
+  "credentials.getClient",
+  "credentials.parentClient.apiCall",
+  "credentials.parentClient.request",
+  "credentials.parentClient.requestStream",
+  "credentials.parentClient.streamApiCall",
+  "credentials.parentClient.unaryApiCall",
+  "credentials.parentClient.fetchUploadUrl",
+  "credentials.parentClient.uploadFile",
+  "credentials.parentClient.uploadFileToFileSearchStore",
   "voices.create",
   "voices.getClient",
   "voices.parentClient.apiCall",
@@ -66,6 +75,7 @@ const GOOGLE_FETCH_PARENTS = [
   "caches.apiClient",
   "chats.apiClient",
   "chats.modelsModule.apiClient",
+  "credentials.parentClient",
   "fileSearchStores.apiClient",
   "fileSearchStores.documents.apiClient",
   "files.apiClient",
@@ -111,7 +121,7 @@ const families = [
     name: "google",
     build: () => new GoogleGenAI({ apiKey: "offline" }),
     paths: [...GOOGLE_GAPS, ...GOOGLE_FETCH_PARENTS.map((parent) => `${parent}.getFetch`)],
-    unknownPaths: ["voices.list"],
+    unknownPaths: ["credentials.create", "credentials.list", "voices.list"],
   },
 ] as const;
 
@@ -177,6 +187,40 @@ it("keeps Anthropic organization traversal distinct from scalar OpenAI attributi
       (context) => resolveSurfaceRule({ context, path: "organization", source: "raw" })?.kind,
     ),
   ).toEqual(["namespace", "metadata"]);
+});
+
+it("keeps Google's credential resource distinct from Anthropic authentication metadata", () => {
+  const contexts: SurfaceContext[] = [
+    { provider: "google", dialect: "google", clientShape: "google_genai" },
+    { provider: "anthropic", dialect: "anthropic", clientShape: "anthropic_sdk" },
+  ];
+  expect(
+    contexts.map(
+      (context) => resolveSurfaceRule({ context, path: "credentials", source: "raw" })?.kind,
+    ),
+  ).toEqual(["namespace", "metadata"]);
+});
+
+it("rechecks the credential getter's value before allowing namespace traversal", async () => {
+  const plane = new FakeControlPlane();
+  const raw = new GoogleGenAI({ apiKey: "offline" });
+  Object.defineProperty(raw, "credentials", { get: () => 42, configurable: true });
+  const client = new Solwyn(raw, {
+    apiKey: plane.apiKey,
+    apiUrl: plane.apiUrl,
+    fetch: plane.fetch,
+    logger: noopLogger,
+    onUnmetered: "raise",
+    reportUntrackedSurfaces: false,
+    breakerReportingEnabled: false,
+  });
+  try {
+    expect(() => Reflect.get(client, "credentials")).toThrow(UntrackedSpendSurfaceError);
+  } finally {
+    await client.close();
+  }
+  expect(plane.checks).toEqual([]);
+  expect(plane.confirms).toEqual([]);
 });
 
 it.each([

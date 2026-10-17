@@ -13,38 +13,38 @@ const OPENAI: SurfaceContext = {
 const PINNED_CONTEXTS = [
   {
     context: { provider: null, dialect: "openai", clientShape: "openai_sdk" },
-    digest: "8eb013188612290a453713886b9966193b598461d901d2c3ee356391e1c217e8", // 49 rules
+    digest: "2bbdb0a80159ee72821e92b85e8fcf1c22a3d394f0d06643f794f4bf9a3cce0e", // 49 rules
     count: 49,
   },
   {
     context: { provider: "openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "6d8fc08636e7079b6c3bf0f6ff9da89840f73cbf993093c9a457d8d610591d2d", // 100 rules
+    digest: "64c3617e2e074597b34d36aeb7bd19f67fd08ef2ebc95ba1459de188c31fdb0f", // 100 rules
     count: 100,
   },
   {
     context: { provider: "azure_openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "583b31c74e9ae1ec3e5e16df68fae7031c99c974e92749f97248ce9e8ee1d8cd", // 99 rules
+    digest: "c3ba73238c888bf8d12febe2af6a96f63d756cf72fd91405e87f6cd019f45a01", // 99 rules
     count: 99,
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "8eb013188612290a453713886b9966193b598461d901d2c3ee356391e1c217e8", // 49 rules
+    digest: "2bbdb0a80159ee72821e92b85e8fcf1c22a3d394f0d06643f794f4bf9a3cce0e", // 49 rules
     count: 49,
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "native_together" },
-    digest: "fe3bbbac27d5a5c8c0145dc11b64aaf9b5053ae7dd09ff941e39a534ecb768bc", // 59 rules
+    digest: "2e0345b53bfcd56aa7a4b4d600d209a49bc6f4cc76121bdc6373deeac4cd59c9", // 59 rules
     count: 59,
   },
   {
     context: { provider: "anthropic", dialect: "anthropic", clientShape: "anthropic_sdk" },
-    digest: "30f68fa41850d2ac563fd613c8fb5610a46fd85a9b180abd686412aafc7fc976", // 77 rules
+    digest: "a52d02879b19a3be4111c199c8a518a9c69a8e64f2a3e71a3f90ba7ea114a2d0", // 77 rules
     count: 77,
   },
   {
     context: { provider: "google", dialect: "google", clientShape: "google_genai" },
-    digest: "181a8b88f29a38defb73061baab993b6478ede26e5f108f79f41ae3b4475e8ae", // 90 rules
-    count: 90,
+    digest: "ac5f7bc6809c988957b0c3b8433300b9178f62a39aefde53fdd5b1d2e08d7f4d", // 101 rules
+    count: 101,
   },
   {
     context: {
@@ -52,12 +52,12 @@ const PINNED_CONTEXTS = [
       dialect: "google",
       clientShape: "google_generativeai",
     },
-    digest: "57c3904e950b26bf9906a52571abcdc64656c1812226249eba0110b54ba390dc", // 38 rules
+    digest: "5ac00cbbc9599d3267654dac853650026a2f6aa3b31c3136db3d2ed44a97753b", // 38 rules
     count: 38,
   },
   {
     context: { provider: "bedrock", dialect: "bedrock", clientShape: "bedrock_v3" },
-    digest: "87f2d6b8b39ef198bf30f78759a0ef5e18483a8d81448a80675936b02aabd124", // 42 rules
+    digest: "ec2244e35bacabce9d7788dcc9d6d846528afaa2d782e49b92b6448664661918", // 42 rules
     count: 42,
   },
 ] as const satisfies readonly {

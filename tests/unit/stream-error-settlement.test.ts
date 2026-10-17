@@ -120,8 +120,12 @@ describe("provider usage observed before a stream error", () => {
     expect(caught).toBeInstanceOf(failure === "http" ? ApiError : Error);
     expect(caught).toBe(fixture.streamError);
     if (failure === "http") expect(caught).toMatchObject({ status: 500 });
-    // Network drops retry the same native checkpoint three times, without new usage.
-    expect(fixture.requests).toBe(failure === "http" ? 2 : 5);
+    if (failure === "http") {
+      expect(fixture.requests).toBe(2);
+    } else {
+      // Require the original hop, continuation, and a reconnect without pinning native retry counts.
+      expect(fixture.requests).toBeGreaterThan(2);
+    }
     expect(breakerFailure).toHaveBeenCalledTimes(1);
     expect(latencySample).not.toHaveBeenCalled();
     expect(plane.checks).toHaveLength(1);
@@ -138,6 +142,78 @@ describe("provider usage observed before a stream error", () => {
       call_id: plane.confirms[0]?.call_id,
     });
     expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
+  });
+
+  it("settles observed usage for a tagged run-scoped stream through a per-call check", async () => {
+    const plane = new FakeControlPlane();
+    const fixture = googleContinuationFailure("http");
+    const tags = { test_case: "stream_error" };
+    const client = plane.wrap(fixture.raw, {
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+    });
+    try {
+      await run("tagged-stream-error", { tags }, async () => {
+        await expect(
+          consume(await client.models.generateContentStream(googleParams)),
+        ).rejects.toBeInstanceOf(ApiError);
+      });
+    } finally {
+      await client.close();
+    }
+    expect(plane.leaseGrants).toHaveLength(0);
+    expect(plane.leaseSurrenders).toHaveLength(0);
+    expect(plane.checks).toHaveLength(1);
+    expect(plane.checks[0]?.tags).toEqual(tags);
+    expect(plane.checks[0]?.agent_run_id).toEqual(expect.any(String));
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      reservation_id: expect.any(String),
+      token_details: observedGoogleUsage,
+    });
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 10,
+      output_tokens: 5,
+      token_details: observedGoogleUsage,
+      possibly_succeeded: true,
+      call_id: plane.confirms[0]?.call_id,
+      agent_run_id: plane.checks[0]?.agent_run_id,
+      tags,
+    });
+  });
+
+  it("reports observed usage without confirmation when admitted locally during a budget outage", async () => {
+    const plane = new FakeControlPlane();
+    plane.outage({ path: "/api/v1/budgets/check" });
+    const fixture = googleContinuationFailure("http");
+    const client = plane.wrap(fixture.raw, {
+      failOpen: true,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+      logger: noopLogger,
+    });
+    try {
+      await expect(
+        consume(await client.models.generateContentStream(googleParams)),
+      ).rejects.toBeInstanceOf(ApiError);
+    } finally {
+      await client.close();
+    }
+    expect(plane.checks).toHaveLength(0);
+    expect(plane.leaseGrants).toHaveLength(0);
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 10,
+      output_tokens: 5,
+      token_details: observedGoogleUsage,
+      possibly_succeeded: true,
+    });
+    expect(plane.ingested[0]?.token_details?.is_estimated).toBe(false);
   });
 
   it("keeps Google lease-funded errors at zero usage and releases the claim", async () => {

@@ -24,7 +24,7 @@ corresponding release notes before users upgrade.
   local claim. Buffered Google continuation keeps its documented limitation: earlier-hop usage
   is unavailable if a later hop fails. Set `config.automaticContinuation: false` for
   application-controlled admission and settlement between hops. Deferred `responses.stream`
-  helpers retain their existing behavior.
+  helpers report a zero-token error event with no confirmation.
 
 ### Changed
 

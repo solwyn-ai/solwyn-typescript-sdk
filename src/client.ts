@@ -3775,9 +3775,7 @@ export class SolwynCore {
                 this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
               );
             }
-            if (!observedUsage || settlement.funding.leaseId === null) {
-              this.#releaseFunding(settlement.callId, settlement.funding);
-            }
+            this.#releaseFunding(settlement.callId, settlement.funding);
           } catch (settlementError) {
             this.#releaseFunding(settlement.callId, settlement.funding);
             throw settlementError;

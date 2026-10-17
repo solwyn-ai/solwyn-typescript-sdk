@@ -44,8 +44,8 @@ the error, including partial usage, and report an `error` event with those token
 `possibly_succeeded: true`. If no usage was observed, the event carries zero tokens and no
 usage confirmation is sent. Lease-funded streams, the default for untagged run-scoped text
 calls, still report zero usage on mid-stream provider errors, release the local claim, and send
-no confirmation. Deferred `responses.stream` helpers retain their existing error settlement
-behavior.
+no confirmation. Deferred `responses.stream` helpers report a zero-token error event with no
+confirmation.
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.

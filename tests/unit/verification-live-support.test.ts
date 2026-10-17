@@ -77,4 +77,52 @@ describe("live integration support (offline)", () => {
       expect(event.token_details.is_estimated).toBeUndefined();
     }
   });
+
+  it.each([
+    "openai",
+    "anthropic",
+    "google",
+    "bedrock",
+  ])("settles observed %s usage after a fixture stream failure", async (provider) => {
+    const { assertDelivery, captureControlPlane, consume, metadata, providerFixture } =
+      await import(supportUrl);
+    const plane = new FakeControlPlane();
+    const wire = captureControlPlane(plane.apiUrl, plane.fetch);
+    const failure = new Error("synthetic mid-stream provider failure");
+    const fixture = providerFixture(provider, { streamError: failure });
+    const client = new Solwyn(fixture.raw, {
+      apiKey: plane.apiKey,
+      apiUrl: plane.apiUrl,
+      fetch: wire.fetch,
+      provider,
+      breakerReportingEnabled: false,
+    });
+    try {
+      await run("synthetic-live-stream-error", async () => {
+        await expect(consume(await fixture.invoke(client, true))).rejects.toBe(failure);
+      });
+    } finally {
+      await client.close();
+    }
+    assertDelivery(wire);
+    expect(fixture.calls).toBe(1);
+    expect(fixture.ended).toBe(1);
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      lease_id: expect.any(String),
+      token_details: { input_tokens: 1000, output_tokens: 500 },
+    });
+    expect(metadata(wire)).toMatchObject([
+      {
+        status: "error",
+        input_tokens: 1000,
+        output_tokens: 500,
+        possibly_succeeded: true,
+        lease_id: plane.confirms[0]?.lease_id,
+        call_id: plane.confirms[0]?.call_id,
+      },
+    ]);
+    expect(plane.leaseSurrenders).toHaveLength(1);
+    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(1500);
+  });
 });

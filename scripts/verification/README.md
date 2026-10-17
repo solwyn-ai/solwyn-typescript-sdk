@@ -26,8 +26,9 @@ the harness. Supply secrets through the environment and keep them out of reports
 The harness discovers the project from a budget check and settles that discovery reservation.
 
 The basic run covers OpenAI-, Anthropic-, Google-, and Bedrock-shaped clients with buffered and
-streaming usage, per-call budget admission, settlement, ingest dispositions (including
-`duplicates`), provider-breaker reports, untracked-surface reports, and `close()` draining. An
+streaming usage, mid-stream provider errors with observed usage, per-call budget admission,
+settlement, ingest dispositions (including `duplicates`), provider-breaker reports,
+untracked-surface reports, and `close()` draining. An
 untagged run additionally grants, renews, settles against, and surrenders a lease; renewal starts
 with a call after the advertised refresh interval, so this phase takes about twenty seconds.
 Tagged calls exercise the per-call path. Cost-event reads, cost totals, budget counters, and

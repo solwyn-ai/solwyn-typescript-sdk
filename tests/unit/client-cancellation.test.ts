@@ -157,9 +157,17 @@ describe("caller cancellation", () => {
       } finally {
         await sdk.close();
       }
-      expect(control.confirms).toHaveLength(phase === "request-error" ? 1 : 5);
-      if (phase !== "request-error")
-        expect(control.events.every((event) => event["status"] === "success")).toBe(true);
+      expect(control.confirms).toHaveLength(5);
+      if (phase === "request-error") {
+        const errors = control.events.filter((event) => event["status"] === "error");
+        expect(errors).toHaveLength(4);
+        for (const event of errors)
+          expect(event).toMatchObject({
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            possibly_succeeded: true,
+          });
+      } else expect(control.events.every((event) => event["status"] === "success")).toBe(true);
     }
   });
 

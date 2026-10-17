@@ -41,8 +41,10 @@ existing `send()` refusal for raw inference commands.
 Google GenAI `2.30.0` enables automatic continuation on the metered `models.generateContent`
 and `models.generateContentStream` paths. Solwyn checks the logical call once and, on success,
 settles the SDK's cumulative usage across all continuation hops. `failoverHopReadTimeout`
-(600 seconds by default) bounds the whole continuation sequence. If a later buffered hop
-fails, the provider SDK does not return earlier-hop usage for Solwyn to settle. Set
+(600 seconds by default) bounds the whole continuation sequence. If a later streaming hop
+fails, Solwyn settles the provider-reported usage observed before the error and reports an
+error event carrying those tokens. Buffered calls retain a limitation: if a later hop fails,
+the provider SDK does not return earlier-hop usage for Solwyn to settle. Set
 `config.automaticContinuation: false` when the application needs separate admission and
 settlement for each hop; increase the timeout for long continuation sequences.
 

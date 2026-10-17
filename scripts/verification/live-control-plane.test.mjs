@@ -216,6 +216,77 @@ test("a Solwyn control plane with fake providers", {
     },
   );
 
+  await t.test("mid-stream provider errors settle observed usage and reconcile spend", async () => {
+    const before = await totals();
+    const beforeBudget = await budget();
+    let runCost = 0;
+    for (const provider of ["openai", "anthropic", "google", "bedrock"]) {
+      for (const leased of [false, true]) {
+        for (const plane of [null, new probes.FakeControlPlane()]) {
+          const wire = captureControlPlane(plane?.apiUrl ?? apiUrl, plane?.fetch);
+          const failure = new Error("synthetic mid-stream provider failure");
+          const fixture = providerFixture(provider, { streamError: failure });
+          const client = wrap(fixture, wire, provider, {
+            leaseEnabled: leased,
+            ...(plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {}),
+          });
+          const name = `sdk-live-stream-error-${provider}-${crypto.randomUUID()}`;
+          let runId;
+          try {
+            await sdk.run(name, async () => {
+              runId = sdk.currentRun().agentRunId;
+              await assert.rejects(
+                async () => consume(await fixture.invoke(client, true)),
+                (error) => error === failure,
+              );
+            });
+          } finally {
+            await client.close();
+          }
+          assertDelivery(wire);
+          assert.equal(fixture.calls, 1);
+          assert.equal(fixture.ended, 1);
+          const confirms = at(wire, "/budgets/confirm");
+          assert.equal(confirms.length, 1);
+          const events = metadata(wire);
+          assert.equal(events.length, 1);
+          assert.equal(events[0].call_id, confirms[0].request.call_id);
+          assert.equal(events[0].status, "error");
+          assert.equal(events[0].input_tokens, INPUT_TOKENS);
+          assert.equal(events[0].output_tokens, OUTPUT_TOKENS);
+          assert.equal(events[0].possibly_succeeded, true);
+          assert.equal(events[0].failover_error_class, undefined);
+          assert.equal(confirms[0].request.token_details.input_tokens, INPUT_TOKENS);
+          assert.equal(confirms[0].request.token_details.output_tokens, OUTPUT_TOKENS);
+          if (leased) {
+            const leaseId = at(wire, "/budgets/lease")[0]?.response.lease_id;
+            assert.equal(typeof leaseId, "string");
+            assert.equal(confirms[0].request.lease_id, leaseId);
+            assert.equal(events[0].lease_id, leaseId);
+            const surrenders = at(wire, "/lease/surrender");
+            assert.equal(surrenders.length, 1);
+            assert.equal(surrenders[0].request.spent_tokens, INPUT_TOKENS + OUTPUT_TOKENS);
+          } else {
+            assert.equal(at(wire, "/budgets/check").length, 1);
+            assert.equal(at(wire, "/budgets/lease").length, 0);
+          }
+          if (!plane) runCost += await assertRollup(runId, name, events);
+        }
+      }
+    }
+    const after = await totals();
+    const afterBudget = await budget();
+    assert.ok(runCost > 0, "observed usage on failed streams must be billable");
+    assert.equal(after.call_count - before.call_count, 8);
+    assert.equal(after.total_input_tokens - before.total_input_tokens, 8 * INPUT_TOKENS);
+    assert.equal(after.total_output_tokens - before.total_output_tokens, 8 * OUTPUT_TOKENS);
+    assert.ok(Math.abs(after.total_cost - before.total_cost - runCost) < 0.000001);
+    assert.ok(
+      Math.abs(afterBudget.current_usage - beforeBudget.current_usage - runCost) < 0.000002,
+      `budget spend delta ${afterBudget.current_usage - beforeBudget.current_usage} differs from event spend ${runCost}`,
+    );
+  });
+
   await t.test(
     "run-scoped lease grant, renewal on the next call, settlement attribution, and surrender",
     async () => {

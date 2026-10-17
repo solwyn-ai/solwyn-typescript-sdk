@@ -229,6 +229,45 @@ describe("deferred Responses client integration", () => {
     expect(f.events).toHaveLength(0);
   });
 
+  it("keeps deferred helper error settlement unchanged after an observed usage snapshot", async () => {
+    const f = fixture();
+    const failure = new TypeError("synthetic Responses body failure");
+    let emitted = false;
+    f.providerFetch.mockImplementationOnce(async () => {
+      const event = {
+        type: "response.created",
+        sequence_number: 0,
+        response: { id: "resp_error", output: [], usage: { input_tokens: 18, output_tokens: 7 } },
+      };
+      return new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              if (emitted) controller.error(failure);
+              else {
+                emitted = true;
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+              }
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    });
+    try {
+      await expect(
+        f.solwyn.responses.stream({ input: "synthetic input" }).done(),
+      ).rejects.toBeInstanceOf(Error);
+    } finally {
+      await f.solwyn.close();
+    }
+    expect(f.confirms).toHaveLength(0);
+    expect(f.events).toMatchObject([
+      { status: "error", input_tokens: 0, output_tokens: 0, possibly_succeeded: true },
+    ]);
+  });
+
   it.each([
     { label: "FAIL_FAST", status: 400, blocked: false, ambiguous: false },
     { label: "FAILOVER", status: 429, blocked: true, ambiguous: false },

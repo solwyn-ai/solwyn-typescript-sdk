@@ -81,7 +81,7 @@ class ConverseCommand {
 class ConverseStreamCommand extends ConverseCommand {}
 
 /** Plain objects only: no provider SDK, credentials, HTTP transport, or provider fetch. */
-export function providerFixture(provider, { onClose = () => {} } = {}) {
+export function providerFixture(provider, { onClose = () => {}, streamError } = {}) {
   let calls = 0;
   let ended = 0;
   let closed = false;
@@ -92,6 +92,7 @@ export function providerFixture(provider, { onClose = () => {} } = {}) {
   async function* stream(chunks) {
     try {
       for (const chunk of chunks) yield chunk;
+      if (streamError !== undefined) throw streamError;
     } finally {
       ended++;
     }

@@ -1,0 +1,391 @@
+import { ApiError, GoogleGenAI } from "@google/genai";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { CircuitBreaker } from "../../src/circuit-breaker";
+import { noopLogger } from "../../src/index";
+import { run } from "../../src/node";
+import { OpenAIAdapter } from "../../src/providers/openai";
+import { LatencyTracker } from "../../src/routing";
+import { FakeControlPlane } from "../../src/testing";
+
+async function consume(stream: AsyncIterable<unknown>): Promise<void> {
+  for await (const _chunk of stream) {
+    // Pull through the provider failure rather than cancelling the stream.
+  }
+}
+
+function googleContinuationFailure(failure: "http" | "network", streaming = true) {
+  let requests = 0;
+  let streamError: unknown;
+  const networkError = new TypeError("synthetic connection drop");
+  const raw = new GoogleGenAI({
+    apiKey: "offline",
+    httpOptions: {
+      fetch: async () => {
+        if (requests++ > 0) {
+          if (failure === "network") throw networkError;
+          return Response.json(
+            { error: { code: 500, message: "synthetic provider failure", status: "INTERNAL" } },
+            { status: 500 },
+          );
+        }
+        const response = {
+          candidates: [
+            {
+              index: 0,
+              content: { role: "model", parts: [] },
+              finishReason: "CONTINUATION",
+              continuationToken: "synthetic-checkpoint",
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 10,
+            candidatesTokenCount: 3,
+            thoughtsTokenCount: 2,
+            cachedContentTokenCount: 4,
+            toolUsePromptTokenCount: 1,
+          },
+        };
+        return streaming
+          ? new Response(`data: ${JSON.stringify(response)}\n\n`, {
+              headers: { "content-type": "text/event-stream" },
+            })
+          : Response.json(response);
+      },
+    },
+  });
+  // Observe the native generator's error identity without replacing its continuation logic.
+  const generate = raw.models.generateContentStream.bind(raw.models);
+  vi.spyOn(raw.models, "generateContentStream").mockImplementation(async (params) => {
+    const source = await generate(params);
+    return (async function* () {
+      try {
+        yield* source;
+      } catch (error) {
+        streamError = error;
+        throw error;
+      }
+    })();
+  });
+  return {
+    raw,
+    get requests() {
+      return requests;
+    },
+    get streamError() {
+      return streamError;
+    },
+  };
+}
+
+const googleParams = {
+  model: "gemini-test",
+  contents: [{ role: "user", parts: [] }],
+  config: { maxOutputTokens: 10 },
+};
+
+const observedGoogleUsage = {
+  input_tokens: 10,
+  output_tokens: 5,
+  cached_input_tokens: 4,
+  reasoning_tokens: 2,
+  tool_use_input_tokens: 1,
+};
+
+describe("provider usage observed before a stream error", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    "http",
+    "network",
+  ] as const)("settles Google continuation usage when the next hop has a %s error", async (failure) => {
+    const plane = new FakeControlPlane();
+    const fixture = googleContinuationFailure(failure);
+    const breakerFailure = vi.spyOn(CircuitBreaker.prototype, "recordFailure");
+    const latencySample = vi.spyOn(LatencyTracker.prototype, "recordLatency");
+    const client = plane.wrap(fixture.raw, {
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+    });
+    let caught: unknown;
+    try {
+      caught = await consume(await client.models.generateContentStream(googleParams)).catch(
+        (error: unknown) => error,
+      );
+    } finally {
+      await client.close();
+    }
+    expect(caught).toBeInstanceOf(failure === "http" ? ApiError : Error);
+    expect(caught).toBe(fixture.streamError);
+    if (failure === "http") expect(caught).toMatchObject({ status: 500 });
+    // Network drops retry the same native checkpoint three times, without new usage.
+    expect(fixture.requests).toBe(failure === "http" ? 2 : 5);
+    expect(breakerFailure).toHaveBeenCalledTimes(1);
+    expect(latencySample).not.toHaveBeenCalled();
+    expect(plane.checks).toHaveLength(1);
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({ token_details: observedGoogleUsage });
+    expect(plane.confirms[0]?.token_details.is_estimated).toBe(false);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 10,
+      output_tokens: 5,
+      token_details: observedGoogleUsage,
+      possibly_succeeded: true,
+      call_id: plane.confirms[0]?.call_id,
+    });
+    expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
+  });
+
+  it("trues up a Google lease claim and uses the remaining grant for the next admission", async () => {
+    const plane = new FakeControlPlane({ grantedTokens: 20, finalGrant: true });
+    const fixture = googleContinuationFailure("http");
+    const client = plane.wrap(fixture.raw, {
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+    });
+    try {
+      await run("stream-error-lease", async () => {
+        await expect(
+          consume(await client.models.generateContentStream(googleParams)),
+        ).rejects.toBeInstanceOf(ApiError);
+        expect(plane.leaseGrants).toHaveLength(1);
+        expect(plane.checks).toHaveLength(0);
+        // Fifteen paid tokens leave five of the twenty-token grant. A second ten-token
+        // reservation must check the control plane instead of reusing refunded authority.
+        await expect(client.models.generateContentStream(googleParams)).rejects.toBeInstanceOf(
+          ApiError,
+        );
+        expect(plane.checks).toHaveLength(1);
+      });
+    } finally {
+      await client.close();
+    }
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      lease_id: expect.any(String),
+      token_details: observedGoogleUsage,
+    });
+    expect(plane.ingested).toHaveLength(2);
+    const paidEvent = plane.ingested.find((event) => event.call_id === plane.confirms[0]?.call_id);
+    expect(paidEvent).toMatchObject({
+      status: "error",
+      input_tokens: 10,
+      output_tokens: 5,
+      lease_id: plane.confirms[0]?.lease_id,
+      possibly_succeeded: true,
+    });
+    expect(plane.leaseSurrenders).toHaveLength(1);
+    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(15);
+  });
+
+  it("keeps a dropped OpenAI stream unconfirmed before include_usage arrives", async () => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic stream failure");
+    const raw = {
+      chat: {
+        completions: {
+          create: async function* (_params: Record<string, unknown>) {
+            yield { choices: [{ delta: { content: "synthetic output" } }] };
+            throw failure;
+          },
+        },
+      },
+    };
+    const client = plane.wrap(raw, { breakerReportingEnabled: false });
+    try {
+      await expect(
+        consume(
+          await client.chat.completions.create({ model: "gpt-test", messages: [], stream: true }),
+        ),
+      ).rejects.toBe(failure);
+    } finally {
+      await client.close();
+    }
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 0,
+      output_tokens: 0,
+      possibly_succeeded: true,
+    });
+    expect(plane.ingested[0]?.token_details).toBeUndefined();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("does not settle compatible fallback estimates (chunk=%s)", async (chunk) => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic compatible stream failure");
+    const client = plane.wrap(
+      {
+        baseURL: "https://api.deepseek.com/v1",
+        chat: {
+          completions: {
+            create: async function* (_params: Record<string, unknown>) {
+              if (chunk) yield { choices: [{ delta: { content: "synthetic output" } }] };
+              throw failure;
+            },
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      await run("compatible-stream-error", async () => {
+        await expect(
+          consume(
+            await client.chat.completions.create({
+              model: "deepseek-chat",
+              messages: [{ role: "user", content: "synthetic input" }],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      });
+    } finally {
+      await client.close();
+    }
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 0,
+      output_tokens: 0,
+      possibly_succeeded: true,
+    });
+    expect(plane.leaseSurrenders).toHaveLength(1);
+    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+  });
+
+  it("preserves the provider error and releases funding when finalization throws", async () => {
+    vi.spyOn(OpenAIAdapter.prototype, "createStreamAccumulator").mockReturnValue({
+      observe() {},
+      finalize() {
+        throw new Error("synthetic usage extraction failure");
+      },
+      getServiceTier: () => null,
+    });
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic provider failure");
+    const client = plane.wrap(
+      {
+        chat: {
+          completions: {
+            create: async function* (_params: Record<string, unknown>) {
+              yield {};
+              throw failure;
+            },
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      await run("unreadable-stream-usage", async () => {
+        await expect(
+          consume(
+            await client.chat.completions.create({
+              model: "gpt-test",
+              messages: [{ role: "user", content: "synthetic input" }],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      });
+    } finally {
+      await client.close();
+    }
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({ status: "error", input_tokens: 0, output_tokens: 0 });
+    expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+  });
+
+  it.each([false, true])("settles partial Anthropic input usage (lease=%s)", async (leased) => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic Anthropic stream failure");
+    const client = plane.wrap(
+      {
+        messages: {
+          create: async function* (_params: Record<string, unknown>) {
+            yield { type: "message_start", message: { usage: { input_tokens: 12 } } };
+            throw failure;
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      const call = async () => {
+        await expect(
+          consume(
+            await client.messages.create({
+              model: "claude-test",
+              messages: [],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      };
+      if (leased) await run("partial-stream-error", call);
+      else await call();
+    } finally {
+      await client.close();
+    }
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]?.token_details).toMatchObject({
+      input_tokens: 12,
+      output_tokens: 0,
+      is_estimated: true,
+    });
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 12,
+      output_tokens: 0,
+      token_details: { input_tokens: 12, output_tokens: 0, is_estimated: true },
+      possibly_succeeded: true,
+    });
+    expect(plane.ingested[0]?.failover_error_class).toBeUndefined();
+    if (leased) {
+      expect(plane.confirms[0]?.lease_id).toEqual(expect.any(String));
+      // Missing output usage retains the twenty-token reservation floor locally.
+      expect(plane.leaseSurrenders).toHaveLength(1);
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(20);
+    }
+  });
+
+  it("cannot settle earlier buffered Google continuation usage when a later hop fails", async () => {
+    const plane = new FakeControlPlane();
+    const fixture = googleContinuationFailure("http", false);
+    const client = plane.wrap(fixture.raw, {
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      breakerReportingEnabled: false,
+    });
+    try {
+      await expect(client.models.generateContent(googleParams)).rejects.toBeInstanceOf(ApiError);
+    } finally {
+      await client.close();
+    }
+    expect(fixture.requests).toBe(2);
+    expect(plane.checks).toHaveLength(1);
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      input_tokens: 0,
+      output_tokens: 0,
+    });
+    expect(plane.ingested[0]?.token_details).toBeUndefined();
+  });
+});

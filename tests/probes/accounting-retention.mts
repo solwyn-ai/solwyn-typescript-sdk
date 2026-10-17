@@ -238,7 +238,10 @@ scenarios["ai-histories"] = async () => {
           doGenerate: async () => ({ content: [], usage: { inputTokens: 0, outputTokens: 0 } }),
         }),
       );
-    await collectStates(f);
+    await collectUntil(
+      () => alive(f.refs) === 0 && f.counters.surrenders === 1000,
+      () => `AI histories: lease states=${alive(f.refs)}, surrenders=${f.counters.surrenders}/1000`,
+    );
     assert.equal(f.refs.filter((ref) => ref.deref() !== undefined).length, 0);
     assert.equal(f.counters.surrenders, 1000);
     results["ai_histories"] = { observed: f.refs.length, alive: 0 };

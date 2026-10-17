@@ -35,7 +35,7 @@ it.each(["esm", "cjs"])(
     );
     const { stdout } = await execFileAsync(
       process.execPath,
-      ["--expose-gc", "--import", "tsx", harness, process.cwd(), format],
+      ["--expose-gc", harness, process.cwd(), format],
       { timeout: 120_000 },
     );
     expect(JSON.parse(stdout)).toEqual({ coverageShared: true, hookShared: true, idle: true });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { setImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { collectUntil } from "../../probes/gc.mts";
+import { collectUntil } from "../../probes/gc.mjs";
 
 const [root, format] = process.argv.slice(2);
 const require = createRequire(import.meta.url);

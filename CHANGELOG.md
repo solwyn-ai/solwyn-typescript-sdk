@@ -9,95 +9,127 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in live control-plane verification.** `pnpm test:live` runs the built SDK against a
+  disposable Solwyn control plane using fake providers, checks settlement and dashboard totals,
+  compares testing-double behavior, and exercises contract probes and run stops with an owner
+  token. It is separate from the offline unit suite and skips when credentials are unset.
+- **Effective call IDs on budget results.** `BudgetEnforcer.checkBudget()` returns `callId`,
+  including an ID minted when the caller omits one, so direct callers can settle or release the
+  corresponding lease reservation. `CheckBudgetOptions.signal` adds caller cancellation.
+
 ### Changed
 
-- **Breaking: closed clients reject intercepted calls.** Once `close()` begins, chat,
+- **Breaking:** **Closed clients reject intercepted calls.** Once `close()` begins, chat,
   Responses, media, and Bedrock calls reject with `SolwynError("client is closed")` before
-  admission or provider dispatch. Buffered calls and stream setup already in flight drain
-  within `reporterShutdownDeadline`, sharing that deadline with settlement and advisory
-  delivery. Lease cleanup has a separate one-second budget; wrapped provider shutdown is
-  awaited afterward and has its own duration. Open streams settle once from usage observed so
-  far without waiting for the consumer; later
-  pulls reject with `SolwynError("client is closed")` at the next provider-chunk boundary.
-  Finish or cancel streams before closing the client to include terminal usage. Calls that
-  outlast the drain deadline may
-  finish after reporting closes, and produce a shutdown warning.
-- **Conservative failover limits.** When a plan suppresses custom failover tuning, the SDK
-  preserves the stricter requested idempotency policy, smaller total failover window, and
-  lower retry count instead of loosening them to defaults.
-- **Per-call idempotency only tightens policy.** `solwynIdempotent: false` limits a call to
-  `"safe"` failover while preserving a configured `"never"`; `true` preserves the configured
-  policy. The option is stripped from every intercepted request, including media and native
-  Bedrock commands, without mutating caller-owned params.
-- **Breaking: numeric configuration rejects unsafe values.** Budget-check and reporter timers
-  must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive timers
-  reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown deadlines
-  allow zero and reject negatives. Empty numeric environment values are rejected. Breaker
-  thresholds must be positive integers, retries must be non-negative integers, and jitter must
-  be between zero and one. Reporter batches cannot exceed 1000 events, and breaker heartbeats
-  cannot exceed 60 seconds. Documented defaults are unchanged.
-- **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects non-number,
-  non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite, non-positive,
-  and oversized per-call `timeout` values with `ConfigurationError`. Both durations are in
-  seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
-- **Velocity history survives higher run concurrency.** Structural loop detection now keeps
-  compact histories for up to 4096 runs and discards stale histories first. At the hard cap,
-  randomized eviction avoids systematically resetting loops under run churn or round-robin
-  overflow; discarding live history emits a rate-limited `velocity.history_evicted` warning.
+  admission or provider dispatch. Buffered calls and stream setup already in flight drain within
+  `reporterShutdownDeadline`, sharing that deadline with settlement and advisory delivery. Lease
+  cleanup has a separate one-second budget; wrapped provider shutdown is awaited afterward and
+  has its own duration. Open streams settle once from usage observed so far without waiting for
+  the consumer; later pulls reject with `SolwynError("client is closed")` at the next
+  provider-chunk boundary. Finish or cancel streams before closing the client to include
+  terminal usage. Calls that outlast the drain deadline may finish after reporting closes and
+  produce a shutdown warning. Complete application work before closing, and create a new client
+  for subsequent calls.
+- **Breaking:** **Conservative failover limits.** When a plan suppresses custom failover tuning,
+  the SDK preserves the stricter requested idempotency policy, smaller total failover window,
+  and lower retry count instead of loosening them to defaults. Configure the intended policy on
+  the client and check plan support for custom tuning.
+- **Breaking:** **Per-call idempotency only tightens policy.** `solwynIdempotent: false` limits
+  a call to `"safe"` failover while preserving a configured `"never"`; `true` preserves the
+  configured policy instead of escalating it to `"always"`. Configure `failoverIdempotency:
+  "always"` on the client when ambiguous retries are intended. The option is stripped from every
+  intercepted request, including media and native Bedrock commands, without mutating
+  caller-owned params.
+- **Breaking:** **Numeric configuration rejects unsafe values.** Budget-check and reporter
+  timers must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive
+  timers reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown
+  deadlines allow zero and reject negatives. Empty numeric environment values are rejected.
+  Breaker thresholds must be positive integers, retries must be non-negative integers, and
+  jitter must be between zero and one. Reporter batches cannot exceed 1000 events, and breaker
+  heartbeats cannot exceed 60 seconds. Replace invalid values with durations and counts within
+  the documented ranges; defaults are unchanged.
+- **Breaking:** **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects
+  non-number, non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite,
+  non-positive, and oversized per-call `timeout` values with `ConfigurationError`. Both
+  durations are in seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
+  Pass finite numbers in that range, allowing zero only for `cacheTtl`.
+- **Breaking:** **Constructor shape validation is synchronous.** Invalid options objects,
+  fallback lists, model values, loggers, and selection policies raise `ConfigurationError`
+  before reporters or budget resources start. Supply all four `debug`, `info`, `warn`, and
+  `error` logger methods and a selection policy with an `order()` method; partial objects are
+  rejected.
+- **Breaking:** **Public token details require consistent cache totals.** `createTokenDetails()`
+  and `TokenDetailsSchema.parse()` now throw `ZodError` when cache reads plus five-minute and
+  one-hour writes exceed `input_tokens`. Include all three buckets in the input total before
+  calling these validating helpers. Provider usage extraction instead preserves the buckets and
+  raises a deficient input total, as described below.
+- **Breaking:** **Velocity history survives higher run concurrency.** Structural loop detection
+  now keeps compact histories for up to 4096 runs and discards stale histories first. At the
+  hard cap, randomized eviction avoids systematically resetting loops under run churn or
+  round-robin overflow; discarding live history emits a rate-limited `velocity.history_evicted`
+  warning. High-concurrency runs can now trigger configured loop denials that history eviction
+  previously missed; use `velocityMode: "warn"` to observe flags before enabling denial.
 - **Run lifetime tracking starts on demand.** Importing the Node entry no longer enables a
   process-wide async hook. Tracking starts with the first callback run or detached handle and
   stops when the last run lifetime is collected. Active lifetimes still add promise overhead.
   The owner registry is versioned so older installed copies can share run context without
   breaking callback runs, detached handles, or their own lifetime tracking in either load order.
-- **Surface reflection is observational.** Key, membership, and descriptor inspection no longer
-  applies untracked-spend posture. Configurable reflected operations enforce policy when used;
-  their descriptor values are live guarded handles, and reflected callable identity can differ
-  from a direct read. Fixed descriptors preserve native Proxy invariants. Unknown data namespaces can be traversed
-  in strict mode, and `warn`/`allow` record only the terminal child, or a bare namespace on the
-  next microtask. Surface reads reuse attribution until mutation or initialization refreshes it.
-- **Typed coverage errors.** In this public preview, `coverage()` now throws
-  `ConfigurationError(field: "client")` instead of `TypeError` for an unregistered object.
+- **Breaking:** **Surface reflection is observational.** Key, membership, and descriptor
+  inspection no longer apply untracked-spend posture. Configurable reflected operations enforce
+  policy when used; their descriptor values are live guarded handles, and reflected callable
+  identity can differ from a direct read. Fixed descriptors preserve native Proxy invariants.
+  Unknown data namespaces can be traversed in strict mode, and `warn`/`allow` record only the
+  terminal child, or a bare namespace on the next microtask. Surface reads reuse attribution
+  until mutation or initialization refreshes it. Enforce coverage by invoking guarded
+  operations; do not use reflection as a policy check or rely on reflected and directly read
+  functions sharing identity.
+- **Breaking:** **Typed coverage errors.** `coverage()` now throws `ConfigurationError(field:
+  "client")` instead of `TypeError` for an unregistered object. Update handlers that previously
+  caught `TypeError`.
 - **Helper coverage guidance.** The README now explicitly identifies Anthropic
   `messages.stream`/`messages.parse` and OpenAI Chat Completions `stream`/`parse`/`runTools`
   helpers as unmetered, with no budget check or cost event under the default warning posture.
-
-- **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per client, with
-  at most four requests in flight and 64 waiting. Finished runs are surrendered as runs end, not
-  by scanning every retained run on each provider call. A surrender that is refused (any 4xx or
-  5xx answer), overflows the queue, or passes its deadline is dropped and counted, and the drops
-  are reported in aggregated `lease.surrenders_dropped` warnings, instead of being retried on
-  every call. The control plane settles spend from lease-tagged confirmations, so a dropped
-  surrender only delays the return of unspent reserved tokens until the lease expires.
-- **Surrender timeout retry.** Outside `close()`, a surrender that times out is now retried once,
-  immediately, within two seconds of being queued. Surrender answers with an HTTP status (4xx or
-  503) still count as control-plane reachability for the circuit breaker.
-- **Close drains through four workers.** `close()` now drains lease surrenders through four
-  workers within its existing one-second deadline, one attempt each, and logs how many were left
-  in a single `lease.close_release_summary` warning.
+- **Breaking:** **Bounded lease surrenders.** Lease surrenders now go through one dispatcher per
+  client, with at most four requests in flight and 64 waiting. Finished runs are surrendered as
+  runs end, not by scanning every retained run on each provider call. A surrender that is
+  refused (any 4xx or 5xx answer), overflows the queue, or passes its deadline is dropped and
+  counted, and the drops are reported in aggregated `lease.surrenders_dropped` warnings, instead
+  of being retried on every call. The control plane settles spend from lease-tagged
+  confirmations, so a dropped surrender only delays the return of unspent reserved tokens until
+  the lease expires. Outside `close()`, a surrender that times out is retried once, immediately,
+  within two seconds of being queued. Surrender answers with an HTTP status (4xx or 503) still
+  count as control-plane reachability for the circuit breaker. `close()` drains lease surrenders
+  through four workers within its existing one-second deadline, one attempt each, and logs how
+  many were left in a single `lease.close_release_summary` warning. Monitor these diagnostics
+  when immediate return of unused lease capacity matters; do not rely on indefinite surrender
+  retries.
 - **Uncounted tallies of finished runs.** Uncounted fail-open tallies can be reported only on a
   lease renewal, which a finished run never sends. They are now aggregated and logged in
   `lease.uncounted_discarded` warnings (at most one every 30 seconds, repeated in the close
   summary) instead of being retained indefinitely. The `lease.uncounted_entry` warning now says
   so.
-- **Lease recovery after a refusal.** After a lease grant is refused with 409, or a renewal comes
-  back ineligible, a run now falls back to per-call budget checks for at most 150 seconds,
+- **Lease recovery after a refusal.** After a lease grant is refused with 409, or a renewal
+  comes back ineligible, a run now falls back to per-call budget checks for at most 150 seconds,
   instead of for the rest of the run. After an ineligible renewal, the SDK releases the lease it
   holds and acquires a new one as soon as the release is confirmed; the new lease's renewals no
   longer repeat the refused renewal's spend or uncounted tallies. An ineligible initial grant
   still keeps the run on per-call checks. The `FakeControlPlane` test double in
   `@solwyn/sdk/testing` now accepts that release, at the generation held before an ineligible or
   denied renewal, as the control plane does, instead of answering 409.
-- **Run leases widen to newly used model chains.** A run lease used to cover only the model chain
-  of the run's first call, so every call on another model or fallback chain took a blocking
-  per-call budget check for the rest of the run. Now, after a per-call check allows a call whose
-  chain the lease does not cover, the SDK renews the lease in the background and re-declares that
-  call's full chain (model, provider and fallbacks); once the renewal is applied, later calls on
-  that chain use the lease. A denied, unreadable or unreachable check never widens the lease, and
-  tagged and media calls never do. If the control plane answers the widening renewal as
-  ineligible, the models it added are recorded for the run and never declared again: calls whose
-  chain names one of them keep per-call checks, and the rest of the run returns to the lease after
-  the SDK releases and re-acquires it. Widening to a more expensive model re-prices the lease for
-  every model in the run, so each model's token grant shrinks.
+- **Run leases widen to newly used model chains.** A run lease used to cover only the model
+  chain of the run's first call, so every call on another model or fallback chain took a
+  blocking per-call budget check for the rest of the run. Now, after a per-call check allows a
+  call whose chain the lease does not cover, the SDK renews the lease in the background and
+  re-declares that call's full chain (model, provider and fallbacks); once the renewal is
+  applied, later calls on that chain use the lease. A denied, unreadable or unreachable check
+  never widens the lease, and tagged and media calls never do. If the control plane answers the
+  widening renewal as ineligible, the models it added are recorded for the run and never
+  declared again: calls whose chain names one of them keep per-call checks, and the rest of the
+  run returns to the lease after the SDK releases and re-acquires it. Widening to a more
+  expensive model re-prices the lease for every model in the run, so each model's token grant
+  shrinks.
 - **Concurrent settlement confirmations.** `reporterMaxInFlight` now limits confirmation POSTs
   (three by default); metadata batches remain serial. A retrying FIFO head holds later dispatch
   while already-active confirmations finish independently. For ERROR escalation, a round fails
@@ -109,49 +141,60 @@ corresponding release notes before users upgrade.
   twenty-response cap instead of consuming ordinary send attempts. Confirmation, ingest,
   provider-breaker, and untracked-surface retries use bounded exponential backoff with
   half-to-full jitter. Ingest and provider-breaker reports share a project rate-limit hold.
-- **Current settlement wire contract (preview breaking).** Ingest responses now require a strict
+- **Breaking:** **Current settlement wire contract.** Ingest responses now require a strict
   `duplicates` disposition list. Metadata accepts an optional, nullable `lease_id` up to 64
   characters. Lease renewals require model and provider together, and fallback declarations
   require that primary pair. The reviewed endpoint snapshot and its contract tables now include
   duplicate dispositions, lease metadata, ingest availability responses, and unsupported-media
-  errors.
-- **Server-faithful testing verdicts (preview breaking).** `FakeControlPlane` now allows project
+  errors. Update custom control-plane responses and fixtures to include `duplicates: []`, and
+  declare the primary model/provider pair on renewal requests with fallbacks.
+- **Breaking:** **Server-faithful testing verdicts.** `FakeControlPlane` now allows project
   overruns in `alert_only` mode with a reservation and negative remaining budget, including
   `solwyn-test/deny-alert` checks and leases. Scoped and run denials use `hard_deny`. Lease
   `postureMode` can model independent scoped enforcement; `final_grant` applies only to a hard
   posture. Opted-in text checks provide price hints (`priceHints: null` returns an empty map,
-  rather than omitting the field), legacy checks omit directive keys, and all opted-in stopped-run
-  verdicts include the directive. `stopRun()` accepts only `manual_kill`;
-  `runUsage` supplies explicit synthetic stopped-run spend. Default lease timers are 120 seconds
-  with a 15-second refresh.
-- **Server-faithful testing ingestion (preview breaking).** The test double returns duplicate
-  dispositions and stores only accepted events; scripted count rejections now carry indexes.
-  It rejects metadata batches above 1,000 events, duplicate untracked keys in one batch,
-  untracked bodies above 256 KiB, and breaker reports outside the key's project. A stopped run
-  is checked before replaying an existing holder's grant.
-
-### Added
-
-- **Opt-in live control-plane verification.** `pnpm test:live` runs the built SDK against a
-  disposable Solwyn control plane using fake providers, checks settlement and dashboard totals,
-  compares testing-double behavior, and exercises contract probes and run stops with an owner
-  token. It is separate from the offline unit suite and skips when credentials are unset.
-- **Effective call IDs on budget results.** `BudgetEnforcer.checkBudget()` returns `callId`,
-  including an ID minted when the caller omits one, so direct callers can settle or release
-  the corresponding lease reservation. `CheckBudgetOptions.signal` adds caller cancellation.
+  rather than omitting the field), legacy checks omit directive keys, and all opted-in
+  stopped-run verdicts include the directive. `stopRun()` accepts only `manual_kill`; `runUsage`
+  supplies explicit synthetic stopped-run spend. Default lease timers are 120 seconds with a
+  15-second refresh. Update fake expectations for these verdicts and timers, and use `hard_deny`
+  or `postureMode` when testing enforced denial.
+- **Breaking:** **Server-faithful testing ingestion.** The test double returns duplicate
+  dispositions and stores only accepted events; scripted count rejections now carry indexes. It
+  rejects metadata batches above 1,000 events, duplicate untracked keys in one batch, untracked
+  bodies above 256 KiB, and breaker reports outside the key's project. A stopped run is checked
+  before replaying an existing holder's grant. Include disposition indexes in scripted
+  rejections and keep fixture batches and project attribution within these limits.
+- **Breaking:** **Caller cancellation preserves observed usage.** Buffered and stream setup
+  aborts never fail over or count as provider failures. Mid-stream cancellation settles observed
+  usage once, using the reservation floor when usage is estimated, including Google reader
+  errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts remain
+  provider failures. Failing usage extractors during caller cancellation fall back to estimated
+  usage and still settle. Cancellation of a dispatched request before connection, including
+  deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
+  funding without confirming usage, and contributes no latency sample. Expect established-stream
+  cancellation to confirm observed usage rather than refunding the entire reservation.
+- **Breaking:** **Established stream failures update provider health.** Non-429 HTTP 4xx errors
+  release recovery probes without a health penalty; status-less provider errors after connection
+  count toward the breaker unless caused by caller cancellation. Account for these failures when
+  selecting breaker thresholds; supply HTTP status on request-shaped errors.
+- **Breaking:** **Budget preflight shares one deadline and honors cancellation.** An initial
+  lease attempt and its per-call fallback now share the requested timeout. With less than 50
+  milliseconds remaining, preflight skips network I/O and applies local policy with a deadline
+  diagnostic, without adding a breaker failure or drawing lease headroom. Caller `AbortSignal`s
+  reach preflight transport; already-aborted requests skip budget I/O, and cancellation rejects
+  without treating it as a control-plane outage. Non-Error abort reasons become `AbortError`s,
+  matching provider dispatch; Error reasons are preserved. Allow at least 50 milliseconds for a
+  network preflight and handle caller cancellation separately from budget denials.
+- **Breaking:** **AI SDK middleware shutdown.** Closing rejects new calls before budget or
+  provider I/O, drains buffered calls and stream setup within the shared reporting deadline, and
+  settles open streams once from observed usage before reporting closes. Calls beyond the drain
+  deadline produce a shutdown warning. Stream settlement registrations are weak so the handle
+  does not keep abandoned streams alive. Provider cleanup remains owned by the AI SDK. Finish or
+  cancel streams before closing to include terminal usage, and create a new middleware handle
+  for subsequent work.
 
 ### Fixed
 
-- **Caller cancellation preserves provider health and observed usage.** Buffered and stream
-  setup aborts never fail over or count as provider failures. Mid-stream cancellation settles
-  observed usage once, using the reservation floor when usage is estimated, including Google
-  reader errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts
-  remain provider failures. Non-429 HTTP 4xx errors release recovery probes without a health
-  penalty; status-less provider errors after connection count toward the breaker. Failing
-  usage extractors during caller cancellation fall back to estimated usage and still settle.
-- **Pending Responses cancellation matches buffered setup.** A deferred Responses helper
-  cancelled before connection reports an error with `possibly_succeeded: true`, releases
-  local funding without confirming usage, and contributes no latency sample.
 - **Abandoned streams release settlement ownership.** Garbage-collection finalization settles
   observed usage once, retaining the reservation floor for estimated usage, and releases run
   lifetimes, caller signals, lease authority, and recovery probes before client shutdown.
@@ -168,28 +211,18 @@ corresponding release notes before users upgrade.
 - **Consumer stream throws settle observed usage.** Iterator `throw()` now follows the same
   settlement and cleanup path as early return, forwards the consumer error to the underlying
   iterator where supported, and rethrows it without counting a provider failure.
-- **Constructor shape errors are typed and synchronous.** Invalid options objects, fallback
-  lists, model values, loggers, and selection policies raise `ConfigurationError` before
-  reporters or budget resources start.
-- **Budget preflight shares one deadline and honors cancellation.** An initial lease attempt
-  and its per-call fallback now share the requested timeout. With less than 50 milliseconds
-  remaining, preflight skips network I/O and applies local policy with a deadline diagnostic,
-  without adding a breaker failure or drawing lease headroom. Caller `AbortSignal`s reach
-  preflight transport; already-aborted requests skip budget I/O, and cancellation rejects
-  without treating it as a control-plane outage. Non-Error abort reasons become `AbortError`s,
-  matching provider dispatch; Error reasons are preserved.
 - **Completed calls release lease bookkeeping immediately.** Settlement, release, and unknown
   usage no longer retain a full claim and expiry entry for 900 seconds. Per-call budget results
   release their unused lease claims, and a bounded recent-ID history still rejects accidental
   call-ID reuse.
 - **Late lease settlements remain accounted for.** After the 900-second reservation sweep
-  refunds an abandoned reservation, a matching late settlement debits its full usage against
-  the original lease. The SDK retains at most 4096 swept reservations and fences settlements
-  from replacement lease incarnations.
+  refunds an abandoned reservation, a matching late settlement debits its full usage against the
+  original lease. The SDK retains at most 4096 swept reservations and fences settlements from
+  replacement lease incarnations.
 - **Lease reports contain only their own spend.** Dropping or replacing a lease clears its
   advisory spend tally so a successor lease's renewal or surrender cannot report the old burn.
-- **Lease outage admissions accrue local estimates.** Calls admitted against the outage share
-  or after lease expiry now accrue the fixed estimate in the current UTC-day bucket. Per-call
+- **Lease outage admissions accrue local estimates.** Calls admitted against the outage share or
+  after lease expiry now accrue the fixed estimate in the current UTC-day bucket. Per-call
   outage checks use that shared spend, and a server's fail-open lease posture cannot relax a
   client's `failOpen: false` setting.
 - **Complete Anthropic usage.** Streaming input and cache totals now follow cumulative
@@ -209,35 +242,28 @@ corresponding release notes before users upgrade.
 - **Cross-dialect stream compatibility.** Bedrock results retain only the metered `stream` when
   served by another dialect, and empty OpenAI `tool_calls` arrays no longer abort translation.
 - **AI SDK accounting and attribution.** Middleware maps aggregate cache writes to the
-  five-minute bucket, bounds cache buckets by input totals, and estimates a missing usage total
-  while retaining its reported counterpart. Vertex Anthropic, LM Studio, vLLM, generic
-  compatible clients, and Alibaba gateway models receive their own provider attribution.
+  five-minute bucket and estimates a missing usage total while retaining its reported
+  counterpart. Vertex Anthropic, LM Studio, vLLM, generic compatible clients, and Alibaba
+  gateway models receive their own provider attribution.
 - **AI SDK run stops.** Middleware refuses dispatch after a concurrent run stop and aborts
   in-flight streams at the next chunk boundary. A stopped stream keeps its termination across
   `clearRunTermination()`. Run stops and caller aborts confirm observed stream usage, including
   the part pulled at the stop boundary, and retain the reservation floor for estimated usage.
   Caller `abortSignal` also reaches budget preflight. Local velocity detection remains
   unsupported by this integration.
-- **AI SDK middleware shutdown (preview breaking).** Closing rejects new calls before budget or provider I/O,
-  drains buffered calls and stream setup within the shared reporting deadline, and settles
-  open streams once from observed usage before reporting closes. Calls beyond the drain
-  deadline produce a shutdown warning. Stream settlement registrations are weak so the handle
-  does not keep abandoned streams alive. Provider cleanup remains owned by the AI SDK.
 - **Shared coverage and explicit Node imports.** ESM and CommonJS builds share wrapper coverage
   registrations. Built Node entries preserve the `node:async_hooks` prefix; core entries remain
   free of Node builtin imports, checked across every emitted shared and provider chunk.
-  Surface-rule validation also avoids compiling a regular
-  expression for every rule during import.
-
+  Surface-rule validation also avoids compiling a regular expression for every rule during
+  import.
 - **Healthy control-plane refusals.** Confirmation 4xx and 503 responses count as reachability,
   matching lease operations, so terminal confirmation refusals cannot open the shared breaker.
 - **Reliable untracked-surface reports.** Closing flushes unsent occurrences without the normal
-  fifteen-minute gate or local retry backoff and uses the configured reporter shutdown deadline.
-  Retries keep the same report ID, occurrence count, and cursor; later observations form a
-  separate report. Refused
-  keys stop retrying, failures produce rate-limited diagnostics, and read-only credentials use
-  the shared configuration diagnostic. Retry exhaustion is aggregated at most once per minute.
-  Reads with nothing due use a constant-time schedule check.
+  fifteen-minute gate or local retry backoff, using the shared shutdown deadline's remaining
+  time. Retries keep the same report ID, occurrence count, and cursor; later observations form a
+  separate report. Refused keys stop retrying, failures produce rate-limited diagnostics, and
+  read-only credentials use the shared configuration diagnostic. Retry exhaustion is aggregated
+  at most once per minute. Reads with nothing due use a constant-time schedule check.
 - **Shutdown delivery across server retry holds.** Final confirmation and metadata flushes wait
   for short `Retry-After` holds within the remaining close deadline. Longer holds are counted as
   `rate_limited` losses, and unsent settlement confirmations still release their paired metadata
@@ -249,36 +275,36 @@ corresponding release notes before users upgrade.
   use strictly increasing per-provider timestamps even if the wall clock stalls or rolls back.
 - **Bounded queue and timer overhead.** Report queue overflow, prefix restoration, and draining
   now avoid array reindexing. Large flush and close timer delays are clamped to the runtime's
-  signed 32-bit timer bound.
+  signed 32-bit timer bound. Closing no longer evicts ready metadata events from a full queue
+  while an already-active delivery round finishes.
 - **Strict ingest diagnostics.** Successful ingest bodies are validated before dispositions are
-  applied. Missing fields, extra keys, and unknown rejection codes count as contract drift;
-  an explicitly logged fallback still surfaces usable per-event rejections.
+  applied. Missing fields, extra keys, and unknown rejection codes count as contract drift; an
+  explicitly logged fallback still surfaces usable per-event rejections.
 - **Lease reconciliation and cache usage.** Every lease-funded settlement's metadata now carries
   its confirmation's lease ID, including when the confirmation is abandoned or local
   confirmation construction fails. Cache normalization preserves reported read/write buckets and
-  raises an inconsistent input total to their sum, marking the correction estimated without
-  retaining the lease reservation floor. Missing or malformed usage still retains that floor.
-  Unnormalized invalid cache breakdowns are rejected locally before they can invalidate a whole
-  ingest batch.
+  raises an inconsistent input total to their sum, including AI SDK usage, marking the
+  correction estimated without retaining the lease reservation floor. Missing or malformed usage
+  still retains that floor. Unnormalized invalid cache breakdowns are rejected locally before
+  they can invalidate a whole ingest batch.
 - **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
   now produces the budget warning while retaining the reservation for settlement. Alert-only
   budget-limit logs emit at most once every 30 seconds per enforcer; every affected result
   retains its warning and reservation.
 - **Gateway-prefixed contract probes.** Testing contract helpers append endpoint paths to the
   configured API prefix using the same URL join as runtime transport.
-- Metadata ingestion no longer starves under sustained confirmation traffic. The background
-  reporter now delivers in bounded rounds: each round confirms at most one batch's worth of
-  standalone confirmations and of settlements, then sends the metadata batches that were queued
-  when the round reached them. When a round stops at its quota with work still due, the next round
-  starts on the following timer turn instead of after the flush interval.
-- `close()` no longer evicts ready metadata events from a full queue while a delivery round that
-  was already in flight finishes.
-- Clients dropped without `close()` no longer keep their provider, timers and heartbeats alive.
-  Once such a client's queued confirmations and events are delivered, its wrapped provider, lease
-  state and background reporter can be garbage-collected, its flush timer and provider-breaker
-  heartbeats stop, and it leaves the Node exit registry. A client constructed inside `run()` no
-  longer keeps that run alive. Reuse one client and `close()` it at shutdown: that remains the
-  supported lifecycle.
+- **Fair metadata delivery.** Metadata ingestion no longer starves under sustained confirmation
+  traffic. The background reporter now delivers in bounded rounds: each round confirms at most
+  one batch's worth of standalone confirmations and of settlements, then sends the metadata
+  batches that were queued when the round reached them. When a round stops at its quota with
+  work still due, the next round starts on the following timer turn instead of after the flush
+  interval.
+- **Unclosed clients can be collected.** Clients dropped without `close()` no longer keep their
+  provider, timers and heartbeats alive. Once such a client's queued confirmations and events
+  are delivered, its wrapped provider, lease state and background reporter can be
+  garbage-collected, its flush timer and provider-breaker heartbeats stop, and it leaves the
+  Node exit registry. A client constructed inside `run()` no longer keeps that run alive. Reuse
+  one client and `close()` it at shutdown: that remains the supported lifecycle.
 - **Faster image translation for cross-dialect failover.** Byte-backed Bedrock images are now
   Base64-encoded in bounded chunks (or with the runtime's native `Uint8Array.prototype.toBase64`
   where available) instead of one string concatenation per byte. A 3 MiB image no longer blocks
@@ -287,13 +313,13 @@ corresponding release notes before users upgrade.
 - **Lower per-event CPU for Azure OpenAI Responses streams.** The OpenAI-compatible length
   estimator no longer throws and discards an internal `TypeError` for every Responses stream
   event, which has no `choices`. Settlement is unchanged.
-- **Wrapped streams no longer keep completed response payloads or request messages
-  reachable.** A held OpenAI stream now retains only the terminal usage block and service tier,
-  not the whole terminal chunk or Responses snapshot (with its generated output and echoed
-  instructions and tools). A held Google stream releases its buffered first chunk once it is
-  delivered or the stream is closed. An unfinished wrapped stream no longer keeps the request's
-  messages and options alive. Delivered events, settlement, and
-  `responses.stream().finalResponse()` are unchanged.
+- **Wrapped streams no longer keep completed response payloads or request messages reachable.**
+  A held OpenAI stream now retains only the terminal usage block and service tier, not the whole
+  terminal chunk or Responses snapshot (with its generated output and echoed instructions and
+  tools). A held Google stream releases its buffered first chunk once it is delivered or the
+  stream is closed. An unfinished wrapped stream no longer keeps the request's messages and
+  options alive. Delivered events, settlement, and `responses.stream().finalResponse()` are
+  unchanged.
 - **Unread control-plane response bodies are released within the request deadline.** Error
   bodies and the success bodies of lease surrender, settlement confirmation, breaker reports and
   untracked-surface reports are no longer left open until garbage collection, which could hold
@@ -304,17 +330,18 @@ corresponding release notes before users upgrade.
   bytes are never retained or logged.
 - **Merged-tag clamping warns once per client.** When configured, run, and per-call tags merge
   to more than 10 keys, the first clamped call on a client still logs a warning; later clamped
-  calls on that client log at debug level with a running count instead of warning on every
-  call. Which tags are kept is unchanged.
+  calls on that client log at debug level with a running count instead of warning on every call.
+  Which tags are kept is unchanged.
 - **Wrapped methods follow raw method replacement.** A wrapped surface method (for example
   `chat.completions.list`) that is replaced directly on the raw client object, or patched on its
   prototype, after it was first read through the wrapper now calls the new function instead of
   the stale bound original. Reads of an unchanged method still return the same function.
-- **Caller aborts end same-provider `Retry-After` waits.** With `sameProviderRetries` above zero,
-  aborting the request's `AbortSignal` during a `Retry-After` sleep now rejects immediately with
-  the signal's reason (or an `AbortError`), clears the timer, and neither re-dispatches to the
-  same provider nor fails over to a fallback, even when the provider SDK ignores the signal.
-  Previously the SDK slept for the whole `Retry-After` interval and then dispatched again.
+- **Caller aborts end same-provider `Retry-After` waits.** With `sameProviderRetries` above
+  zero, aborting the request's `AbortSignal` during a `Retry-After` sleep now rejects
+  immediately with the signal's reason (or an `AbortError`), clears the timer, and neither
+  re-dispatches to the same provider nor fails over to a fallback, even when the provider SDK
+  ignores the signal. Previously the SDK slept for the whole `Retry-After` interval and then
+  dispatched again.
 - **Documented what `failoverHopReadTimeout` bounds.** The README no longer says it bounds the
   whole provider request. For the OpenAI, OpenAI-compatible, and Anthropic SDKs it covers
   connecting and receiving headers only, so a stream that stalls after its first bytes is not

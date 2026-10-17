@@ -761,10 +761,12 @@ describe("declared contexts and client-shape derivation", () => {
 });
 
 describe("curated JS surface rules", () => {
-  it("curates native OpenAI transport and client escapes without broadening compat contexts", () => {
+  it("classifies shared Stainless escapes identically in every declared Stainless context", () => {
     const expectedSelectors = [
       { provider: "openai", dialect: "openai", clientShape: "openai_sdk" },
       { provider: "azure_openai", dialect: "openai", clientShape: "openai_sdk" },
+      { provider: "together", dialect: "openai", clientShape: "native_together" },
+      { provider: "anthropic", dialect: "anthropic", clientShape: "anthropic_sdk" },
     ];
     const scopes = {
       get: "arbitrary_endpoint",
@@ -773,8 +775,25 @@ describe("curated JS surface rules", () => {
       patch: "arbitrary_endpoint",
       delete: "arbitrary_endpoint",
       request: "arbitrary_endpoint",
+      getAPIList: "arbitrary_endpoint",
+      requestAPIList: "arbitrary_endpoint",
+      methodRequest: "arbitrary_endpoint",
+      makeRequest: "arbitrary_endpoint",
+      retryRequest: "arbitrary_endpoint",
+      fetchWithTimeout: "arbitrary_endpoint",
+      fetch: "arbitrary_endpoint",
+      getRequestClient: "client",
       withOptions: "client",
     } as const;
+
+    expect(
+      DECLARED_SURFACE_CONTEXTS.filter((context) =>
+        expectedSelectors.some(
+          (selector) =>
+            selector.provider === context.provider && selector.clientShape === context.clientShape,
+        ),
+      ),
+    ).toEqual(expectedSelectors);
 
     for (const [path, capabilityScope] of Object.entries(scopes)) {
       const ledgerRows = SURFACE_RULES.filter((rule) => rule.surface === path);
@@ -787,8 +806,14 @@ describe("curated JS surface rules", () => {
         capabilityScope,
       });
 
-      for (const context of [OPENAI, AZURE]) {
+      for (const context of [OPENAI, AZURE, TOGETHER_NATIVE, ANTHROPIC]) {
         const candidate = resolve(context, path, "raw");
+        expect(candidate, `${context.provider}/${path}`).toMatchObject({
+          kind: "unmetered_spend",
+          source: "raw",
+          acknowledgmentToken: path,
+          capabilityScope,
+        });
         expect(candidate?.ruleId).toBe(ledgerRows[0]?.ruleId);
         expect(
           candidate?.acceptsShape({
@@ -811,10 +836,69 @@ describe("curated JS surface rules", () => {
             returnShape: "scalar",
           }),
         ).toBe(false);
+        expect(resolve(context, path, "wrapper")).toBeUndefined();
       }
+    }
+  });
 
-      expect(resolve(GROQ_COMPAT, path, "raw")).toBeUndefined();
-      expect(resolve(TOGETHER_NATIVE, path, "raw")).toBeUndefined();
+  it("keeps Stainless transport and client escape rules out of compatible contexts", () => {
+    const contexts: SurfaceContext[] = [
+      { provider: null, dialect: "openai", clientShape: "openai_sdk" },
+      { provider: "together", dialect: "openai", clientShape: "openai_sdk" },
+      GROQ_COMPAT,
+    ];
+    for (const context of contexts) {
+      for (const path of [
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "request",
+        "getAPIList",
+        "requestAPIList",
+        "methodRequest",
+        "makeRequest",
+        "retryRequest",
+        "fetchWithTimeout",
+        "fetch",
+        "fetchWithAuth",
+        "getRequestClient",
+        "withOptions",
+      ]) {
+        expect(resolve(context, path, "raw"), `${context.provider}/${path}`).toBeUndefined();
+      }
+    }
+  });
+
+  it("keeps fetchWithAuth native to OpenAI and Azure", () => {
+    for (const context of [OPENAI, AZURE]) {
+      expect(resolve(context, "fetchWithAuth")).toMatchObject({
+        kind: "unmetered_spend",
+        capabilityScope: "arbitrary_endpoint",
+        acknowledgmentToken: "fetchWithAuth",
+      });
+    }
+    for (const context of [ANTHROPIC, TOGETHER_NATIVE]) {
+      expect(resolve(context, "fetchWithAuth")).toBeUndefined();
+    }
+  });
+
+  it("leaves pure Stainless helpers and OpenAI call controls unknown", () => {
+    for (const context of [OPENAI, AZURE, TOGETHER_NATIVE, ANTHROPIC]) {
+      for (const path of ["buildRequest", "buildURL", "prepareOptions", "makeStatusError"]) {
+        expect(resolve(context, path), `${context.provider}/${path}`).toBeUndefined();
+      }
+    }
+    for (const context of [OPENAI, AZURE]) {
+      for (const path of [
+        "realtime.calls.hangup",
+        "realtime.calls.refer",
+        "realtime.calls.reject",
+        "live.sessions.downloadRecording",
+      ]) {
+        expect(resolve(context, path), `${context.provider}/${path}`).toBeUndefined();
+      }
     }
   });
 
@@ -963,6 +1047,7 @@ describe("curated JS surface rules", () => {
 
   it.each([
     "InvokeModelCommand",
+    "InvokeModelWithBidirectionalStreamCommand",
     "InvokeModelWithResponseStreamCommand",
     "StartAsyncInvokeCommand",
   ])("blocks Bedrock command class %s", (path) => {

@@ -71,6 +71,7 @@ const ANTHROPIC: SurfaceSelector = {
   dialect: "anthropic",
   clientShape: "anthropic_sdk",
 };
+const STAINLESS = [OPENAI, AZURE, TOGETHER_NATIVE, ANTHROPIC] as const;
 const GOOGLE_GENAI: SurfaceSelector = {
   provider: "google",
   dialect: "google",
@@ -208,10 +209,26 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   rows.push(meteredRow("audio.transcriptions.create", OPENAI_MEDIA, "provider"));
   rows.push(meteredRow("audio.speech.create", OPENAI_MEDIA, "request_derived"));
   rows.push(meteredRow("videos.create", [OPENAI], "request_derived"));
-  for (const path of ["get", "post", "put", "patch", "delete", "request"]) {
-    rows.push(unmeteredRow(path, NATIVE_OPENAI, "arbitrary_endpoint"));
+  for (const path of [
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "request",
+    "getAPIList",
+    "requestAPIList",
+    "methodRequest",
+    "makeRequest",
+    "retryRequest",
+    "fetchWithTimeout",
+    "fetch",
+  ]) {
+    rows.push(unmeteredRow(path, STAINLESS, "arbitrary_endpoint"));
   }
-  rows.push(unmeteredRow("withOptions", NATIVE_OPENAI, "client"));
+  rows.push(unmeteredRow("fetchWithAuth", NATIVE_OPENAI, "arbitrary_endpoint"));
+  rows.push(unmeteredRow("getRequestClient", STAINLESS, "client"));
+  rows.push(unmeteredRow("withOptions", STAINLESS, "client"));
   rows.push(unmeteredRow("responsePromise", NATIVE_OPENAI, "raw_response"));
   rows.push(unmeteredRow("parseResponseWithTimeout", NATIVE_OPENAI, "arbitrary_endpoint"));
 
@@ -223,6 +240,9 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "beta.agents.environments.files",
     "beta.agents.sessions",
     "beta.agents.sessions.events",
+    "beta.realtime",
+    "beta.realtime.sessions",
+    "beta.realtime.transcriptionSessions",
     "beta.responses",
     "contentProvenanceChecks",
     "decisions",
@@ -230,6 +250,7 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "live.sessions",
     "realtime",
     "realtime.calls",
+    "realtime.clientSecrets",
     "realtime.translations",
     "realtime.translations.clientSecrets",
   ]) {
@@ -245,6 +266,8 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "beta.agents.sessions.stream",
     "beta.agents.sessions.events.create",
     "beta.agents.sessions.events.stream",
+    "beta.realtime.sessions.create",
+    "beta.realtime.transcriptionSessions.create",
     "beta.responses.create",
     "beta.responses.compact",
     "beta.responses.retrieve",
@@ -254,6 +277,8 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "live.sessions.accept",
     "live.sessions.fork",
     "realtime.calls.create",
+    "realtime.calls.accept",
+    "realtime.clientSecrets.create",
     "realtime.translations.clientSecrets.create",
   ]) {
     rows.push(unmeteredRow(path, NATIVE_OPENAI, "operation"));
@@ -329,7 +354,7 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   rows.push(meteredRow("models.embedContent", [GOOGLE_GENAI], "provider_or_estimate"));
   rows.push(meteredRow("models.generateImages", [GOOGLE_GENAI], "request_derived"));
   rows.push(meteredRow("models.generateVideos", [GOOGLE_GENAI], "request_derived"));
-  for (const path of ["chats", "chats.modelsModule", "voices"]) {
+  for (const path of ["chats", "chats.modelsModule", "voices", "live", "live.music"]) {
     rows.push(namespaceRow(path, [GOOGLE_GENAI], "google", "raw"));
   }
   rows.push({
@@ -346,31 +371,13 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "chats.modelsModule.generateContentWithContinuation",
     "chats.modelsModule.generateContentStreamWithContinuation",
     "voices.create",
+    "live.connect",
+    "live.music.connect",
   ]) {
     rows.push(unmeteredRow(path, [GOOGLE_GENAI], "operation"));
   }
   for (const path of ["credentials.getClient", "voices.getClient"]) {
     rows.push(unmeteredRow(path, [GOOGLE_GENAI], "client"));
-  }
-  for (const path of [
-    "credentials.parentClient.apiCall",
-    "credentials.parentClient.request",
-    "credentials.parentClient.requestStream",
-    "credentials.parentClient.streamApiCall",
-    "credentials.parentClient.unaryApiCall",
-    "credentials.parentClient.fetchUploadUrl",
-    "credentials.parentClient.uploadFile",
-    "credentials.parentClient.uploadFileToFileSearchStore",
-    "voices.parentClient.apiCall",
-    "voices.parentClient.request",
-    "voices.parentClient.requestStream",
-    "voices.parentClient.streamApiCall",
-    "voices.parentClient.unaryApiCall",
-    "voices.parentClient.fetchUploadUrl",
-    "voices.parentClient.uploadFile",
-    "voices.parentClient.uploadFileToFileSearchStore",
-  ]) {
-    rows.push(unmeteredRow(path, [GOOGLE_GENAI], "arbitrary_endpoint"));
   }
   for (const parent of [
     "apiClient",
@@ -391,7 +398,20 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     "voices.parentClient",
   ]) {
     rows.push(namespaceRow(parent, [GOOGLE_GENAI], "google", "raw"));
-    rows.push(unmeteredRow(`${parent}.getFetch`, [GOOGLE_GENAI], "arbitrary_endpoint"));
+    for (const method of [
+      "apiCall",
+      "downloadFile",
+      "fetchUploadUrl",
+      "getFetch",
+      "request",
+      "requestStream",
+      "streamApiCall",
+      "unaryApiCall",
+      "uploadFile",
+      "uploadFileToFileSearchStore",
+    ]) {
+      rows.push(unmeteredRow(`${parent}.${method}`, [GOOGLE_GENAI], "arbitrary_endpoint"));
+    }
   }
   rows.push(meteredRow("generateContent", [GOOGLE_LEGACY], "provider"));
 
@@ -400,6 +420,7 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   }
   for (const path of [
     "InvokeModelCommand",
+    "InvokeModelWithBidirectionalStreamCommand",
     "InvokeModelWithResponseStreamCommand",
     "StartAsyncInvokeCommand",
   ]) {

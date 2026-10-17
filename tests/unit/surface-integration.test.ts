@@ -1958,6 +1958,33 @@ describe("runtime surface guard", () => {
     expect(wire.calls[1]?.body).toEqual([expect.objectContaining({ occurrences: hits - 1 })]);
   });
 
+  it.each([
+    ["getAPIList", "arbitrary_endpoint"],
+    ["getRequestClient", "client"],
+    ["withOptions", "client"],
+  ] as const)("preserves an existing exact %s acknowledgment when its scope becomes explicit", async (surface, capabilityScope) => {
+    const result = { synthetic: true };
+    const raw = { ...fakeOpenAI().client, [surface]: () => result };
+    const wire = wireRecorder();
+    const log = recordingLogger();
+    const wrapped = wrap(raw, wire.fetch, log.logger, {
+      onUnmetered: "raise",
+      acknowledgeUntracked: [surface],
+    });
+
+    expect(coverage(wrapped).entries.find((entry) => entry.surface === surface)).toMatchObject({
+      token: surface,
+      kind: "unmetered_spend",
+      capabilityScope,
+      policyAction: "acknowledged",
+      dispatchAction: "return",
+    });
+    expect(Reflect.apply(Reflect.get(wrapped, surface), undefined, [])).toBe(result);
+    await wrapped.close();
+    expect(log.warn).not.toHaveBeenCalled();
+    expect(wire.calls).toEqual([]);
+  });
+
   it("allows an exact responses.retrieve acknowledgment while keeping the namespace and sibling guarded", async () => {
     const raw = fakeOpenAI();
     const wire = wireRecorder();

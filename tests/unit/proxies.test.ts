@@ -2384,6 +2384,9 @@ class InvokeModelCommand {
 class InvokeModelWithResponseStreamCommand {
   constructor(public readonly input: Record<string, unknown>) {}
 }
+class InvokeModelWithBidirectionalStreamCommand {
+  constructor(public readonly input: Record<string, unknown>) {}
+}
 class ListFoundationModelsCommand {
   constructor(public readonly input: Record<string, unknown>) {}
 }
@@ -2719,6 +2722,36 @@ describe("proxies — Bedrock send(command) interception (AWS SDK v3)", () => {
     expect(send).not.toHaveBeenCalled();
     // Fail-loud is BEFORE spend: no budget check ever left the client for these commands.
     expect(budgetCheckCalls(fetchMock)).toHaveLength(0);
+  });
+
+  it("reports bidirectional raw inference as blocked and refuses send before provider or budget I/O", async () => {
+    const send = vi.fn();
+    const { fetchMock } = makeFetch();
+    const solwyn = new Solwyn(bedrockClient(send), {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      onUnmetered: "allow",
+    });
+    try {
+      expect(
+        coverage(solwyn).entries.find(
+          (entry) => entry.surface === "InvokeModelWithBidirectionalStreamCommand",
+        ),
+      ).toMatchObject({
+        kind: "blocked",
+        policyAction: "block",
+        dispatchAction: "refuse",
+      });
+      await expect(
+        (solwyn as unknown as { send(command: unknown): Promise<unknown> }).send(
+          new InvokeModelWithBidirectionalStreamCommand({ modelId: "synthetic-model" }),
+        ),
+      ).rejects.toBeInstanceOf(ConfigurationError);
+    } finally {
+      await solwyn.close();
+    }
+    expect(send).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("passes a non-Converse command straight through to the wrapped client's send (full-surface passthrough)", async () => {

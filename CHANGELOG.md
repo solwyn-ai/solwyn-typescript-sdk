@@ -16,6 +16,20 @@ corresponding release notes before users upgrade.
   Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
   and conservative handling of unknown TTLs or decreasing totals are preserved.
 
+### Changed
+
+- **Public-preview compatibility:** Legacy raw-request and client escapes on native OpenAI,
+  Azure OpenAI, Anthropic and Together clients, OpenAI Realtime session/client-secret creation
+  and call acceptance, and Google GenAI Live and ApiClient transports now report
+  `unmetered_spend` with explicit scopes instead of `unknown`. Bedrock coverage now lists
+  `InvokeModelWithBidirectionalStreamCommand` as `blocked`, matching its existing runtime
+  refusal. Warning scope text, `UntrackedSpendSurfaceError.kind`, and advisory `rule_kind` and
+  `capability_scope` reflect these classifications. The `onUnmetered` posture is unchanged;
+  newly declared namespaces defer enforcement to their terminal operations. Existing exact
+  `acknowledgeUntracked` tokens remain valid. Review and refresh pinned
+  `coverage(client).expect(...)` fingerprints for OpenAI, Azure, Anthropic, Together, Google
+  GenAI and Bedrock when upgrading, even with unchanged provider SDK versions.
+
 ## [0.1.1] — 2026-10-17
 
 ### Fixed

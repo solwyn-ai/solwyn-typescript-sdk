@@ -325,7 +325,7 @@ export interface RunContext {
 // The store itself must be shared: replacing only a global reader would hide runs
 // created by the previously loaded format. Keep Node-specific state in this entry.
 const RUN_STORE_KEY = Symbol.for("@solwyn/sdk.node.runStore");
-const RUN_OWNERS_KEY = Symbol.for("@solwyn/sdk.node.runOwners");
+const RUN_OWNERS_KEY = Symbol.for("@solwyn/sdk.node.runOwners.v2");
 interface RunOwners {
   readonly resources: Map<number, object>;
   readonly synchronous: Set<object>;

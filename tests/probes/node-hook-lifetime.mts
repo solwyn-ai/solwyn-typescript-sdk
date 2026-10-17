@@ -25,7 +25,7 @@ nativeHooks.createHook = (callbacks: HookCallbacks): AsyncHook => {
 syncBuiltinESMExports();
 const { createRun, currentRun, run } = await import("../../src/node");
 
-const owners = Reflect.get(globalThis, Symbol.for("@solwyn/sdk.node.runOwners")) as {
+const owners = Reflect.get(globalThis, Symbol.for("@solwyn/sdk.node.runOwners.v2")) as {
   hook: AsyncHook;
   liveCount: number;
 };

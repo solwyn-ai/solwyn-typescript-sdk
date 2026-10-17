@@ -21,6 +21,28 @@ corresponding release notes before users upgrade.
 
 ### Changed
 
+- **Reviewed provider surfaces.** Refresh floor/latest evidence and curated rules for
+  `@anthropic-ai/sdk@0.135.0`, `openai@7.36.0`, `together-ai@0.58.0`, and
+  `@google/genai@2.30.0`. Newly reviewed OpenAI Agents, beta Responses, Decisions, Live,
+  voice/provenance operations, Together cluster/storage allocation and Jig rollback, Google
+  continuation/voice helpers, and raw request escapes are explicitly unmetered. They follow
+  `onUnmetered`; use `"raise"` to refuse them. No new metering adapters are added. Existing
+  strict coverage fingerprints must be reviewed and refreshed before upgrading.
+- **OpenAI 7 compatibility.** The optional `openai` peer range is now `>=4.41.0 <8`, with
+  current integration checks at `7.36.0`. OpenAI 7 itself requires Node 22 or later; Solwyn's
+  provider-free core remains compatible with Node 20 and compatible older provider releases.
+- **Breaking:** **Responses parsing types reflect runtime values.** Raw JSON-schema formats
+  produce `unknown` parsed values, and optional or union branded formats retain their nullable
+  parsed type. Older OpenAI declarations sometimes promised only `null` despite parsing JSON
+  at runtime. Narrow raw parsed values or use a branded schema helper. Generic forwarding
+  code can specify `responses.parse<Params, Parsed>(params)` or
+  `responses.stream<Params, Parsed>(params)` explicitly when comparing with older native
+  declarations. No provider imports or runtime parsing changes are introduced.
+- **Google continuation and deadline compatibility.** The reviewed `@google/genai@2.30.0`
+  transport uses Solwyn-owned request deadlines so completed calls and streams release timers
+  and run lifetimes. Automatic continuation on the existing metered generate-content methods
+  receives one budget check and settles the SDK's cumulative usage once. Set
+  `config.automaticContinuation: false` for application-controlled admission between hops.
 - **Breaking:** **Closed clients reject intercepted calls.** Once `close()` begins, chat,
   Responses, media, and Bedrock calls reject with `SolwynError("client is closed")` before
   admission or provider dispatch. Buffered calls and stream setup already in flight drain within

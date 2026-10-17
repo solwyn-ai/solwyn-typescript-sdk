@@ -233,9 +233,9 @@ function hasVerifiedGoogleSignalSupport(models: unknown): boolean {
   const userVersion = pattern.exec(userAgent);
   const apiVersion = pattern.exec(apiClient);
   if (userVersion === null || apiVersion === null || userVersion[0] !== apiVersion[0]) return false;
-  // The checked native package verifies the complete 2.20 transport surface. Older and
+  // The checked 2.20 and 2.30 packages verify the complete transport surface. Older and
   // unreviewed versions keep their finite native carrier rather than guessing support.
-  return Number(userVersion[1]) === 2 && Number(userVersion[2]) === 20;
+  return Number(userVersion[1]) === 2 && [20, 30].includes(Number(userVersion[2]));
 }
 
 /** Own the request timer until the buffered response or exact streaming iterator ends. */

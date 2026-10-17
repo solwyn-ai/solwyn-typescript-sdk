@@ -28,6 +28,7 @@ describe("native Google request deadline ownership", () => {
     "missing",
     "conflicting",
     "older",
+    "unreviewed minor",
     "future major",
     "malformed",
   ])("keeps a finite native bound when SDK metadata is %s", async (kind) => {
@@ -41,7 +42,14 @@ describe("native Google request deadline ownership", () => {
     } else if (kind === "conflicting") {
       headers["User-Agent"] = "google-genai-sdk/0.3.1";
     } else {
-      const version = kind === "older" ? "0.3.1" : kind === "future major" ? "99.0.0" : "invalid";
+      const version =
+        kind === "older"
+          ? "0.3.1"
+          : kind === "unreviewed minor"
+            ? "2.29.0"
+            : kind === "future major"
+              ? "99.0.0"
+              : "invalid";
       headers["User-Agent"] = `google-genai-sdk/${version}`;
       headers["x-goog-api-client"] = `google-genai-sdk/${version}`;
     }

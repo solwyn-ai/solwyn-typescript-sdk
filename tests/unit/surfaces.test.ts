@@ -1031,7 +1031,6 @@ describe("curated JS surface rules", () => {
       "credentials",
       "maxRetries",
       "modelName",
-      "organization",
       "project",
       "projectId",
       "qs",
@@ -1044,7 +1043,7 @@ describe("curated JS surface rules", () => {
       "AI_PROMPT",
       "HUMAN_PROMPT",
     ] as const;
-    expect(metadata).toHaveLength(19);
+    expect(metadata).toHaveLength(18);
     for (const path of metadata) {
       const candidate = resolve(ANTHROPIC, path, "raw");
       expect(candidate).toMatchObject({ kind: "metadata", source: "raw" });

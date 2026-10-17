@@ -266,11 +266,11 @@ Optional provider peers are bounded to the reviewed major-version intervals:
 
 | Package | Optional peer range | Reviewed boundary or integration cells |
 |---------|---------------------|----------------------------------------|
-| `openai` | `>=4.41.0 <7` | 4.41.0 and 6.45.0 surface cells; deeper checks at 6.45.0 |
-| `@anthropic-ai/sdk` | `>=0.30.0 <1` | 0.30.0 and 0.123.0 surface cells; deeper checks at 0.123.0 |
+| `openai` | `>=4.41.0 <8` | 4.41.0 and 7.36.0 surface cells; deeper checks at 7.36.0 and installed native type checks at 6.45.0 |
+| `@anthropic-ai/sdk` | `>=0.30.0 <1` | 0.30.0 and 0.135.0 surface cells; deeper checks at 0.135.0 |
 | `@aws-sdk/client-bedrock-runtime` | `>=3.422.0 <4` | 3.422.0 and 3.1124.0 surface cells |
-| `@google/genai` | `>=0.3.1 <3` | 0.3.1 and 2.20.0 surface cells and deeper checks |
-| `together-ai` | `>=0.16.0 <1` | 0.16.0 and 0.50.0 surface cells |
+| `@google/genai` | `>=0.3.1 <3` | 0.3.1 and 2.30.0 surface cells and deeper checks |
+| `together-ai` | `>=0.16.0 <1` | 0.16.0 and 0.58.0 surface cells |
 | `ai` | `>=7.0.14 <8` | Vercel AI SDK integration checks at 7.0.14 |
 
 `@google/generative-ai` has one reviewed surface cell at 0.24.1 and is not an optional peer; do
@@ -280,6 +280,9 @@ Boundary cells are not continuous-version coverage: they do not claim that every
 version received every runtime scenario. Only the named cells are release-validated; the manifest
 intervals admit other compatible versions within the bounded majors without claiming the same
 depth of evidence for each version.
+
+OpenAI 7 requires Node 22 or later. The Solwyn core still supports Node 20; use a compatible
+older provider SDK when running on Node 20.
 
 ### OpenAI
 
@@ -312,6 +315,14 @@ For Responses, Solwyn meters `responses.create`, `responses.parse`, and `respons
 native OpenAI and Azure OpenAI clients. Calls are primary-only: they never enter the fallback or
 translation walk. Buffered and streaming calls settle provider-reported Responses usage; missing
 or unusable zero usage falls back to the pre-flight estimate and is marked as estimated.
+
+For `responses.parse` and parsed `responses.stream` results, a raw `json_schema` format
+produces `unknown` parsed values: narrow them before use, or use a branded helper such as
+`zodTextFormat` for schema inference. Optional and union helper formats preserve their parsed
+type alongside `null`. This reflects runtime parsing even with older provider declarations
+that typed these cases as always `null`. Generic forwarding code can supply an explicit parsed
+result type with `responses.parse<Params, Parsed>(params)` or
+`responses.stream<Params, Parsed>(params)`.
 
 The `responses.stream()` helper is deferred: the control-plane check and provider request begin on
 first iteration or when `finalResponse()`, `done()`, `on()`, `once()`, or `emitted()` first needs
@@ -621,6 +632,25 @@ Native OpenAI and Azure OpenAI `responses.create`, `responses.parse`, and `respo
 tracked. Other OpenAI-compatible clients retain their native Responses managers under the
 unmetered posture because their wire behavior is not assumed to match OpenAI's native client.
 
+The reviewed latest provider SDKs also expose these unmetered operations:
+
+| Provider | Unmetered surfaces |
+|----------|--------------------|
+| OpenAI / Azure | Voice creation; beta Responses creation, compaction and retrieval; Agents hosted environments, file staging and session execution/event streams; Decisions, content-provenance checks, Live session creation/acceptance/forking, Realtime call creation and translation client secrets. |
+| Anthropic | `makeTracedRequest`, a raw request escape that bypasses metered `messages.create`. |
+| Together | Jig rollback; cluster creation/resizing, remediation creation/approval, and shared-storage creation/resizing. |
+| Google GenAI | Direct continuation helpers on `models` and `chats.modelsModule`; `voices.create`; `voices.getClient`; raw `getFetch` accessors and the voice manager's underlying request/upload methods. |
+
+These operations have no Solwyn budget check or settlement event. Use `onUnmetered: "raise"`
+to refuse them, or explicitly review each exact acknowledgment token before permitting one.
+Administrative, read-only and unevaluated accessor observations in the test baselines are
+structural evidence; they do not grant metering or runtime safety to an otherwise unknown path.
+
+Google GenAI `2.30.0` enables automatic continuation on the metered `models.generateContent`
+and `models.generateContentStream` paths. Solwyn checks the logical call once and settles the
+SDK's cumulative usage across all continuation hops. Set `config.automaticContinuation: false`
+when the application needs a separate admission decision for each hop.
+
 Untracked-surface advisories coalesce occurrences for fifteen minutes per key. Retries keep the
 same report ID and occurrence snapshot; later observations wait for a separate report. Closing
 flushes unsent occurrences within `reporterShutdownDeadline`, bypassing local retry backoff while
@@ -628,7 +658,7 @@ respecting `Retry-After`. Exhausted reports produce aggregated warnings at most 
 
 `coverage(client)` computes a local structural report without calling a provider operation or
 transmitting data. For CI, pin an independently reviewed literal. This exhaustive strict,
-unacknowledged example is reviewed against `openai@6.45.0`:
+unacknowledged example is reviewed against `openai@7.36.0`:
 
 ```ts
 import OpenAI from "openai";
@@ -642,14 +672,14 @@ const client = new Solwyn(new OpenAI(), {
 
 const OPENAI_STRICT_FINGERPRINT: CoverageFingerprint = {
   conditional: "sha256:077917c04e6b5e20fd8ccc6a0eb8a580e83fac87669294994d289b2093ea8f18",
-  guarded_namespaces: "sha256:a1288a7a5a96886831bbf1db63983f5fc27c2a3a1588a986a7f3f8430185f508",
+  guarded_namespaces: "sha256:0a25b65f25c51a07bf9fd3f3e9f31fb5e8a6e886050d40d71ce8ae31cca49181",
   tracked: "sha256:901afc09bff7b5d104f6318dbcc2096b22384e3414eb9c60daa9191dc789121a",
-  unknown: "sha256:03de074672db9bf0f7847eab1ff9fc62b74c0422f2d4d880a4f60038c0375643",
+  unknown: "sha256:56626248c38bbd2342250da2b39f80d231e7f301bdf66e9930afb11a1c4bfb49",
   blocked: "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   unsupported: "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-  safe: "sha256:937cecc4482b2a7bd34ffd7055356e2ea39405c022748a25ab4916f7136d9e15",
-  scoped_escapes: "sha256:0526a31b028ba65707f0e314ea3119a7747c3961b30d9f9cd150658953fd132f",
-  untracked: "sha256:3eafdebfab1bd7cd00f2656091950b1cbee7ed89dedc287ff26c730ba0ddf54c",
+  safe: "sha256:53e52065adeab1166f4c12caf309be213176cf990fd610f0cdaf16df55b12365",
+  scoped_escapes: "sha256:92ff5b06664289a1c19d73d15b2891f831766e911517531fedd90751277496ce",
+  untracked: "sha256:3041aadf9018ae24a3cb8770fac31292d7c42c5119df3a352d7cfe7f80195da4",
 };
 
 coverage(client).expect(OPENAI_STRICT_FINGERPRINT);

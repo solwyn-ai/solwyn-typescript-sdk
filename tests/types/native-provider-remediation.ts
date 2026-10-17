@@ -140,19 +140,19 @@ export async function nativeOptionalParseTypes(
   const rawNoFormat = await oa.responses.parse({ model: "gpt-review", text: {} });
   const noFormatMatches: typeof rawNoFormat = noFormat;
   const optionalResult = await wrapped.responses.parse(optional);
-  const nativeOptional = await oa.responses.parse(optional);
+  const nativeOptional = await oa.responses.parse<typeof optional, { count: number }>(optional);
   const optionalMatches: typeof nativeOptional = optionalResult;
   const unionResult = await wrapped.responses.parse(union);
-  const nativeUnion = await oa.responses.parse(union);
+  const nativeUnion = await oa.responses.parse<typeof union, { count: number }>(union);
   const unionMatches: typeof nativeUnion = unionResult;
   const absent: null = noFormat.output_parsed;
-  const optionalAbsent: null = optionalResult.output_parsed;
-  const unionAbsent: null = unionResult.output_parsed;
+  const optionalParsed: { count: number } | null = optionalResult.output_parsed;
+  const unionParsed: { count: number } | null = unionResult.output_parsed;
   // @ts-expect-error native Responses does not accept a null format
   void oa.responses.parse({ model: "gpt-review", text: { format: null } });
   // @ts-expect-error the wrapper must preserve that native parameter rejection
   void wrapped.responses.parse({ model: "gpt-review", text: { format: null } });
-  void [noFormatMatches, optionalMatches, unionMatches, absent, optionalAbsent, unionAbsent];
+  void [noFormatMatches, optionalMatches, unionMatches, absent, optionalParsed, unionParsed];
 }
 
 export async function ordinaryPromiseGenerics() {
@@ -174,13 +174,13 @@ export async function ordinaryPromiseGenerics() {
   void [count, explicit];
 }
 
-export function genericNativeParseForwarding<Params extends ResponseCreateParamsWithTools>(
+export function genericNativeParseForwarding<Params extends ResponseCreateParamsWithTools, Parsed>(
   oa: OpenAI,
   params: Params,
 ) {
   const wrapped = new Solwyn(oa, {});
-  const raw = oa.responses.parse(params);
-  const actual = wrapped.responses.parse(params);
+  const raw = oa.responses.parse<Params, Parsed>(params);
+  const actual = wrapped.responses.parse<Params, Parsed>(params);
   const nativeResult: Promise<Awaited<typeof raw>> = actual;
   const wrappedResult: Promise<Awaited<typeof actual>> = raw;
   return { nativeResult, wrappedResult };

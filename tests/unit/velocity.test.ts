@@ -18,8 +18,18 @@ const BASE_CONFIG: VelocityConfig = Object.freeze({
   velocity_accel_factor: 3,
 });
 
-function monitor(overrides: Partial<VelocityConfig> = {}): VelocityMonitor {
-  return new VelocityMonitor({ ...BASE_CONFIG, ...overrides });
+function seededRandom(seed = 42): () => number {
+  return () => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed / 0x1_0000_0000;
+  };
+}
+
+function monitor(
+  overrides: Partial<VelocityConfig> = {},
+  random = seededRandom(),
+): VelocityMonitor {
+  return new VelocityMonitor({ ...BASE_CONFIG, ...overrides }, noopLogger, random);
 }
 
 function observe(
@@ -124,6 +134,40 @@ describe("VelocityMonitor repeat detection", () => {
     }
     expect(repeats).toBeGreaterThanOrEqual(runCount - 2);
     expect(subject.runCount()).toBeLessThanOrEqual(4096);
+  });
+
+  it.each([
+    ["warn", 50],
+    ["warn", 100],
+    ["deny", 50],
+    ["deny", 100],
+  ] as const)("detects new loops in %s mode among %i new runs per second", (mode, rate) => {
+    const subject = monitor({ velocity_mode: mode });
+    let firstRepeat: number | undefined;
+    let firstGrowth: number | undefined;
+    for (let second = 0; second < 120; second += 1) {
+      for (let index = 0; index < rate; index += 1) {
+        observe(subject, `short-${second}-${index}`, 100, second + index / rate);
+      }
+      if (second < 100) continue;
+      // Both loops start only after one-call runs have filled the hard cap.
+      if (second === 100) expect(subject.runCount()).toBe(4096);
+      const now = second + 0.999;
+      if (observe(subject, "repeat-loop", 500, now).includes("repeat_size")) {
+        firstRepeat ??= second;
+      }
+      if (
+        observe(subject, "growth-loop", 100 * 1.25 ** (second - 100), now).includes(
+          "monotonic_growth",
+        )
+      ) {
+        firstGrowth ??= second;
+      }
+    }
+
+    expect(firstRepeat).toBe(104);
+    expect(firstGrowth).toBe(107);
+    expect(subject.runCount()).toBe(4096);
   });
 
   it("rate-limits warnings when the hard cap discards live history", () => {
@@ -256,7 +300,10 @@ describe("VelocityMonitor rate-acceleration detection", () => {
   });
 
   it("suppresses a returning evicted run through its live tombstone deadline", () => {
-    const subject = monitor({ velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 });
+    const subject = monitor(
+      { velocity_accel_floor_per_min: 1, velocity_accel_factor: 2 },
+      () => 1 - Number.EPSILON,
+    );
     for (let index = 0; index < 4095; index += 1) {
       observe(subject, `seed-${index}`, 100, 0);
     }

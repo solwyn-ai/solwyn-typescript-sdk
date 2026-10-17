@@ -131,6 +131,8 @@ export const DEFAULT_COST_PER_TOKEN = 0.00003;
 
 /** Default per-request timeout for the check POST (Python `httpx timeout=5.0`). */
 const DEFAULT_CHECK_TIMEOUT_MS = 5000;
+/** A nearly spent preflight deadline cannot provide a useful control-plane request window. */
+const MIN_PREFLIGHT_REQUEST_MS = 50;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function validateDuration(value: number, field: string, allowZero: boolean): number {
@@ -149,7 +151,14 @@ function validateDuration(value: number, field: string, allowZero: boolean): num
 
 function throwIfCheckAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
-    throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+    const reason: unknown = signal.reason;
+    if (reason instanceof Error) throw reason;
+    if (typeof DOMException === "function") {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    const error = new Error("The operation was aborted.");
+    error.name = "AbortError";
+    throw error;
   }
 }
 
@@ -167,6 +176,7 @@ const MAX_UNCOUNTED_EPISODES = 128;
  * aggregate release diagnostics (dropped surrenders, discarded uncounted tallies).
  */
 const UNCOUNTED_WARN_INTERVAL_MS = 30_000;
+const ALERT_ONLY_WARN_INTERVAL_MS = 30_000;
 
 /** Renewal I/O is always detached from admission and independently bounded. */
 const RENEWAL_TIMEOUT_MS = 5_000;
@@ -349,7 +359,7 @@ export function buildBudgetExceededError(
 /**
  * Build the {@link BudgetExceededError} the client throws off a deny {@link
  * BudgetCheckResult}. This preserves the ordinary branch of the enforcer-owned typed denial
- * builder. `checkBudget` never throws (it returns a result), so the client turns an
+ * builder. `checkBudget` returns ordinary denials as results, so the client turns an
  * `allowed: false` result into an error. Fields are copied VERBATIM from the result's own `budgetLimit`/
  * `currentUsage`/`mode`/`projectId` (which the enforcer copied verbatim from the deny
  * response — Bug 1.1 guard), and `budgetPeriod` is resolved from the result's
@@ -686,6 +696,7 @@ export class BudgetEnforcer {
   private readonly unreportedUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
   private readonly totalUncounted: UncountedAggregate = { runs: 0, calls: 0, tokens: 0 };
   private lastUncountedWarnAt: number | null = null;
+  private lastAlertOnlyWarnAt: number | null = null;
   private uncountedWarnScheduled = false;
   private closeEpoch = 0;
   private closePromise: Promise<void> | null = null;
@@ -964,7 +975,7 @@ export class BudgetEnforcer {
 
   /**
    * Ask the cloud whether a call is within budget. Returns a {@link BudgetCheckResult};
-   * it does NOT throw itself (the client raises the applicable typed error off a deny result).
+   * denial results become typed errors in the client. Caller aborts reject immediately.
    * On an outage it degrades per
    * the sticky-deny → fail-open → local-enforcement precedence.
    */
@@ -1147,9 +1158,15 @@ export class BudgetEnforcer {
 
       throwIfCheckAborted(captured.signal);
       const remainingMs = captured.deadlineMs - this.monotonicNow();
-      const admission: CircuitBreakerAdmission | null =
-        remainingMs > 0 ? (this.controlPlaneBreaker?.admit() ?? null) : null;
-      if (remainingMs <= 0 || (admission !== null && !admission.allowed)) {
+      if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
+        this.logger.debug("budget.check_skipped_deadline");
+        return this.withLeaseClaim(
+          this.handleOutage(captured.estimatedInputTokens, captured.agentRunId, "deadline"),
+          leaseClaimToken,
+        );
+      }
+      const admission = this.controlPlaneBreaker?.admit() ?? null;
+      if (admission !== null && !admission.allowed) {
         this.logger.debug("budget.check_skipped_breaker_open");
         if (leaseCallId !== null && leaseClaimToken !== null) {
           const reentry = this.admitLease(captured, leaseCallId, leaseClaimToken, true);
@@ -1659,10 +1676,13 @@ export class BudgetEnforcer {
     const closeDispatchEpoch = this.closeEpoch;
     const remainingMs = captured.deadlineMs - this.monotonicNow();
     const admission: CircuitBreakerAdmission | null =
-      remainingMs > 0 ? (this.controlPlaneBreaker?.admit() ?? null) : null;
+      remainingMs >= MIN_PREFLIGHT_REQUEST_MS ? (this.controlPlaneBreaker?.admit() ?? null) : null;
     try {
       throwIfCheckAborted(captured.signal);
-      if (remainingMs <= 0) return { kind: "outage" };
+      if (remainingMs < MIN_PREFLIGHT_REQUEST_MS) {
+        this.logger.debug("lease.grant_skipped_deadline");
+        return { kind: "legacy" };
+      }
       if (admission !== null && !admission.allowed) {
         this.logger.debug("lease.grant_skipped_breaker_open");
         return { kind: "outage" };
@@ -2075,9 +2095,16 @@ export class BudgetEnforcer {
 
     const limitUsd = money(response.budget_limit);
     const usageUsd = money(response.current_usage);
-    this.logger.warn(
-      `Budget limit reached (alert_only mode): limit=$${limitUsd}, usage=$${usageUsd}`,
-    );
+    const now = this.monotonicNow();
+    if (
+      this.lastAlertOnlyWarnAt === null ||
+      now - this.lastAlertOnlyWarnAt >= ALERT_ONLY_WARN_INTERVAL_MS
+    ) {
+      this.lastAlertOnlyWarnAt = now;
+      this.logger.warn(
+        `Budget limit reached (alert_only mode): limit=$${limitUsd}, usage=$${usageUsd}`,
+      );
+    }
     return budgetCheckResult({
       allowed: true,
       remainingBudget: response.remaining_budget,
@@ -2559,7 +2586,8 @@ export class BudgetEnforcer {
   }
 
   /**
-   * The cloud-unreachable decision tree. Precedence (behaviors 8–12):
+   * Local decisions when cloud authority is unavailable or the preflight deadline expires.
+   * Precedence (behaviors 8–12):
    *   1. A remembered hard deny wins FIRST — never re-opened, regardless of `failOpen`
    *      or the configured `budgetMode` (invariant 9, the milestone's soul).
    *   2. `failOpen` → allow, accruing the fallback estimate into local spend.
@@ -2569,22 +2597,26 @@ export class BudgetEnforcer {
   private handleOutage(
     estimatedInputTokens: number,
     agentRunId: string | undefined,
+    cause: "unreachable" | "deadline" = "unreachable",
   ): MaterializedBudgetCheckResult {
+    const unavailable =
+      cause === "deadline" ? "Budget preflight deadline exhausted" : "Cloud API unreachable";
+    const shortUnavailable = cause === "deadline" ? unavailable : "Cloud unreachable";
     // 1. Sticky hard deny — checked BEFORE fail-open / local enforcement.
     const globalSticky = this.lastHardDenyResponse;
     if (globalSticky !== null) {
-      return this.priorHardDenyUnavailableResult(globalSticky, agentRunId);
+      return this.priorHardDenyUnavailableResult(globalSticky, agentRunId, unavailable);
     }
     if (agentRunId !== undefined) {
       const runSticky = this.runHardDenyResponses.get(agentRunId);
       if (runSticky !== undefined) {
         this.runHardDenyResponses.delete(agentRunId);
         this.runHardDenyResponses.set(agentRunId, runSticky);
-        return this.priorHardDenyUnavailableResult(runSticky.response, agentRunId);
+        return this.priorHardDenyUnavailableResult(runSticky.response, agentRunId, unavailable);
       }
       const retained = this.readTermination(agentRunId);
       if (retained.isPresent) {
-        const warning = "Cloud API unreachable; preserving retained run stop";
+        const warning = `${unavailable}; preserving retained run stop`;
         this.logger.warn(warning);
         const budgetLimit = this.lastKnownBudgetLimit ?? 0;
         const currentUsage = this.lastKnownCurrentUsage ?? 0;
@@ -2612,7 +2644,7 @@ export class BudgetEnforcer {
         allowed: true,
         remainingBudget: 0,
         mode: this.budgetMode,
-        warning: "Cloud API unreachable; proceeding in fail-open mode",
+        warning: `${unavailable}; proceeding in fail-open mode`,
       });
     }
 
@@ -2624,7 +2656,7 @@ export class BudgetEnforcer {
         allowed: false,
         remainingBudget: 0,
         mode: this.budgetMode,
-        warning: "Cloud unreachable and no prior budget limit known; denying request (fail-closed)",
+        warning: `${shortUnavailable} and no prior budget limit known; denying request (fail-closed)`,
         denySource: "local_enforcement",
         denyReason: "no_prior_budget_limit",
       });
@@ -2639,7 +2671,7 @@ export class BudgetEnforcer {
         allowed: false,
         remainingBudget: Math.max(0, limit - current),
         mode: this.budgetMode,
-        warning: `Cloud unreachable; local enforcement denies: $${money(current)} + $${money(estimatedCost)} > $${money(limit)}`,
+        warning: `${shortUnavailable}; local enforcement denies: $${money(current)} + $${money(estimatedCost)} > $${money(limit)}`,
         budgetLimit: limit,
         currentUsage: current,
         denySource: "local_enforcement",
@@ -2653,7 +2685,7 @@ export class BudgetEnforcer {
       allowed: true,
       remainingBudget: Math.max(0, limit - current - estimatedCost),
       mode: this.budgetMode,
-      warning: "Cloud API unreachable; enforcing locally",
+      warning: `${unavailable}; enforcing locally`,
       budgetLimit: limit,
       currentUsage: current + estimatedCost,
     });
@@ -2663,8 +2695,9 @@ export class BudgetEnforcer {
   private priorHardDenyUnavailableResult(
     response: BudgetCheckResponse,
     activeAgentRunId: string | undefined,
+    unavailable: string,
   ): MaterializedBudgetCheckResult {
-    const warning = `Cloud API unreachable; preserving prior hard deny: $${money(response.current_usage)}/$${money(response.budget_limit)} used`;
+    const warning = `${unavailable}; preserving prior hard deny: $${money(response.current_usage)}/$${money(response.budget_limit)} used`;
     this.logger.warn(warning);
     return budgetCheckResult({
       allowed: false,

@@ -44,6 +44,8 @@ class RunHistory {
   length = 0;
   start = 0;
 
+  constructor(public slot: number) {}
+
   time(index: number): number {
     return this.samples[((this.start + index) % VELOCITY_HISTORY_LIMIT) * 2] as number;
   }
@@ -86,15 +88,21 @@ export class VelocityMonitor {
   readonly #logger: Logger;
   readonly #historyHorizon: number;
   readonly #runs = new Map<string, RunHistory>();
+  readonly #runIds: string[] = [];
+  readonly #random: () => number;
   readonly #rateTombstones = new Map<string, number>();
   readonly #warningTimes = new Map<string, number>();
   #rateOverflowSuppressThrough: number | undefined;
   #warningOverflowSuppressThrough: number | undefined;
-  #newestRunId: string | undefined;
   #lastEvictionWarning: number | undefined;
 
-  constructor(config: VelocityConfig, logger: Logger = noopLogger) {
+  constructor(
+    config: VelocityConfig,
+    logger: Logger = noopLogger,
+    random: () => number = Math.random,
+  ) {
     this.#logger = bestEffortLogger(logger);
+    this.#random = random;
     this.#historyHorizon = Math.max(
       config.velocity_repeat_window_s,
       30 * (config.velocity_growth_streak - 1),
@@ -128,14 +136,16 @@ export class VelocityMonitor {
     if (history === undefined) {
       for (const [id, candidate] of this.#runs) {
         if (now - candidate.time(candidate.length - 1) <= this.#historyHorizon) break;
-        this.#runs.delete(id);
+        this.#deleteHistory(id, candidate);
       }
       if (this.#runs.size >= RUN_LIMIT) {
-        // Keep established histories progressing under round-robin overflow; evicting
-        // the oldest on every insertion would reset every run before a rule can fire.
-        const evictedRunId = this.#newestRunId as string;
+        // Sample independently of observation order: oldest eviction cascades under
+        // round-robin overflow, while newest eviction erases fresh loops amid churn.
+        const evictedRunId = this.#runIds[
+          Math.floor(this.#random() * this.#runIds.length)
+        ] as string;
         const evictedHistory = this.#runs.get(evictedRunId) as RunHistory;
-        this.#runs.delete(evictedRunId);
+        this.#deleteHistory(evictedRunId, evictedHistory);
         this.#rememberRateEviction(evictedRunId, evictedHistory, now);
         if (
           this.#lastEvictionWarning === undefined ||
@@ -145,15 +155,15 @@ export class VelocityMonitor {
           this.#logger.warn("velocity.history_evicted");
         }
       }
-      history = new RunHistory();
+      history = new RunHistory(this.#runIds.length);
+      this.#runIds.push(runId);
     } else {
       this.#runs.delete(runId);
       if (now - history.time(history.length - 1) > this.#historyHorizon) {
-        history = new RunHistory();
+        history = new RunHistory(history.slot);
       }
     }
     this.#runs.set(runId, history);
-    this.#newestRunId = runId;
 
     const droppedAt = history.push(now, estimatedInputTokens, model);
 
@@ -250,6 +260,15 @@ export class VelocityMonitor {
 
   runCount(): number {
     return this.#runs.size;
+  }
+
+  #deleteHistory(runId: string, history: RunHistory): void {
+    const lastRunId = this.#runIds.pop() as string;
+    if (history.slot < this.#runIds.length) {
+      this.#runIds[history.slot] = lastRunId;
+      (this.#runs.get(lastRunId) as RunHistory).slot = history.slot;
+    }
+    this.#runs.delete(runId);
   }
 
   #hasLiveRateTombstone(runId: string, now: number): boolean {

@@ -822,6 +822,51 @@ describe("cloud reachable + allow", () => {
 // ---------------------------------------------------------------------------
 
 describe("cloud reachable + deny (alert_only)", () => {
+  it.each([
+    true,
+    false,
+  ])("rate-limits overrun logs while preserving each verdict's warning and reservation (allowed=%s)", async (allowed) => {
+    const records: FetchRecord[] = [];
+    const log = capturingLogger();
+    const clock = fakeMonotonicClock();
+    const enforcer = new BudgetEnforcer({
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      leaseEnabled: false,
+      logger: log.logger,
+      monotonicNow: clock.now,
+      fetch: okFetch(records, () =>
+        makeResponse({
+          allowed,
+          current_usage: 101,
+          remaining_budget: -1,
+          reservation_id: `res-${records.length}`,
+        }),
+      ),
+    });
+    const check = { ...baseCheck(), agentRunId: "run-alert-warning" };
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => enforcer.checkBudget(check)),
+    );
+    expect(log.warn).toHaveLength(1);
+    clock.advance(29_999);
+    results.push(await enforcer.checkBudget(check));
+    expect(log.warn).toHaveLength(1);
+    clock.advance(1);
+    results.push(await enforcer.checkBudget(check));
+    expect(log.warn).toHaveLength(2);
+    expect(log.warn[1]).toContain("limit=$100.00, usage=$101.00");
+    expect(records).toHaveLength(12);
+    for (const [index, result] of results.entries()) {
+      expect(result).toMatchObject({
+        allowed: true,
+        mode: "alert_only",
+        reservationId: `res-${index + 1}`,
+        warning: "Budget limit reached: $101.00/$100.00 used",
+      });
+    }
+  });
+
   it("warns for an allowed alert-only overrun while preserving its reservation", async () => {
     const log = capturingLogger();
     const enforcer = new BudgetEnforcer({

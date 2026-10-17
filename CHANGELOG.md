@@ -42,8 +42,8 @@ corresponding release notes before users upgrade.
   seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
 - **Velocity history survives higher run concurrency.** Structural loop detection now keeps
   compact histories for up to 4096 runs and discards stale histories first. At the hard cap,
-  established histories continue progressing through round-robin traffic; discarding live
-  history emits a rate-limited `velocity.history_evicted` warning.
+  randomized eviction avoids systematically resetting loops under run churn or round-robin
+  overflow; discarding live history emits a rate-limited `velocity.history_evicted` warning.
 - **Run lifetime tracking starts on demand.** Importing the Node entry no longer enables a
   process-wide async hook. Tracking starts with the first callback run or detached handle and
   stops when the last run lifetime is collected. Active lifetimes still add promise overhead.
@@ -171,10 +171,12 @@ corresponding release notes before users upgrade.
   lists, model values, loggers, and selection policies raise `ConfigurationError` before
   reporters or budget resources start.
 - **Budget preflight shares one deadline and honors cancellation.** An initial lease attempt
-  and its per-call fallback now share the requested timeout. An exhausted deadline skips the
-  fallback without adding a breaker failure. Caller `AbortSignal`s reach preflight transport;
-  already-aborted requests skip budget I/O, and cancellation rejects without treating it as a
-  control-plane outage.
+  and its per-call fallback now share the requested timeout. With less than 50 milliseconds
+  remaining, preflight skips network I/O and applies local policy with a deadline diagnostic,
+  without adding a breaker failure or drawing lease headroom. Caller `AbortSignal`s reach
+  preflight transport; already-aborted requests skip budget I/O, and cancellation rejects
+  without treating it as a control-plane outage. Non-Error abort reasons become `AbortError`s,
+  matching provider dispatch; Error reasons are preserved.
 - **Completed calls release lease bookkeeping immediately.** Settlement, release, and unknown
   usage no longer retain a full claim and expiry entry for 900 seconds. Per-call budget results
   release their unused lease claims, and a bounded recent-ID history still rejects accidental
@@ -248,7 +250,9 @@ corresponding release notes before users upgrade.
   marked estimated during normalization; unnormalized
   invalid cache breakdowns are rejected locally before they can invalidate a whole ingest batch.
 - **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
-  now produces the budget warning while retaining the reservation for settlement.
+  now produces the budget warning while retaining the reservation for settlement. Alert-only
+  budget-limit logs emit at most once every 30 seconds per enforcer; every affected result
+  retains its warning and reservation.
 - **Gateway-prefixed contract probes.** Testing contract helpers append endpoint paths to the
   configured API prefix using the same URL join as runtime transport.
 - Metadata ingestion no longer starves under sustained confirmation traffic. The background

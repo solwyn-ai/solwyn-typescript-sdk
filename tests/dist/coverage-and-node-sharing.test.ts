@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
+import { gcProbeTimeout } from "../helpers/gc-probe";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,20 +27,21 @@ async function checkCoreBundles(root: string, extension: string): Promise<void> 
   }
 }
 
-it.each([
-  "esm",
-  "cjs",
-])("shares coverage and lazy run tracking when %s loads first", async (format) => {
-  const harness = fileURLToPath(
-    new URL("./fixtures/coverage-and-node-sharing.mjs", import.meta.url),
-  );
-  const { stdout } = await execFileAsync(
-    process.execPath,
-    ["--expose-gc", harness, process.cwd(), format],
-    { timeout: 30_000 },
-  );
-  expect(JSON.parse(stdout)).toEqual({ coverageShared: true, hookShared: true, idle: true });
-});
+it.each(["esm", "cjs"])(
+  "shares coverage and lazy run tracking when %s loads first",
+  async (format) => {
+    const harness = fileURLToPath(
+      new URL("./fixtures/coverage-and-node-sharing.mjs", import.meta.url),
+    );
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ["--expose-gc", "--import", "tsx", harness, process.cwd(), format],
+      { timeout: 120_000 },
+    );
+    expect(JSON.parse(stdout)).toEqual({ coverageShared: true, hookShared: true, idle: true });
+  },
+  gcProbeTimeout,
+);
 
 it.each([
   ["esm", "legacy-first"],

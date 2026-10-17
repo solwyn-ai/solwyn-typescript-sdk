@@ -9,16 +9,8 @@ import { createRun, currentRun, noopLogger, run, Solwyn } from "../../src/node";
 import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import type { FetchLike } from "../../src/transport";
 import type { LeaseGrantResponse } from "../../src/types";
+import { alive, collectUntil, settle } from "./gc.mjs";
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
-async function collect(): Promise<void> {
-  for (let index = 0; index < 8; index++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  await setImmediate();
-}
 /** The enforcer's bounded surrender dispatcher (diagnostic counters only). */
 function releasesOf(budget: BudgetEnforcer): ReleaseDispatcher {
   return (budget as unknown as { releases: ReleaseDispatcher }).releases;
@@ -30,6 +22,7 @@ async function releasesIdle(budget: BudgetEnforcer): Promise<void> {
 const apiKey = `sk_proj_${"a".repeat(64)}`;
 const projectId = `proj_${"0".repeat(24)}`;
 const results: Record<string, unknown> = {};
+const scenarios: Record<string, () => Promise<void>> = {};
 
 function fixture(ineligible = false, tokens = 0) {
   const refs: WeakRef<LeaseState>[] = [];
@@ -171,7 +164,14 @@ function fixture(ineligible = false, tokens = 0) {
   };
 }
 
-{
+async function collectStates(f: ReturnType<typeof fixture>): Promise<void> {
+  await collectUntil(
+    () => alive(f.refs) === 0,
+    () => `lease states=${alive(f.refs)}/${f.refs.length}, ${JSON.stringify(f.counters)}`,
+  );
+}
+
+scenarios["retained-denial"] = async () => {
   const f = fixture(true);
   const handle = createRun("retained-denial");
   try {
@@ -180,7 +180,7 @@ function fixture(ineligible = false, tokens = 0) {
       handle.activate(() => f.call()),
       BudgetExceededError,
     );
-    await collect();
+    await settle(8);
     f.setChecksOutage(true);
     await assert.rejects(
       handle.activate(() => f.call()),
@@ -193,15 +193,19 @@ function fixture(ineligible = false, tokens = 0) {
       "a retained run denial governs reactivation during outage",
     );
     handle.finish();
-    await collect();
+    await collectUntil(
+      () => f.ledger.stateFor(handle.runId) === null && alive(f.refs) === 0,
+      () =>
+        `finished handle: states=${alive(f.refs)}, retained=${f.ledger.stateFor(handle.runId) !== null}`,
+    );
     assert.equal(f.ledger.stateFor(handle.runId), null);
     results["retained_denial"] = true;
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["ai-histories"] = async () => {
   const f = fixture();
   const middleware = createSolwynMiddleware({
     apiKey,
@@ -234,12 +238,12 @@ function fixture(ineligible = false, tokens = 0) {
           doGenerate: async () => ({ content: [], usage: { inputTokens: 0, outputTokens: 0 } }),
         }),
       );
-    await collect();
+    await collectStates(f);
     assert.equal(f.refs.filter((ref) => ref.deref() !== undefined).length, 0);
     assert.equal(f.counters.surrenders, 1000);
     results["ai_histories"] = { observed: f.refs.length, alive: 0 };
     const completedStreams: ReadableStream<unknown>[] = [];
-    for (let index = 0; index < 100; index++) {
+    async function completeStream(): Promise<void> {
       const { stream } = await run("ai-completed-stream", () =>
         streamCall({
           model: { provider: "openai", modelId: "gpt-4o" },
@@ -261,7 +265,8 @@ function fixture(ineligible = false, tokens = 0) {
       }
       reader.releaseLock();
     }
-    await collect();
+    for (let index = 0; index < 100; index++) await completeStream();
+    await collectStates(f);
     assert.equal(
       f.refs.filter((ref) => ref.deref() !== undefined).length,
       0,
@@ -273,36 +278,39 @@ function fixture(ineligible = false, tokens = 0) {
     await middleware.close();
     await f.close();
   }
-}
+};
 
 for (const ineligible of [false, true]) {
-  const f = fixture(ineligible);
-  try {
-    for (let count = 0; count < 10000; count++) await run("completed", () => f.call());
-    f.ledger.sweep(performance.now() / 1000 + 901);
-    await collect();
-    const alive = f.refs.filter((ref) => ref.deref() !== undefined).length;
-    assert.equal(alive, 0, "unreachable completed scopes must not retain lease states");
-    results[ineligible ? "completed_ineligible" : "completed_granted"] = {
-      observed: f.refs.length,
-      alive,
-      surrenders: f.counters.surrenders,
-    };
-  } finally {
-    await f.close();
-  }
+  scenarios[ineligible ? "completed-ineligible" : "completed-granted"] = async () => {
+    const f = fixture(ineligible);
+    try {
+      for (let count = 0; count < 10000; count++) await run("completed", () => f.call());
+      f.ledger.sweep(performance.now() / 1000 + 901);
+      await collectStates(f);
+      const liveStates = alive(f.refs);
+      assert.equal(liveStates, 0, "unreachable completed scopes must not retain lease states");
+      results[ineligible ? "completed_ineligible" : "completed_granted"] = {
+        observed: f.refs.length,
+        alive: liveStates,
+        surrenders: f.counters.surrenders,
+      };
+    } finally {
+      await f.close();
+    }
+  };
 }
 
-{
+scenarios["retained-completed-promises"] = async () => {
   const f = fixture();
   const completed: Promise<unknown>[] = [];
   try {
-    for (let index = 0; index < 100; index++) {
+    async function completeCall(): Promise<void> {
       const promise = run("kept-completion", () => f.call());
       completed.push(promise);
       await promise;
     }
-    await collect();
+    for (let index = 0; index < 100; index++) await completeCall();
+    await collectStates(f);
     assert.equal(
       f.refs.filter((ref) => ref.deref() !== undefined).length,
       0,
@@ -313,13 +321,13 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["retained-terminal-native-streams"] = async () => {
   const f = fixture();
   const completed: AsyncIterable<unknown>[] = [];
   try {
-    for (let index = 0; index < 100; index++) {
+    async function completeStream(): Promise<void> {
       const stream = (await run("kept-terminal-stream", () =>
         f.client.chat.completions.create({ model: "gpt-4o", max_tokens: 1, stream: true }),
       )) as AsyncIterable<unknown>;
@@ -328,7 +336,8 @@ for (const ineligible of [false, true]) {
         /* consume through terminal */
       }
     }
-    await collect();
+    for (let index = 0; index < 100; index++) await completeStream();
+    await collectStates(f);
     assert.equal(
       f.refs.filter((ref) => ref.deref() !== undefined).length,
       0,
@@ -339,9 +348,9 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["async-resource-owner"] = async () => {
   const f = fixture(true);
   let resource!: AsyncResource;
   let runId = "";
@@ -351,50 +360,60 @@ for (const ineligible of [false, true]) {
       await f.call();
       resource = new AsyncResource("solwyn-retention-control");
     });
-    await collect();
+    await settle(8);
     assert.equal(f.ledger.stateFor(runId)?.runIneligible, true);
     await resource.runInAsyncScope(() => f.call());
     assert.equal(f.counters.grants, 1);
     resource.emitDestroy();
-    await collect();
+    await collectUntil(
+      () => f.ledger.stateFor(runId) === null && alive(f.refs) === 0,
+      () =>
+        `destroyed AsyncResource: states=${alive(f.refs)}, retained=${f.ledger.stateFor(runId) !== null}`,
+    );
     assert.equal(f.ledger.stateFor(runId), null);
     results["async_resource_owner"] = true;
   } finally {
     resource?.emitDestroy();
     await f.close();
   }
-}
+};
 
 for (const ineligible of [false, true]) {
-  const f = fixture(ineligible);
-  const handle = createRun("reactivatable");
-  try {
-    await handle.activate(() => f.call());
-    await collect();
-    assert.ok(
-      f.ledger.stateFor(handle.runId),
-      "unfinished handles preserve state between activations",
-    );
-    await handle.activate(() => f.call());
-    assert.equal(
-      f.counters.grants,
-      1,
-      "reactivation must preserve grant or permanent ineligibility",
-    );
-    handle.finish();
-    await collect();
-    assert.equal(
-      f.ledger.stateFor(handle.runId),
-      null,
-      "a kept finished handle releases its owner token",
-    );
-    results[ineligible ? "ineligible_handle" : "granted_handle"] = true;
-  } finally {
-    await f.close();
-  }
+  scenarios[ineligible ? "ineligible-handle" : "granted-handle"] = async () => {
+    const f = fixture(ineligible);
+    const handle = createRun("reactivatable");
+    try {
+      await handle.activate(() => f.call());
+      await settle(8);
+      assert.ok(
+        f.ledger.stateFor(handle.runId),
+        "unfinished handles preserve state between activations",
+      );
+      await handle.activate(() => f.call());
+      assert.equal(
+        f.counters.grants,
+        1,
+        "reactivation must preserve grant or permanent ineligibility",
+      );
+      handle.finish();
+      await collectUntil(
+        () => f.ledger.stateFor(handle.runId) === null && alive(f.refs) === 0,
+        () =>
+          `finished handle: states=${alive(f.refs)}, retained=${f.ledger.stateFor(handle.runId) !== null}`,
+      );
+      assert.equal(
+        f.ledger.stateFor(handle.runId),
+        null,
+        "a kept finished handle releases its owner token",
+      );
+      results[ineligible ? "ineligible_handle" : "granted_handle"] = true;
+    } finally {
+      await f.close();
+    }
+  };
 }
 
-{
+scenarios["active-stream"] = async () => {
   const f = fixture(false, 2);
   try {
     let runId = "";
@@ -402,7 +421,7 @@ for (const ineligible of [false, true]) {
       runId = currentRun()?.agentRunId ?? "";
       return f.client.chat.completions.create({ model: "gpt-4o", max_tokens: 100, stream: true });
     })) as AsyncIterable<unknown>;
-    await collect();
+    await settle(8);
     assert.equal(
       f.ledger.stateFor(runId)?.reservations.size,
       1,
@@ -417,9 +436,9 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["background-frame"] = async () => {
   const f = fixture(true);
   try {
     let resume!: () => void;
@@ -435,7 +454,7 @@ for (const ineligible of [false, true]) {
         await f.call();
       });
     });
-    await collect();
+    await settle(8);
     assert.equal(f.ledger.stateFor(runId)?.runIneligible, true);
     resume();
     await background;
@@ -444,14 +463,14 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["refused-surrender"] = async () => {
   const f = fixture(false, 2);
   try {
     f.setSurrenderFailure(true);
     await run("unsettled", () => f.call());
-    await collect();
+    await collectStates(f);
     assert.equal(
       f.refs.filter((ref) => ref.deref() !== undefined).length,
       0,
@@ -471,9 +490,9 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["identity-only-reuse"] = async () => {
   const f = fixture(true);
   let runId = "";
   try {
@@ -487,7 +506,7 @@ for (const ineligible of [false, true]) {
         estimatedInputTokens: 0,
       });
     });
-    await collect();
+    await settle(8);
     assert.equal(
       f.ledger.stateFor(runId)?.runIneligible,
       true,
@@ -497,9 +516,9 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["unmanaged-before-owned"] = async () => {
   const f = fixture(true);
   const enforcer = new BudgetEnforcer({
     apiKey,
@@ -515,11 +534,20 @@ for (const ineligible of [false, true]) {
   };
   try {
     await enforcer.checkBudget(options);
-    let owner: object | undefined = {};
-    enforcer.observeRun({ agentRunId: runId, agentRunName: "mixed-order", lifetime: owner });
-    await enforcer.checkBudget({ ...options, runLifetime: owner });
-    owner = undefined;
-    await collect();
+    async function observeOwner(): Promise<WeakRef<object>> {
+      const owner = {};
+      enforcer.observeRun({ agentRunId: runId, agentRunName: "mixed-order", lifetime: owner });
+      await enforcer.checkBudget({ ...options, runLifetime: owner });
+      return new WeakRef(owner);
+    }
+    const owner = await observeOwner();
+    const ownerCounts = (enforcer as unknown as { runOwnerCounts: Map<string, number> })
+      .runOwnerCounts;
+    await collectUntil(
+      () => owner.deref() === undefined && !ownerCounts.has(runId),
+      () =>
+        `managed owner: alive=${Number(owner.deref() !== undefined)}, registered=${ownerCounts.get(runId) ?? 0}`,
+    );
     await enforcer.checkBudget(options);
     assert.equal(
       f.counters.grants,
@@ -531,9 +559,9 @@ for (const ineligible of [false, true]) {
     await enforcer.close();
     await f.close();
   }
-}
+};
 
-{
+scenarios["pending-renewal"] = async () => {
   const f = fixture(false, 2);
   let finishRenewal!: (response: LeaseGrantResponse) => void;
   f.setRenewal(
@@ -545,14 +573,17 @@ for (const ineligible of [false, true]) {
     await run("pending-renewal", () =>
       f.client.chat.completions.create({ model: "gpt-4o", max_tokens: 1500 }),
     );
-    await collect();
+    await settle(8);
     assert.equal(
       f.counters.surrenders,
       0,
       "renewal owns the state after run frames become unreachable",
     );
     finishRenewal(f.grant(2));
-    await collect();
+    await collectUntil(
+      () => alive(f.refs) === 0 && f.counters.surrenders === 1 && f.counters.surrenderedSpend === 2,
+      () => `renewal retired: states=${alive(f.refs)}, ${JSON.stringify(f.counters)}`,
+    );
     assert.equal(f.counters.surrenders, 1);
     assert.equal(
       f.counters.surrenderedSpend,
@@ -564,9 +595,9 @@ for (const ineligible of [false, true]) {
   } finally {
     await f.close();
   }
-}
+};
 
-{
+scenarios["revival-during-retirement"] = async () => {
   const f = fixture(false, 2);
   let finishSurrender!: () => void;
   f.setSurrenderGate(
@@ -580,8 +611,10 @@ for (const ineligible of [false, true]) {
       runId = currentRun()?.agentRunId ?? "";
       await f.call();
     });
-    await collect();
-    assert.equal(f.counters.surrenders, 1);
+    await collectUntil(
+      () => f.counters.surrenders === 1,
+      () => `surrender started: states=${alive(f.refs)}, ${JSON.stringify(f.counters)}`,
+    );
     const options = {
       agentRunId: runId,
       model: "gpt-4o",
@@ -596,7 +629,14 @@ for (const ineligible of [false, true]) {
     );
     assert.equal(f.counters.checks, 1);
     finishSurrender();
-    await collect();
+    await collectUntil(
+      () =>
+        f.ledger.stateFor(runId)?.hasLease === false &&
+        f.ledger.stateFor(runId)?.spentTokensSinceReport === 0 &&
+        f.counters.surrenderedSpend === 2,
+      () =>
+        `surrender completed: hasLease=${f.ledger.stateFor(runId)?.hasLease}, ${JSON.stringify(f.counters)}`,
+    );
     assert.equal(f.ledger.stateFor(runId)?.hasLease, false);
     assert.equal(f.ledger.stateFor(runId)?.spentTokensSinceReport, 0);
     assert.equal(f.counters.surrenderedSpend, 2);
@@ -607,9 +647,9 @@ for (const ineligible of [false, true]) {
     finishSurrender();
     await f.close();
   }
-}
+};
 
-{
+scenarios["idle-release-dispatcher"] = async () => {
   // An idle release dispatcher starts no timers and holds no pending work, so it cannot
   // keep an unclosed enforcer reachable.
   async function exercise(): Promise<WeakRef<BudgetEnforcer>> {
@@ -646,9 +686,17 @@ for (const ineligible of [false, true]) {
     return new WeakRef(enforcer);
   }
   const reference = await run("idle-dispatcher", () => exercise());
-  await collect();
+  await collectUntil(
+    () => reference.deref() === undefined,
+    () => `idle release dispatcher: enforcers=${Number(reference.deref() !== undefined)}`,
+  );
   assert.equal(reference.deref(), undefined, "an idle release dispatcher roots nothing");
   results["idle_release_dispatcher"] = true;
-}
+};
 
-process.stdout.write(`${JSON.stringify({ ok: true, results })}\n`);
+const name = process.argv[2] ?? "";
+const scenario = scenarios[name];
+assert.ok(scenario, "unknown scenario");
+await scenario();
+
+process.stdout.write(`${JSON.stringify({ ok: true, scenario: name, results })}\n`);

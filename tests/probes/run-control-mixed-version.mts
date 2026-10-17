@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { setImmediate } from "node:timers/promises";
 import * as current from "../../src/run-control";
 import * as rc1 from "../helpers/run-control-rc1";
+import { collectUntil, settle } from "./gc.mjs";
 
 interface GroupView {
   readonly handles: Set<object>;
@@ -15,8 +15,6 @@ interface CopyApi {
   resetRunControlForTest(): void;
 }
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
 const RUN_CONTROL_KEY = Symbol.for("@solwyn/sdk.runControl");
 
 function activeHandles(): Map<string, GroupView> {
@@ -40,18 +38,6 @@ function abandonHandle(copy: CopyApi, runId: string): WeakRef<object> {
   return new WeakRef(copy.acquireTerminationHandle(runId));
 }
 
-async function collect(ref: WeakRef<object>): Promise<void> {
-  for (let attempt = 0; attempt < 50 && ref.deref() !== undefined; attempt++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  assert.equal(ref.deref(), undefined, "abandoned handle shell was not collected");
-  for (let turn = 0; turn < 8; turn++) {
-    await setImmediate();
-    forceGc?.();
-  }
-}
-
 const copies: Record<"rc1" | "current", CopyApi> = { rc1, current };
 
 for (const [abandoning, keeping] of [
@@ -65,7 +51,19 @@ for (const [abandoning, keeping] of [
   const ref = abandonHandle(copies[abandoning], "run");
   // One per-handle cell plus the current copy's single epoch cell.
   assert.deepEqual(accounting("run"), [2, 1, 1]);
-  await collect(ref);
+  await collectUntil(
+    () => {
+      const counts = accounting("run");
+      return (
+        ref.deref() === undefined &&
+        counts?.[0] === 1 &&
+        counts[1] === keptCurrent &&
+        counts[2] === keptCurrent
+      );
+    },
+    () =>
+      `${abandoning} abandoned: shells=${Number(ref.deref() !== undefined)}, accounting=${JSON.stringify(accounting("run"))}`,
+  );
   assert.deepEqual(accounting("run"), [1, keptCurrent, keptCurrent]);
   kept.release();
   assert.equal(activeHandles().size, 0);
@@ -76,7 +74,12 @@ for (const [abandoning, keeping] of [
   copies[keeping].resetRunControlForTest();
   const successor = copies[keeping].acquireTerminationHandle("late") as { release(): void };
   const successorGroup = activeHandles().get("late");
-  await collect(staleRef);
+  await collectUntil(
+    () => staleRef.deref() === undefined,
+    () => `${abandoning} stale handle shells=${Number(staleRef.deref() !== undefined)}`,
+  );
+  // Neither copy may lose successor ownership during later finalizer turns.
+  await settle(8);
   assert.equal(activeHandles().get("late"), successorGroup);
   assert.deepEqual(accounting("late"), [1, keptCurrent, keptCurrent]);
   successor.release();

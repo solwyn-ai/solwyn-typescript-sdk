@@ -3,11 +3,12 @@
 // while queued work is still delivered first and reachable clients keep their cadence.
 // Offline only: in-process fake provider and fake control plane. Prints one JSON object.
 import assert from "node:assert/strict";
-import { setImmediate, setTimeout as sleep } from "node:timers/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createSolwynMiddleware } from "../../src/ai-sdk/index";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import type { FetchLike } from "../../src/transport";
+import { alive, collectUntil } from "./gc.mjs";
 
 const forceGc = (globalThis as { gc?: () => void }).gc;
 assert.ok(forceGc, "run with --expose-gc");
@@ -49,22 +50,6 @@ MetadataReporter.prototype._flushRemaining = function (this: MetadataReporter, .
   }
   return flushRemaining.apply(this, args);
 };
-
-const alive = (refs: readonly WeakRef<object>[]): number =>
-  refs.filter((ref) => ref.deref() !== undefined).length;
-
-async function collect(turns = 8): Promise<void> {
-  for (let index = 0; index < turns; index++) {
-    await setImmediate();
-    await sleep(2);
-    forceGc?.();
-  }
-  await setImmediate();
-}
-
-async function collectUntil(refs: readonly WeakRef<object>[], maxRounds = 40): Promise<void> {
-  for (let round = 0; round < maxRounds && alive(refs) > 0; round++) await collect();
-}
 
 interface Counters {
   checks: number;
@@ -267,7 +252,10 @@ async function stageA() {
       providers.push(await dropClient(fetch, mode, { lease: mode === "leased-run" }, 2));
     }
     const holders = leaseRefs.slice(firstLease);
-    await collectUntil([...providers, ...holders]);
+    await collectUntil(
+      () => alive(providers) === 0 && alive(holders) === 0,
+      () => `${mode}: providers=${alive(providers)}, leaseHolders=${alive(holders)}`,
+    );
     lanes[mode] = {
       clients: providers.length,
       providersAlive: alive(providers),
@@ -297,7 +285,10 @@ async function heartbeat() {
   // Let dropped clients deliver their settlement and start heartbeating before the drop.
   await sleep(150);
   const droppedBreakerBeforeDrop = droppedCount.breaker;
-  await collectUntil([...providers, ...reporters]);
+  await collectUntil(
+    () => alive(providers) === 0 && alive(reporters) === 0,
+    () => `dropped clients: providers=${alive(providers)}, reporters=${alive(reporters)}`,
+  );
 
   const before = {
     dropped: requests(droppedCount),
@@ -353,7 +344,10 @@ async function heartbeatEveryTick(failBreaker: boolean) {
   // Let dropped clients deliver their settlement and start breaker reporting before the drop.
   await sleep(150);
   const droppedBreakerBeforeDrop = droppedCount.breaker;
-  await collectUntil([...providers, ...reporters]);
+  await collectUntil(
+    () => alive(providers) === 0 && alive(reporters) === 0,
+    () => `dropped clients: providers=${alive(providers)}, reporters=${alive(reporters)}`,
+  );
 
   const before = {
     dropped: requests(droppedCount),
@@ -395,13 +389,16 @@ async function retryDelivery() {
   }
   const reporters = reporterRefs.slice(firstReporter);
   // Collect aggressively while the dropped clients' first sends fail and retry.
-  const pending = (): boolean =>
-    count.confirmed.size < count.reservations || count.ingested.size < 6;
-  for (let round = 0; round < 200 && pending(); round++) {
-    await collect(1);
-  }
+  await collectUntil(
+    () => count.confirmed.size === count.reservations && count.ingested.size === 6,
+    () =>
+      `retry delivery: providers=${alive(providers)}, reporters=${alive(reporters)}, confirmed=${count.confirmed.size}/${count.reservations}, ingested=${count.ingested.size}/6`,
+  );
   const reportersAliveAfterDelivery = alive(reporters);
-  await collectUntil([...providers, ...reporters]);
+  await collectUntil(
+    () => alive(providers) === 0 && alive(reporters) === 0,
+    () => `dropped clients: providers=${alive(providers)}, reporters=${alive(reporters)}`,
+  );
   const before = requests(count);
   for (let index = 0; index < 10; index++) {
     await sleep(20);
@@ -450,15 +447,32 @@ async function registryScenario() {
   const firstLease = leaseRefs.length;
   for (let index = 0; index < 200; index++) await dropClient(fetch, "idle", { lease: true });
   const dropped = [...reporterRefs.slice(firstReporter), ...leaseRefs.slice(firstLease)];
-  await collectUntil(dropped);
+  await collectUntil(
+    () =>
+      alive(dropped) === 0 &&
+      registry().reporters.size === liveRegistrations &&
+      registry().leaseHolders.size === liveRegistrations,
+    () =>
+      `dropped registry participants=${alive(dropped)}, reporters=${registry().reporters.size}/${liveRegistrations}, leaseHolders=${registry().leaseHolders.size}/${liveRegistrations}`,
+  );
   const sizesAfterDrop = {
     reporters: registry().reporters.size,
     leaseHolders: registry().leaseHolders.size,
   };
 
-  const heldRefs = reporterRefs.slice(heldStart, firstReporter);
+  const heldRefs = [
+    ...reporterRefs.slice(heldStart, firstReporter),
+    ...leaseRefs.slice(0, firstLease),
+  ];
   held.length = 0;
-  await collectUntil(heldRefs);
+  await collectUntil(
+    () =>
+      alive(heldRefs) === 0 &&
+      registry().reporters.size === 0 &&
+      registry().leaseHolders.size === 0,
+    () =>
+      `released registry participants=${alive(heldRefs)}, reporters=${registry().reporters.size}, leaseHolders=${registry().leaseHolders.size}`,
+  );
   return {
     liveRegistrations,
     registrationDerefs: derefs,
@@ -490,7 +504,6 @@ async function runRetire() {
   for (let index = 0; index < 5; index++) {
     await run("later-request", () => client?.chat.completions.create(call));
   }
-  await sleep(100); // several flush-loop turns
   const pinned = (): number => {
     const lifetime = firstRun?.deref();
     let n = 0;
@@ -498,9 +511,16 @@ async function runRetire() {
     for (const owner of owners.resources.values()) if (owner === lifetime) n++;
     return n;
   };
-  await collect();
+  await collectUntil(
+    () =>
+      firstRun?.deref() === undefined &&
+      pinned() === 0 &&
+      count.surrenders === count.grants &&
+      count.spentReported === 12,
+    () =>
+      `first run: owners=${Number(firstRun?.deref() !== undefined)}, pinned=${pinned()}, surrenders=${count.surrenders}/${count.grants}, spent=${count.spentReported}/12`,
+  );
   const pinnedOwnerEntries = pinned();
-  for (let round = 0; round < 20 && count.surrenders < count.grants; round++) await collect();
   const result = {
     pinnedOwnerEntries,
     firstRunRetired: firstRun?.deref() === undefined,
@@ -548,7 +568,15 @@ async function middleware() {
   const holders = leaseRefs.slice(firstLease);
   await sleep(100); // deliver the dropped handles' queued events first
   const ingestedBeforeDrop = droppedCount.ingests;
-  await collectUntil([...reporters, ...holders]);
+  await collectUntil(
+    () =>
+      alive(reporters) === 0 &&
+      alive(holders) === 0 &&
+      registry().reporters.size === 1 &&
+      registry().leaseHolders.size === 1,
+    () =>
+      `dropped middleware: reporters=${alive(reporters)}, leaseHolders=${alive(holders)}, registeredReporters=${registry().reporters.size}/1, registeredLeaseHolders=${registry().leaseHolders.size}/1`,
+  );
   const before = { requests: requests(droppedCount), rounds: rounds.dropped, held: rounds.held };
   for (let index = 0; index < 10; index++) {
     await sleep(20);

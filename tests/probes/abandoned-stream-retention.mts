@@ -1,18 +1,25 @@
 import assert from "node:assert/strict";
-import { setImmediate } from "node:timers/promises";
+import { CircuitBreaker } from "../../src/circuit-breaker";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import { LatencyTracker } from "../../src/routing";
 import { getCurrentRun } from "../../src/run-context";
 import type { FetchLike } from "../../src/transport";
+import { alive, collectUntil } from "./gc.mjs";
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
 const lifetimes: WeakRef<object>[] = [];
 const signals: WeakRef<object>[] = [];
 const wrappers: WeakRef<object>[] = [];
 const clients: WeakRef<object>[] = [];
 const providers: WeakRef<object>[] = [];
+let probeReleases = 0;
+const releaseProbe = CircuitBreaker.prototype.releaseProbe;
+CircuitBreaker.prototype.releaseProbe = function (admission) {
+  const wasActive = Reflect.get(this, "halfOpenProbeActive") === true;
+  releaseProbe.call(this, admission);
+  if (admission?.ownsProbe && wasActive && Reflect.get(this, "halfOpenProbeActive") === false)
+    probeReleases++;
+};
 let latencySamples = 0;
 const recordLatency = LatencyTracker.prototype.recordLatency;
 LatencyTracker.prototype.recordLatency = function (provider, ms) {
@@ -126,16 +133,20 @@ async function abandonUnclosed(index: number): Promise<void> {
     await stream.next();
   });
 }
-async function collect(): Promise<void> {
-  for (let turn = 0; turn < 40; turn++) {
-    await setImmediate();
-    forceGc?.();
-  }
+function describe(): string {
+  return `wrappers=${alive(wrappers)}, lifetimes=${alive(lifetimes)}, signals=${alive(signals)}, clients=${alive(clients)}, providers=${alive(providers)}, settlements=${settlements.length}, surrenders=${surrenders.length}`;
 }
 try {
   for (let index = 0; index < 10; index++) await abandon();
-  await collect();
-  const alive = (refs: WeakRef<object>[]) => refs.filter((ref) => ref.deref()).length;
+  await collectUntil(
+    () =>
+      alive(wrappers) === 0 &&
+      alive(lifetimes) === 0 &&
+      alive(signals) === 0 &&
+      settlements.length === 10 &&
+      surrenders.length === 10,
+    describe,
+  );
   assert.equal(alive(wrappers), 0, "abandoned wrappers must be collectible");
   assert.equal(alive(lifetimes), 0, "abandoned streams must release run lifetimes");
   assert.equal(alive(signals), 0, "abandoned streams must release caller signals");
@@ -148,7 +159,15 @@ try {
   assert.equal(settlements.length, 10, "close must not settle collected streams again");
 
   for (let index = 0; index < 10; index++) await abandonUnclosed(index);
-  await collect();
+  await collectUntil(
+    () =>
+      alive(clients) === 0 &&
+      alive(providers) === 0 &&
+      alive(wrappers) === 0 &&
+      alive(lifetimes) === 0 &&
+      settlements.length === 20,
+    describe,
+  );
   assert.equal(settlements.length, 20, "unclosed clients' abandoned streams settle once");
   assert.equal(alive(clients), 0, "unclosed clients with abandoned streams must be collectible");
   assert.equal(alive(providers), 0, "unclosed clients must release their providers");
@@ -196,7 +215,10 @@ try {
     }
     await abandonProbe();
     await assert.rejects(probeClient.chat.completions.create({ model: "gpt-4o" }));
-    await collect();
+    await collectUntil(
+      () => probeReleases === 1,
+      () => `abandoned recovery probe: releases=${probeReleases}/1, dispatches=${calls}`,
+    );
     await probeClient.chat.completions.create({ model: "gpt-4o" });
     assert.equal(calls, 3, "finalization releases the probe without waiting for expiry");
   } finally {
@@ -210,4 +232,5 @@ try {
   await sdk.close();
   MetadataReporter.prototype.reportSettlement = reportSettlement;
   LatencyTracker.prototype.recordLatency = recordLatency;
+  CircuitBreaker.prototype.releaseProbe = releaseProbe;
 }

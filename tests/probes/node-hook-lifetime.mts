@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import type { AsyncHook, HookCallbacks } from "node:async_hooks";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { setImmediate } from "node:timers/promises";
+import { collectUntil, settle } from "./gc.mjs";
 
 const nativeHooks = createRequire(import.meta.url)(
   "node:async_hooks",
@@ -29,15 +30,11 @@ const owners = Reflect.get(globalThis, Symbol.for("@solwyn/sdk.node.runOwners.v2
   hook: AsyncHook;
   liveCount: number;
 };
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
-
-async function collect(): Promise<void> {
-  for (let i = 0; i < 30 && owners.liveCount > 0; i++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  await setImmediate();
+async function collectOwners(): Promise<void> {
+  await collectUntil(
+    () => owners.liveCount === 0 && !(enabled.get(owners.hook) ?? false),
+    () => `run owners=${owners.liveCount}, hookEnabled=${enabled.get(owners.hook) ?? false}`,
+  );
 }
 
 assert.equal(
@@ -46,7 +43,7 @@ assert.equal(
   "import alone must leave promise tracking disabled",
 );
 run("synchronous", () => assert.equal(enabled.get(owners.hook) ?? false, true));
-await collect();
+await collectOwners();
 assert.equal(
   enabled.get(owners.hook) ?? false,
   false,
@@ -55,10 +52,10 @@ assert.equal(
 
 const handle = createRun("detached");
 assert.equal(enabled.get(owners.hook) ?? false, true, "detached handles keep tracking available");
-await collect();
+await settle(8);
 assert.equal(enabled.get(owners.hook) ?? false, true, "unfinished handles retain their lifetime");
 handle.finish();
-await collect();
+await collectOwners();
 assert.equal(
   enabled.get(owners.hook) ?? false,
   false,
@@ -82,7 +79,7 @@ await run("right", async () => {
   assert.equal(currentRun()?.agentRunId, id);
   seen.push(id ?? "");
 });
-await collect();
+await settle(8);
 assert.equal(
   enabled.get(owners.hook) ?? false,
   true,
@@ -91,7 +88,7 @@ assert.equal(
 release();
 await left;
 assert.equal(new Set(seen).size, 2, "concurrent runs stay isolated");
-await collect();
+await collectOwners();
 assert.equal(
   enabled.get(owners.hook) ?? false,
   false,

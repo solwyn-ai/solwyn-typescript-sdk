@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { setImmediate, setTimeout as sleep } from "node:timers/promises";
+import { setImmediate } from "node:timers/promises";
 import { createSolwynMiddleware } from "../../src/ai-sdk";
 import { noopLogger, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import { getCurrentRun } from "../../src/run-context";
 import { markTerminated } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing";
+import { alive, collectUntil, settle } from "./gc.mjs";
 
 const forceGc = (globalThis as { gc?: () => void }).gc;
 assert.ok(forceGc, "run with --expose-gc");
@@ -72,17 +73,9 @@ async function open(handle: Handle, part?: unknown) {
   return { ...result, controller, abort };
 }
 
-async function collectUntil(done: () => boolean, message: string): Promise<void> {
-  for (let turn = 0; turn < 120; turn++) {
-    await setImmediate();
-    forceGc?.();
-    await sleep(5);
-    if (done()) return;
-  }
-  assert.fail(message);
-}
-
-const allCollected = () => refs.every((ref) => ref.deref() === undefined);
+const allCollected = () => alive(refs) === 0;
+const describe = (plane: FakeControlPlane): string =>
+  `AI stream references=${alive(refs)}/${refs.length}, confirms=${plane.confirms.length}, ingested=${plane.ingested.length}, surrenders=${plane.leaseSurrenders.length}`;
 
 async function leaseAccounting(): Promise<void> {
   const { plane, handle } = fixture();
@@ -117,7 +110,7 @@ async function leaseAccounting(): Promise<void> {
         plane.confirms.length === 5 &&
         plane.ingested.length === 5 &&
         plane.leaseSurrenders.length === 5,
-      "GC must settle abandoned streams and retire their run leases before handle close",
+      () => describe(plane),
     );
     assert.deepEqual(
       plane.leaseSurrenders.map((request) => request.spent_tokens ?? -1).sort((a, b) => a - b),
@@ -191,11 +184,16 @@ async function terminalOnce(): Promise<void> {
         }
       });
     }
-    await collectUntil(allCollected, "terminal streams and run ownership must be collectible");
-    // A further GC turn also runs callbacks that were queued just before close.
-    await setImmediate();
-    forceGc?.();
-    await sleep(20);
+    await collectUntil(
+      () =>
+        allCollected() &&
+        plane.confirms.length === 6 &&
+        plane.ingested.length === 7 &&
+        plane.leaseSurrenders.length === 7,
+      () => describe(plane),
+    );
+    // Settled streams must stay settled when additional finalizer callbacks run.
+    await settle(8);
     assert.equal(settlements - before.settlements, 6, "GC after close cannot enqueue again");
     assert.equal(errors - before.errors, 1);
     assert.equal(plane.confirms.length, 6);
@@ -218,7 +216,7 @@ async function abandonedError(): Promise<void> {
     });
     await collectUntil(
       () => allCollected() && plane.ingested.length === 1 && plane.leaseSurrenders.length === 1,
-      "an observed provider error must retain its error disposition on GC",
+      () => describe(plane),
     );
     assert.equal(plane.confirms.length, 0);
     assert.equal(plane.ingested[0]?.status, "error");
@@ -242,8 +240,16 @@ async function closeBeforeFinalization(): Promise<void> {
     forceGc?.();
     // Close's microtask runs before the GC callback; it still owns the detached record.
     await handle.close();
-    await collectUntil(allCollected, "close cannot keep collected stream ownership alive");
-    await sleep(20);
+    await collectUntil(
+      () =>
+        allCollected() &&
+        plane.confirms.length === 1 &&
+        plane.ingested.length === 1 &&
+        plane.leaseSurrenders.length === 1,
+      () => describe(plane),
+    );
+    // Closing and later finalization must keep the settlement count unchanged.
+    await settle(8);
     assert.equal(settlements - before, 1, "close and queued finalization share one settlement");
     assert.equal(plane.confirms.length, 1);
     assert.equal(plane.ingested.length, 1);
@@ -262,7 +268,7 @@ async function unclosedHandle(): Promise<void> {
   });
   await collectUntil(
     () => allCollected() && plane.confirms.length === 1 && plane.ingested.length === 1,
-    "an abandoned stream cannot retain an unclosed middleware handle, source or run",
+    () => describe(plane),
   );
   assert.equal(plane.confirms[0]?.token_details.input_tokens, 50);
   assert.equal(plane.confirms[0]?.token_details.output_tokens, 20);

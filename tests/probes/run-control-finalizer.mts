@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { setImmediate } from "node:timers/promises";
 import {
   acquireTerminationHandle,
   markTerminated,
@@ -7,14 +6,13 @@ import {
   resetRunControlForTest,
   runTermination,
 } from "../../src/run-control";
+import { collectUntil, settle } from "./gc.mjs";
 
 interface GroupView {
   readonly epoch: { readonly owners: number };
   readonly members: number;
 }
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
 const RUN_CONTROL_KEY = Symbol.for("@solwyn/sdk.runControl");
 
 function activeHandles(): Map<string, GroupView> {
@@ -30,23 +28,6 @@ function abandonHandle(runId: string): WeakRef<object> {
   return new WeakRef(acquireTerminationHandle(runId));
 }
 
-/**
- * Collect until the abandoned shell is gone, then give finalization cleanup
- * tasks several more turns. The control scenario proves the window is enough
- * for the SDK's own finalizer to run.
- */
-async function collect(ref: WeakRef<object>): Promise<void> {
-  for (let attempt = 0; attempt < 50 && ref.deref() !== undefined; attempt++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  assert.equal(ref.deref(), undefined, "abandoned handle shell was not collected");
-  for (let turn = 0; turn < 8; turn++) {
-    await setImmediate();
-    forceGc?.();
-  }
-}
-
 // Control: an abandoned handle's finalizer releases its own group ownership.
 resetRunControlForTest();
 const kept = acquireTerminationHandle("control");
@@ -55,7 +36,14 @@ assert.deepEqual(
   [activeHandles().get("control")?.members, activeHandles().get("control")?.epoch.owners],
   [2, 2],
 );
-await collect(controlRef);
+await collectUntil(
+  () =>
+    controlRef.deref() === undefined &&
+    activeHandles().get("control")?.members === 1 &&
+    activeHandles().get("control")?.epoch.owners === 1,
+  () =>
+    `control: shells=${Number(controlRef.deref() !== undefined)}, members=${activeHandles().get("control")?.members}, owners=${activeHandles().get("control")?.epoch.owners}`,
+);
 assert.deepEqual(
   [activeHandles().get("control")?.members, activeHandles().get("control")?.epoch.owners],
   [1, 1],
@@ -75,7 +63,12 @@ for (let index = 0; index < 256; index++) {
   markTerminated(`eviction-${index}`, { reason: "other", source: "server" });
 }
 assert.equal(runTermination("run"), undefined);
-await collect(staleRef);
+await collectUntil(
+  () => staleRef.deref() === undefined,
+  () => `stale handle shells=${Number(staleRef.deref() !== undefined)}`,
+);
+// The successor's ownership must stay intact across further finalizer turns.
+await settle(8);
 assert.equal(activeHandles().get("run"), successorGroup);
 assert.deepEqual([successorGroup.members, successorGroup.epoch.owners], [1, 1]);
 assert.equal(postcheckTermination("run"), winner);

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { setImmediate } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
+import { collectUntil } from "../../probes/gc.mts";
 
 const [root, format] = process.argv.slice(2);
 const require = createRequire(import.meta.url);
@@ -57,11 +58,11 @@ await first.run("shared-formats", async () => {
   await setImmediate();
   assert.equal(second.currentRun()?.agentRunId, id);
 });
-for (let i = 0; i < 30 && owners.liveCount > 0; i++) {
-  await setImmediate();
-  globalThis.gc();
-}
-await setImmediate();
+await collectUntil(
+  () => owners.liveCount === 0 && !(enabled.get(owners.hook) ?? false),
+  () =>
+    `shared ${format} run owners=${owners.liveCount}, hookEnabled=${enabled.get(owners.hook) ?? false}`,
+);
 assert.equal(enabled.get(owners.hook) ?? false, false);
 await Promise.all(clients.map((client) => client.close()));
 process.stdout.write(`${JSON.stringify({ coverageShared: true, hookShared: true, idle: true })}\n`);

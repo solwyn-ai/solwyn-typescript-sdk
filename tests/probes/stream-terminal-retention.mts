@@ -1,34 +1,20 @@
 import assert from "node:assert/strict";
-import { setImmediate } from "node:timers/promises";
 import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
 import { LeaseLedger, type LeaseState } from "../../src/lease";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { getCurrentRun } from "../../src/run-context";
 import type { FetchLike } from "../../src/transport";
+import { alive, collectUntil, settle } from "./gc.mjs";
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
-async function collect(): Promise<void> {
-  for (let index = 0; index < 8; index++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  await setImmediate();
-}
 const states: WeakRef<LeaseState>[] = [];
 const lifetimes: WeakRef<object>[] = [];
 async function collectCompleted(): Promise<void> {
-  // Finalizer callbacks can enqueue asynchronous surrenders. Give that bounded
-  // cleanup chain several collection turns rather than assuming one GC cadence.
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await collect();
-    if (
-      states.every((ref) => ref.deref() === undefined) &&
-      lifetimes.every((ref) => ref.deref() === undefined)
-    )
-      return;
-  }
+  await collectUntil(
+    () => alive(states) === 0 && alive(lifetimes) === 0 && surrenders === grants,
+    () =>
+      `terminal streams: states=${alive(states)}, lifetimes=${alive(lifetimes)}, surrenders=${surrenders}/${grants}`,
+  );
 }
 const apply = LeaseLedger.prototype.applyGrantResponse;
 LeaseLedger.prototype.applyGrantResponse = function (runId, response, options) {
@@ -202,8 +188,6 @@ function captureLifetime(): void {
 // ---------------------------------------------------------------------------
 const HELD = 8;
 const payloadClients: { close(): Promise<void> }[] = [];
-const alive = (refs: readonly WeakRef<object>[]): number =>
-  refs.filter((ref) => ref.deref() !== undefined).length;
 const encoder = new TextEncoder();
 /** SSE body; `failAfter` errors the body after that many events (a mid-stream disconnect). */
 function sseBody(events: readonly unknown[], failAfter?: number): Response {
@@ -449,14 +433,20 @@ async function payloadRetention(): Promise<Record<string, Record<string, number>
     for (let index = 0; index < HELD; index++)
       held.push(await iterateResponses(path, output, tools));
     assert.equal(output.length, HELD);
-    await collect();
+    await collectUntil(
+      () => alive(output) === 0 && alive(tools) === 0,
+      () => `Responses ${path}: output=${alive(output)}, tools=${alive(tools)}`,
+    );
     out[`responses_${path}`] = { output: alive(output), tools: alive(tools) };
   }
   for (const path of ["exhausted", "early_closed"] as const) {
     const choices: WeakRef<object>[] = [];
     for (let index = 0; index < HELD; index++) held.push(await iterateChat(path, choices));
     assert.equal(choices.length, HELD);
-    await collect();
+    await collectUntil(
+      () => alive(choices) === 0,
+      () => `chat ${path}: choices=${alive(choices)}`,
+    );
     out[`chat_${path}`] = { choices: alive(choices) };
   }
   for (const path of [
@@ -468,7 +458,10 @@ async function payloadRetention(): Promise<Record<string, Record<string, number>
   ] as const) {
     const candidates: WeakRef<object>[] = [];
     for (let index = 0; index < HELD; index++) held.push(await iterateGoogle(path, candidates));
-    await collect();
+    await collectUntil(
+      () => alive(candidates) === 0,
+      () => `Google ${path}: candidates=${alive(candidates)}`,
+    );
     out[`google_${path}`] = { first_candidates: alive(candidates) };
   }
   assert.equal(held.length, HELD * 10, "every wrapped handle stays held while measured");
@@ -506,7 +499,10 @@ async function requestRetention(): Promise<Record<string, number>> {
   for (const kind of ["chat", "responses", "google"] as const) {
     const refs: WeakRef<object>[] = [];
     for (let index = 0; index < REQUESTS; index++) held.push(await openHeldStream(kind, refs));
-    await collect();
+    await collectUntil(
+      () => alive(refs) === 0,
+      () => `${kind} unfinished requests=${alive(refs)}/${refs.length}`,
+    );
     out[kind] = alive(refs);
   }
   assert.equal(held.length, REQUESTS * 3, "every unfinished stream stays held while measured");
@@ -587,7 +583,7 @@ try {
     captureLifetime();
     return clients.plain.chat.completions.create({ model: "gpt-4o", max_tokens: 1, stream: true });
   });
-  await collect();
+  await settle(8);
   assert.equal(states.filter((ref) => ref.deref() !== undefined).length, 1);
   assert.equal(lifetimes.filter((ref) => ref.deref() !== undefined).length, 1);
   for await (const item of active) void item;

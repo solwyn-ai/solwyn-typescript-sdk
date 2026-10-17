@@ -1,19 +1,10 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { setImmediate } from "node:timers/promises";
 import { MessageChannel } from "node:worker_threads";
 import { currentRun, run } from "../../src/node";
 import { getCurrentRun } from "../../src/run-context";
+import { alive, collectUntil, settle } from "./gc.mjs";
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
-async function collect(): Promise<void> {
-  for (let index = 0; index < 12; index++) {
-    await setImmediate();
-    forceGc?.();
-  }
-  await setImmediate();
-}
 function captureOwner(): WeakRef<object> {
   const owner = getCurrentRun()?.lifetime;
   assert.ok(owner);
@@ -29,7 +20,10 @@ for (let index = 0; index < 10; index++) {
     assert.deepEqual(structuredClone({ count: index }), { count: index });
   });
 }
-await collect();
+await collectUntil(
+  () => alive(completedOwners) === 0,
+  () => `completed clone owners=${alive(completedOwners)}/${completedOwners.length}`,
+);
 assert.equal(
   completedOwners.filter((reference) => reference.deref() !== undefined).length,
   0,
@@ -52,11 +46,11 @@ run("user-message-channel", () => {
   channel.port1.once("message", () => deliver(currentRun()?.agentRunId));
 });
 try {
-  await collect();
+  await settle(12);
   assert.ok(channelOwner.deref(), "open user MessagePorts retain run authority");
   channel.port2.postMessage(null);
   assert.equal(await delivered, expectedRunId, "the user message resumes its inherited run");
-  await collect();
+  await settle(12);
   assert.ok(channelOwner.deref(), "a live user channel stays owned after one delivered message");
 } finally {
   const closed = Promise.all([once(channel.port1, "close"), once(channel.port2, "close")]);
@@ -64,7 +58,10 @@ try {
   channel.port2.close();
   await closed;
 }
-await collect();
+await collectUntil(
+  () => channelOwner.deref() === undefined,
+  () => `closed MessageChannel owners=${Number(channelOwner.deref() !== undefined)}`,
+);
 assert.equal(channelOwner.deref(), undefined, "closed user MessagePorts release their owner");
 process.stdout.write(
   `${JSON.stringify({ ok: true, completed_clones: 10, user_message_channel: true })}\n`,

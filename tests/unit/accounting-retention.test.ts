@@ -1,8 +1,7 @@
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { currentRun, currentRunContext, run } from "../../src/node";
 import { getCurrentRun } from "../../src/run-context";
+import { gcProbeTimeout, runGcProbe } from "../helpers/gc-probe";
 
 it("keeps ownership tokens out of public attribution snapshots and enumerable metadata", () => {
   run("private-lifetime", () => {
@@ -20,13 +19,29 @@ it("keeps ownership tokens out of public attribution snapshots and enumerable me
   });
 });
 
-it("reclaims unreachable public run histories while preserving live accounting owners", () => {
-  const root = fileURLToPath(new URL("../../", import.meta.url));
-  const result = spawnSync(
-    process.execPath,
-    ["--expose-gc", "--import", "tsx", "tests/probes/accounting-retention.mts"],
-    { cwd: root, encoding: "utf8", timeout: 30_000 },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout).ok).toBe(true);
-}, 35_000);
+it.concurrent.each([
+  "retained-denial",
+  "ai-histories",
+  "completed-granted",
+  "completed-ineligible",
+  "retained-completed-promises",
+  "retained-terminal-native-streams",
+  "async-resource-owner",
+  "granted-handle",
+  "ineligible-handle",
+  "active-stream",
+  "background-frame",
+  "refused-surrender",
+  "identity-only-reuse",
+  "unmanaged-before-owned",
+  "pending-renewal",
+  "revival-during-retirement",
+  "idle-release-dispatcher",
+])(
+  "reclaims unreachable accounting owners: %s",
+  async (scenario) => {
+    const stdout = await runGcProbe("accounting-retention", scenario);
+    expect(JSON.parse(stdout)).toMatchObject({ ok: true, scenario });
+  },
+  gcProbeTimeout,
+);

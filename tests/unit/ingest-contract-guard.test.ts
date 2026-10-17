@@ -1,7 +1,11 @@
 import { expect, it, vi } from "vitest";
 import { noopLogger } from "../../src/logging";
 import { MetadataReporter } from "../../src/reporter";
-import { allowIngestContractDrift, assertNoIngestContractDrift } from "../helpers/ingest-contract";
+import {
+  allowIngestContractDrift,
+  assertNoIngestContractDrift,
+  installIngestContractGuard,
+} from "../helpers/ingest-contract";
 
 const reporter = () =>
   new MetadataReporter("https://api.solwyn.test", `sk_proj_${"0".repeat(64)}`, {
@@ -26,5 +30,18 @@ it.each([
   allowIngestContractDrift();
   vi.restoreAllMocks();
   reporter()._parseIngestRejections(body, 1);
+  expect(assertNoIngestContractDrift).toThrow("Unexpected ingest contract drift");
+});
+
+it("detects ingest drift after the reporter module is reloaded", async () => {
+  allowIngestContractDrift();
+  vi.resetModules();
+  const { MetadataReporter: ReloadedReporter } = await import("../../src/reporter");
+  expect(ReloadedReporter).not.toBe(MetadataReporter);
+  installIngestContractGuard(ReloadedReporter);
+  const reloaded = new ReloadedReporter("https://api.solwyn.test", `sk_proj_${"0".repeat(64)}`, {
+    logger: noopLogger,
+  });
+  reloaded._parseIngestRejections({ ingested: 1, rejected: [] }, 1);
   expect(assertNoIngestContractDrift).toThrow("Unexpected ingest contract drift");
 });

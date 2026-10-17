@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, LeaseGrantResponse, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { installIngestContractGuard } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -102,6 +103,7 @@ describe("node beforeExit reporter drain", () => {
     }) as typeof process.once);
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const order: string[] = [];
     const ingestBodies: MetadataEvent[][] = [];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
@@ -168,6 +170,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const firstGate = deferred<Response>();
     const secondGate = deferred<Response>();
     const firstFetch = vi.fn(() => firstGate.promise);
@@ -213,6 +216,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
 
     const firstGate = deferred<Response>();
     const firstFetch = vi.fn(() => firstGate.promise);
@@ -265,6 +269,7 @@ describe("node beforeExit reporter drain", () => {
       .mockRejectedValue(new TypeError("global fetch must not be used"));
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const { BudgetEnforcer } = await import("../../src/budget");
     const order: string[] = [];
     const reporterGate = deferred<Response>();
@@ -356,6 +361,7 @@ describe("node beforeExit reporter drain", () => {
     }) as typeof process.once);
     await import("../../src/node");
     const { MetadataReporter } = await import("../../src/reporter");
+    installIngestContractGuard(MetadataReporter);
     const reporterGate = deferred<Response>();
     const reporterFetch = vi.fn(() => reporterGate.promise);
     const reporter = new MetadataReporter(API_URL, API_KEY, { fetch: reporterFetch });

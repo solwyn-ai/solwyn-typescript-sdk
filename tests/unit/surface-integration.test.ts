@@ -13,6 +13,7 @@ import { buildRuntimes } from "../../src/registry";
 import { MetadataReporter } from "../../src/reporter";
 import type { FetchLike } from "../../src/transport";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
+import { installIngestContractGuard } from "../helpers/ingest-contract";
 
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const MODEL = "gpt-4o-mini";
@@ -281,6 +282,7 @@ describe("public surface controls", () => {
     });
     vi.resetModules();
     const secondSdk = await import("../../src/index");
+    installIngestContractGuard((await import("../../src/reporter")).MetadataReporter);
     const secondClientModule = await import("../../src/client");
     const second = new secondSdk.Solwyn(fakeOpenAI().client, {
       ...PUBLIC_SURFACE_OPTIONS,

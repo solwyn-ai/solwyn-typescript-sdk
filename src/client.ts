@@ -176,7 +176,7 @@ import {
 } from "./surfaces";
 import { captureTags } from "./tags";
 import type { TokenDetails } from "./token-details";
-import { buildTokenDetails, zeroTokenDetails } from "./token-details";
+import { buildTokenDetails, isUsageUnmeasured, zeroTokenDetails } from "./token-details";
 import { type FetchLike, requireFetchLike } from "./transport";
 import type {
   BudgetMode,
@@ -3572,7 +3572,7 @@ export class SolwynCore {
         this.#streamSettlements.delete(streamToken);
         try {
           let settledTokenDetails = tokenDetails;
-          let usageUnmeasured = tokenDetails.is_estimated;
+          let usageUnmeasured = isUsageUnmeasured(tokenDetails);
           if (settlement.surface === "responses") {
             if (tokenDetails.input_tokens === 0 && tokenDetails.output_tokens === 0) {
               settledTokenDetails = buildTokenDetails({
@@ -3581,7 +3581,7 @@ export class SolwynCore {
                 is_estimated: true,
               });
               usageUnmeasured = true;
-            } else if (tokenDetails.is_estimated) {
+            } else if (isUsageUnmeasured(tokenDetails)) {
               usageUnmeasured = true;
             }
           }

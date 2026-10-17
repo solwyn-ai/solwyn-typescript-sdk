@@ -120,9 +120,8 @@ class UntrackedReportState {
     if (!final) return now >= this.#nextDueAt;
     for (const observation of this.#observations.values()) {
       if (observation.disabled || now < observation.poisonUntil) continue;
-      if (observation.pending !== null) {
-        if (now >= observation.pending.nextAttemptAt) return true;
-      } else if (observation.totalOccurrences > observation.sentCursor) return true;
+      if (observation.pending !== null || observation.totalOccurrences > observation.sentCursor)
+        return true;
     }
     return false;
   }
@@ -217,7 +216,7 @@ class UntrackedReportState {
     for (const [key, observation] of this.#observations) {
       if (observation.disabled) continue;
       if (observation.pending !== null) {
-        if (monotonicNow >= observation.pending.nextAttemptAt) {
+        if (final || monotonicNow >= observation.pending.nextAttemptAt) {
           observation.pending.nextAttemptAt = Number.POSITIVE_INFINITY;
           built.push(observation.pending);
         } else this.#noteDue(observation);
@@ -324,6 +323,7 @@ export class UntrackedSurfaceReporter {
   #disabled = false;
   #rateLimitedUntil = 0;
   readonly #lastFailureLogAt = new Map<string, number>();
+  #retryExhaustedSinceLog = 0;
   readonly #warnedLocalClientShapes = new Set<SurfaceClientShape>();
   #activeFlush: Promise<void> | undefined;
   #flushRequested = false;
@@ -486,6 +486,7 @@ export class UntrackedSurfaceReporter {
     if (rateLimited) {
       this.#rateLimitedUntil = Math.max(this.#rateLimitedUntil, now + retryAfterMs);
     }
+    let exhausted = 0;
     for (const built of batch) {
       if (rateLimited) built.rateLimitAttempts += 1;
       else built.attempts += 1;
@@ -494,7 +495,7 @@ export class UntrackedSurfaceReporter {
         built.rateLimitAttempts >= MAX_RATE_LIMIT_ATTEMPTS
       ) {
         this.#state.markSent([built]);
-        this.#logger.warn("untracked.retry_exhausted");
+        exhausted += 1;
         continue;
       }
       const delay = Math.max(
@@ -508,6 +509,13 @@ export class UntrackedSurfaceReporter {
       );
       this.#state.defer([built], now + delay);
       if (rateLimited) this.#rateLimitedUntil = Math.max(this.#rateLimitedUntil, now + delay);
+    }
+    this.#retryExhaustedSinceLog += exhausted;
+    const last = this.#lastFailureLogAt.get("retry_exhausted");
+    if (this.#retryExhaustedSinceLog > 0 && (last === undefined || now - last >= 60_000)) {
+      this.#lastFailureLogAt.set("retry_exhausted", now);
+      this.#logger.warn("untracked.retry_exhausted: reports=%d", this.#retryExhaustedSinceLog);
+      this.#retryExhaustedSinceLog = 0;
     }
   }
 

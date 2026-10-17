@@ -485,10 +485,16 @@ export class Transport {
           throw new TransportNetworkError("response arrived after the attempt ended");
         }
         if (!response.ok) {
+          let retryAfterMs: number | undefined;
+          try {
+            retryAfterMs = parseRetryAfter(response.headers.get("Retry-After"));
+          } catch {
+            // Custom fetch responses may lack a usable headers interface.
+          }
           const failure = new TransportHttpError(
             response.status,
             await sanitizedHttpMarker(response),
-            parseRetryAfter(response.headers.get("Retry-After")),
+            retryAfterMs,
           );
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.

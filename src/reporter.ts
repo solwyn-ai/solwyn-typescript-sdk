@@ -199,14 +199,15 @@ class BoundedQueue<T> {
 
   /**
    * A claimed prefix keeps its older positions. Evict the newest refill suffix
-   * when restoring it would exceed the cap; return evictions oldest-first.
+   * when restoring it would exceed the cap; final delivery preserves all work.
+   * Return evictions oldest-first.
    */
-  restorePrefix(prefix: readonly T[]): T[] {
+  restorePrefix(prefix: readonly T[], bypassCapacity = false): T[] {
     for (let index = prefix.length - 1; index >= 0; index -= 1) {
       this.items.set(--this.head, prefix[index] as T);
     }
     const evicted: T[] = [];
-    while (this.length > this.maxSize) {
+    while (!bypassCapacity && this.length > this.maxSize) {
       this.tail -= 1;
       evicted.push(this.items.get(this.tail) as T);
       this.items.delete(this.tail);
@@ -692,7 +693,7 @@ export class MetadataReporter {
   }
 
   private _restoreEventPrefix(prefix: readonly PendingEvent[], emit = true): void {
-    const evicted = this.metadataQueue.restorePrefix(prefix);
+    const evicted = this.metadataQueue.restorePrefix(prefix, this.finalDeliveryStarted);
     for (const pending of evicted) {
       this._foldOrRecordEventDrop(pending.item, "overflow");
     }
@@ -1372,7 +1373,10 @@ export class MetadataReporter {
             if (result.outcome === "dropped") {
               stage.claims.delete(token);
               stage.dispose(item, "terminal_status");
-            } else if (!this._scheduleRetry(pending, result) || final) {
+            } else if (
+              !this._scheduleRetry(pending, result) ||
+              (final && (result.retryAfterMs ?? 0) <= 0)
+            ) {
               stage.claims.delete(token);
               stage.dispose(item, "retry_exhausted");
             } else {
@@ -1387,8 +1391,28 @@ export class MetadataReporter {
       }
     };
     dispatch();
-    while (active.size > 0) {
-      await Promise.race(active);
+    while (true) {
+      if (active.size > 0) {
+        await Promise.race(active);
+        dispatch();
+        continue;
+      }
+      const head = stage.queue.peek();
+      if (
+        !final ||
+        blocked ||
+        head === undefined ||
+        this.deliveryClosed ||
+        this._deadlineExpired(deadline)
+      ) {
+        break;
+      }
+      const pending = stage.confirm(head);
+      if (pending.retryNotBefore <= this.monotonicClock()) break;
+      if (!(await this._waitForRetryAfter(pending.retryNotBefore, deadline))) {
+        if (this.deliveryClosed || this._deadlineExpired(deadline)) break;
+        stage.dispose(stage.queue.shift() as T, "rate_limited");
+      }
       dispatch();
     }
     if (restore.length > 0 && !this.deliveryClosed && !this._deadlineExpired(deadline)) {
@@ -1398,6 +1422,7 @@ export class MetadataReporter {
           .filter(({ token }) => stage.claims.delete(token))
           .map(({ item }) => item),
       );
+      if (final) return this._drainControlQueue(stage, cycle, deadline, true);
       // A successful half-open probe can close the breaker while siblings are held.
       return held && this.controlPlaneBreaker?.getState().state === "closed" && headDue();
     }
@@ -1506,8 +1531,41 @@ export class MetadataReporter {
       if (!final && batchesLeft <= 0) {
         return { clean: cleanNow(), more: this._headDue(this.metadataQueue.peek()) };
       }
+      const head = this.metadataQueue.peek();
+      if (
+        final &&
+        head !== undefined &&
+        !(await this._waitForRetryAfter(
+          Math.max(this.telemetryRetryNotBefore, head.retryNotBefore),
+          deadline,
+        ))
+      ) {
+        if (this.deliveryClosed || this._deadlineExpired(deadline)) break;
+        const now = this.monotonicClock();
+        const held = this.metadataQueue.drainWhileUpTo(
+          this.batchSize,
+          (pending) => Math.max(this.telemetryRetryNotBefore, pending.retryNotBefore) > now,
+        );
+        this._disposeEvents(
+          held.map((pending) => pending.item),
+          "rate_limited",
+          { forceTerminal: true },
+        );
+        cycleClean = false;
+        continue;
+      }
       const claimed = this._claimEventBatch(final);
-      if (claimed === null) break;
+      if (claimed === null) {
+        // An active breaker report can extend the shared hold while final delivery waits.
+        if (
+          final &&
+          this.metadataQueue.length > 0 &&
+          this.monotonicClock() < this.telemetryRetryNotBefore
+        ) {
+          continue;
+        }
+        break;
+      }
       batchesLeft -= 1;
       const [token, pendingBatch] = claimed;
       const valid: PendingEvent[] = [];
@@ -1566,7 +1624,7 @@ export class MetadataReporter {
       const exhausted: MetadataEvent[] = [];
       for (const pending of valid) {
         const retry = this._scheduleRetry(pending, result);
-        if (final || !retry) {
+        if (!retry || (final && (result.retryAfterMs ?? 0) <= 0)) {
           exhausted.push(pending.item);
         } else {
           survivors.push(pending);
@@ -1578,6 +1636,7 @@ export class MetadataReporter {
         forceTerminal: final,
       });
       this._maybeLogDrops(false);
+      if (final && survivors.length > 0) continue;
       return { clean: cleanNow(), more: false };
     }
     return { clean: cleanNow(), more: false };
@@ -1985,6 +2044,27 @@ export class MetadataReporter {
     if (effective === null) return ordinaryTimeout;
     const remaining = effective - this.monotonicClock();
     return Math.max(50, Math.min(5000, remaining));
+  }
+
+  /** Final delivery bypasses local backoff, but waits only for server holds that fit. */
+  private async _waitForRetryAfter(notBefore: number, deadline?: number): Promise<boolean> {
+    while (!this.deliveryClosed && !this._deadlineExpired(deadline)) {
+      const remaining = notBefore - this.monotonicClock();
+      if (remaining <= 0) return true;
+      const effective = this._effectiveDeadline(deadline);
+      if (effective !== null && notBefore >= effective) return false;
+      await new Promise<void>((resolve) => {
+        const signal = this.deliveryAbortController.signal;
+        const finish = (): void => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, Math.min(2 ** 31 - 1, remaining));
+        signal.addEventListener("abort", finish, { once: true });
+      });
+    }
+    return false;
   }
 
   /** Race an advisory worker against the one absolute close deadline. */

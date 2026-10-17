@@ -119,8 +119,9 @@ corresponding release notes before users upgrade.
   overruns in `alert_only` mode with a reservation and negative remaining budget, including
   `solwyn-test/deny-alert` checks and leases. Scoped and run denials use `hard_deny`. Lease
   `postureMode` can model independent scoped enforcement; `final_grant` applies only to a hard
-  posture. Opted-in text checks provide price hints, legacy checks omit directive keys, and all
-  opted-in stopped-run verdicts include the directive. `stopRun()` accepts only `manual_kill`;
+  posture. Opted-in text checks provide price hints (`priceHints: null` returns an empty map,
+  rather than omitting the field), legacy checks omit directive keys, and all opted-in stopped-run
+  verdicts include the directive. `stopRun()` accepts only `manual_kill`;
   `runUsage` supplies explicit synthetic stopped-run spend. Default lease timers are 120 seconds
   with a 15-second refresh.
 - **Server-faithful testing ingestion (preview breaking).** The test double returns duplicate
@@ -231,10 +232,18 @@ corresponding release notes before users upgrade.
 - **Healthy control-plane refusals.** Confirmation 4xx and 503 responses count as reachability,
   matching lease operations, so terminal confirmation refusals cannot open the shared breaker.
 - **Reliable untracked-surface reports.** Closing flushes unsent occurrences without the normal
-  fifteen-minute gate and uses the configured reporter shutdown deadline. Retries keep the same
-  report ID, occurrence count, and cursor; later observations form a separate report. Refused
+  fifteen-minute gate or local retry backoff and uses the configured reporter shutdown deadline.
+  Retries keep the same report ID, occurrence count, and cursor; later observations form a
+  separate report. Refused
   keys stop retrying, failures produce rate-limited diagnostics, and read-only credentials use
-  the shared configuration diagnostic. Reads with nothing due use a constant-time schedule check.
+  the shared configuration diagnostic. Retry exhaustion is aggregated at most once per minute.
+  Reads with nothing due use a constant-time schedule check.
+- **Shutdown delivery across server retry holds.** Final confirmation and metadata flushes wait
+  for short `Retry-After` holds within the remaining close deadline. Longer holds are counted as
+  `rate_limited` losses, and unsent settlement confirmations still release their paired metadata
+  for ingestion.
+- **Custom fetch HTTP failures.** Missing or throwing response-header access no longer turns an
+  HTTP refusal into a network failure or prevents unused response bodies from being discarded.
 - **Provider-health heartbeat recovery.** A failed unchanged heartbeat remains due for a normal
   backoff retry before the server's snapshot expires. Reports allow ten seconds for delivery and
   use strictly increasing per-provider timestamps even if the wall clock stalls or rolls back.
@@ -245,10 +254,12 @@ corresponding release notes before users upgrade.
   applied. Missing fields, extra keys, and unknown rejection codes count as contract drift;
   an explicitly logged fallback still surfaces usable per-event rejections.
 - **Lease reconciliation and cache usage.** Every lease-funded settlement's metadata now carries
-  its confirmation's lease ID, including when confirmation delivery is abandoned or local
-  confirmation construction fails. Overlapping cache buckets are clamped to the input total and
-  marked estimated during normalization; unnormalized
-  invalid cache breakdowns are rejected locally before they can invalidate a whole ingest batch.
+  its confirmation's lease ID, including when the confirmation is abandoned or local
+  confirmation construction fails. Cache normalization preserves reported read/write buckets and
+  raises an inconsistent input total to their sum, marking the correction estimated without
+  retaining the lease reservation floor. Missing or malformed usage still retains that floor.
+  Unnormalized invalid cache breakdowns are rejected locally before they can invalidate a whole
+  ingest batch.
 - **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
   now produces the budget warning while retaining the reservation for settlement. Alert-only
   budget-limit logs emit at most once every 30 seconds per enforcer; every affected result

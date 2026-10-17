@@ -1,5 +1,5 @@
 import type { Logger } from "./logging";
-import { buildTokenDetails, type TokenDetails } from "./token-details";
+import { buildTokenDetails, isUsageUnmeasured, type TokenDetails } from "./token-details";
 import type { MediaUsage } from "./types";
 
 export interface FailSoftUsage {
@@ -52,7 +52,7 @@ export function extractUsageFailSoft(options: UsageOptions): FailSoftUsage {
   const selected = estimated ?? extracted;
   if (options.estimateEmptyUsage === true && providerUsageEmpty) {
     if (estimated?.is_estimated === true) {
-      return { tokenDetails: estimated, usageUnmeasured: true };
+      return { tokenDetails: estimated, usageUnmeasured: isUsageUnmeasured(estimated) };
     }
     return {
       tokenDetails: buildTokenDetails({
@@ -64,7 +64,7 @@ export function extractUsageFailSoft(options: UsageOptions): FailSoftUsage {
     };
   }
   if (selected !== null && selected !== undefined) {
-    return { tokenDetails: selected, usageUnmeasured: selected.is_estimated };
+    return { tokenDetails: selected, usageUnmeasured: isUsageUnmeasured(selected) };
   }
   return {
     tokenDetails: buildTokenDetails({

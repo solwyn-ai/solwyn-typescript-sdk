@@ -125,6 +125,44 @@ describe("Transport — URL + headers + body", () => {
 
 describe("Transport — non-2xx surfacing (D10 generic handling)", () => {
   it.each([
+    "missing",
+    "throwing headers",
+    "throwing get",
+  ])("preserves HTTP failures and discards the body with %s from a custom fetch", async (shape) => {
+    const response = new Response("synthetic failure", { status: 503 });
+    Object.defineProperty(
+      response,
+      "headers",
+      shape === "missing"
+        ? { value: undefined }
+        : shape === "throwing headers"
+          ? {
+              get() {
+                throw new TypeError("unavailable headers");
+              },
+            }
+          : {
+              value: {
+                get() {
+                  throw new TypeError("unavailable header");
+                },
+              },
+            },
+    );
+    const transport = new Transport("https://api.solwyn.test", API_KEY, {
+      fetch: async () => response,
+    });
+
+    const error = await transport
+      .postJson(METADATA_INGEST_PATH, [], { timeoutMs: 1000 })
+      .catch((error: unknown) => error);
+
+    expect(error).toBeInstanceOf(TransportHttpError);
+    expect(error).toMatchObject({ status: 503, retryAfterMs: undefined });
+    expect(response.bodyUsed).toBe(true);
+  });
+
+  it.each([
     ["60", 60_000],
     ["Thu, 01 Jan 2026 00:01:00 GMT", 60_000],
     ["Wed, 31 Dec 2025 23:59:00 GMT", 0],

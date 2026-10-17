@@ -5,7 +5,8 @@
  * It is a pure data struct with a single wire-serialization quirk: `is_estimated`
  * is OMITTED from the serialized JSON entirely when `false` (key-absent means
  * provider-reported), and only emitted (`true`) when the counts are SDK-side
- * length-based estimates. It carries zero prompt/response content.
+ * estimates or inconsistent cache totals needed normalization. It carries zero
+ * prompt/response content.
  *
  * Ported from `solwyn/_token_details.py`. Per D1 / wire-contract, every numeric
  * field is bounded `0 <= n <= 100_000_000` (the API's canonical model bound; the
@@ -72,6 +73,14 @@ export const TokenDetailsSchema = z
 /** Parsed TokenDetails shape (all fields present, defaults applied). */
 export type TokenDetails = z.infer<typeof TokenDetailsSchema>;
 
+/** Cache-only corrections keep measured usage without adding a wire field or retaining it. */
+const measuredCacheAdjustments = new WeakSet<TokenDetails>();
+
+/** Missing/malformed usage needs a reservation floor; cache-only normalization does not. */
+export function isUsageUnmeasured(details: TokenDetails): boolean {
+  return details.is_estimated && !measuredCacheAdjustments.has(details);
+}
+
 /**
  * Construct a validated TokenDetails from a partial set of counters.
  * Omitted fields default to 0 (or false for `is_estimated`).
@@ -99,7 +108,7 @@ export function createTokenDetails(partial: Partial<TokenDetails> = {}): TokenDe
  * is caught at that boundary, matching Python's unbounded vendored model.
  */
 export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDetails {
-  return clampCacheBuckets({
+  return normalizeCacheInput({
     input_tokens: partial.input_tokens ?? 0,
     output_tokens: partial.output_tokens ?? 0,
     cached_input_tokens: partial.cached_input_tokens ?? 0,
@@ -117,8 +126,8 @@ export function buildTokenDetails(partial: Partial<TokenDetails> = {}): TokenDet
   });
 }
 
-/** Preserve the input total; trim cache reads, then short- and long-lived writes to fit. */
-function clampCacheBuckets(details: TokenDetails): TokenDetails {
+/** Input includes all cache reads/writes; preserve those buckets and raise a deficient total. */
+function normalizeCacheInput(details: TokenDetails): TokenDetails {
   const fields = [
     "cached_input_tokens",
     "cache_creation_5m_tokens",
@@ -126,12 +135,11 @@ function clampCacheBuckets(details: TokenDetails): TokenDetails {
   ] as const;
   if (!isUsageCount(details.input_tokens) || fields.some((field) => !isUsageCount(details[field])))
     return details;
-  let remaining = details.input_tokens;
-  for (const field of fields) {
-    const count = Math.min(details[field], remaining);
-    if (count !== details[field]) details.is_estimated = true;
-    details[field] = count;
-    remaining -= count;
+  const cacheTotal = fields.reduce((total, field) => total + details[field], 0);
+  if (cacheTotal > details.input_tokens) {
+    if (!details.is_estimated) measuredCacheAdjustments.add(details);
+    details.input_tokens = cacheTotal;
+    details.is_estimated = true;
   }
   return details;
 }
@@ -162,7 +170,7 @@ export function buildReportedTokenDetails(
     if (isUsageCount(value)) details[field] = value;
     else if (value !== undefined && value !== null) details.is_estimated = true;
   }
-  return clampCacheBuckets(details);
+  return normalizeCacheInput(details);
 }
 
 /**

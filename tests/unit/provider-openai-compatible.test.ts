@@ -758,7 +758,7 @@ describe("extractUsage — non-streaming", () => {
     expect(adapter.extractServiceTier({})).toBeNull();
   });
 
-  it("clamps overlapping Z.ai cache reads and writes through the shared OpenAI path", () => {
+  it("preserves Z.ai cache reads and writes while raising an inconsistent input total", () => {
     const td = adapterNamed("zai").extractUsage({
       usage: {
         prompt_tokens: 12,
@@ -766,8 +766,9 @@ describe("extractUsage — non-streaming", () => {
         prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 9 },
       },
     });
+    expect(td.input_tokens).toBe(13);
     expect(td.cached_input_tokens).toBe(4);
-    expect(td.cache_creation_5m_tokens).toBe(8);
+    expect(td.cache_creation_5m_tokens).toBe(9);
     expect(td.is_estimated).toBe(true);
     expect(td.cache_creation_1h_tokens).toBe(0);
     expect(td.reasoning_tokens).toBe(0);

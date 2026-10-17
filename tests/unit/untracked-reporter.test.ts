@@ -394,6 +394,85 @@ describe("UntrackedSurfaceReporter", () => {
     expect(counts).toEqual([1, 99]);
   });
 
+  it("retries a pending report at close before sending its later occurrences", async () => {
+    let now = 0;
+    let sequence = 0;
+    const bodies: Array<Array<{ report_id: string; occurrences: number }>> = [];
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => now,
+      randomUUID: () => reportId(++sequence),
+      random: () => 1,
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(null, { status: bodies.length === 1 ? 500 : 204 });
+      },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    reporter.observe(observation({ occurrences: 99 }));
+    now = 100;
+    await reporter.close();
+
+    expect(bodies).toHaveLength(3);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[2]?.[0]).toMatchObject({ report_id: reportId(2), occurrences: 99 });
+  });
+
+  it("keeps a server Retry-After hold during the final flush", async () => {
+    let now = 0;
+    const bodies: unknown[] = [];
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => now,
+      fetch: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(null, { status: 429, headers: { "Retry-After": "60" } });
+      },
+    });
+    reporter.observe(observation());
+    await reporter.flushDue();
+    reporter.observe(observation({ occurrences: 99 }));
+    now = 100;
+    await reporter.close();
+
+    expect(bodies).toHaveLength(1);
+  });
+
+  it("aggregates retry exhaustion warnings at most once per minute", async () => {
+    let now = 0;
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
+      sdkInstanceId: "synthetic",
+      monotonicClock: () => now,
+      maxSendAttempts: 1,
+      logger,
+      fetch: async () => new Response(null, { status: 500 }),
+    });
+    const exhaustionWarnings = () =>
+      logger.warn.mock.calls.filter(([message]) =>
+        String(message).startsWith("untracked.retry_exhausted"),
+      );
+    for (let index = 0; index < 101; index += 1) {
+      reporter.observe(observation({ surface: `resource.entry_${index}` }));
+    }
+    await reporter.flushDue();
+    expect(exhaustionWarnings()).toEqual([["untracked.retry_exhausted: reports=%d", 100]]);
+
+    now = 59_999;
+    reporter.observe(observation({ surface: "resource.later" }));
+    await reporter.flushDue();
+    expect(exhaustionWarnings()).toHaveLength(1);
+    now = 60_000;
+    reporter.observe(observation({ surface: "resource.latest" }));
+    await reporter.flushDue();
+    expect(exhaustionWarnings()).toEqual([
+      ["untracked.retry_exhausted: reports=%d", 100],
+      ["untracked.retry_exhausted: reports=%d", 3],
+    ]);
+    await reporter.close();
+  });
+
   it.each([400, 403, 422])("logs HTTP %d once and stops retrying refused keys", async (status) => {
     const warn = vi.fn();
     const fetch = vi.fn(async () => new Response(null, { status }));

@@ -501,6 +501,17 @@ export function classifyException(exc: unknown): Disposition {
   }
 }
 
+/** Established streams need positive evidence before an error is health-neutral. */
+export function isNeutralStreamError(error: unknown): boolean {
+  try {
+    if (isCallerAbort(error)) return true;
+    const status = readStatus(error);
+    return status !== null && status >= 400 && status < 500 && status !== 429;
+  } catch {
+    return false;
+  }
+}
+
 function classifyInspectableException(exc: unknown): Disposition {
   const names = errorTypeNames(exc);
 

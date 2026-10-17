@@ -30,7 +30,7 @@
  * can embed streamed content into.
  */
 
-import { SolwynError } from "./errors";
+import { markCallerAbort, SolwynError } from "./errors";
 import type { Logger } from "./logging";
 import { consoleLogger } from "./logging";
 import type { StreamUsageAccumulator } from "./providers/protocol";
@@ -720,7 +720,7 @@ export function observeResponseStream(
   listen("abort", (error) => {
     // Before connect this is a rejected request entry, not abandoned generated output.
     if (connected) finish(false);
-    else finish(true, error);
+    else finish(true, markCallerAbort(error, provider.controller.signal));
   });
   listen("response.completed", () => finish(false));
   listen("end", () => finish(false));

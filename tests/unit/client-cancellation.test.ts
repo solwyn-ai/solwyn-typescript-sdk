@@ -4,9 +4,12 @@ import { CircuitBreaker } from "../../src/circuit-breaker";
 import type { SolwynOptions } from "../../src/client";
 import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
+import { run } from "../../src/node";
+import { resetRunControlForTest } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
 
 afterEach(() => {
+  resetRunControlForTest();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -55,6 +58,49 @@ const usage = { prompt_tokens: 17, completion_tokens: 6 };
 const aborted = () => new DOMException("cancelled", "AbortError");
 
 describe("caller cancellation", () => {
+  it.each([
+    "chat",
+    "responses",
+    "media",
+  ] as const)("already-aborted %s calls do not feed velocity or stop a run", async (surface) => {
+    const create = vi.fn(async (_params: Record<string, unknown>, _options?: unknown) => ({
+      usage,
+    }));
+    const control = controlPlane({ velocityMode: "deny", velocityRepeatCount: 3 });
+    const sdk = new Solwyn(
+      {
+        chat: { completions: { create } },
+        responses: { create },
+        embeddings: { create },
+      },
+      control.options,
+    );
+    const call = (signal?: AbortSignal) => {
+      if (surface === "media")
+        return sdk.embeddings.create(
+          { model: "text-embedding-3-small", input: "synthetic" },
+          { signal },
+        );
+      if (surface === "responses")
+        return sdk.responses.create({ model: "gpt-4o", input: "synthetic" }, { signal });
+      return sdk.chat.completions.create({ model: "gpt-4o" }, { signal });
+    };
+    try {
+      await run("preaborted-calls", async () => {
+        const caller = new AbortController();
+        caller.abort();
+        for (let index = 0; index < 3; index++)
+          await expect(call(caller.signal)).rejects.toBe(caller.signal.reason);
+        await call();
+      });
+    } finally {
+      await sdk.close();
+    }
+    expect(create).toHaveBeenCalledOnce();
+    expect(control.events).toMatchObject([{ status: "success" }]);
+    expect(control.events).toHaveLength(1);
+  });
+
   it.each([
     "safe",
     "always",

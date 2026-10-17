@@ -659,8 +659,12 @@ JavaScript provider SDKs expose one per-request timeout rather than separate con
 Circuit breakers, latency signals, and failover labeling key off the provider **name** — so give distinct endpoints distinct identities (via `provider` or the 4th fallback element) when you want them tracked separately.
 
 Caller cancellation never advances to another provider or counts as a provider failure. A
-cancelled stream settles the usage observed so far, using the reservation floor when usage is
-estimated. SDK request-deadline aborts still count as provider failures. A half-open streaming
+cancelled established stream settles the usage observed so far, using the reservation floor
+when usage is estimated. Cancellation of a dispatched request before connection, including
+deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
+funding, and does not confirm usage or record latency. Already-aborted requests skip velocity
+detection and budget I/O.
+SDK request-deadline aborts still count as provider failures. A half-open streaming
 probe is held for at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second
 minimum. Expiry or finalization releases it neutrally, so an unread stream cannot block later
 recovery indefinitely. Its later outcome cannot affect a newer probe.
@@ -1033,16 +1037,23 @@ also reject if first activated after closing begins. Repeated `close()` and asyn
 the same shutdown promise.
 
 Buffered calls and stream setup already in flight drain within `reporterShutdownDeadline`;
-settlement delivery uses the time remaining in that same deadline. A call that outlasts it can
-finish after reporting closes, and the SDK logs a shutdown warning with the number still active.
-The settlement reporter closes first, followed by the advisory reporter, budget/lease holder,
-and wrapped provider.
+settlement delivery and the advisory reporter use the time remaining in that same deadline.
+A call that outlasts it can finish after reporting closes, and the SDK logs a shutdown warning
+with the number still active. The settlement reporter closes first, followed by the advisory
+reporter, budget/lease holder, and wrapped provider. Lease cleanup has a separate one-second
+budget, so Solwyn's asynchronous shutdown work is bounded by `reporterShutdownDeadline + 1`
+seconds, plus the wrapped provider's own `close()` duration.
 
 Open streams settle once from usage observed so far, without waiting for the consumer to pull
-another chunk. Further chunks are withheld at the next provider-chunk boundary. Finish or
-cancel streams before closing the client when you need their terminal usage included; provider
-stream cleanup still belongs to the consumer. Usage that is estimated retains the reservation
-floor during settlement.
+another chunk. A subsequent pull rejects with `SolwynError("client is closed")` at the next
+provider-chunk boundary. Finish or cancel streams before closing the client when you need their
+terminal usage included; provider stream cleanup still belongs to the consumer. Usage that is
+estimated retains the reservation floor during settlement.
+
+When garbage collection finalizes an abandoned stream, it settles the usage observed so far
+and releases its run and lease ownership instead of retaining them until client shutdown.
+Estimated usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
+or cancel streams explicitly for deterministic settlement.
 
 Or let `await using` do it:
 

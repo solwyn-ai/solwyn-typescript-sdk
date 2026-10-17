@@ -63,6 +63,7 @@ import type { CoverageRuntime, CoverageSource } from "./coverage";
 import { safeErrorClassName } from "./error-class";
 import {
   ConfigurationError,
+  isCallerAbort,
   ProviderUnavailableError,
   RunStoppedError,
   SolwynError,
@@ -120,6 +121,7 @@ import {
   dropForeignCandidates,
   HealthBasedPolicy,
   type IdempotencyMode,
+  isNeutralStreamError,
   LatencyTracker,
   type ProviderCandidate,
   providerNameOf,
@@ -198,6 +200,8 @@ function streamReleaseCallback(
   admission: CircuitBreakerAdmission,
   releaseTermination: (() => void) | undefined,
   probeTimeoutMs: number,
+  settlements: Map<object, () => void>,
+  token: object,
 ): () => void {
   // Retain the single probe until terminal health is known, but never beyond one
   // recovery window (at least one second). Expiry consumes the admission neutrally;
@@ -214,6 +218,9 @@ function streamReleaseCallback(
     timer = undefined;
     breaker.releaseProbe(admission);
     releaseTermination?.();
+    const settle = settlements.get(token);
+    settlements.delete(token);
+    settle?.();
   };
 }
 
@@ -1131,7 +1138,7 @@ export class SolwynCore {
   #initPromise: Promise<InitState> | null = null;
   #closePromise: Promise<void> | null = null;
   readonly #inFlightCalls = new Set<Promise<void>>();
-  readonly #streamSettlements = new Set<() => void>();
+  readonly #streamSettlements = new Map<object, () => void>();
   #failoverTuningSuppressionLogged = false;
 
   constructor(client: unknown, options: SolwynOptions = {}) {
@@ -2293,15 +2300,15 @@ export class SolwynCore {
       modality: surface === "responses" ? "text" : undefined,
       estimatedMedia: null,
     };
+    const signal = callerAbortSignal(passthroughArgs, mergedPrimary, primaryDialect);
+    if (signal?.aborted) throw callerAbortError(signal);
     const velocity = this.#precheckRunControl(admission);
 
     // Budget pre-flight (behavior 4): checked ONCE against the PRIMARY provider/model,
     // before any hop, bounded by the SAME chain deadline. A deny throws a typed budget/stop
-    // error and the wrapped client is never called. checkBudget never throws
-    // (it degrades on an outage per its own sticky-deny -> fail-open -> local-enforcement
-    // precedence — invariant 9 lives inside it); the client never swallows its result.
-    const signal = callerAbortSignal(passthroughArgs, mergedPrimary, primaryDialect);
-    if (signal?.aborted) throw callerAbortError(signal);
+    // error and the wrapped client is never called. Outages return a local verdict under
+    // retained-denial -> fail-open -> local-enforcement precedence; caller cancellation
+    // can reject preflight. The client preserves either result.
     const budget = budgetCheckResult(
       await this.#budget.checkBudget({
         runLifetime: run?.lifetime,
@@ -2466,9 +2473,9 @@ export class SolwynCore {
       modality: spec.modality,
       estimatedMedia,
     };
-    const velocity = this.#precheckRunControl(admission);
     const signal = callerAbortSignal(passthroughArgs, merged, primary.adapter.dialect);
     if (signal?.aborted) throw callerAbortError(signal);
+    const velocity = this.#precheckRunControl(admission);
     const budget = budgetCheckResult(
       await this.#budget.checkBudget({
         runLifetime: run?.lifetime,
@@ -3042,7 +3049,9 @@ export class SolwynCore {
       this.#safeWarn("budget.confirm_construction_failed: paid usage retained conservatively");
       // Preserve the independent success receipt where its structural metadata is valid.
       try {
-        this.#reporter.report(event);
+        this.#reporter.report(
+          options.leaseId == null ? event : { ...event, lease_id: options.leaseId },
+        );
       } catch {
         /* Reporting cannot replace provider success. */
       }
@@ -3542,16 +3551,25 @@ export class SolwynCore {
           ? undefined
           : new ProvisionalTerminationHandoff(ctx.streamTermination.handle);
       let streamSettled = false;
+      const streamToken = {};
       // Close retains only content-blind settlement state, never the provider stream or request.
       // Consumer-held streams are settled at observed usage without awaiting another chunk.
       const settleOnClose = (): void => {
+        if (streamSettled) return;
+        this.#streamSettlements.delete(streamToken);
         releaseStream?.();
-        completeStream(accumulator.finalize(), nowMs() - hopStarted);
+        const usage = extractUsageFailSoft({
+          extract: () => accumulator.finalize(),
+          estimate: () => null,
+          estimatedInputTokens: settlement.estimatedInputTokens,
+          logger: this.#logger,
+        });
+        completeStream(usage.tokenDetails, nowMs() - hopStarted);
       };
       const completeStream = (tokenDetails: TokenDetails, elapsedMs: number): void => {
         if (streamSettled) return;
         streamSettled = true;
-        this.#streamSettlements.delete(settleOnClose);
+        this.#streamSettlements.delete(streamToken);
         try {
           let settledTokenDetails = tokenDetails;
           let usageUnmeasured = tokenDetails.is_estimated;
@@ -3613,6 +3631,8 @@ export class SolwynCore {
         admission,
         terminationHandoff?.abortRelease,
         Math.max(1, this.#config.circuit_breaker_recovery_timeout) * 1000,
+        this.#streamSettlements,
+        streamToken,
       );
       const streamOptions: StreamWrapperOptions = {
         stream: source,
@@ -3621,12 +3641,18 @@ export class SolwynCore {
         onComplete: completeStream,
         onError: (error) => {
           if (streamSettled) return;
-          if (settlement.callerSignal?.aborted) {
+          if (settlement.callerSignal?.aborted || isCallerAbort(error)) {
             breaker.releaseProbe(admission);
-            return completeStream(accumulator.finalize(), nowMs() - hopStarted);
+            const usage = extractUsageFailSoft({
+              extract: () => accumulator.finalize(),
+              estimate: () => null,
+              estimatedInputTokens: settlement.estimatedInputTokens,
+              logger: this.#logger,
+            });
+            return completeStream(usage.tokenDetails, nowMs() - hopStarted);
           }
           streamSettled = true;
-          this.#streamSettlements.delete(settleOnClose);
+          this.#streamSettlements.delete(streamToken);
           if (translationFailure !== undefined && translationFailure.error === error) {
             translationFailure = undefined;
             // Translation stopped a paid stream after observe(); it is neither a provider
@@ -3676,7 +3702,7 @@ export class SolwynCore {
             return;
           }
           try {
-            if (classifyException(error) === Disposition.FAIL_FAST) breaker.releaseProbe(admission);
+            if (isNeutralStreamError(error)) breaker.releaseProbe(admission);
             else
               this.#recordBreakerFailureDedup(
                 breaker,
@@ -3703,14 +3729,13 @@ export class SolwynCore {
         ctx.responsesLeaf === "stream"
           ? observeResponseStream(rawResponse, streamOptions, (error) => {
               if (streamSettled) return;
-              if (settlement.callerSignal?.aborted) {
-                breaker.releaseProbe(admission);
-                return completeStream(accumulator.finalize(), nowMs() - hopStarted);
-              }
+              const callerCancelled = settlement.callerSignal?.aborted || isCallerAbort(error);
               streamSettled = true;
-              this.#streamSettlements.delete(settleOnClose);
+              this.#streamSettlements.delete(streamToken);
               try {
-                const disposition = classifyException(error);
+                const disposition = callerCancelled
+                  ? Disposition.FAIL_FAST
+                  : classifyException(error);
                 if (disposition === Disposition.FAIL_FAST) breaker.releaseProbe(admission);
                 else
                   this.#recordBreakerFailureDedup(
@@ -3725,7 +3750,9 @@ export class SolwynCore {
                     hop,
                     error,
                     nowMs() - hopStarted,
-                    disposition === Disposition.POST_SEND_AMBIGUOUS ? true : null,
+                    callerCancelled || disposition === Disposition.POST_SEND_AMBIGUOUS
+                      ? true
+                      : null,
                     region,
                   ),
                 );
@@ -3746,7 +3773,7 @@ export class SolwynCore {
       if (ctx.streamTermination !== undefined) {
         ctx.streamTermination.transferred = true;
       }
-      if (!streamSettled) this.#streamSettlements.add(settleOnClose);
+      if (!streamSettled) this.#streamSettlements.set(streamToken, settleOnClose);
       return result;
     } catch (error) {
       terminationHandoff?.discard();
@@ -4101,7 +4128,7 @@ export class SolwynCore {
         `client.close_inflight_timeout: ${this.#inFlightCalls.size} calls still active`,
       );
     }
-    for (const settle of this.#streamSettlements) {
+    for (const settle of this.#streamSettlements.values()) {
       try {
         settle();
       } catch {
@@ -4111,7 +4138,7 @@ export class SolwynCore {
     this.#streamSettlements.clear();
     // Settlement telemetry takes precedence over the best-effort advisory channel.
     await this.#reporter.close(Math.max(0, deadline - nowMs()));
-    await this.#untrackedSurfaceReporter?.close();
+    await this.#untrackedSurfaceReporter?.close(Math.max(0, deadline - nowMs()));
     await this.#budget.close();
 
     const client = this.#client;

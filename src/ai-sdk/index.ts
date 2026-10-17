@@ -34,7 +34,7 @@ import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } fr
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
-import { ConfigurationError, RunStoppedError } from "../errors";
+import { ConfigurationError, RunStoppedError, SolwynError } from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
 import { resolveAiSdkOutputBound } from "../output-bound";
@@ -147,6 +147,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function getProp(obj: unknown, key: string): unknown {
   return isRecord(obj) ? obj[key] : undefined;
+}
+
+function callerAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
 }
 
 /**
@@ -474,7 +480,7 @@ const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
 export interface SolwynMiddlewareHandle {
   /** Pass to `wrapLanguageModel({ model, middleware })`. */
   readonly middleware: LanguageModelMiddleware;
-  /** Flush queued confirms/events and shut down. Safe to call more than once. */
+  /** Reject new calls, drain in-flight work, settle open streams, and flush queued usage. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link close}. */
   [Symbol.asyncDispose](): Promise<void>;
@@ -584,18 +590,17 @@ async function instrumentReadable<T>(
     const stream = new ReadableStream<T>({
       async pull(controller) {
         try {
-          hooks.checkTermination();
           const { done, value } = await reader.read();
           if (aborted) {
             return;
           }
-          hooks.checkTermination();
           if (done) {
             hooks.onEnd();
             controller.close();
             return;
           }
           hooks.onPart(value);
+          hooks.checkTermination();
           controller.enqueue(value);
         } catch (error) {
           try {
@@ -658,8 +663,9 @@ async function instrumentReadable<T>(
  * BEFORE `doGenerate`/`doStream` (a hard deny throws the applicable typed denial error to the
  * caller and the model is never invoked) and settles usage AFTER — one `call_id` per call,
  * exactly-once settlement including error paths (mirroring `src/client.ts`): a served
- * success confirms its reservation + reports a success event, a thrown call reports one
- * error event and sends NO confirm, a hard deny reports one `budget_denied` event.
+ * success confirms its reservation + reports a success event, an ordinary provider failure
+ * reports one error event and sends NO confirm, a hard deny reports one `budget_denied` event.
+ * Cooperative stream stops and caller cancellation settle the usage observed so far.
  *
  * Attribution is derived from the wrapped model's `provider`/`modelId` (see
  * {@link resolveProviderName}); there is no failover (the AI SDK owns the model), so every
@@ -728,6 +734,35 @@ export function createSolwynMiddleware(
   });
   reporter.start();
 
+  let closePromise: Promise<void> | null = null;
+  const inFlightCalls = new Set<Promise<void>>();
+  // The stream owns its settlement callback; the handle must not keep abandoned streams alive.
+  const streamSettlements = new Set<WeakRef<() => void>>();
+  const collectedStreamSettlements = new FinalizationRegistry<WeakRef<() => void>>((reference) => {
+    streamSettlements.delete(reference);
+  });
+  const safeWarn = (message: string): void => {
+    try {
+      logger.warn(message);
+    } catch {
+      // Lifecycle cleanup must survive caller-owned diagnostics.
+    }
+  };
+  const trackCall = async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (closePromise !== null) throw new SolwynError("client is closed");
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    inFlightCalls.add(pending);
+    try {
+      return await operation();
+    } finally {
+      inFlightCalls.delete(pending);
+      release();
+    }
+  };
+
   // --- Per-call attribution + the pre-flight budget decision. ---
 
   interface CallContext {
@@ -736,6 +771,7 @@ export function createSolwynMiddleware(
     callId: string;
     run: CurrentRun | undefined;
     estimatedInputTokens: number;
+    abortSignal: AbortSignal | undefined;
     /** Immutable process-local settlement/release authority captured from preflight. */
     funding: Readonly<{
       reservationId: string | null;
@@ -756,6 +792,7 @@ export function createSolwynMiddleware(
   interface WrappedCallParams {
     readonly prompt: unknown;
     readonly maxOutputTokens?: unknown;
+    readonly abortSignal?: AbortSignal;
   }
 
   /**
@@ -767,6 +804,7 @@ export function createSolwynMiddleware(
     model: WrappedModelInfo,
     params: WrappedCallParams,
   ): Promise<CallContext> => {
+    if (params.abortSignal?.aborted) throw callerAbortError(params.abortSignal);
     const modelId = typeof model.modelId === "string" ? model.modelId : "";
     const provider = resolveProviderName(
       typeof model.provider === "string" ? model.provider : "",
@@ -801,6 +839,7 @@ export function createSolwynMiddleware(
         model: modelId,
         provider,
         timeout: config.budget_check_timeout,
+        signal: params.abortSignal,
       }),
     );
     reporter.observeProjectId(decision.projectId);
@@ -834,6 +873,7 @@ export function createSolwynMiddleware(
       callId,
       run,
       estimatedInputTokens,
+      abortSignal: params.abortSignal,
       funding: Object.freeze({
         reservationId: decision.reservationId,
         leaseId: decision.leaseId,
@@ -873,6 +913,10 @@ export function createSolwynMiddleware(
   };
 
   const assertDispatchAllowed = (ctx: CallContext, handle?: TerminationHandle): void => {
+    if (ctx.abortSignal?.aborted) {
+      releaseFunding(ctx);
+      throw callerAbortError(ctx.abortSignal);
+    }
     const error = stoppedError(ctx, handle);
     if (error === undefined) return;
     try {
@@ -1053,7 +1097,7 @@ export function createSolwynMiddleware(
     }
   };
 
-  const middleware: LanguageModelMiddleware = {
+  const meteredMiddleware = {
     wrapGenerate: async ({ doGenerate, model, params }) => {
       const ctx = await preflight(model, params);
       assertDispatchAllowed(ctx);
@@ -1117,13 +1161,14 @@ export function createSolwynMiddleware(
         throw error;
       }
 
-      // Streaming settlement state, settled EXACTLY ONCE at stream end (behaviors 25/26):
+      // Streaming settlement state, settled EXACTLY ONCE at a terminal boundary:
       // usage settles from the terminal `finish` part; a mid-stream error part or a stream
       // rejection settles an error event with possibly_succeeded (the stream established).
       let settled = false;
       let capturedFinishPart: unknown;
       let sawErrorPart = false;
       let outputChars = 0;
+      let streamSettlement: WeakRef<() => void> | undefined;
 
       const settleStreamSuccess = (): void => {
         const latencyMs = performance.now() - started;
@@ -1187,18 +1232,26 @@ export function createSolwynMiddleware(
         }
       };
 
-      const settleOnce = (isStreamRejection: boolean): void => {
+      const settleOnce = (outcome: "success" | "error" | "interrupted"): void => {
         if (settled) {
           return;
         }
         settled = true;
+        if (streamSettlement !== undefined) {
+          streamSettlements.delete(streamSettlement);
+          collectedStreamSettlements.unregister(streamSettlement);
+        }
         terminationHandle?.release();
         // A finish part with usage settles success; a mid-stream error part or a stream
         // rejection settles an error event (possibly_succeeded — the stream established, so
         // the provider may have generated billable output) and sends NO confirm. Mid-stream
         // errors never fail over, so the event carries NO failover_error_class (F9 /
         // #buildStreamErrorEvent) — passing `null` regardless of the underlying error.
-        if (isStreamRejection || (sawErrorPart && capturedFinishPart === undefined)) {
+        // Cooperative stops and caller aborts use success settlement for observed usage.
+        if (
+          outcome === "error" ||
+          (outcome === "success" && sawErrorPart && capturedFinishPart === undefined)
+        ) {
           reportErrorAndRelease(ctx, null, performance.now() - started, true);
           return;
         }
@@ -1210,10 +1263,13 @@ export function createSolwynMiddleware(
         }
       };
 
+      const settleOnClose = (): void => settleOnce("interrupted");
       let abortSetup = (): Promise<void> => cancelReadableSource(result.stream);
       try {
         const instrumented = await instrumentReadable(result.stream, {
           checkTermination() {
+            if (closePromise !== null) throw new SolwynError("client is closed");
+            if (ctx.abortSignal?.aborted) throw callerAbortError(ctx.abortSignal);
             const error = stoppedError(ctx, terminationHandle);
             if (error !== undefined) throw error;
           },
@@ -1227,12 +1283,31 @@ export function createSolwynMiddleware(
               outputChars += deltaChars(part);
             }
           },
-          onEnd: () => settleOnce(false),
-          onError: () => settleOnce(true),
-          onCancel: () => settleOnce(false),
+          onEnd: () => settleOnce("success"),
+          onError: (error) => {
+            if (
+              error instanceof RunStoppedError ||
+              ctx.abortSignal?.aborted ||
+              closePromise !== null
+            ) {
+              settleOnClose();
+            } else {
+              settleOnce("error");
+            }
+          },
+          onCancel: () => {
+            if (ctx.abortSignal?.aborted) settleOnClose();
+            else settleOnce("success");
+          },
         });
         abortSetup = instrumented.abort;
-        return { ...result, stream: instrumented.stream };
+        const wrappedResult = { ...result, stream: instrumented.stream };
+        if (!settled) {
+          streamSettlement = new WeakRef(settleOnClose);
+          streamSettlements.add(streamSettlement);
+          collectedStreamSettlements.register(settleOnClose, streamSettlement, streamSettlement);
+        }
+        return wrappedResult;
       } catch (error) {
         terminationHandle?.release();
         try {
@@ -1244,22 +1319,48 @@ export function createSolwynMiddleware(
         throw error;
       }
     },
-  };
+  } satisfies LanguageModelMiddleware;
 
-  let closePromise: Promise<void> | null = null;
   const close = (): Promise<void> => {
     // Publish one captured identity before cleanup can synchronously re-enter.
-    closePromise ??= Promise.resolve().then(async () => {
+    if (closePromise !== null) return closePromise;
+    const deadline = performance.now() + config.reporter_shutdown_deadline * 1000;
+    closePromise = Promise.resolve().then(async () => {
+      const remaining = Math.max(0, deadline - performance.now());
+      if (inFlightCalls.size > 0 && remaining > 0) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, remaining);
+          void Promise.all(inFlightCalls).then(() => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      if (inFlightCalls.size > 0) {
+        safeWarn(`middleware.close_inflight_timeout: ${inFlightCalls.size} calls still active`);
+      }
+      for (const reference of streamSettlements) {
+        try {
+          reference.deref()?.();
+        } catch {
+          safeWarn("middleware.close_stream_settlement_failed");
+        }
+        collectedStreamSettlements.unregister(reference);
+      }
+      streamSettlements.clear();
       // Reporter first: queued settlement/event delivery precedes the budget
       // enforcer's future lease-surrender point, matching the core client.
-      await reporter.close();
+      await reporter.close(Math.max(0, deadline - performance.now()));
       await budget.close();
     });
     return closePromise;
   };
 
   return {
-    middleware,
+    middleware: {
+      wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
+      wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
+    },
     close,
     [Symbol.asyncDispose](): Promise<void> {
       return close();

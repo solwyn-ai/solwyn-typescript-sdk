@@ -512,6 +512,7 @@ export class GoogleAdapter implements ProviderAdapter {
  */
 export class GoogleStreamAccumulator implements StreamUsageAccumulator {
   #lastUsageMetadata: unknown = null;
+  #sawFinishReason = false;
 
   /**
    * Retain the chunk's `usageMetadata` iff present (non-`null`/`undefined`). A later chunk
@@ -519,6 +520,15 @@ export class GoogleStreamAccumulator implements StreamUsageAccumulator {
    * not last-chunk-unconditionally).
    */
   observe(chunk: unknown): void {
+    const candidates = getProp(chunk, "candidates");
+    if (Array.isArray(candidates)) {
+      this.#sawFinishReason ||= candidates.some((candidate) => {
+        const reason = getProp(candidate, "finishReason");
+        return (
+          typeof reason === "string" && reason.length > 0 && reason !== "FINISH_REASON_UNSPECIFIED"
+        );
+      });
+    }
     const usageMetadata = getProp(chunk, "usageMetadata");
     if (usageMetadata != null) {
       this.#lastUsageMetadata = usageMetadata;
@@ -530,7 +540,14 @@ export class GoogleStreamAccumulator implements StreamUsageAccumulator {
    * {@link TokenDetails} if no chunk ever carried usage. Never throws.
    */
   finalize(): TokenDetails {
-    return extractGoogleUsage(this.#lastUsageMetadata);
+    const details = extractGoogleUsage(this.#lastUsageMetadata);
+    if (
+      !this.#sawFinishReason &&
+      getProp(this.#lastUsageMetadata, "candidatesTokenCount") == null
+    ) {
+      return { ...details, is_estimated: true };
+    }
+    return details;
   }
 
   /** ALWAYS `null` — Google streams expose no service-tier concept. */

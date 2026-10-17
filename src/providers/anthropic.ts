@@ -26,7 +26,6 @@ import type { Logger } from "../logging";
 import { consoleLogger } from "../logging";
 import type { TokenDetails } from "../token-details";
 import { buildReportedTokenDetails, isUsageCount } from "../token-details";
-import { SERVICE_TIER_MAX_LENGTH } from "../types";
 import { detectAnthropicClient } from "./detection";
 import type {
   CreateStreamAccumulatorOptions,
@@ -68,11 +67,8 @@ function numberOrZero(value: unknown): number {
   return isUsageCount(value) ? value : 0;
 }
 
-function anthropicServiceTier(tier: unknown, logger: Logger): string | null {
-  if (typeof tier !== "string") return null;
-  if (tier.length <= SERVICE_TIER_MAX_LENGTH) return tier;
-  logger.warn(`Anthropic service tier exceeds ${SERVICE_TIER_MAX_LENGTH} characters; truncating`);
-  return tier.slice(0, SERVICE_TIER_MAX_LENGTH);
+function anthropicServiceTier(tier: unknown): string | null {
+  return tier === "standard" || tier === "priority" ? tier : null;
 }
 
 /**
@@ -218,7 +214,7 @@ export class AnthropicAdapter implements ProviderAdapter {
 
   /** Anthropic carries its service tier inside `usage`. */
   extractServiceTier(response: unknown): string | null {
-    return anthropicServiceTier(getProp(getProp(response, "usage"), "service_tier"), this.#logger);
+    return anthropicServiceTier(getProp(getProp(response, "usage"), "service_tier"));
   }
 
   /** ALWAYS `null` — Anthropic pricing is not regional. */
@@ -379,8 +375,14 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
         } else {
           const aggregate = getProp(usage, "cache_creation_input_tokens");
           if (isUsageCount(aggregate)) {
-            this.#cache5m = aggregate;
-            this.#cache1h = 0;
+            // Real deltas carry only the aggregate; retain the start event's TTL split.
+            const increment = aggregate - this.#cache5m - this.#cache1h;
+            if (increment >= 0) {
+              this.#cache5m += increment;
+            } else {
+              // Cumulative usage cannot shrink. Keep observed writes conservatively.
+              this.#invalidDetails = true;
+            }
           }
         }
         const output = getProp(usage, "output_tokens");
@@ -433,6 +435,6 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   }
 
   getServiceTier(): string | null {
-    return anthropicServiceTier(this.#serviceTier, this.#logger);
+    return anthropicServiceTier(this.#serviceTier);
   }
 }

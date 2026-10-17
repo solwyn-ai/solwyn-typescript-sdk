@@ -17,7 +17,7 @@ const PROJECT = `proj_${"0".repeat(24)}`;
 const REPORTER_HOOK = Symbol.for("@solwyn/sdk/node-reporter-registration");
 const LEASE_HOOK = Symbol.for("@solwyn/sdk/node-lease-registration");
 const REGISTRY = Symbol.for("@solwyn/sdk/node-reporter-registry");
-const RUN_OWNERS = Symbol.for("@solwyn/sdk.node.runOwners");
+const RUN_OWNERS = Symbol.for("@solwyn/sdk.node.runOwners.v2");
 const RUN_READER = Symbol.for("@solwyn/sdk.currentRunReader");
 
 type Registry = { reporters: Set<WeakRef<object>>; leaseHolders: Set<WeakRef<object>> };

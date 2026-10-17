@@ -28,10 +28,10 @@ const load = (entry, kind) =>
     ? import(pathToFileURL(`${root}/dist/${entry}.js`).href)
     : require(`${root}/dist/${entry}.cjs`);
 const first = await load("node", format);
-const owners = globalThis[Symbol.for("@solwyn/sdk.node.runOwners")];
+const owners = globalThis[Symbol.for("@solwyn/sdk.node.runOwners.v2")];
 assert.equal(enabled.get(owners.hook) ?? false, false);
 const second = await load("node", format === "esm" ? "cjs" : "esm");
-assert.equal(globalThis[Symbol.for("@solwyn/sdk.node.runOwners")], owners);
+assert.equal(globalThis[Symbol.for("@solwyn/sdk.node.runOwners.v2")], owners);
 assert.equal(enabled.get(owners.hook) ?? false, false);
 
 const clients = [first, second].map(

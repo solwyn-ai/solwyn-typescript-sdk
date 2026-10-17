@@ -357,8 +357,11 @@ await client.messages.create({
 ```
 
 Streaming settles usage from cumulative `message_delta` counters, including input and cache
-totals updated by server tools. When supplied, thinking tokens are reported as a subset of
-the output total, and `usage.service_tier` is preserved.
+totals updated by server tools. Aggregate-only deltas preserve the initial five-minute and
+one-hour cache split; additional writes enter the five-minute bucket. Decreasing aggregate
+counts retain observed cache writes and mark usage estimated. When supplied, thinking tokens
+are reported as a subset of the output total. Service tiers `standard` and `priority` are
+preserved; unsupported tiers such as `batch` are omitted.
 
 `messages.stream` and `messages.parse` are unmetered helpers. With the default
 `onUnmetered: "warn"`, each passes through after one warning, with no budget check or cost
@@ -384,6 +387,10 @@ for await (const chunk of stream) {
   process.stdout.write(chunk.text ?? "");
 }
 ```
+
+If a Google stream omits the candidate output count, its usage remains estimated until a
+candidate finish reason is observed. Cancelling an unfinished stream retains the reservation
+floor. Buffered responses and finished streams can report omitted candidate output as zero.
 
 ### Amazon Bedrock
 
@@ -533,6 +540,10 @@ allows future work; an already stopped stream retains its stop. Local velocity d
 is not supported by the AI SDK middleware. Cache writes are reported in the default
 five-minute bucket, and missing usage totals fall back to length estimates for that side
 of the call while preserving reported totals.
+
+The call's `abortSignal` also cancels budget preflight. Run stops and caller cancellation
+settle stream usage observed so far, including the part pulled at the cancellation boundary;
+estimated usage retains the reservation floor.
 
 > **Gateway attribution.** When a model id is resolved through the Vercel AI Gateway (a bare string model like `generateText({ model: "anthropic/claude-sonnet-4.5" })`), the AI SDK stamps `provider: "gateway"`. Solwyn derives the true vendor from the `vendor/model` prefix of the model id, so per-vendor budgets and metadata are attributed correctly instead of collapsing onto `openai_compatible`.
 
@@ -1062,7 +1073,10 @@ await using client = new Solwyn(new OpenAI(), { apiKey: process.env.SOLWYN_API_K
 // close() runs at scope exit.
 ```
 
-The AI SDK middleware handle exposes the same `close()` / `Symbol.asyncDispose` contract.
+The AI SDK middleware handle also rejects new calls once closing begins, drains buffered
+calls and stream setup within the shared reporting deadline, and settles open streams from
+observed usage. Its `close()` and `Symbol.asyncDispose` share one shutdown promise. The handle
+closes its reporter before its budget/lease holder; the AI SDK owns provider cleanup.
 
 <details>
 <summary>Wrapper compatibility</summary>

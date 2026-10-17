@@ -221,9 +221,13 @@ describe("middleware usage and run control", () => {
     });
     await handle.close();
     expect(cancel).toHaveBeenCalledTimes(1);
-    expect(captured.confirms).toEqual([]);
+    expect(captured.confirms).toEqual([
+      expect.objectContaining({
+        token_details: expect.objectContaining({ output_tokens: 2, is_estimated: true }),
+      }),
+    ]);
     expect(captured.events).toEqual([
-      expect.objectContaining({ status: "error", possibly_succeeded: true }),
+      expect.objectContaining({ status: "success", input_tokens: 0, output_tokens: 2 }),
     ]);
   });
 });

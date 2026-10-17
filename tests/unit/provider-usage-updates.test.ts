@@ -10,6 +10,50 @@ import { TokenDetailsSchema } from "../../src/token-details";
 
 describe("Anthropic cumulative stream usage", () => {
   it.each([
+    { aggregate: 1200, cache5m: 200, estimated: false },
+    { aggregate: 1500, cache5m: 500, estimated: false },
+    { aggregate: 900, cache5m: 200, estimated: true },
+  ])("preserves the initial 1h split with aggregate-only deltas: $aggregate", ({
+    aggregate,
+    cache5m,
+    estimated,
+  }) => {
+    const acc = new AnthropicStreamAccumulator(noopLogger);
+    acc.observe({
+      type: "message_start",
+      message: {
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 1200,
+          cache_creation: { ephemeral_5m_input_tokens: 200, ephemeral_1h_input_tokens: 1000 },
+          output_tokens: 1,
+        },
+      },
+    });
+    const delta = {
+      type: "message_delta",
+      usage: {
+        input_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: aggregate,
+        output_tokens: 50,
+        output_tokens_details: null,
+        server_tool_use: null,
+      },
+    };
+    acc.observe(delta);
+    acc.observe(delta);
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 1010 + cache5m,
+      output_tokens: 50,
+      cache_creation_5m_tokens: cache5m,
+      cache_creation_1h_tokens: 1000,
+      is_estimated: estimated,
+    });
+  });
+
+  it.each([
     { cache_creation_input_tokens: -1 },
     { cache_creation: { ephemeral_5m_input_tokens: "bad", ephemeral_1h_input_tokens: 20 } },
   ])("keeps malformed cache deltas estimated: %j", (cache) => {
@@ -123,6 +167,23 @@ describe("Anthropic cumulative stream usage", () => {
 });
 
 describe("Anthropic usage details", () => {
+  it.each([
+    ["standard", "standard"],
+    ["priority", "priority"],
+    ["batch", null],
+    ["unknown", null],
+    ["x".repeat(50), null],
+  ])("filters unsupported service tiers from buffered and streamed usage: %s", (tier, expected) => {
+    const adapter = new AnthropicAdapter({ logger: noopLogger });
+    const response = { usage: { input_tokens: 10, output_tokens: 20, service_tier: tier } };
+    expect(adapter.extractServiceTier(response)).toBe(expected);
+    const acc = adapter.createStreamAccumulator();
+    acc.observe({ type: "message_start", message: response });
+    expect(acc.getServiceTier()).toBe(expected);
+    acc.observe({ type: "message_delta", usage: { output_tokens: 20, service_tier: tier } });
+    expect(acc.getServiceTier()).toBe(expected);
+  });
+
   it("reports service tier and thinking as a subset of output", () => {
     const adapter = new AnthropicAdapter({ logger: noopLogger });
     const response = {
@@ -177,7 +238,7 @@ describe("Google omitted zero output counters", () => {
   it.each([
     { promptTokenCount: 100 },
     { promptTokenCount: 100, thoughtsTokenCount: 20 },
-  ])("trusts measured input when candidates are omitted: %j", (usageMetadata) => {
+  ])("trusts omitted candidates only for buffered or finished responses: %j", (usageMetadata) => {
     const adapter = new GoogleAdapter();
     const expected = {
       input_tokens: 100,
@@ -187,7 +248,28 @@ describe("Google omitted zero output counters", () => {
     expect(adapter.extractUsage({ usageMetadata })).toMatchObject(expected);
     const acc = new GoogleStreamAccumulator();
     acc.observe({ usageMetadata });
+    expect(acc.finalize()).toMatchObject({ ...expected, is_estimated: true });
+    acc.observe({ candidates: [{ finishReason: "STOP" }] });
     expect(acc.finalize()).toMatchObject(expected);
+  });
+
+  it("trusts explicit streamed zero output without a finish reason", () => {
+    const acc = new GoogleStreamAccumulator();
+    acc.observe({ usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 0 } });
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 100,
+      output_tokens: 0,
+      is_estimated: false,
+    });
+  });
+
+  it("keeps an unspecified stream finish reason estimated", () => {
+    const acc = new GoogleStreamAccumulator();
+    acc.observe({
+      usageMetadata: { promptTokenCount: 100 },
+      candidates: [{ finishReason: "FINISH_REASON_UNSPECIFIED" }],
+    });
+    expect(acc.finalize().is_estimated).toBe(true);
   });
   it("still marks absent and malformed usage as estimated", () => {
     const adapter = new GoogleAdapter();

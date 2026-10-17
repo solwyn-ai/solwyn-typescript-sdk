@@ -78,6 +78,7 @@ it("passes the Solwyn logger to adapters on lazy initialization", async () => {
         {
           ingested: JSON.parse(String(init?.body)).length,
           rejected: [],
+          duplicates: [],
         },
         { status: 202 },
       );
@@ -106,4 +107,7 @@ it("passes the Solwyn logger to adapters on lazy initialization", async () => {
   } finally {
     await wrapped.close();
   }
+  expect(warn.mock.calls.some(([message]) => message.includes("reporter.ingest_response_"))).toBe(
+    false,
+  );
 });

@@ -678,7 +678,6 @@ type StreamSettlementContext = Omit<CallContext, "run" | "abortSignal"> & {
 interface StreamSettlementOwner {
   readonly settlements: Set<MiddlewareStreamSettlement>;
   readonly logger: Logger;
-  closed: boolean;
   settleSuccess(
     ctx: StreamSettlementContext,
     tokenDetails: TokenDetails,
@@ -691,7 +690,6 @@ interface StreamSettlementOwner {
     latencyMs: number,
     possiblySucceeded: boolean | null,
   ): void;
-  releaseFunding(ctx: StreamSettlementContext): void;
 }
 
 function extractStreamUsage(
@@ -756,10 +754,7 @@ class MiddlewareStreamSettlement {
 
   settle(outcome: "success" | "error" | "interrupted"): void {
     if (!this.release()) return;
-    if (this.owner.closed) {
-      this.owner.releaseFunding(this.ctx);
-      return;
-    }
+    // The reporter counts late drops without enqueuing; still reconcile local lease spend.
     const latencyMs = performance.now() - this.started;
     if (
       outcome === "error" ||
@@ -1220,10 +1215,8 @@ export function createSolwynMiddleware(
   const streamSettlementOwner: StreamSettlementOwner = {
     settlements: streamSettlements,
     logger,
-    closed: false,
     settleSuccess: settleBufferedSuccess,
     reportErrorAndRelease,
-    releaseFunding,
   };
 
   const meteredMiddleware = {
@@ -1290,8 +1283,8 @@ export function createSolwynMiddleware(
         throw error;
       }
 
-      // Construct the finalizer's held value outside this frame. It must not reach result,
-      // params, the source reader, the caller signal or the run's ownership token.
+      // Build the held value from a module-scope class so it cannot capture this frame.
+      // It must not reach result, params, the reader, caller signal or run ownership token.
       const settlement = new MiddlewareStreamSettlement(
         streamSettlementOwner,
         {
@@ -1389,7 +1382,6 @@ export function createSolwynMiddleware(
         }
       }
       streamSettlements.clear();
-      streamSettlementOwner.closed = true;
       // Reporter first: queued settlement/event delivery precedes the budget
       // enforcer's future lease-surrender point, matching the core client.
       await reporter.close(Math.max(0, deadline - performance.now()));

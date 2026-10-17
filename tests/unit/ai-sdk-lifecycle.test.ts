@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSolwynMiddleware } from "../../src/ai-sdk";
+import { BudgetEnforcer } from "../../src/budget";
 import { noopLogger } from "../../src/logging";
 import { currentRun, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
@@ -417,9 +418,9 @@ describe("AI SDK middleware shutdown", () => {
     expect(plane.confirms).toHaveLength(1);
   });
 
-  it("does not enqueue settlement when stream setup outlasts reporting shutdown", async () => {
+  it("counts late settlement drops without enqueuing after reporting shutdown", async () => {
     const { plane, handle } = fixture({ leaseEnabled: false, reporterShutdownDeadline: 0 });
-    const reportSettlement = vi.spyOn(MetadataReporter.prototype, "reportSettlement");
+    const reporterClose = vi.spyOn(MetadataReporter.prototype, "close");
     const entered = deferred<void>();
     const response = deferred<{ stream: ReadableStream<unknown> }>();
     const call = stream(handle, { prompt: [] }, async () => {
@@ -431,9 +432,54 @@ describe("AI SDK middleware shutdown", () => {
     response.resolve({ stream: new ReadableStream() });
     const result = await call;
     await result.stream.cancel();
-    expect(reportSettlement).not.toHaveBeenCalled();
+    await result.stream.cancel();
+    expect(reporterClose.mock.contexts[0]).toHaveProperty("droppedCounts", {
+      "settlement_confirm.closed_enqueue": 1,
+      "event.closed_enqueue": 1,
+    });
     expect(plane.confirms).toHaveLength(0);
     expect(plane.ingested).toHaveLength(0);
+  });
+
+  it("retains the lease floor when a late stream settles before surrender", async () => {
+    const { plane, handle } = fixture({ reporterShutdownDeadline: 0 });
+    const reporterClose = vi.spyOn(MetadataReporter.prototype, "close");
+    const entered = deferred<void>();
+    const response = deferred<{ stream: ReadableStream<unknown> }>();
+    const call = run("late-lease", () =>
+      stream(handle, { prompt: [], maxOutputTokens: 100 }, async () => {
+        entered.resolve();
+        return response.promise;
+      }),
+    );
+    await entered.promise;
+    const closeBudget = BudgetEnforcer.prototype.close;
+    vi.spyOn(BudgetEnforcer.prototype, "close").mockImplementationOnce(async function (
+      this: BudgetEnforcer,
+      timeoutMs,
+    ) {
+      response.resolve({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "text-delta", delta: "abcd" });
+          },
+        }),
+      });
+      const result = await call;
+      await expect(result.stream.getReader().read()).rejects.toMatchObject({
+        name: "SolwynError",
+        message: "client is closed",
+      });
+      await closeBudget.call(this, timeoutMs);
+    });
+    await handle.close();
+    expect(plane.leaseSurrenders).toMatchObject([{ spent_tokens: 100 }]);
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(0);
+    expect(reporterClose.mock.contexts[0]).toHaveProperty("droppedCounts", {
+      "settlement_confirm.closed_enqueue": 1,
+      "event.closed_enqueue": 1,
+    });
   });
 
   it("retains the reservation floor when closing an unmeasured lease stream", async () => {

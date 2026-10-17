@@ -200,15 +200,15 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
-- **Abandoned AI SDK middleware streams settle usage.** Garbage-collection finalization now
-  confirms observed usage and reports metadata once, including lease attribution, matching the
-  drop-in client. Estimated or unmeasured usage keeps the reservation floor. Settlement records
-  retain no stream, source, middleware handle, caller signal or run lifetime; finalization after
-  explicit completion, cancellation or `close()` cannot enqueue another settlement.
-- **Abandoned streams release settlement ownership.** Garbage-collection finalization in the
-  drop-in client and AI SDK middleware settles observed usage once, retaining the reservation
-  floor for missing or malformed usage, and releases run lifetimes, caller signals and lease
-  authority before shutdown. The drop-in client also releases recovery probes. Finalization
+- **Abandoned streams settle usage and release ownership.** Garbage-collection finalization now
+  covers both the drop-in client and AI SDK middleware. Streams settle observed usage once with
+  paired confirmation and metadata, including lease attribution; a middleware error part without
+  a finish part instead reports an error event without confirmation. Estimated or
+  unmeasured usage keeps the reservation floor. Settlement records retain no stream, source,
+  middleware handle, caller signal or run lifetime, and finalization releases run and lease
+  ownership before shutdown. The drop-in client also releases recovery probes. Finalization
+  after completion, cancellation or `close()` cannot enqueue another settlement; a stream whose
+  setup outlasts reporting shutdown counts its late settlement as dropped usage. Finalization
   timing remains runtime-dependent; explicit stream cleanup is deterministic. Settlements
   triggered by finalization or `close()` do not contribute routing latency samples.
 - **Already-aborted calls skip velocity detection.** Chat, Responses, and media calls whose

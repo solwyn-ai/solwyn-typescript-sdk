@@ -28,8 +28,10 @@ function releaseChannel(version: string): "latest" | "next" {
 
 function expectReleaseCompatibility(readme: string, version: string): void {
   const channel = releaseChannel(version);
-  expect(readme).toContain(`npm install @solwyn/sdk@${channel}`);
-  expect(readme).toContain(`pnpm add @solwyn/sdk@${channel}`);
+  const tag = channel === "next" ? "@next" : "";
+  expect(readme).toContain(`npm install @solwyn/sdk${tag}`);
+  expect(readme).toContain(`pnpm add @solwyn/sdk${tag}`);
+  if (channel === "latest") expect(readme).not.toContain("@solwyn/sdk@next");
   if (channel === "next") {
     expect(readme).toMatch(/prerelease[^\n]*`next`/i);
     expect(readme).toMatch(

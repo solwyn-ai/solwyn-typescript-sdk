@@ -402,7 +402,7 @@ export interface CheckBudgetOptions {
   fallbackProviders?: ProviderName[];
   /** Failover model chain (default `[]`); the caller's array is never mutated. */
   fallbackModels?: string[];
-  /** Per-call timeout in SECONDS, at least 0.05; falls back to the 5s default. */
+  /** Per-call timeout in SECONDS, at least 0.1; falls back to the 5s default. */
   timeout?: number;
   /** @internal Shared failover deadline; only caps the validated timeout. */
   deadline?: Deadline;
@@ -991,7 +991,7 @@ export class BudgetEnforcer {
     const timeout = validateDuration(
       options.timeout === undefined ? DEFAULT_CHECK_TIMEOUT_MS / 1000 : options.timeout,
       "timeout",
-      MIN_PREFLIGHT_REQUEST_MS / 1000,
+      0.1,
     );
     const deadlineMs =
       this.monotonicNow() + Math.min(timeout, options.deadline?.remaining() ?? timeout) * 1000;

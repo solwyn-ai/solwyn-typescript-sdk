@@ -61,8 +61,13 @@ describe("package smoke", () => {
     expect(CHANGELOG).toContain(
       `[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v${PACKAGE_JSON.version}...HEAD`,
     );
+    const versions = Array.from(CHANGELOG.matchAll(/^## \[([^\]]+)\] — /gm), (match) => match[1]);
+    const previousVersion = versions[versions.indexOf(PACKAGE_JSON.version) + 1];
+    const releasePath = previousVersion
+      ? `compare/v${previousVersion}...v${PACKAGE_JSON.version}`
+      : `releases/tag/v${PACKAGE_JSON.version}`;
     expect(CHANGELOG).toContain(
-      `[${PACKAGE_JSON.version}]: https://github.com/solwyn-ai/solwyn-typescript-sdk/releases/tag/v${PACKAGE_JSON.version}`,
+      `[${PACKAGE_JSON.version}]: https://github.com/solwyn-ai/solwyn-typescript-sdk/${releasePath}`,
     );
   });
 

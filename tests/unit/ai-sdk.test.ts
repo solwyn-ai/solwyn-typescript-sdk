@@ -437,18 +437,18 @@ describe("remediation: AI paid usage bookkeeping", () => {
 });
 
 describe("ai-sdk middleware options", () => {
-  it.each(["option", "env"])("rejects a sub-50ms budget timeout from %s", (source) => {
-    vi.stubEnv("SOLWYN_BUDGET_CHECK_TIMEOUT", "0.04");
+  it.each(["option", "env"])("rejects a sub-100ms budget timeout from %s", (source) => {
+    vi.stubEnv("SOLWYN_BUDGET_CHECK_TIMEOUT", "0.05");
     const fetch = vi.fn();
     try {
       expect(() =>
         createSolwynMiddleware({
           apiKey: API_KEY,
           fetch,
-          ...(source === "option" ? { budgetCheckTimeout: 0.04 } : {}),
+          ...(source === "option" ? { budgetCheckTimeout: 0.05 } : {}),
         }),
       ).toThrow(
-        expect.objectContaining({ name: "ConfigurationError", field: "budgetCheckTimeout" }),
+        expect.objectContaining({ name: "ConfigurationError", field: "budget_check_timeout" }),
       );
       expect(fetch).not.toHaveBeenCalled();
     } finally {

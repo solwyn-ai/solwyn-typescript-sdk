@@ -9,6 +9,8 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-10-17
+
 ### Added
 
 - **Opt-in live control-plane verification.** `pnpm test:live` runs the built SDK against a
@@ -30,8 +32,9 @@ corresponding release notes before users upgrade.
   are added. Review and refresh strict coverage fingerprints when upgrading `@solwyn/sdk`, even
   if the provider SDK versions stay pinned.
 - **OpenAI 7 compatibility.** The optional `openai` peer range is now `>=4.41.0 <8`, with
-  current integration checks at `7.36.0`. OpenAI 7 itself requires Node 22 or later; Solwyn's
-  provider-free core remains compatible with Node 20 and compatible older provider releases.
+  unit and surface checks at `7.36.0`; installed native type checks retain `6.45.0`.
+  OpenAI 7 itself requires Node 22 or later; Solwyn's provider-free core remains compatible
+  with Node 20 and compatible older provider releases.
 - **Breaking:** **Responses parsing types reflect runtime values.** Raw JSON-schema formats
   produce `unknown` parsed values, and optional or union branded formats retain their nullable
   parsed type. Older OpenAI declarations sometimes promised only `null` despite parsing JSON
@@ -71,17 +74,18 @@ corresponding release notes before users upgrade.
   timers must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive
   timers reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown
   deadlines allow zero and reject negatives. Empty numeric environment values are rejected.
-  `budgetCheckTimeout`, including `SOLWYN_BUDGET_CHECK_TIMEOUT`, must be at least `0.05`
-  seconds; invalid values fail construction with `ConfigurationError(field: "budgetCheckTimeout")`.
+  `budgetCheckTimeout`, including `SOLWYN_BUDGET_CHECK_TIMEOUT`, must be at least `0.1`
+  seconds, leaving setup headroom above the 50 ms preflight skip floor; invalid values fail
+  construction with `ConfigurationError(field: "budget_check_timeout")`.
   Breaker thresholds must be positive integers, retries must be non-negative integers, and
   jitter must be between zero and one. Reporter batches cannot exceed 1000 events, and breaker
   heartbeats cannot exceed 60 seconds. Replace invalid values with durations and counts within
   the documented ranges; defaults are unchanged.
 - **Breaking:** **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects
   non-number, non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite,
-  sub-`0.05`-second, and oversized per-call `timeout` values with `ConfigurationError`. Both
+  sub-`0.1`-second, and oversized per-call `timeout` values with `ConfigurationError`. Both
   durations are in seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
-  Pass finite numbers in that range, allowing zero only for `cacheTtl` and at least `0.05`
+  Pass finite numbers in that range, allowing zero only for `cacheTtl` and at least `0.1`
   seconds for `timeout`.
 - **Breaking:** **Constructor shape validation is synchronous.** Invalid options objects,
   fallback lists, model values, loggers, and selection policies raise `ConfigurationError`
@@ -213,8 +217,8 @@ corresponding release notes before users upgrade.
   headroom. Caller `AbortSignal`s reach preflight transport; already-aborted requests skip budget
   I/O, and cancellation rejects without treating it as a control-plane outage. Non-Error abort
   reasons become `AbortError`s, matching provider dispatch; Error reasons are preserved. Allow
-  at least 50 milliseconds for a network preflight and handle caller cancellation separately
-  from budget denials.
+  at least `0.1` seconds for the configured timeout and 50 milliseconds on the shared deadline
+  for a network preflight; handle caller cancellation separately from budget denials.
 - **Breaking:** **AI SDK middleware shutdown.** Closing rejects new calls before budget or
   provider I/O, drains buffered calls and stream setup within the shared reporting deadline, and
   settles open streams once from observed usage before reporting closes. Calls beyond the drain
@@ -557,5 +561,6 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0-rc.1...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0-rc.1...v0.1.0
 [0.1.0-rc.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/releases/tag/v0.1.0-rc.1

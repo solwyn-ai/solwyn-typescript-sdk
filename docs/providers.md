@@ -87,7 +87,7 @@ event. Use `messages.create`, with `stream: true` for streaming, for metered cal
 Notes:
 
 - Model identity is reported exactly as you pass it — foundation-model ids, cross-region inference profiles (`us.` / `eu.` / `jp.` / `global.` …), or full ARNs — together with the client's region (from `client.config.region`), because Bedrock pricing is keyed per model **and** region.
-- `InvokeModelCommand` / `InvokeModelWithResponseStreamCommand` raise `ConfigurationError` instead of bypassing budget tracking (their usage is buried in a consume-once body alongside response content). Use Converse, or call the unwrapped AWS client directly for deliberately untracked calls.
+- Every `InvokeModel*` command, including `InvokeModelCommand`, `InvokeModelWithResponseStreamCommand`, and `InvokeModelWithBidirectionalStreamCommand`, raises `ConfigurationError` instead of bypassing budget tracking (their usage is buried in a consume-once body alongside response content). Use Converse, or call the unwrapped AWS client directly for deliberately untracked calls.
 - Any **other** command passes straight through to the wrapped client's native `send`. An unrecognized command that carries `input.modelId` passes through untracked with a one-time warning (never silently).
 - The callback form `send(command, callback)` is not budget-trackable on an intercepted command and fails loud — await the returned Promise instead.
 

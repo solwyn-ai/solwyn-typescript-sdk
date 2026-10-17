@@ -340,8 +340,9 @@ for await (const event of res.stream ?? []) {
 }
 ```
 
-`InvokeModelCommand` / `InvokeModelWithResponseStreamCommand` raise `ConfigurationError`
-instead of bypassing budget tracking. See
+Every `InvokeModel*` command, including `InvokeModelCommand`,
+`InvokeModelWithResponseStreamCommand`, and `InvokeModelWithBidirectionalStreamCommand`,
+raises `ConfigurationError` instead of bypassing budget tracking. See
 [Bedrock details](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/providers.md#amazon-bedrock-details)
 for model and region attribution, other commands, and callback limitations.
 

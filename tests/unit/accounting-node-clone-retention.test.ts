@@ -1,14 +1,11 @@
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
+import { gcProbeTimeout, runGcProbe } from "../helpers/gc-probe";
 
-it("separates process-cached clone resources from live user MessageChannels", () => {
-  const root = fileURLToPath(new URL("../../", import.meta.url));
-  const result = spawnSync(
-    process.execPath,
-    ["--expose-gc", "--import", "tsx", "tests/probes/accounting-node-clone-retention.mts"],
-    { cwd: root, encoding: "utf8", timeout: 30_000 },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, user_message_channel: true });
-}, 35_000);
+it(
+  "separates process-cached clone resources from live user MessageChannels",
+  async () => {
+    const stdout = await runGcProbe("accounting-node-clone-retention");
+    expect(JSON.parse(stdout)).toMatchObject({ ok: true, user_message_channel: true });
+  },
+  gcProbeTimeout,
+);

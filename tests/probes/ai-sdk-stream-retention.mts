@@ -1,11 +1,9 @@
 import assert from "node:assert/strict";
-import { setImmediate } from "node:timers/promises";
 import { createSolwynMiddleware } from "../../src/ai-sdk";
 import { noopLogger } from "../../src/logging";
 import { FakeControlPlane } from "../../src/testing";
+import { alive, collectUntil } from "./gc.mjs";
 
-const forceGc = (globalThis as { gc?: () => void }).gc;
-assert.ok(forceGc, "run with --expose-gc");
 const plane = new FakeControlPlane();
 const handle = createSolwynMiddleware({
   apiKey: plane.apiKey,
@@ -46,17 +44,11 @@ const held = await open({
   type: "finish",
   usage: { inputTokens: { total: 50 }, outputTokens: { total: 20 } },
 });
-for (let attempt = 0; attempt < 60; attempt++) {
-  await setImmediate();
-  forceGc();
-  await setImmediate();
-  if (
-    dropped.every((reference) => reference.deref() === undefined) &&
-    plane.confirms.length === 32 &&
-    plane.ingested.length === 32
-  )
-    break;
-}
+await collectUntil(
+  () => alive(dropped) === 0 && plane.confirms.length === 32 && plane.ingested.length === 32,
+  () =>
+    `abandoned AI streams=${alive(dropped)}, confirms=${plane.confirms.length}/32, ingested=${plane.ingested.length}/32`,
+);
 assert.ok(dropped.every((reference) => reference.deref() === undefined));
 assert.equal(plane.confirms.length, 32, "abandoned streams settle before handle close");
 assert.equal(plane.ingested.length, 32, "each abandoned stream reports its observed usage");

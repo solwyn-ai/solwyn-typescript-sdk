@@ -1,5 +1,3 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSolwynMiddleware } from "../../src/ai-sdk";
 import { BudgetEnforcer } from "../../src/budget";
@@ -8,6 +6,7 @@ import { currentRun, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import { clearRunTermination, markTerminated, resetRunControlForTest } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing";
+import { gcProbeTimeout, runGcProbe } from "../helpers/gc-probe";
 
 afterEach(() => {
   resetRunControlForTest();
@@ -291,27 +290,27 @@ describe("AI SDK preflight cancellation", () => {
 });
 
 describe("AI SDK middleware shutdown", () => {
-  it("settles 32 abandoned streams before closing and still settles a reachable stream", async () => {
-    const { stdout } = await promisify(execFile)(
-      process.execPath,
-      ["--expose-gc", "--import", "tsx", "tests/probes/ai-sdk-stream-retention.mts"],
-      { cwd: process.cwd(), timeout: 30_000 },
-    );
-    expect(JSON.parse(stdout)).toEqual({ collected: true, liveConfirmed: true });
-  }, 35_000);
+  it(
+    "settles 32 abandoned streams before closing and still settles a reachable stream",
+    async () => {
+      const stdout = await runGcProbe("ai-sdk-stream-retention");
+      expect(JSON.parse(stdout)).toEqual({ collected: true, liveConfirmed: true });
+    },
+    gcProbeTimeout,
+  );
 
-  it("finalizes abandoned run streams without retaining unclosed handles or settling twice", async () => {
-    const { stdout } = await promisify(execFile)(
-      process.execPath,
-      ["--expose-gc", "--import", "tsx", "tests/probes/ai-sdk-abandoned-stream-retention.mts"],
-      { cwd: process.cwd(), timeout: 30_000 },
-    );
-    expect(JSON.parse(stdout)).toEqual({
-      leases: true,
-      exactlyOnce: true,
-      unclosedCollected: true,
-    });
-  }, 35_000);
+  it(
+    "finalizes abandoned run streams without retaining unclosed handles or settling twice",
+    async () => {
+      const stdout = await runGcProbe("ai-sdk-abandoned-stream-retention");
+      expect(JSON.parse(stdout)).toEqual({
+        leases: true,
+        exactlyOnce: true,
+        unclosedCollected: true,
+      });
+    },
+    gcProbeTimeout,
+  );
 
   it.each([
     false,

@@ -1,8 +1,7 @@
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RunStoppedSource } from "../../src/errors";
 import * as current from "../../src/run-control";
+import { gcProbeTimeout, runGcProbe } from "../helpers/gc-probe";
 import * as rc1 from "../helpers/run-control-rc1";
 
 /**
@@ -379,13 +378,11 @@ describe("randomized cross-copy interleavings", () => {
   });
 });
 
-it("releases abandoned handles of either copy by finalizer without touching the other copy", () => {
-  const root = fileURLToPath(new URL("../../", import.meta.url));
-  const result = spawnSync(
-    process.execPath,
-    ["--expose-gc", "--import", "tsx", "tests/probes/run-control-mixed-version.mts"],
-    { cwd: root, encoding: "utf8", timeout: 30_000 },
-  );
-  expect(result.status, result.stderr).toBe(0);
-  expect(JSON.parse(result.stdout)).toEqual({ ok: true });
-}, 35_000);
+it(
+  "releases abandoned handles of either copy by finalizer without touching the other copy",
+  async () => {
+    const stdout = await runGcProbe("run-control-mixed-version");
+    expect(JSON.parse(stdout)).toEqual({ ok: true });
+  },
+  gcProbeTimeout,
+);

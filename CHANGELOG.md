@@ -46,15 +46,18 @@ corresponding release notes before users upgrade.
   timers must be finite, non-boolean durations within 2,147,483,647 milliseconds; positive
   timers reject zero, while cache TTLs, recovery waits, the total failover window, and shutdown
   deadlines allow zero and reject negatives. Empty numeric environment values are rejected.
+  `budgetCheckTimeout`, including `SOLWYN_BUDGET_CHECK_TIMEOUT`, must be at least `0.05`
+  seconds; invalid values fail construction with `ConfigurationError(field: "budgetCheckTimeout")`.
   Breaker thresholds must be positive integers, retries must be non-negative integers, and
   jitter must be between zero and one. Reporter batches cannot exceed 1000 events, and breaker
   heartbeats cannot exceed 60 seconds. Replace invalid values with durations and counts within
   the documented ranges; defaults are unchanged.
 - **Breaking:** **Direct budget-enforcer durations are validated.** `BudgetEnforcer` now rejects
   non-number, non-finite, negative, and oversized `cacheTtl` values, and non-number, non-finite,
-  non-positive, and oversized per-call `timeout` values with `ConfigurationError`. Both
+  sub-`0.05`-second, and oversized per-call `timeout` values with `ConfigurationError`. Both
   durations are in seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
-  Pass finite numbers in that range, allowing zero only for `cacheTtl`.
+  Pass finite numbers in that range, allowing zero only for `cacheTtl` and at least `0.05`
+  seconds for `timeout`.
 - **Breaking:** **Constructor shape validation is synchronous.** Invalid options objects,
   fallback lists, model values, loggers, and selection policies raise `ConfigurationError`
   before reporters or budget resources start. Supply all four `debug`, `info`, `warn`, and
@@ -181,11 +184,12 @@ corresponding release notes before users upgrade.
 - **Breaking:** **Budget preflight shares one deadline and honors cancellation.** An initial
   lease attempt and its per-call fallback now share the requested timeout. With less than 50
   milliseconds remaining, preflight skips network I/O and applies local policy with a deadline
-  diagnostic, without adding a breaker failure or drawing lease headroom. Caller `AbortSignal`s
-  reach preflight transport; already-aborted requests skip budget I/O, and cancellation rejects
-  without treating it as a control-plane outage. Non-Error abort reasons become `AbortError`s,
-  matching provider dispatch; Error reasons are preserved. Allow at least 50 milliseconds for a
-  network preflight and handle caller cancellation separately from budget denials.
+  warning at most once per minute per client, without adding a breaker failure or drawing lease
+  headroom. Caller `AbortSignal`s reach preflight transport; already-aborted requests skip budget
+  I/O, and cancellation rejects without treating it as a control-plane outage. Non-Error abort
+  reasons become `AbortError`s, matching provider dispatch; Error reasons are preserved. Allow
+  at least 50 milliseconds for a network preflight and handle caller cancellation separately
+  from budget denials.
 - **Breaking:** **AI SDK middleware shutdown.** Closing rejects new calls before budget or
   provider I/O, drains buffered calls and stream setup within the shared reporting deadline, and
   settles open streams once from observed usage before reporting closes. Calls beyond the drain
@@ -196,11 +200,13 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
-- **Abandoned streams release settlement ownership.** Garbage-collection finalization settles
-  observed usage once, retaining the reservation floor for missing or malformed usage, and
-  releases run lifetimes, caller signals, lease authority, and recovery probes before client
-  shutdown. Finalization timing remains runtime-dependent; explicit stream cleanup is
-  deterministic.
+- **Abandoned streams release settlement ownership.** In the drop-in client, garbage-collection
+  finalization settles observed usage once, retaining the reservation floor for missing or
+  malformed usage, and releases run lifetimes, caller signals, lease authority, and recovery
+  probes before client shutdown. Finalization timing remains runtime-dependent; explicit stream
+  cleanup is deterministic. Settlements triggered by finalization or `close()` do not contribute routing
+  latency samples. AI SDK middleware streams must be consumed or cancelled; garbage collection
+  does not settle abandoned middleware streams.
 - **Already-aborted calls skip velocity detection.** Chat, Responses, and media calls whose
   signal is already aborted reject before observing velocity or starting budget I/O, so
   cancelled retries cannot stop a run without dispatching work.
@@ -229,10 +235,12 @@ corresponding release notes before users upgrade.
   client's `failOpen: false` setting.
 - **Complete Anthropic usage.** Streaming input and cache totals now follow cumulative
   `message_delta` counters, including server-tool usage. Aggregate-only deltas preserve the
-  initial five-minute/one-hour cache split and assign only additional writes to five minutes;
-  decreasing aggregates retain observed writes and mark usage estimated. Buffered and streamed
-  usage map thinking tokens without adding them twice to output, and preserve supported
-  `standard`/`priority` service tiers while omitting unsupported values such as `batch`.
+  initial five-minute/one-hour cache split. Additional writes use the initial TTL when exactly
+  one TTL was used; when both or neither were used, additional writes use the conservative
+  one-hour bucket and mark usage estimated. Decreasing aggregates retain observed writes and
+  mark usage estimated. Buffered and streamed usage map thinking tokens without adding them
+  twice to output, and preserve supported `standard`/`priority` service tiers while omitting
+  unsupported values such as `batch`.
 - **Google sizing and omitted zero counters.** Preflight estimates include Content `parts` and
   `config.systemInstruction`. A measured input total with omitted candidate output tokens is
   treated as reported usage with zero candidate output for buffered responses and streams with
@@ -252,7 +260,8 @@ corresponding release notes before users upgrade.
   in-flight streams at the next chunk boundary. A stopped stream keeps its termination across
   `clearRunTermination()`. Run stops and caller aborts confirm observed stream usage, including
   the part pulled at the stop boundary, and retain the reservation floor for estimated usage.
-  Caller `abortSignal` also reaches budget preflight. Local velocity detection remains
+  Caller `abortSignal` also reaches budget preflight. Non-Error abort reasons become consistent
+  `AbortError`s even when `DOMException` is unavailable. Local velocity detection remains
   unsupported by this integration.
 - **Shared coverage and explicit Node imports.** ESM and CommonJS builds share wrapper coverage
   registrations. Built Node entries preserve the `node:async_hooks` prefix; core entries remain
@@ -266,7 +275,8 @@ corresponding release notes before users upgrade.
   time. Retries keep the same report ID, occurrence count, and cursor; later observations form a
   separate report. Refused keys stop retrying, failures produce rate-limited diagnostics, and
   read-only credentials use the shared configuration diagnostic. Retry exhaustion is aggregated
-  at most once per minute. Reads with nothing due use a constant-time schedule check.
+  at most once per minute, and any remaining count is emitted once at close. Reads with nothing
+  due use a constant-time schedule check.
 - **Shutdown delivery across server retry holds.** Final confirmation and metadata flushes wait
   for short `Retry-After` holds within the remaining close deadline. Longer holds are counted as
   `rate_limited` losses, and unsent settlement confirmations still release their paired metadata

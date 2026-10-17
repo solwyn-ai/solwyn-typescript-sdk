@@ -1614,6 +1614,40 @@ describe("strict schema", () => {
 
 describe("numeric configuration safety bounds", () => {
   const maxTimerSeconds = 2_147_483_647 / 1000;
+  it.each([
+    0.001, 0.04, 0.049,
+  ])("rejects a sub-50ms budget timeout at construction: %s", (timeout) => {
+    const fetch = vi.fn();
+    for (const source of ["option", "env"]) {
+      vi.stubEnv("SOLWYN_BUDGET_CHECK_TIMEOUT", String(timeout));
+      expect(
+        () =>
+          new SolwynCore(declaredOpenAIClient(), {
+            apiKey: VALID_KEY,
+            fetch,
+            ...(source === "option" ? { budgetCheckTimeout: timeout } : {}),
+          }),
+      ).toThrow(
+        expect.objectContaining({
+          name: "ConfigurationError",
+          field: "budgetCheckTimeout",
+        }),
+      );
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("accepts the 50ms budget timeout boundary from options and environment", () => {
+    expect(
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, budget_check_timeout: 0.05 }, {})
+        .budget_check_timeout,
+    ).toBe(0.05);
+    expect(
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_BUDGET_CHECK_TIMEOUT: "0.05" })
+        .budget_check_timeout,
+    ).toBe(0.05);
+  });
+
   const integerFields = [
     "same_provider_retries",
     "circuit_breaker_failure_threshold",

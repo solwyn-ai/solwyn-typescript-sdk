@@ -112,7 +112,6 @@ import {
 } from "./request-options";
 import {
   ambiguousFailoverAllowed,
-  budgetCheckTimeout,
   buildCandidate,
   CostPolicy,
   classifyException,
@@ -194,7 +193,7 @@ import { DENY_ELIGIBLE_RULE_ORDER, VelocityMonitor } from "./velocity";
 const CUSTOM_INSPECT = Symbol.for("nodejs.util.inspect.custom");
 const EMPTY_VELOCITY_FLAGS: readonly VelocityFlag[] = Object.freeze([]);
 
-/** A finalizer must never capture the client or the frame that constructed its stream. */
+/** A finalizer's held value must never reach the stream wrapper or its source. */
 function streamReleaseCallback(
   breaker: CircuitBreaker,
   admission: CircuitBreakerAdmission,
@@ -2322,7 +2321,8 @@ export class SolwynCore {
         fallbackProviders: surface === "responses" ? [] : fallbackProviders,
         fallbackModels: surface === "responses" ? [] : fallbackModels,
         ...(surface === "responses" ? { modality: "text" as const } : {}),
-        timeout: budgetCheckTimeout(deadline, this.#config.budget_check_timeout),
+        timeout: this.#config.budget_check_timeout,
+        deadline,
         signal,
       }),
     );
@@ -2489,7 +2489,8 @@ export class SolwynCore {
         modality: spec.modality,
         fallbackProviders: [],
         fallbackModels: [],
-        timeout: budgetCheckTimeout(deadline, this.#config.budget_check_timeout),
+        timeout: this.#config.budget_check_timeout,
+        deadline,
         signal,
       }),
     );
@@ -3564,9 +3565,14 @@ export class SolwynCore {
           estimatedInputTokens: settlement.estimatedInputTokens,
           logger: this.#logger,
         });
-        completeStream(usage.tokenDetails, nowMs() - hopStarted);
+        // Shutdown and GC timing measure ownership delay rather than provider completion.
+        completeStream(usage.tokenDetails, nowMs() - hopStarted, false);
       };
-      const completeStream = (tokenDetails: TokenDetails, elapsedMs: number): void => {
+      const completeStream = (
+        tokenDetails: TokenDetails,
+        elapsedMs: number,
+        recordLatency = true,
+      ): void => {
         if (streamSettled) return;
         streamSettled = true;
         this.#streamSettlements.delete(streamToken);
@@ -3586,7 +3592,7 @@ export class SolwynCore {
             }
           }
           breaker.recordSuccess(admission);
-          this.#latency.recordLatency(hop.provider, elapsedMs);
+          if (recordLatency) this.#latency.recordLatency(hop.provider, elapsedMs);
           const serviceTier = safeExtractServiceTier(
             () => accumulator.getServiceTier(),
             this.#logger,
@@ -3642,6 +3648,7 @@ export class SolwynCore {
         onError: (error) => {
           if (streamSettled) return;
           if (settlement.callerSignal?.aborted || isCallerAbort(error)) {
+            // Caller aborts still record elapsed time observed during active consumption.
             breaker.releaseProbe(admission);
             const usage = extractUsageFailSoft({
               extract: () => accumulator.finalize(),

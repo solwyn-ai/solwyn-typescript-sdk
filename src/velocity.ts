@@ -142,7 +142,10 @@ export class VelocityMonitor {
         // Sample independently of observation order: oldest eviction cascades under
         // round-robin overflow, while newest eviction erases fresh loops amid churn.
         const evictedRunId = this.#runIds[
-          Math.floor(this.#random() * this.#runIds.length)
+          Math.max(
+            0,
+            Math.min(this.#runIds.length - 1, Math.floor(this.#random() * this.#runIds.length)),
+          )
         ] as string;
         const evictedHistory = this.#runs.get(evictedRunId) as RunHistory;
         this.#deleteHistory(evictedRunId, evictedHistory);

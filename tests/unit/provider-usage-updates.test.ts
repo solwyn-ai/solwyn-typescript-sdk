@@ -10,12 +10,12 @@ import { TokenDetailsSchema } from "../../src/token-details";
 
 describe("Anthropic cumulative stream usage", () => {
   it.each([
-    { aggregate: 1200, cache5m: 200, estimated: false },
-    { aggregate: 1500, cache5m: 500, estimated: false },
-    { aggregate: 900, cache5m: 200, estimated: true },
-  ])("preserves the initial 1h split with aggregate-only deltas: $aggregate", ({
+    { aggregate: 1200, cache1h: 1000, estimated: false },
+    { aggregate: 1500, cache1h: 1300, estimated: true },
+    { aggregate: 900, cache1h: 1000, estimated: true },
+  ])("preserves observed mixed-TTL writes with aggregate-only deltas: $aggregate", ({
     aggregate,
-    cache5m,
+    cache1h,
     estimated,
   }) => {
     const acc = new AnthropicStreamAccumulator(noopLogger);
@@ -45,11 +45,73 @@ describe("Anthropic cumulative stream usage", () => {
     acc.observe(delta);
     acc.observe(delta);
     expect(acc.finalize()).toMatchObject({
-      input_tokens: 1010 + cache5m,
+      input_tokens: 210 + cache1h,
       output_tokens: 50,
-      cache_creation_5m_tokens: cache5m,
-      cache_creation_1h_tokens: 1000,
+      cache_creation_5m_tokens: 200,
+      cache_creation_1h_tokens: cache1h,
       is_estimated: estimated,
+    });
+  });
+
+  it.each([
+    { start5m: 0, start1h: 1000, cache5m: 0, cache1h: 1500, estimated: false },
+    { start5m: 1000, start1h: 0, cache5m: 1500, cache1h: 0, estimated: false },
+    { start5m: 0, start1h: 0, cache5m: 0, cache1h: 1500, estimated: true },
+  ])("attributes aggregate server-tool growth from initial TTLs $start5m/$start1h", ({
+    start5m,
+    start1h,
+    cache5m,
+    cache1h,
+    estimated,
+  }) => {
+    const acc = new AnthropicStreamAccumulator(noopLogger);
+    acc.observe({
+      type: "message_start",
+      message: {
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: start5m + start1h,
+          cache_creation: {
+            ephemeral_5m_input_tokens: start5m,
+            ephemeral_1h_input_tokens: start1h,
+          },
+          output_tokens: 1,
+          service_tier: "standard",
+        },
+      },
+    });
+    for (const aggregate of [1200, 1500, 1500]) {
+      acc.observe({
+        type: "message_delta",
+        usage: {
+          input_tokens: 30,
+          cache_read_input_tokens: 1000,
+          cache_creation_input_tokens: aggregate,
+          output_tokens: 80,
+          output_tokens_details: null,
+          server_tool_use: { web_search_requests: 1 },
+        },
+      });
+    }
+    const buffered = new AnthropicAdapter({ logger: noopLogger }).extractUsage({
+      usage: {
+        input_tokens: 30,
+        cache_read_input_tokens: 1000,
+        cache_creation_input_tokens: 1500,
+        cache_creation: {
+          ephemeral_5m_input_tokens: cache5m,
+          ephemeral_1h_input_tokens: cache1h,
+        },
+        output_tokens: 80,
+      },
+    });
+    expect(acc.finalize()).toEqual({ ...buffered, is_estimated: estimated });
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 2530,
+      cached_input_tokens: 1000,
+      cache_creation_5m_tokens: cache5m,
+      cache_creation_1h_tokens: cache1h,
     });
   });
 

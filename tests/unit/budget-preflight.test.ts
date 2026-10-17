@@ -9,6 +9,7 @@ import { ConfigurationError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import type { LeaseLedger } from "../../src/lease";
 import { noopLogger } from "../../src/logging";
+import { Deadline } from "../../src/routing";
 import { createTokenDetails } from "../../src/token-details";
 import type { LeaseGrantResponse } from "../../src/types";
 
@@ -121,7 +122,10 @@ describe("budget preflight deadline and cancellation", () => {
     expect(breaker.getState()).toMatchObject({ state: "closed", lastFailureTime: null });
     expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
     expect(debug).not.toHaveBeenCalledWith("budget.check_skipped_breaker_open");
-    expect(warn).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "budget.preflight_skipped_deadline: applying local policy (fail_open=%s)",
+      true,
+    );
     expect(result.warning).toBe(
       "Budget preflight deadline exhausted; proceeding in fail-open mode",
     );
@@ -144,17 +148,46 @@ describe("budget preflight deadline and cancellation", () => {
       logger: { ...noopLogger, warn, debug },
     });
 
-    const result = await budget.checkBudget(options({ timeout: 0.049 }));
+    const result = await budget.checkBudget(
+      options({ timeout: 0.5, deadline: new Deadline(0.049, () => 0) }),
+    );
     expect(result.allowed).toBe(failOpen);
     expect(result.warning).toContain("Budget preflight deadline exhausted");
     expect(result.warning).not.toContain("unreachable");
     expect(fetch).not.toHaveBeenCalled();
     expect(admit).not.toHaveBeenCalled();
-    expect(warn).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "budget.preflight_skipped_deadline: applying local policy (fail_open=%s)",
+      failOpen,
+    );
     expect(debug).toHaveBeenCalledWith("lease.grant_skipped_deadline");
     expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
     expect(ledger(budget).bookkeepingSize().claims).toBe(0);
     expect(ledger(budget).stateFor("run-preflight")).toBeNull();
+  });
+
+  it.each([
+    true,
+    false,
+  ])("rate-limits exhausted deadline warnings with leases=%s", async (leaseEnabled) => {
+    let now = 0;
+    const warn = vi.fn();
+    const fetch = vi.fn(async () => new Response(JSON.stringify(grant())));
+    const budget = enforcer({
+      fetch,
+      leaseEnabled,
+      monotonicNow: () => now,
+      logger: { ...noopLogger, warn },
+    });
+    for (const time of [0, 59_999, 60_000]) {
+      now = time;
+      const result = await budget.checkBudget(
+        options({ callId: crypto.randomUUID(), deadline: new Deadline(0.049, () => 0) }),
+      );
+      expect(result.warning).toContain("Budget preflight deadline exhausted");
+      expect(warn).toHaveBeenCalledTimes(time < 60_000 ? 1 : 2);
+    }
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("still dispatches an initial grant with exactly 50ms remaining", async () => {
@@ -203,7 +236,10 @@ describe("budget preflight deadline and cancellation", () => {
     expect(result.warning).not.toContain("unreachable");
     expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
     expect(debug).not.toHaveBeenCalledWith("budget.check_skipped_breaker_open");
-    expect(warn).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      "budget.preflight_skipped_deadline: applying local policy (fail_open=%s)",
+      failOpen,
+    );
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(ledger(budget).stateFor("run-preflight")).toMatchObject({
       grantedRemainingTokens: 0,
@@ -349,6 +385,9 @@ describe("direct budget enforcer safety", () => {
     NaN,
     Infinity,
     0,
+    0.001,
+    0.04,
+    0.049,
     -1,
     MAX_DELAY_S + 1,
     true,

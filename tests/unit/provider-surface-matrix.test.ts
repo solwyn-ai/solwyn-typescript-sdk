@@ -22,7 +22,10 @@ interface SurfaceCatalog {
   readonly include: readonly CatalogCell[];
 }
 
-async function executeWorkflowCatalog(eventName: string): Promise<readonly CatalogCell[]> {
+async function executeWorkflowCatalog(
+  eventName: string,
+  ref = "refs/heads/main",
+): Promise<readonly CatalogCell[]> {
   const outputDirectory = await mkdtemp(join(tmpdir(), "provider-surface-matrix-"));
   const scriptsDirectory = join(outputDirectory, "scripts");
   const testsDirectory = join(outputDirectory, "tests");
@@ -42,6 +45,7 @@ async function executeWorkflowCatalog(eventName: string): Promise<readonly Catal
       env: {
         ...process.env,
         GITHUB_EVENT_NAME: eventName,
+        GITHUB_REF: ref,
         GITHUB_OUTPUT: outputPath,
       },
     });
@@ -57,6 +61,18 @@ async function executeWorkflowCatalog(eventName: string): Promise<readonly Catal
 }
 
 describe("provider surface matrix catalog command", () => {
+  it.each([
+    "refs/heads/feature",
+    "refs/heads/Main",
+    "refs/heads/main-canary",
+    "refs/tags/main",
+    "",
+  ])("rejects a manual canary dispatch outside main: %s", async (ref) => {
+    await expect(executeWorkflowCatalog("workflow_dispatch", ref)).rejects.toThrow(
+      "Manual CI canary dispatches must target refs/heads/main",
+    );
+  });
+
   it("preserves every reviewed catalog cell for pull requests and pushes", async () => {
     const catalog = JSON.parse(await readFile(catalogPath, "utf8")) as SurfaceCatalog;
 

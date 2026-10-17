@@ -11,6 +11,9 @@ To run the same six `@latest` provider canaries as the schedule on demand, dispa
 gh workflow run CI --ref main
 ```
 
+Dispatches must target `main`. Dispatching another branch or tag fails `Provider surface catalog`
+and `Required / CI`.
+
 ## 1. Identify
 
 Open the failing cell and download its `provider-surface-<family>-<interval>` artifact.
@@ -31,8 +34,8 @@ request review before assigning a stronger classification.
 
 ## 3. Apply
 
-1. Before capturing a scheduled `latest` drift, read the affected provider package name
-   and exact installed version from the failing artifact's `distributions` array.
+1. Before capturing a scheduled or dispatched `latest` drift, read the affected provider package
+   name and exact installed version from the failing artifact's `distributions` array.
    Install and pin that release, then update its `latest` row in
    [`tests/provider-surface-intervals.json`](../tests/provider-surface-intervals.json)
    and the corresponding catalog expectations in

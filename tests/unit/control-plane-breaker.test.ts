@@ -171,21 +171,25 @@ describe("budget-check breaker admission and taxonomy", () => {
         });
         return new Response(body, { status: 200 });
       });
-      const budget = budgetWithBreaker(breaker, { failOpen: false, fetch });
+      const budget = budgetWithBreaker(breaker, {
+        failOpen: false,
+        fetch,
+        monotonicNow: () => 0,
+      });
       const check = budget.checkBudget({
         estimatedInputTokens: 1,
         model: "gpt-4o",
         provider: "openai",
-        timeout: 0.01,
+        timeout: 0.1,
       });
       const outcome = Promise.race([
         check.then((result) => ({ kind: "result" as const, result })),
         new Promise<{ kind: "watchdog" }>((resolve) => {
-          setTimeout(() => resolve({ kind: "watchdog" }), 11);
+          setTimeout(() => resolve({ kind: "watchdog" }), 101);
         }),
       ]);
 
-      await vi.advanceTimersByTimeAsync(11);
+      await vi.advanceTimersByTimeAsync(101);
 
       await expect(outcome).resolves.toMatchObject({
         kind: "result",

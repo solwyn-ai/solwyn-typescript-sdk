@@ -8,6 +8,7 @@ import { CircuitBreaker } from "../../src/circuit-breaker";
 import { ConfigurationError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import type { LeaseLedger } from "../../src/lease";
+import { noopLogger } from "../../src/logging";
 import { createTokenDetails } from "../../src/token-details";
 import type { LeaseGrantResponse } from "../../src/types";
 
@@ -89,19 +90,128 @@ describe("budget preflight deadline and cancellation", () => {
     expect(paths).toEqual(["/api/v1/budgets/lease", "/api/v1/budgets/check"]);
   });
 
-  it("skips a fallback with no remaining time without recording a breaker failure", async () => {
+  it.each([
+    0, 1, 49,
+  ])("skips a fallback with only %ims left without changing breaker health", async (remainingMs) => {
+    vi.useFakeTimers();
     let monotonic = 0;
     const breaker = new CircuitBreaker();
     const failure = vi.spyOn(breaker, "recordFailure");
-    const fetch = vi.fn(async () => {
-      monotonic = 500;
-      return new Response(null, { status: 503 });
+    const debug = vi.fn();
+    const warn = vi.fn();
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith("/lease")) {
+        monotonic = 500 - remainingMs;
+        return new Response(null, { status: 503 });
+      }
+      return new Promise<Response>(() => {});
     });
-    const budget = enforcer({ fetch, monotonicNow: () => monotonic, controlPlaneBreaker: breaker });
-    const result = await budget.checkBudget(options({ timeout: 0.5 }));
+    const budget = enforcer({
+      fetch,
+      monotonicNow: () => monotonic,
+      controlPlaneBreaker: breaker,
+      logger: { ...noopLogger, debug, warn },
+    });
+    const pending = budget.checkBudget(options({ timeout: 0.5 }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await pending;
     expect(result.allowed).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(failure).not.toHaveBeenCalled();
+    expect(breaker.getState()).toMatchObject({ state: "closed", lastFailureTime: null });
+    expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
+    expect(debug).not.toHaveBeenCalledWith("budget.check_skipped_breaker_open");
+    expect(warn).not.toHaveBeenCalled();
+    expect(result.warning).toBe(
+      "Budget preflight deadline exhausted; proceeding in fail-open mode",
+    );
+    expect(ledger(budget).bookkeepingSize().claims).toBe(0);
+  });
+
+  it.each([
+    true,
+    false,
+  ])("skips a short initial grant without an outage episode with failOpen=%s", async (failOpen) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify(grant())));
+    const warn = vi.fn();
+    const debug = vi.fn();
+    const breaker = new CircuitBreaker();
+    const admit = vi.spyOn(breaker, "admit");
+    const budget = enforcer({
+      fetch,
+      failOpen,
+      controlPlaneBreaker: breaker,
+      logger: { ...noopLogger, warn, debug },
+    });
+
+    const result = await budget.checkBudget(options({ timeout: 0.049 }));
+    expect(result.allowed).toBe(failOpen);
+    expect(result.warning).toContain("Budget preflight deadline exhausted");
+    expect(result.warning).not.toContain("unreachable");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(admit).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith("lease.grant_skipped_deadline");
+    expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
+    expect(ledger(budget).bookkeepingSize().claims).toBe(0);
+    expect(ledger(budget).stateFor("run-preflight")).toBeNull();
+  });
+
+  it("still dispatches an initial grant with exactly 50ms remaining", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify(grant())));
+    const budget = enforcer({ fetch, monotonicNow: () => 0 });
+    const result = await budget.checkBudget(options({ timeout: 0.05 }));
+
+    expect(result).toMatchObject({ allowed: true, leaseId: "lease-preflight", warning: null });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    budget.releaseReservation(CALL_ID, result.leaseClaimToken ?? null);
+  });
+
+  it.each([
+    true,
+    false,
+  ])("preserves a live lease's headroom share on a local deadline with failOpen=%s", async (failOpen) => {
+    let expiredDeadline = false;
+    let deadlineReads = 0;
+    const fetch = vi.fn(
+      async () => new Response(JSON.stringify({ ...grant(), granted_tokens: 600 })),
+    );
+    const debug = vi.fn();
+    const warn = vi.fn();
+    const budget = enforcer({
+      fetch,
+      failOpen,
+      monotonicNow: () => (expiredDeadline && ++deadlineReads > 1 ? 500 : 0),
+      logger: { ...noopLogger, debug, warn },
+    });
+    const funded = await budget.checkBudget(options());
+    budget.buildConfirmRequest({
+      callId: CALL_ID,
+      leaseId: funded.leaseId,
+      leaseClaimToken: funded.leaseClaimToken,
+      provider: "openai",
+      model: "model-a",
+      tokenDetails: createTokenDetails({ input_tokens: 100, output_tokens: 500 }),
+    });
+    expiredDeadline = true;
+    const result = await budget.checkBudget(
+      options({ callId: "00000000-0000-0000-0000-000000000002", timeout: 0.5 }),
+    );
+
+    expect(result).toMatchObject({ allowed: true, leaseId: null, reservationId: null });
+    expect(result.warning).toContain("Budget preflight deadline exhausted");
+    expect(result.warning).not.toContain("unreachable");
+    expect(debug).toHaveBeenCalledWith("budget.check_skipped_deadline");
+    expect(debug).not.toHaveBeenCalledWith("budget.check_skipped_breaker_open");
+    expect(warn).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(ledger(budget).stateFor("run-preflight")).toMatchObject({
+      grantedRemainingTokens: 0,
+      shareRemainingTokens: 1_000,
+      reservedTokens: 0,
+      spentTokensSinceReport: 600,
+    });
+    expect(budget.getLocalCurrentSpend()).toBeCloseTo(0.003);
     expect(ledger(budget).bookkeepingSize().claims).toBe(0);
   });
 
@@ -145,6 +255,30 @@ describe("budget preflight deadline and cancellation", () => {
     expect(await outcome).toBe(reason);
     expect(transportSignal?.aborted).toBe(true);
     expect(failure).not.toHaveBeenCalled();
+    expect(ledger(budget).bookkeepingSize().claims).toBe(0);
+  });
+
+  it.each([
+    [true, "before"],
+    [false, "before"],
+    [true, "during"],
+    [false, "during"],
+  ] as const)("normalizes a non-Error abort reason %s/%s preflight", async (leaseEnabled, timing) => {
+    const controller = new AbortController();
+    const fetch = vi.fn(async () => new Promise<Response>(() => {}));
+    const breaker = new CircuitBreaker();
+    const budget = enforcer({ fetch, leaseEnabled, controlPlaneBreaker: breaker });
+    if (timing === "before") controller.abort("cancelled");
+    const outcome = budget
+      .checkBudget(options({ signal: controller.signal }))
+      .catch((error: unknown) => error);
+    if (timing === "during") controller.abort("cancelled");
+
+    const error = await outcome;
+    expect(error).toBeInstanceOf(DOMException);
+    expect(error).toMatchObject({ name: "AbortError", message: "The operation was aborted." });
+    expect(fetch).toHaveBeenCalledTimes(timing === "before" ? 0 : 1);
+    expect(breaker.getState()).toMatchObject({ failureCount: 0, lastFailureTime: null });
     expect(ledger(budget).bookkeepingSize().claims).toBe(0);
   });
 

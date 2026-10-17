@@ -126,6 +126,9 @@ live budget check is authoritative:
 | `alert_only` | Log a warning and allow the provider call |
 | `hard_deny` | Throw `BudgetExceededError` before provider dispatch |
 
+Alert-only budget-limit logs emit at most once every 30 seconds per enforcer. Each affected
+budget result retains its warning and reservation ID.
+
 The constructor's `budgetMode` option is not sent in `BudgetCheckRequest` and does not enable live
 Cloud blocking. It supplies the mode attached to SDK-local outage decisions. `failOpen` controls
 whether those local decisions allow or deny when the budget service cannot be reached.
@@ -177,9 +180,12 @@ estimate. The ordinary check path uses `POST /api/v1/budgets/check`; when it ret
 the reporter settles it through `POST /api/v1/budgets/confirm` with observed usage. Streaming
 settles once, at stream end. Eligible calls can reuse cached authority or a run lease. A hard
 deny throws before provider dispatch and reports a `budget_denied` event carrying the estimate.
-The budget preflight timeout is shared by a lease attempt and any per-call fallback. A caller's
+The budget preflight timeout is shared by a lease attempt and any per-call fallback. With less
+than 50 milliseconds remaining, preflight skips network I/O and applies local policy with a
+deadline warning, without recording a breaker failure or drawing lease headroom. A caller's
 request `AbortSignal` also cancels preflight; cancellation rejects without recording a
-control-plane breaker failure. Direct `BudgetEnforcer.checkBudget()` callers can pass `signal`
+control-plane breaker failure. Error abort reasons are preserved; other reasons become an
+`AbortError`. Direct `BudgetEnforcer.checkBudget()` callers can pass `signal`
 and use the returned `callId` to settle or release a lease reservation, including when the SDK
 generated the ID.
 
@@ -807,9 +813,9 @@ timestamps, and estimated input-token counts — never prompts or responses. In 
 adds structural `velocity_flags` and rate-limited warnings; in `"deny"` mode only
 `repeat_size` and `monotonic_growth` can terminate a run. `rate_acceleration` is advisory.
 The detector retains up to 64 observations per run for at most 4096 runs. Stale run histories
-are discarded first; if the hard cap displaces live history, `velocity.history_evicted` warns
-at most once every 30 seconds. Established histories keep progressing under round-robin traffic
-above the cap, but a displaced run can lose observations needed to detect a loop.
+are discarded first; at the hard cap, a random live history is displaced to avoid systematically
+resetting loops under run churn or round-robin traffic. `velocity.history_evicted` warns at most
+once every 30 seconds. A displaced run can lose observations needed to detect a loop.
 
 | Option | Env var | Default | Meaning |
 |--------|---------|---------|---------|

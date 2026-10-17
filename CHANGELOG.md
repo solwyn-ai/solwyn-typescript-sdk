@@ -193,20 +193,24 @@ corresponding release notes before users upgrade.
 - **Breaking:** **AI SDK middleware shutdown.** Closing rejects new calls before budget or
   provider I/O, drains buffered calls and stream setup within the shared reporting deadline, and
   settles open streams once from observed usage before reporting closes. Calls beyond the drain
-  deadline produce a shutdown warning. Stream settlement registrations are weak so the handle
-  does not keep abandoned streams alive. Provider cleanup remains owned by the AI SDK. Finish or
-  cancel streams before closing to include terminal usage, and create a new middleware handle
-  for subsequent work.
+  deadline produce a shutdown warning. Stream settlement records retain usage counts and
+  attribution while allowing abandoned streams to be collected and settled before shutdown.
+  Provider cleanup remains owned by the AI SDK. Finish or cancel streams before closing to
+  include terminal usage, and create a new middleware handle for subsequent work.
 
 ### Fixed
 
-- **Abandoned streams release settlement ownership.** In the drop-in client, garbage-collection
-  finalization settles observed usage once, retaining the reservation floor for missing or
-  malformed usage, and releases run lifetimes, caller signals, lease authority, and recovery
-  probes before client shutdown. Finalization timing remains runtime-dependent; explicit stream
-  cleanup is deterministic. Settlements triggered by finalization or `close()` do not contribute routing
-  latency samples. AI SDK middleware streams must be consumed or cancelled; garbage collection
-  does not settle abandoned middleware streams.
+- **Abandoned streams settle usage and release ownership.** Garbage-collection finalization now
+  covers both the drop-in client and AI SDK middleware. Streams settle observed usage once with
+  paired confirmation and metadata, including lease attribution; a middleware error part without
+  a finish part instead reports an error event without confirmation. Estimated or
+  unmeasured usage keeps the reservation floor. Settlement records retain no stream, source,
+  middleware handle, caller signal or run lifetime, and finalization releases run and lease
+  ownership before shutdown. The drop-in client also releases recovery probes. Finalization
+  after completion, cancellation or `close()` cannot enqueue another settlement; a stream whose
+  setup outlasts reporting shutdown counts its late settlement as dropped usage. Finalization
+  timing remains runtime-dependent; explicit stream cleanup is deterministic. Settlements
+  triggered by finalization or `close()` do not contribute routing latency samples.
 - **Already-aborted calls skip velocity detection.** Chat, Responses, and media calls whose
   signal is already aborted reject before observing velocity or starting budget I/O, so
   cancelled retries cannot stop a run without dispatching work.

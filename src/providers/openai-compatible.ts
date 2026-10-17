@@ -38,7 +38,7 @@ import {
   estimateTokensFromLength,
 } from "../privacy";
 import type { TokenDetails } from "../token-details";
-import { buildTokenDetails } from "../token-details";
+import { buildTokenDetails, zeroTokenDetails } from "../token-details";
 import type { ProviderName } from "../types";
 import {
   type BoundedServiceTier,
@@ -520,7 +520,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
     }
   }
 
-  finalize(): TokenDetails {
+  finalize({ estimateMissingUsage = true }: { estimateMissingUsage?: boolean } = {}): TokenDetails {
     if (this.#standardUsage !== null) {
       return this.#standardUsage;
     }
@@ -528,6 +528,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
       return this.#xGroqUsage;
     }
     if (this.#zeroUsage !== null && this.#contentChars === 0) return this.#zeroUsage;
+    if (!estimateMissingUsage) return zeroTokenDetails();
     // Tier 3: no usable usage anywhere — settle from accumulated content length.
     const outputTokens =
       this.#contentChars > 0

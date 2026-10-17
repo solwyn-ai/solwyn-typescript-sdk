@@ -242,8 +242,8 @@ export type PreparedDispatch = (...passthroughArgs: unknown[]) => unknown;
 export interface StreamUsageAccumulator {
   /** Called for every chunk yielded by the stream. */
   observe(chunk: unknown): void;
-  /** Settle final usage. Returns all-zero TokenDetails if none observed; must never throw. */
-  finalize(): TokenDetails;
+  /** Final usage; disabling fallback estimates returns zero if none observed. Must never throw. */
+  finalize(options?: { estimateMissingUsage?: boolean }): TokenDetails;
   /** Service tier settled from observed chunks, or `null`. */
   getServiceTier(): string | null;
 }

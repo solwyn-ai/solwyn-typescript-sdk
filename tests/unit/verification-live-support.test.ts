@@ -77,4 +77,62 @@ describe("live integration support (offline)", () => {
       expect(event.token_details.is_estimated).toBeUndefined();
     }
   });
+
+  for (const leased of [false, true]) {
+    it.each([
+      "openai",
+      "anthropic",
+      "google",
+      "bedrock",
+    ])(`settles observed %s stream-error usage only without lease funding (lease=${leased})`, async (provider) => {
+      const { assertDelivery, captureControlPlane, consume, metadata, providerFixture } =
+        await import(supportUrl);
+      const plane = new FakeControlPlane();
+      const wire = captureControlPlane(plane.apiUrl, plane.fetch);
+      const failure = new Error("synthetic mid-stream provider failure");
+      const fixture = providerFixture(provider, { streamError: failure });
+      const client = new Solwyn(fixture.raw, {
+        apiKey: plane.apiKey,
+        apiUrl: plane.apiUrl,
+        fetch: wire.fetch,
+        provider,
+        leaseEnabled: leased,
+        breakerReportingEnabled: false,
+      });
+      try {
+        await run("synthetic-live-stream-error", async () => {
+          await expect(consume(await fixture.invoke(client, true))).rejects.toBe(failure);
+        });
+      } finally {
+        await client.close();
+      }
+      assertDelivery(wire);
+      expect(fixture.calls).toBe(1);
+      expect(fixture.ended).toBe(1);
+      expect(plane.confirms).toHaveLength(leased ? 0 : 1);
+      expect(metadata(wire)).toMatchObject([
+        {
+          status: "error",
+          input_tokens: leased ? 0 : 1000,
+          output_tokens: leased ? 0 : 500,
+          possibly_succeeded: true,
+        },
+      ]);
+      if (leased) {
+        expect(metadata(wire)[0].token_details).toBeUndefined();
+        expect(plane.checks).toHaveLength(0);
+        expect(plane.leaseGrants).toHaveLength(1);
+        expect(plane.leaseSurrenders).toHaveLength(1);
+        expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+      } else {
+        expect(plane.confirms[0]).toMatchObject({
+          call_id: metadata(wire)[0].call_id,
+          token_details: { input_tokens: 1000, output_tokens: 500 },
+        });
+        expect(plane.confirms[0]?.lease_id).toBeUndefined();
+        expect(plane.checks).toHaveLength(1);
+        expect(plane.leaseGrants).toHaveLength(0);
+      }
+    });
+  }
 });

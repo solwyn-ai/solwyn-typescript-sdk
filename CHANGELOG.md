@@ -16,6 +16,16 @@ corresponding release notes before users upgrade.
   Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
   and conservative handling of unknown TTLs or decreasing totals are preserved.
 
+- **Settlement after per-call streaming errors.** Ordinary mid-stream provider errors on streams
+  using per-call budget checks now settle provider-reported usage observed before the error and
+  include those tokens in the error event. Cloud spend can increase for such calls, including
+  failed Google streaming continuation hops. Lease-funded streams, the default for untagged
+  run-scoped text calls, still report zero usage on mid-stream provider errors and release the
+  local claim. Buffered Google continuation keeps its documented limitation: earlier-hop usage
+  is unavailable if a later hop fails. Set `config.automaticContinuation: false` for
+  application-controlled admission and settlement between hops. Deferred `responses.stream`
+  helpers report a zero-token error event with no confirmation.
+
 ### Changed
 
 - **Public-preview compatibility:** Legacy raw-request and client escapes on native OpenAI,

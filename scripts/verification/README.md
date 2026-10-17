@@ -27,8 +27,11 @@ The harness discovers the project from a budget check and settles that discovery
 
 The basic run covers OpenAI-, Anthropic-, Google-, and Bedrock-shaped clients with buffered and
 streaming usage, per-call budget admission, settlement, ingest dispositions (including
-`duplicates`), provider-breaker reports, untracked-surface reports, and `close()` draining. An
-untagged run additionally grants, renews, settles against, and surrenders a lease; renewal starts
+`duplicates`), provider-breaker reports, untracked-surface reports, and `close()` draining.
+Mid-stream provider errors settle observed usage for per-call-checked streams; lease-funded
+errors retain zero-token events, release the local claim, and send no confirmation. The harness
+checks both paths against budget counters and dashboard totals. An untagged run additionally
+grants, renews, settles against, and surrenders a lease; renewal starts
 with a call after the advertised refresh interval, so this phase takes about twenty seconds.
 Tagged calls exercise the per-call path. Cost-event reads, cost totals, budget counters, and
 agent-run rollups are reconciled using the control plane's prices, with no local pricing formula.

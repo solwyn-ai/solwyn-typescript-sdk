@@ -3510,9 +3510,13 @@ describe("SolwynCore — mid-stream error event (F9)", () => {
     __resetAdapterRegistry();
   });
 
-  it("sets possibly_succeeded=true, served region, measured latency, and NO failover_error_class", async () => {
+  it.each([
+    zeroTokenDetails(),
+    createTokenDetails({ input_tokens: 11, output_tokens: 4 }),
+    createTokenDetails({ input_tokens: 0, output_tokens: 4 }),
+  ])("reports observed usage with possibly_succeeded and no failover class ($input_tokens/$output_tokens)", async (usage) => {
     __setAdapterLoadersForTesting({
-      openai: async () => new RegionStreamingAdapter("eu-west-1", zeroTokenDetails()),
+      openai: async () => new RegionStreamingAdapter("eu-west-1", usage),
     });
     const drop = new ProviderBoom();
     async function* yieldThenThrow(): AsyncGenerator<unknown> {
@@ -3542,8 +3546,15 @@ describe("SolwynCore — mid-stream error event (F9)", () => {
     expect(ingested).toHaveLength(1);
     const event = ingested[0] as WireEvent;
     expect(event.status).toBe("error");
-    // The sole possibly_succeeded=true case: billed-but-unconfirmed spend to reconcile.
     expect(event.possibly_succeeded).toBe(true);
+    expect(event.input_tokens).toBe(usage.input_tokens);
+    expect(event.output_tokens).toBe(usage.output_tokens);
+    if (usage.input_tokens > 0 || usage.output_tokens > 0)
+      expect(event.token_details).toMatchObject({
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+      });
+    else expect(event.token_details).toBeUndefined();
     // Served hop's region rides through (needed for reconciliation).
     expect(event.provider_region).toBe("eu-west-1");
     // Mid-stream errors never fail over → no health-signal class name.

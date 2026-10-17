@@ -3555,6 +3555,7 @@ export class SolwynCore {
         ctx.streamTermination === undefined
           ? undefined
           : new ProvisionalTerminationHandoff(ctx.streamTermination.handle);
+      const deferredResponses = ctx.responsesLeaf === "stream";
       let streamSettled = false;
       const streamToken = {};
       // Close retains only content-blind settlement state, never the provider stream or request.
@@ -3721,11 +3722,63 @@ export class SolwynCore {
                 failedBreakerProviders,
                 admission,
               );
-            this.#reporter.report(
-              this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
-            );
-          } finally {
+            // Cloud lease netting currently covers only success events with a receipt.
+            // Pairing a lease confirmation with an error event would count the spend twice.
+            const usage =
+              deferredResponses || settlement.funding.leaseId !== null
+                ? null
+                : extractUsageFailSoft({
+                    extract: () => accumulator.finalize({ estimateMissingUsage: false }),
+                    estimate: () => null,
+                    estimatedInputTokens: 0,
+                    logger: this.#logger,
+                  });
+            const observedUsage =
+              usage !== null &&
+              (usage.tokenDetails.input_tokens > 0 || usage.tokenDetails.output_tokens > 0);
+            if (observedUsage) {
+              const serviceTier = safeExtractServiceTier(
+                () => accumulator.getServiceTier(),
+                this.#logger,
+              );
+              const event = this.#baseEvent(settlement, hop, {
+                status: "error",
+                inputTokens: usage.tokenDetails.input_tokens,
+                outputTokens: usage.tokenDetails.output_tokens,
+                tokenDetails: usage.tokenDetails,
+                latencyMs: nowMs() - hopStarted,
+                serviceTier,
+                region,
+                failoverErrorClass: null,
+                possiblySucceeded: true,
+                velocityFlags: settlement.velocityFlags,
+              });
+              if (hasSettlementFunding(settlement.funding)) {
+                this.#settlePaidCall(event, {
+                  reservationId: settlement.funding.reservationId,
+                  leaseId: settlement.funding.leaseId,
+                  leaseClaimToken: settlement.funding.leaseClaimToken,
+                  model: hop.model,
+                  tokenDetails: usage.tokenDetails,
+                  provider: hop.provider,
+                  isProviderFallback: hop.isProviderFallback,
+                  callId: settlement.callId,
+                  providerRegion: region,
+                  serviceTier,
+                  floorAtReservation: usage.usageUnmeasured,
+                });
+              } else {
+                this.#reporter.report(event);
+              }
+            } else {
+              this.#reporter.report(
+                this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
+              );
+            }
             this.#releaseFunding(settlement.callId, settlement.funding);
+          } catch (settlementError) {
+            this.#releaseFunding(settlement.callId, settlement.funding);
+            throw settlementError;
           }
         },
         chunkTranslator,
@@ -3965,12 +4018,9 @@ export class SolwynCore {
   }
 
   /**
-   * Mid-stream error event: the stream established (tokens may have been generated and
-   * will be billed by the provider) then dropped in flight. Sets `possibly_succeeded:
-   * true` (the sole flag-true case — client-base.md #21) with measured latency and the
-   * SERVED hop's region so the Cloud API can reconcile the possibly-landed, never-confirmed
-   * spend, and NO `failover_error_class` (mid-stream errors never fail over, so no
-   * health-signal class name — matches Python's stream `on_error`, F9).
+   * An established stream can fail without exposing usage even if tokens were billed.
+   * Flag that uncertain outcome with the served region, without inventing usage or a
+   * failover class. Mid-stream errors never fail over.
    */
   #buildStreamErrorEvent(
     ctx: EventContext,

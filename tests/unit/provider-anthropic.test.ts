@@ -366,6 +366,29 @@ describe("AnthropicAdapter.createStreamAccumulator", () => {
       AnthropicStreamAccumulator,
     );
   });
+
+  it("uses the requested cache TTL when a stream starts without cache writes", () => {
+    const acc = adapter.createStreamAccumulator({ requestedCacheTtl: "5m" });
+    acc.observe({
+      type: "message_start",
+      message: {
+        usage: {
+          input_tokens: 10,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+        },
+      },
+    });
+    acc.observe({
+      type: "message_delta",
+      usage: { output_tokens: 5, cache_creation_input_tokens: 100 },
+    });
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 110,
+      cache_creation_5m_tokens: 100,
+      cache_creation_1h_tokens: 0,
+      is_estimated: false,
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

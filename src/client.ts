@@ -83,6 +83,7 @@ import {
   estimateContentLength,
   estimateResponsesContentLength,
   estimateTokensFromLength,
+  requestedAnthropicCacheTtls,
 } from "./privacy";
 import { validatePinnedClientFamily } from "./providers/detection";
 import { resolveProviderIdentity } from "./providers/index";
@@ -3467,6 +3468,8 @@ export class SolwynCore {
     failedBreakerProviders: Set<string>,
   ): Promise<unknown> {
     const adapter = runtime.adapter;
+    const requestedCacheTtl =
+      adapter.dialect === "anthropic" ? requestedAnthropicCacheTtls(hopKwargs) : undefined;
     const endpointTransition =
       hop.isProviderFallback || runtime.sdkClient !== ctx.primary.sdkClient;
     const rawResponse = await this.#invoke(
@@ -3508,6 +3511,7 @@ export class SolwynCore {
       const accumulator = adapter.createStreamAccumulator({
         estimatedInputTokens: ctx.estimatedInputTokens,
         surface: ctx.surface,
+        requestedCacheTtl,
       });
       const region = safeExtractRegion(
         () => adapter.extractRegion(runtime.sdkClient),

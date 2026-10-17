@@ -1349,6 +1349,181 @@ describe("failover — the native path performs ZERO translation (TestZeroTransl
 // the real client walk.
 // ---------------------------------------------------------------------------
 
+describe("Anthropic streaming request cache TTLs", () => {
+  async function* cacheWriteStream(): AsyncGenerator<unknown> {
+    yield {
+      type: "message_start",
+      message: {
+        usage: {
+          input_tokens: 10,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+          output_tokens: 0,
+        },
+      },
+    };
+    for (const aggregate of [1200, 1500]) {
+      yield {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: {
+          input_tokens: 30,
+          cache_read_input_tokens: 1000,
+          cache_creation_input_tokens: aggregate,
+          output_tokens: 80,
+          output_tokens_details: null,
+          server_tool_use: { web_search_requests: 1 },
+        },
+      };
+    }
+    yield { type: "message_stop" };
+  }
+
+  it.each<{
+    name: string;
+    requestCache?: Record<string, unknown>;
+    defaultCache?: Record<string, unknown>;
+    cache5m: number;
+    cache1h: number;
+  }>([
+    {
+      name: "request one-hour TTL",
+      requestCache: { type: "ephemeral", ttl: "1h" },
+      cache5m: 0,
+      cache1h: 1500,
+    },
+    {
+      name: "omitted TTL defaults to five minutes",
+      requestCache: { type: "ephemeral" },
+      cache5m: 1500,
+      cache1h: 0,
+    },
+    {
+      name: "request overrides client defaults",
+      requestCache: { type: "ephemeral", ttl: "5m" },
+      defaultCache: { type: "ephemeral", ttl: "1h" },
+      cache5m: 1500,
+      cache1h: 0,
+    },
+    {
+      name: "client default one-hour TTL",
+      defaultCache: { type: "ephemeral", ttl: "1h" },
+      cache5m: 0,
+      cache1h: 1500,
+    },
+  ])("reports the served request TTL: $name", async ({
+    requestCache,
+    defaultCache,
+    cache5m,
+    cache1h,
+  }) => {
+    const client = {
+      messages: { create: vi.fn((_kwargs: Record<string, unknown>) => cacheWriteStream()) },
+    };
+    const { fetchMock, confirms, events } = makeCapture();
+    const solwyn = new Solwyn(client, {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      defaultParams: defaultCache === undefined ? {} : { cache_control: defaultCache },
+    });
+    try {
+      const stream = await solwyn.messages.create({
+        model: "claude-sonnet-4-5",
+        messages: [{ role: "user", content: "synthetic-cache-ttl-prompt" }],
+        max_tokens: 100,
+        stream: true,
+        ...(requestCache === undefined ? {} : { cache_control: requestCache }),
+      });
+      for await (const _chunk of stream as AsyncIterable<unknown>) {
+        /* consume */
+      }
+    } finally {
+      await solwyn.close();
+    }
+    const details = {
+      input_tokens: 2530,
+      output_tokens: 80,
+      cached_input_tokens: 1000,
+      cache_creation_5m_tokens: cache5m,
+      cache_creation_1h_tokens: cache1h,
+    };
+    expect(confirms).toHaveLength(1);
+    expect(confirms[0]).toMatchObject({ provider: "anthropic", token_details: details });
+    expect(confirms[0]).not.toHaveProperty("token_details.is_estimated");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      provider: "anthropic",
+      status: "success",
+      token_details: details,
+    });
+    expect(events[0]).not.toHaveProperty("token_details.is_estimated");
+    expect(JSON.stringify({ confirms, events })).not.toContain("synthetic-cache-ttl-prompt");
+    expect(JSON.stringify({ confirms, events })).not.toContain("cache_control");
+  });
+
+  it.each([
+    { name: "no cache control", defaults: {}, estimated: true },
+    {
+      name: "target cache control",
+      defaults: { cache_control: { type: "ephemeral", ttl: "1h" } },
+      estimated: false,
+    },
+  ])("uses the translated hop's TTL: $name", async ({ defaults, estimated }) => {
+    const primary = openaiClient(() => {
+      throw statusError("rate limited", 429);
+    });
+    const create = vi.fn((_kwargs: Record<string, unknown>) => cacheWriteStream());
+    const fallback = { messages: { create } };
+    const { fetchMock, confirms, events } = makeCapture();
+    const solwyn = new Solwyn(primary, {
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      fallback: [[fallback, "claude-sonnet-4-5", defaults]],
+    });
+    try {
+      const stream = await solwyn.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "synthetic-cache-ttl-prompt" }],
+        max_tokens: 100,
+        stream: true,
+      });
+      for await (const _chunk of stream as AsyncIterable<unknown>) {
+        /* consume */
+      }
+    } finally {
+      await solwyn.close();
+    }
+    const sent = create.mock.calls[0]?.[0];
+    if ("cache_control" in defaults)
+      expect(sent).toHaveProperty("cache_control", defaults.cache_control);
+    else expect(sent).not.toHaveProperty("cache_control");
+    const details = {
+      input_tokens: 2530,
+      output_tokens: 80,
+      cached_input_tokens: 1000,
+      cache_creation_5m_tokens: 0,
+      cache_creation_1h_tokens: 1500,
+      ...(estimated ? { is_estimated: true } : {}),
+    };
+    expect(confirms).toHaveLength(1);
+    expect(confirms[0]).toMatchObject({ provider: "anthropic", token_details: details });
+    if (!estimated) expect(confirms[0]).not.toHaveProperty("token_details.is_estimated");
+    expect(events.filter((event) => event["status"] === "success")).toEqual([
+      expect.objectContaining({
+        provider: "anthropic",
+        is_provider_fallback: true,
+        token_details: expect.objectContaining(details),
+      }),
+    ]);
+    if (!estimated) {
+      expect(events.find((event) => event["status"] === "success")).not.toHaveProperty(
+        "token_details.is_estimated",
+      );
+    }
+  });
+});
+
 describe("failover — a cross-dialect streaming hop translates chunks or fails loud on tools", () => {
   it("streams openai→anthropic failover, translating each chunk back to the caller's dialect", async () => {
     const primary = openaiClient(() => {

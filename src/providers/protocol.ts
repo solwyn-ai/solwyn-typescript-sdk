@@ -15,6 +15,7 @@
  */
 
 import { ConfigurationError } from "../errors";
+import type { RequestedAnthropicCacheTtl } from "../privacy";
 import type { TokenDetails } from "../token-details";
 import type { MediaUsage, Modality, ProviderName } from "../types";
 
@@ -118,6 +119,8 @@ export interface PrepareStreamingOptions {
 export interface CreateStreamAccumulatorOptions {
   /** Consumed only by compat accumulators (length-based estimation); ignored by OpenAI's. */
   estimatedInputTokens?: number;
+  /** Content-free request TTL summary, consumed only by Anthropic's accumulator. */
+  requestedCacheTtl?: RequestedAnthropicCacheTtl;
   /**
    * The surface the streaming call arrived on, so an adapter can pick the accumulator
    * matching the stream's terminal-usage shape (OpenAI Chat Completions settles usage

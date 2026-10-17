@@ -7,13 +7,14 @@
  * fields (`content`, `text`, `messages`, `system`, `contents`, `reasoning_content`,
  * `tool_calls`).
  *
- * Every function here takes content in and returns a plain non-negative `number`
- * out — never a string, never the original object. It computes character counts
+ * Content measurements return a plain non-negative `number`, never the original
+ * object or any content string. They compute character counts
  * and token estimates so the rest of the SDK can size pre-flight budget checks and
  * post-hoc usage estimates WITHOUT ever materializing, joining, logging, storing,
  * or transmitting the underlying text.
  * Media helpers follow the same boundary: they return a complete plain
  * `MediaUsage` value containing only counts and bounded non-content selectors.
+ * Cache TTL detection returns only a fixed enum, never request content.
  *
  * Ported from `solwyn/_privacy.py`. Deliberately imports NOTHING (no logger, no
  * zod, no I/O) — enforced by the privacy-firewall test. Do NOT add a `import`
@@ -82,6 +83,57 @@ function getProp(obj: unknown, name: string): unknown {
     // an unreadable selector exactly like a missing one and retain nothing.
   }
   return undefined;
+}
+
+/** Content-free summary of Anthropic's requested cache-write TTLs. */
+export type RequestedAnthropicCacheTtl = "5m" | "1h" | "mixed" | "none" | "unknown";
+
+/**
+ * Inspect cache markers without reading string contents or tool input/schema subtrees.
+ * Only `type` and `ttl` are read from a marker; missing TTL means five minutes.
+ * Cycles are visited once, and at most 10,000 properties are traversed. Unreadable,
+ * invalid or oversized requests return `unknown` without retaining or logging data.
+ */
+export function requestedAnthropicCacheTtls(
+  kwargs: Record<string, unknown>,
+): RequestedAnthropicCacheTtl {
+  let has5m = false;
+  let has1h = false;
+  let remaining = 10_000;
+  const pending: unknown[] = [kwargs];
+  const seen = new WeakSet<object>();
+  try {
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (value === null || typeof value !== "object" || seen.has(value)) continue;
+      seen.add(value);
+      const record = value as Record<string, unknown>;
+      const cacheControl = record["cache_control"];
+      if (cacheControl != null) {
+        if (!isRecord(cacheControl) || cacheControl["type"] !== "ephemeral") return "unknown";
+        const ttl = cacheControl["ttl"];
+        if (ttl === undefined || ttl === "5m") has5m = true;
+        else if (ttl === "1h") has1h = true;
+        else return "unknown";
+      }
+      for (const key in record) {
+        if (--remaining < 0) return "unknown";
+        if (
+          !Object.hasOwn(record, key) ||
+          key === "cache_control" ||
+          key === "input" ||
+          key === "input_schema"
+        )
+          continue;
+        const child = record[key];
+        if (child !== null && typeof child === "object") pending.push(child);
+      }
+    }
+  } catch {
+    // Getter/proxy failures reveal no diagnostic or request data.
+    return "unknown";
+  }
+  return has5m ? (has1h ? "mixed" : "5m") : has1h ? "1h" : "none";
 }
 
 /** Complete wire-shaped media carrier; every key stays explicit when serialized. */

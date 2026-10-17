@@ -5,6 +5,7 @@ import { AnthropicAdapter, AnthropicStreamAccumulator } from "../../src/provider
 import { BedrockAdapter } from "../../src/providers/bedrock";
 import { GoogleAdapter, GoogleStreamAccumulator } from "../../src/providers/google";
 import { buildCompatAdapters } from "../../src/providers/openai-compatible";
+import type { CreateStreamAccumulatorOptions } from "../../src/providers/protocol";
 import { openaiChunkToDeltas } from "../../src/providers/translation/openai";
 import { TokenDetailsSchema } from "../../src/token-details";
 
@@ -53,18 +54,187 @@ describe("Anthropic cumulative stream usage", () => {
     });
   });
 
-  it.each([
+  it.each<{
+    start5m: number;
+    start1h: number;
+    requestedCacheTtl?: CreateStreamAccumulatorOptions["requestedCacheTtl"];
+    cache5m: number;
+    cache1h: number;
+    estimated: boolean;
+  }>([
     { start5m: 0, start1h: 1000, cache5m: 0, cache1h: 1500, estimated: false },
     { start5m: 1000, start1h: 0, cache5m: 1500, cache1h: 0, estimated: false },
     { start5m: 0, start1h: 0, cache5m: 0, cache1h: 1500, estimated: true },
-  ])("attributes aggregate server-tool growth from initial TTLs $start5m/$start1h", ({
+    { start5m: 200, start1h: 1000, cache5m: 200, cache1h: 1300, estimated: true },
+    {
+      start5m: 0,
+      start1h: 1000,
+      requestedCacheTtl: "unknown",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: false,
+    },
+    {
+      start5m: 1000,
+      start1h: 0,
+      requestedCacheTtl: "unknown",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: false,
+    },
+    {
+      start5m: 0,
+      start1h: 0,
+      requestedCacheTtl: "unknown",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: true,
+    },
+    {
+      start5m: 200,
+      start1h: 1000,
+      requestedCacheTtl: "unknown",
+      cache5m: 200,
+      cache1h: 1300,
+      estimated: true,
+    },
+    {
+      start5m: 0,
+      start1h: 1000,
+      requestedCacheTtl: "none",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: false,
+    },
+    {
+      start5m: 1000,
+      start1h: 0,
+      requestedCacheTtl: "none",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: false,
+    },
+    {
+      start5m: 0,
+      start1h: 0,
+      requestedCacheTtl: "none",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: true,
+    },
+    {
+      start5m: 200,
+      start1h: 1000,
+      requestedCacheTtl: "none",
+      cache5m: 200,
+      cache1h: 1300,
+      estimated: true,
+    },
+    {
+      start5m: 0,
+      start1h: 0,
+      requestedCacheTtl: "1h",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: false,
+    },
+    {
+      start5m: 0,
+      start1h: 0,
+      requestedCacheTtl: "5m",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: false,
+    },
+    {
+      start5m: 0,
+      start1h: 1000,
+      requestedCacheTtl: "1h",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: false,
+    },
+    {
+      start5m: 1000,
+      start1h: 0,
+      requestedCacheTtl: "5m",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: false,
+    },
+    {
+      start5m: 200,
+      start1h: 1000,
+      requestedCacheTtl: "1h",
+      cache5m: 200,
+      cache1h: 1300,
+      estimated: true,
+    },
+    {
+      start5m: 200,
+      start1h: 1000,
+      requestedCacheTtl: "5m",
+      cache5m: 200,
+      cache1h: 1300,
+      estimated: true,
+    },
+    {
+      start5m: 0,
+      start1h: 1000,
+      requestedCacheTtl: "5m",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: false,
+    },
+    {
+      start5m: 1000,
+      start1h: 0,
+      requestedCacheTtl: "1h",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: false,
+    },
+    {
+      start5m: 0,
+      start1h: 1000,
+      requestedCacheTtl: "mixed",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: true,
+    },
+    {
+      start5m: 1000,
+      start1h: 0,
+      requestedCacheTtl: "mixed",
+      cache5m: 1500,
+      cache1h: 0,
+      estimated: true,
+    },
+    {
+      start5m: 0,
+      start1h: 0,
+      requestedCacheTtl: "mixed",
+      cache5m: 0,
+      cache1h: 1500,
+      estimated: true,
+    },
+    {
+      start5m: 200,
+      start1h: 1000,
+      requestedCacheTtl: "mixed",
+      cache5m: 200,
+      cache1h: 1300,
+      estimated: true,
+    },
+  ])("attributes server-tool growth from start $start5m/$start1h and request $requestedCacheTtl", ({
     start5m,
     start1h,
+    requestedCacheTtl,
     cache5m,
     cache1h,
     estimated,
   }) => {
-    const acc = new AnthropicStreamAccumulator(noopLogger);
+    const acc = new AnthropicStreamAccumulator(noopLogger, requestedCacheTtl);
     acc.observe({
       type: "message_start",
       message: {
@@ -169,8 +339,15 @@ describe("Anthropic cumulative stream usage", () => {
     });
   });
 
-  it("updates cache writes by TTL without adding cumulative counters twice", () => {
-    const acc = new AnthropicStreamAccumulator(noopLogger);
+  it.each([
+    undefined,
+    "5m",
+    "1h",
+    "mixed",
+    "none",
+    "unknown",
+  ] as const)("keeps explicit split deltas authoritative with request %s", (requestedCacheTtl) => {
+    const acc = new AnthropicStreamAccumulator(noopLogger, requestedCacheTtl);
     acc.observe({
       type: "message_start",
       message: {
@@ -198,6 +375,56 @@ describe("Anthropic cumulative stream usage", () => {
       cached_input_tokens: 40,
       cache_creation_5m_tokens: 50,
       cache_creation_1h_tokens: 60,
+      is_estimated: false,
+    });
+  });
+
+  it.each([
+    undefined,
+    "5m",
+    "1h",
+    "mixed",
+    "none",
+    "unknown",
+  ] as const)("preserves shrinking totals with request %s", (requestedCacheTtl) => {
+    const acc = new AnthropicStreamAccumulator(noopLogger, requestedCacheTtl);
+    acc.observe({
+      type: "message_start",
+      message: {
+        usage: {
+          input_tokens: 10,
+          cache_creation: { ephemeral_5m_input_tokens: 200, ephemeral_1h_input_tokens: 1000 },
+        },
+      },
+    });
+    acc.observe({
+      type: "message_delta",
+      usage: { output_tokens: 50, cache_creation_input_tokens: 900 },
+    });
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 1210,
+      output_tokens: 50,
+      cache_creation_5m_tokens: 200,
+      cache_creation_1h_tokens: 1000,
+      is_estimated: true,
+    });
+  });
+
+  it("does not mark a known mixed request estimated when cache writes do not grow", () => {
+    const acc = new AnthropicStreamAccumulator(noopLogger, "mixed");
+    acc.observe({
+      type: "message_start",
+      message: { usage: { input_tokens: 10, cache_creation_input_tokens: 1000 } },
+    });
+    acc.observe({
+      type: "message_delta",
+      usage: { output_tokens: 50, cache_creation_input_tokens: 1000 },
+    });
+    expect(acc.finalize()).toMatchObject({
+      input_tokens: 1010,
+      cache_creation_5m_tokens: 1000,
+      cache_creation_1h_tokens: 0,
+      is_estimated: false,
     });
   });
 

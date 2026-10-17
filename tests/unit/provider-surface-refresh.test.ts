@@ -78,7 +78,12 @@ const GOOGLE_FETCH_PARENTS = [
 ] as const;
 
 const families = [
-  { name: "openai", build: () => new OpenAI({ apiKey: "offline" }), paths: OPENAI_GAPS },
+  {
+    name: "openai",
+    build: () => new OpenAI({ apiKey: "offline" }),
+    paths: OPENAI_GAPS,
+    unknownPaths: ["beta.agents.create", "webhooks.create"],
+  },
   {
     name: "azure",
     build: () =>
@@ -88,26 +93,30 @@ const families = [
         apiVersion: "2024-06-01",
       }),
     paths: OPENAI_GAPS,
+    unknownPaths: ["beta.agents.create", "webhooks.create"],
   },
   {
     name: "anthropic",
     build: () => new Anthropic({ apiKey: "offline" }),
     paths: ["makeTracedRequest"],
+    unknownPaths: ["organization.workspaces.create"],
   },
   {
     name: "together",
     build: () => new Together({ apiKey: "offline" }),
     paths: TOGETHER_GAPS,
+    unknownPaths: ["clusters.list", "beta.jig.deploy"],
   },
   {
     name: "google",
     build: () => new GoogleGenAI({ apiKey: "offline" }),
     paths: [...GOOGLE_GAPS, ...GOOGLE_FETCH_PARENTS.map((parent) => `${parent}.getFetch`)],
+    unknownPaths: ["voices.list"],
   },
 ] as const;
 
-describe.each(families)("reviewed $name coverage gaps", ({ build, paths }) => {
-  it("classifies each gap and refuses it before provider or budget I/O in strict mode", async () => {
+describe.each(families)("reviewed $name coverage gaps", ({ build, paths, unknownPaths }) => {
+  it("refuses curated gaps and baseline-only observations before provider or budget I/O", async () => {
     const guard = installOfflineGuard();
     const attempts = guard.socketAttempts();
     const plane = new FakeControlPlane();
@@ -135,6 +144,18 @@ describe.each(families)("reviewed $name coverage gaps", ({ build, paths }) => {
           for (const segment of path.split(".")) current = Reflect.get(current, segment);
           if (typeof current === "function") Reflect.apply(current, undefined, []);
         }, path).toThrow(UntrackedSpendSurfaceError);
+      }
+      for (const path of unknownPaths) {
+        let caught: unknown;
+        try {
+          let current: object = client;
+          for (const segment of path.split(".")) current = Reflect.get(current, segment);
+          if (typeof current === "function") Reflect.apply(current, undefined, []);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught, path).toBeInstanceOf(UntrackedSpendSurfaceError);
+        expect(caught, path).toMatchObject({ surface: path, kind: "unknown" });
       }
     } finally {
       await client.close();

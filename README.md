@@ -636,7 +636,7 @@ The reviewed latest provider SDKs also expose these unmetered operations:
 
 | Provider | Unmetered surfaces |
 |----------|--------------------|
-| OpenAI / Azure | Voice creation; beta Responses creation, compaction and retrieval; Agents hosted environments, file staging and session execution/event streams; Decisions, content-provenance checks, Live session creation/acceptance/forking, Realtime call creation and translation client secrets. |
+| OpenAI / Azure | Voice creation; beta Responses creation, compaction and retrieval; Agents hosted environments, file staging and session execution/event streams; Decisions, content-provenance checks, Live session creation/acceptance/forking, Realtime call creation and translation client secrets; raw response/request helpers (`responsePromise`, `parseResponseWithTimeout`). |
 | Anthropic | `makeTracedRequest`, a raw request escape that bypasses metered `messages.create`. |
 | Together | Jig rollback; cluster creation/resizing, remediation creation/approval, and shared-storage creation/resizing. |
 | Google GenAI | Direct continuation helpers on `models` and `chats.modelsModule`; `voices.create`; `voices.getClient`; raw `getFetch` accessors and the voice manager's underlying request/upload methods. |
@@ -647,9 +647,12 @@ Administrative, read-only and unevaluated accessor observations in the test base
 structural evidence; they do not grant metering or runtime safety to an otherwise unknown path.
 
 Google GenAI `2.30.0` enables automatic continuation on the metered `models.generateContent`
-and `models.generateContentStream` paths. Solwyn checks the logical call once and settles the
-SDK's cumulative usage across all continuation hops. Set `config.automaticContinuation: false`
-when the application needs a separate admission decision for each hop.
+and `models.generateContentStream` paths. Solwyn checks the logical call once and, on success,
+settles the SDK's cumulative usage across all continuation hops. `failoverHopReadTimeout`
+(600 seconds by default) bounds the whole continuation sequence. If a later buffered hop
+fails, the provider SDK does not return earlier-hop usage for Solwyn to settle. Set
+`config.automaticContinuation: false` when the application needs separate admission and
+settlement for each hop; increase the timeout for long continuation sequences.
 
 Untracked-surface advisories coalesce occurrences for fifteen minutes per key. Retries keep the
 same report ID and occurrence snapshot; later observations wait for a separate report. Closing

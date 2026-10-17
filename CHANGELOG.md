@@ -27,7 +27,8 @@ corresponding release notes before users upgrade.
   voice/provenance operations, Together cluster/storage allocation and Jig rollback, Google
   continuation/voice helpers, and raw request escapes are explicitly unmetered. They follow
   `onUnmetered`; use `"raise"` to refuse them. No new metering adapters are added. Existing
-  strict coverage fingerprints must be reviewed and refreshed before upgrading.
+  strict coverage fingerprints must be reviewed and refreshed when upgrading `@solwyn/sdk`,
+  even if the provider SDK versions stay pinned.
 - **OpenAI 7 compatibility.** The optional `openai` peer range is now `>=4.41.0 <8`, with
   current integration checks at `7.36.0`. OpenAI 7 itself requires Node 22 or later; Solwyn's
   provider-free core remains compatible with Node 20 and compatible older provider releases.
@@ -41,8 +42,10 @@ corresponding release notes before users upgrade.
 - **Google continuation and deadline compatibility.** The reviewed `@google/genai@2.30.0`
   transport uses Solwyn-owned request deadlines so completed calls and streams release timers
   and run lifetimes. Automatic continuation on the existing metered generate-content methods
-  receives one budget check and settles the SDK's cumulative usage once. Set
-  `config.automaticContinuation: false` for application-controlled admission between hops.
+  receives one budget check and, on success, settles the SDK's cumulative usage once. The
+  request deadline bounds the whole continuation sequence. If a later buffered hop fails,
+  earlier-hop usage is unavailable for settlement. Set `config.automaticContinuation: false`
+  for application-controlled admission and settlement between hops.
 - **Breaking:** **Closed clients reject intercepted calls.** Once `close()` begins, chat,
   Responses, media, and Bedrock calls reject with `SolwynError("client is closed")` before
   admission or provider dispatch. Buffered calls and stream setup already in flight drain within

@@ -144,6 +144,28 @@ describe("client shutdown", () => {
     expect(control.confirms).toHaveLength(1);
   });
 
+  it("throws the closed-client error on the next provider chunk after close", async () => {
+    const control = fixture();
+    const create = async (_params: Record<string, unknown>) =>
+      (async function* () {
+        yield { usage: { prompt_tokens: 13, completion_tokens: 5 } };
+        yield { usage: { prompt_tokens: 13, completion_tokens: 10 } };
+      })();
+    const sdk = new Solwyn({ chat: { completions: { create } } }, control.options);
+    const stream = await sdk.chat.completions.create({ model: "gpt-4o", stream: true });
+    await stream.next();
+    await sdk.close();
+    await expect(stream.next()).rejects.toMatchObject({
+      name: "SolwynError",
+      message: "client is closed",
+    });
+    expect(control.confirms).toMatchObject([
+      { token_details: { input_tokens: 13, output_tokens: 5 } },
+    ]);
+    expect(control.confirms).toHaveLength(1);
+    expect(control.events).toHaveLength(1);
+  });
+
   it("drains stream setup and settles the returned unread stream before provider close", async () => {
     const control = fixture();
     const started = deferred<void>();
@@ -214,5 +236,44 @@ describe("client shutdown", () => {
     expect(reporterClose.mock.calls[0]?.[0]).toBe(0);
     response.resolve({ usage: { prompt_tokens: 13, completion_tokens: 5 } });
     await call;
+  });
+
+  it("shares the reporting deadline with advisory shutdown on a blackholed network", async () => {
+    vi.useFakeTimers();
+    const control = fixture();
+    const close = vi.fn();
+    const fetch: FetchLike = async (url, init) => {
+      if (url.endsWith("/budgets/confirm") || url.endsWith("/untracked-surfaces"))
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) reject(signal.reason);
+          else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      return control.options.fetch(url, init);
+    };
+    const sdk = new Solwyn(
+      {
+        chat: {
+          completions: {
+            create: async (_params: Record<string, unknown>) => ({
+              usage: { prompt_tokens: 13, completion_tokens: 5 },
+            }),
+          },
+        },
+        files: { list: async () => ({ data: [] }) },
+        close,
+      },
+      { ...control.options, fetch, reportUntrackedSurfaces: true, reporterShutdownDeadline: 0.05 },
+    );
+    await sdk.chat.completions.create({ model: "gpt-4o" });
+    await sdk.files.list();
+    const closing = sdk.close();
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      await vi.advanceTimersByTimeAsync(100);
+      await closing;
+    }
   });
 });

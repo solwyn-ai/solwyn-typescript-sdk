@@ -14,10 +14,13 @@ corresponding release notes before users upgrade.
 - **Breaking: closed clients reject intercepted calls.** Once `close()` begins, chat,
   Responses, media, and Bedrock calls reject with `SolwynError("client is closed")` before
   admission or provider dispatch. Buffered calls and stream setup already in flight drain
-  within `reporterShutdownDeadline`, sharing that deadline with settlement delivery. Open
-  streams settle once from usage observed so far without waiting for the consumer; later
-  chunks are withheld at the next provider-chunk boundary. Finish or cancel streams before
-  closing the client to include terminal usage. Calls that outlast the drain deadline may
+  within `reporterShutdownDeadline`, sharing that deadline with settlement and advisory
+  delivery. Lease cleanup has a separate one-second budget; wrapped provider shutdown is
+  awaited afterward and has its own duration. Open streams settle once from usage observed so
+  far without waiting for the consumer; later
+  pulls reject with `SolwynError("client is closed")` at the next provider-chunk boundary.
+  Finish or cancel streams before closing the client to include terminal usage. Calls that
+  outlast the drain deadline may
   finish after reporting closes, and produce a shutdown warning.
 - **Conservative failover limits.** When a plan suppresses custom failover tuning, the SDK
   preserves the stricter requested idempotency policy, smaller total failover window, and
@@ -140,8 +143,19 @@ corresponding release notes before users upgrade.
   setup aborts never fail over or count as provider failures. Mid-stream cancellation settles
   observed usage once, using the reservation floor when usage is estimated, including Google
   reader errors, Bedrock aborts, and native Responses helpers. SDK request-deadline aborts
-  remain provider failures. Other stream errors now follow the exception classifier, so
-  request errors release recovery probes without a health penalty.
+  remain provider failures. Non-429 HTTP 4xx errors release recovery probes without a health
+  penalty; status-less provider errors after connection count toward the breaker. Failing
+  usage extractors during caller cancellation fall back to estimated usage and still settle.
+- **Pending Responses cancellation matches buffered setup.** A deferred Responses helper
+  cancelled before connection reports an error with `possibly_succeeded: true`, releases
+  local funding without confirming usage, and contributes no latency sample.
+- **Abandoned streams release settlement ownership.** Garbage-collection finalization settles
+  observed usage once, retaining the reservation floor for estimated usage, and releases run
+  lifetimes, caller signals, lease authority, and recovery probes before client shutdown.
+  Finalization timing remains runtime-dependent; explicit stream cleanup is deterministic.
+- **Already-aborted calls skip velocity detection.** Chat, Responses, and media calls whose
+  signal is already aborted reject before observing velocity or starting budget I/O, so
+  cancelled retries cannot stop a run without dispatching work.
 - **Unread recovery streams release probe ownership.** A half-open streaming probe is held for
   at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second minimum. Expiry
   or finalization releases the probe neutrally; stale outcomes cannot affect later probes.
@@ -213,8 +227,9 @@ corresponding release notes before users upgrade.
   applied. Missing fields, extra keys, and unknown rejection codes count as contract drift;
   an explicitly logged fallback still surfaces usable per-event rejections.
 - **Lease reconciliation and cache usage.** Every lease-funded settlement's metadata now carries
-  its confirmation's lease ID, including when the confirmation is abandoned. Overlapping cache
-  buckets are clamped to the input total and marked estimated during normalization; unnormalized
+  its confirmation's lease ID, including when confirmation delivery is abandoned or local
+  confirmation construction fails. Overlapping cache buckets are clamped to the input total and
+  marked estimated during normalization; unnormalized
   invalid cache breakdowns are rejected locally before they can invalidate a whole ingest batch.
 - **Allowed alert-only overrun warnings.** A live allowed response at or above its budget limit
   now produces the budget warning while retaining the reservation for settlement.

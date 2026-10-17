@@ -2742,6 +2742,31 @@ describe("SolwynCore — fail-soft post-success bookkeeping", () => {
     vi.restoreAllMocks();
   });
 
+  it("preserves lease attribution when confirmation construction fails", async () => {
+    const adapter = new FailSoftAdapter();
+    adapter.extractUsageImpl = () => createTokenDetails({ input_tokens: 13, output_tokens: 5 });
+    __setAdapterLoadersForTesting({ openai: async () => adapter });
+    const funding = installFailSoftFundingDecision();
+    funding.buildConfirmRequest.mockImplementation(() => {
+      throw new Error("synthetic confirm construction failure");
+    });
+    const { fetchMock, ingested, confirms } = makeFetch();
+    const solwyn = new Solwyn(
+      openAIClient(() => ({ id: "paid" })),
+      {
+        apiKey: API_KEY,
+        fetch: fetchMock,
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+      },
+    );
+    await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
+    await solwyn.close();
+    expect(confirms).toHaveLength(0);
+    expect(ingested).toMatchObject([
+      { status: "success", input_tokens: 13, output_tokens: 5, lease_id: "lease-fail-soft" },
+    ]);
+  });
+
   it.each([
     "chat",
     "responses",

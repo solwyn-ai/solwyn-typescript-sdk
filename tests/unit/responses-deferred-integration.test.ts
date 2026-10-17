@@ -4,6 +4,8 @@ import type { SolwynOptions } from "../../src/client";
 import { Solwyn } from "../../src/index";
 import { currentRun, run } from "../../src/node";
 import { __resetAdapterRegistry, __setAdapterLoadersForTesting } from "../../src/providers/index";
+import { OpenAIAdapter } from "../../src/providers/openai";
+import { LatencyTracker } from "../../src/routing";
 import { markTerminated, resetRunControlForTest } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
 
@@ -345,7 +347,7 @@ describe("deferred Responses client integration", () => {
     expect(f.confirms).toHaveLength(0);
   });
 
-  it("keeps unclassified established-stream errors neutral after connect", async () => {
+  it("counts unclassified established-stream errors as provider failures after connect", async () => {
     const f = fixture(undefined, { circuitBreakerFailureThreshold: 1 });
     f.providerFetch.mockImplementationOnce(
       async () =>
@@ -355,11 +357,13 @@ describe("deferred Responses client integration", () => {
         ),
     );
     await expect(f.solwyn.responses.stream({ input: "hi" }).done()).rejects.toBeInstanceOf(Error);
-    await expect(f.solwyn.responses.stream({ input: "hi" }).done()).resolves.toBeUndefined();
+    await expect(f.solwyn.responses.stream({ input: "hi" }).done()).rejects.toMatchObject({
+      name: "ProviderUnavailableError",
+    });
     await f.solwyn.close();
-    expect(f.streamCall).toHaveBeenCalledTimes(2);
-    expect(f.confirms).toHaveLength(1);
-    expect(f.events).toHaveLength(2);
+    expect(f.streamCall).toHaveBeenCalledTimes(1);
+    expect(f.confirms).toHaveLength(0);
+    expect(f.events).toHaveLength(1);
     expect(f.events[0]).toMatchObject({ status: "error", possibly_succeeded: true });
   });
 
@@ -454,6 +458,7 @@ describe("deferred Responses client integration", () => {
     "already aborted",
     "pending connection",
   ] as const)("settles a request signal cancellation (%s) before connect without a health verdict", async (phase) => {
+    const recordLatency = vi.spyOn(LatencyTracker.prototype, "recordLatency");
     const f = fixture(undefined, { circuitBreakerFailureThreshold: 1 });
     const controller = new AbortController();
     let started!: () => void;
@@ -494,12 +499,13 @@ describe("deferred Responses client integration", () => {
     expect(f.streamCall).toHaveBeenCalledTimes(1);
     expect(f.providerFetch).toHaveBeenCalledTimes(1);
     expect(f.checks).toHaveLength(1);
-    expect(f.confirms).toHaveLength(1);
+    expect(f.confirms).toHaveLength(0);
     expect(f.events).toHaveLength(1);
     expect(f.events[0]).toMatchObject({
-      status: "success",
+      status: "error",
+      possibly_succeeded: true,
     });
-    expect(f.events[0]).not.toHaveProperty("possibly_succeeded");
+    expect(recordLatency).not.toHaveBeenCalled();
     expect(f.breakerReports).toHaveLength(1);
     expect(f.breakerReports[0]).toMatchObject({
       provider: "openai",
@@ -522,6 +528,53 @@ describe("deferred Responses client integration", () => {
     expect(f.checks).toHaveLength(0);
     expect(f.streamCall).not.toHaveBeenCalled();
     expect(f.events).toHaveLength(0);
+  });
+
+  it.each([
+    "signal",
+    "helper",
+  ] as const)("releases pending %s cancellation without confirming or spending its lease", async (cancellation) => {
+    const finalize = vi.fn(() => {
+      throw new Error("synthetic usage extraction failure");
+    });
+    vi.spyOn(OpenAIAdapter.prototype, "createStreamAccumulator").mockReturnValue({
+      observe: () => {},
+      finalize,
+      getServiceTier: () => null,
+    });
+    const f = fixture(undefined, { leaseEnabled: true, tags: undefined, velocityMode: "off" });
+    let started!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    f.providerFetch.mockImplementationOnce(
+      (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("synthetic abort", "AbortError")),
+            { once: true },
+          );
+          started();
+        }),
+    );
+    await run("pending-cancellation", async () => {
+      const caller = new AbortController();
+      const helper = f.solwyn.responses.stream(
+        { input: "12345678", max_output_tokens: 100 },
+        { signal: caller.signal },
+      );
+      const outcome = expect(helper.done()).rejects.toBeInstanceOf(OpenAI.APIUserAbortError);
+      await requestStarted;
+      if (cancellation === "signal") caller.abort();
+      else helper.abort();
+      await outcome;
+    });
+    await f.solwyn.close();
+    expect(f.confirms).toHaveLength(0);
+    expect(f.events).toMatchObject([{ status: "error", possibly_succeeded: true }]);
+    expect(f.surrenders).toMatchObject([{ spent_tokens: 0 }]);
+    expect(finalize).not.toHaveBeenCalled();
   });
 
   it("retains native stream parameters and the supported deferred helper shape", async () => {

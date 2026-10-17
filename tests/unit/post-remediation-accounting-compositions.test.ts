@@ -164,11 +164,9 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
             else await expect(branches[1].next()).rejects.toBe(failure);
           }
           await stream.close();
-          expect(fallbackBreaker.getState().state).toBe(
-            outcome === "stop" ? "closed" : outcome === "error" ? "open" : "half_open",
-          );
+          expect(fallbackBreaker.getState().state).toBe(outcome === "stop" ? "closed" : "open");
           expect(failures.mock.contexts.filter((item) => item === fallbackBreaker)).toHaveLength(
-            outcome === "error" ? 2 : 1,
+            outcome === "stop" ? 1 : 2,
           );
           expect(successes.mock.contexts.filter((item) => item === fallbackBreaker)).toHaveLength(
             outcome === "stop" ? 1 : 0,

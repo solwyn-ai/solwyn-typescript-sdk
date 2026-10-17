@@ -405,13 +405,17 @@ export class UntrackedSurfaceReporter {
   }
 
   /** One bounded final cycle, including any already-active advisory send. */
-  close(): Promise<void> {
+  close(timeout = this.#shutdownBudget): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
-    this.#shutdownDeadline = performance.now() + this.#shutdownBudget;
+    const budget = Number.isFinite(timeout)
+      ? Math.max(0, Math.min(timeout, this.#shutdownBudget))
+      : 0;
+    this.#shutdownDeadline = performance.now() + budget;
     this.#closePromise = Promise.resolve().then(async () => {
+      if (budget === 0) this.#shutdownController.abort();
       const timer = setTimeout(
         () => this.#shutdownController.abort(),
-        Math.min(2 ** 31 - 1, this.#shutdownBudget),
+        Math.min(2 ** 31 - 1, budget),
       );
       try {
         await this.#requestFlush();

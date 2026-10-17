@@ -32,8 +32,9 @@ corresponding release notes before users upgrade.
   are added. Review and refresh strict coverage fingerprints when upgrading `@solwyn/sdk`, even
   if the provider SDK versions stay pinned.
 - **OpenAI 7 compatibility.** The optional `openai` peer range is now `>=4.41.0 <8`, with
-  current integration checks at `7.36.0`. OpenAI 7 itself requires Node 22 or later; Solwyn's
-  provider-free core remains compatible with Node 20 and compatible older provider releases.
+  unit and surface checks at `7.36.0`; installed native type checks retain `6.45.0`.
+  OpenAI 7 itself requires Node 22 or later; Solwyn's provider-free core remains compatible
+  with Node 20 and compatible older provider releases.
 - **Breaking:** **Responses parsing types reflect runtime values.** Raw JSON-schema formats
   produce `unknown` parsed values, and optional or union branded formats retain their nullable
   parsed type. Older OpenAI declarations sometimes promised only `null` despite parsing JSON
@@ -86,10 +87,6 @@ corresponding release notes before users upgrade.
   durations are in seconds and must fit a timer delay of at most 2,147,483,647 milliseconds.
   Pass finite numbers in that range, allowing zero only for `cacheTtl` and at least `0.1`
   seconds for `timeout`.
-- **Breaking:** **Consistent configuration error fields.** Invalid `budgetCheckTimeout` values
-  now report `ConfigurationError.field: "budget_check_timeout"` from both constructor options
-  and the environment, matching other configuration schema fields. Update error handlers that
-  matched the previous `"budgetCheckTimeout"` field value to use `"budget_check_timeout"`.
 - **Breaking:** **Constructor shape validation is synchronous.** Invalid options objects,
   fallback lists, model values, loggers, and selection policies raise `ConfigurationError`
   before reporters or budget resources start. Supply all four `debug`, `info`, `warn`, and

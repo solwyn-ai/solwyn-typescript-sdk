@@ -221,15 +221,17 @@ explicitly with the manifest and public documentation:
   types/runtime fixtures, and separate Google GenAI 0.3.1 plus 2.20.0 installations for native
   lifecycle behavior. These installed probes retain their own pins; they do not install the
   development dependencies or the provider-surface matrix's latest cells;
-- provider-surface floor/latest boundary cells separately check OpenAI 4.41.0 and 6.45.0,
-  Anthropic 0.30.0 and 0.123.0, Bedrock Runtime 3.422.0 and 3.1124.0, Google GenAI 0.3.1 and
-  2.20.0, Together AI 0.16.0 and 0.50.0, plus Google Generative AI 0.24.1 as its reviewed cell.
+- provider-surface floor/latest boundary cells separately check OpenAI 4.41.0 and 7.36.0,
+  Anthropic 0.30.0 and 0.135.0, Bedrock Runtime 3.422.0 and 3.1124.0, Google GenAI 0.3.1 and
+  2.30.0, Together AI 0.16.0 and 0.58.0, plus Google Generative AI 0.24.1 as its reviewed cell.
 
 Do not describe two boundary cells as continuous support evidence or full runtime/type coverage
 for intervening versions. The quality jobs run the unit suite against the development pins in
-`package.json` and `pnpm-lock.yaml`; each provider-surface job overlays only its cell's package
-from `tests/provider-surface-intervals.json` and runs capture plus the surface canary. The consumer
-jobs test the same tarball using the independent fixture/probe pins described above. When a
+`package.json` and `pnpm-lock.yaml`: OpenAI 7.36.0, Anthropic 0.135.0, Google GenAI 2.30.0,
+and Together AI 0.58.0 for the refreshed providers. Each provider-surface job overlays only the
+package specified for its cell in `tests/provider-surface-intervals.json` and runs capture plus
+the surface canary. The consumer jobs test the same tarball using the independent fixture/probe
+pins described above. When a
 version changes, reconcile the relevant fixtures, lockfiles, CI matrix, manifest peer range,
 README, and release notes together, identifying the evidence each check actually supplies.
 

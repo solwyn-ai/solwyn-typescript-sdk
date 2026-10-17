@@ -267,15 +267,19 @@ Optional provider peers are bounded to the reviewed major-version intervals:
 
 | Package | Optional peer range | Reviewed boundary or integration cells |
 |---------|---------------------|----------------------------------------|
-| `openai` | `>=4.41.0 <8` | 4.41.0 and 7.36.0 surface cells; deeper checks at 7.36.0 and installed native type checks at 6.45.0 |
-| `@anthropic-ai/sdk` | `>=0.30.0 <1` | 0.30.0 and 0.135.0 surface cells; deeper checks at 0.135.0 |
+| `openai` | `>=4.41.0 <8` | 4.41.0 and 7.36.0 surface cells; installed native type checks at 6.45.0 |
+| `@anthropic-ai/sdk` | `>=0.30.0 <1` | 0.30.0 and 0.135.0 surface cells; installed native type/runtime checks at 0.123.0 |
 | `@aws-sdk/client-bedrock-runtime` | `>=3.422.0 <4` | 3.422.0 and 3.1124.0 surface cells |
-| `@google/genai` | `>=0.3.1 <3` | 0.3.1 and 2.30.0 surface cells and deeper checks |
+| `@google/genai` | `>=0.3.1 <3` | 0.3.1 and 2.30.0 surface cells; installed lifecycle checks at 0.3.1 and 2.20.0 |
 | `together-ai` | `>=0.16.0 <1` | 0.16.0 and 0.58.0 surface cells |
 | `ai` | `>=7.0.14 <8` | Vercel AI SDK integration checks at 7.0.14 |
 
 `@google/generative-ai` has one reviewed surface cell at 0.24.1 and is not an optional peer; do
 not infer a supported peer interval from that evidence.
+
+The full unit suite uses the development pins: OpenAI 7.36.0, Anthropic 0.135.0, Google GenAI
+2.30.0, and Together AI 0.58.0. Installed-consumer probes retain their independent fixture
+versions listed above; refreshing a surface cell does not refresh those fixtures.
 
 Boundary cells are not continuous-version coverage: they do not claim that every intervening
 version received every runtime scenario. Only the named cells are release-validated; the manifest

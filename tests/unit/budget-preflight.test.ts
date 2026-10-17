@@ -11,7 +11,7 @@ import type { LeaseLedger } from "../../src/lease";
 import { noopLogger } from "../../src/logging";
 import { Deadline } from "../../src/routing";
 import { createTokenDetails } from "../../src/token-details";
-import type { LeaseGrantResponse } from "../../src/types";
+import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
 
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
@@ -36,6 +36,20 @@ function grant(): LeaseGrantResponse {
     budget_limit: 100,
     current_usage: 0,
     remaining_budget: 100,
+  };
+}
+
+function checkResponse(): BudgetCheckResponse {
+  return {
+    allowed: true,
+    remaining_budget: 100,
+    reservation_id: "res-preflight",
+    mode: "hard_deny",
+    budget_limit: 100,
+    current_usage: 0,
+    project_id: PROJECT_ID,
+    denied_by_period: null,
+    price_hints: null,
   };
 }
 
@@ -190,15 +204,28 @@ describe("budget preflight deadline and cancellation", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("still dispatches an initial grant with exactly 50ms remaining", async () => {
-    const fetch = vi.fn(async () => new Response(JSON.stringify(grant())));
-    const budget = enforcer({ fetch, monotonicNow: () => 0 });
+  it.each([
+    true,
+    false,
+  ])("still dispatches with exactly 50ms remaining and leases=%s", async (leaseEnabled) => {
+    const fetch = vi.fn(
+      async (_url: string) =>
+        new Response(JSON.stringify(leaseEnabled ? grant() : checkResponse())),
+    );
+    const budget = enforcer({ fetch, leaseEnabled, monotonicNow: () => 0 });
     const result = await budget.checkBudget(
       options({ timeout: 0.1, deadline: new Deadline(0.05, () => 0) }),
     );
 
-    expect(result).toMatchObject({ allowed: true, leaseId: "lease-preflight", warning: null });
+    expect(result).toMatchObject({
+      allowed: true,
+      warning: null,
+      ...(leaseEnabled ? { leaseId: "lease-preflight" } : { reservationId: "res-preflight" }),
+    });
     expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(fetch.mock.calls[0]?.[0])).toBe(
+      `${API_URL}/api/v1/budgets/${leaseEnabled ? "lease" : "check"}`,
+    );
     budget.releaseReservation(CALL_ID, result.leaseClaimToken ?? null);
   });
 
@@ -208,21 +235,7 @@ describe("budget preflight deadline and cancellation", () => {
   ])("dispatches at the 100ms timeout minimum after setup overhead with leases=%s", async (leaseEnabled) => {
     const fetch = vi.fn(
       async (_url: string) =>
-        new Response(
-          JSON.stringify(
-            leaseEnabled
-              ? grant()
-              : {
-                  allowed: true,
-                  remaining_budget: 100,
-                  reservation_id: "res-preflight",
-                  mode: "hard_deny",
-                  budget_limit: 100,
-                  current_usage: 0,
-                  project_id: PROJECT_ID,
-                },
-          ),
-        ),
+        new Response(JSON.stringify(leaseEnabled ? grant() : checkResponse())),
     );
     const monotonicNow = vi.fn().mockReturnValueOnce(0).mockReturnValue(1);
     const budget = enforcer({ fetch, leaseEnabled, monotonicNow });

@@ -13,38 +13,38 @@ const OPENAI: SurfaceContext = {
 const PINNED_CONTEXTS = [
   {
     context: { provider: null, dialect: "openai", clientShape: "openai_sdk" },
-    digest: "3b6576c4b60101fbdc0424ec18a43848f6a5e34b30154aefd9385d296ff695b8", // 49 rules
+    digest: "2bbdb0a80159ee72821e92b85e8fcf1c22a3d394f0d06643f794f4bf9a3cce0e", // 49 rules
     count: 49,
   },
   {
     context: { provider: "openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "ab4b1a63ce7b576154cb24d0def6615c41921e10c45e137aff9924f4057e7931", // 63 rules
-    count: 63,
+    digest: "64c3617e2e074597b34d36aeb7bd19f67fd08ef2ebc95ba1459de188c31fdb0f", // 100 rules
+    count: 100,
   },
   {
     context: { provider: "azure_openai", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "5381844c5db9bea405c64163190f41b002f5102d8758c94709c92a4ad6eb2d03", // 62 rules
-    count: 62,
+    digest: "c3ba73238c888bf8d12febe2af6a96f63d756cf72fd91405e87f6cd019f45a01", // 99 rules
+    count: 99,
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "openai_sdk" },
-    digest: "3b6576c4b60101fbdc0424ec18a43848f6a5e34b30154aefd9385d296ff695b8", // 49 rules
+    digest: "2bbdb0a80159ee72821e92b85e8fcf1c22a3d394f0d06643f794f4bf9a3cce0e", // 49 rules
     count: 49,
   },
   {
     context: { provider: "together", dialect: "openai", clientShape: "native_together" },
-    digest: "7125cd6cb2f0c63650ab7de5f65dd626e8a397e544aad95defd78eaea51c9179", // 47 rules
-    count: 47,
+    digest: "2e0345b53bfcd56aa7a4b4d600d209a49bc6f4cc76121bdc6373deeac4cd59c9", // 59 rules
+    count: 59,
   },
   {
     context: { provider: "anthropic", dialect: "anthropic", clientShape: "anthropic_sdk" },
-    digest: "7ce48d92513fa4312cc2204b46f3bc435712a79856790d5d117a3fedf183a3e2", // 76 rules
-    count: 76,
+    digest: "a52d02879b19a3be4111c199c8a518a9c69a8e64f2a3e71a3f90ba7ea114a2d0", // 77 rules
+    count: 77,
   },
   {
     context: { provider: "google", dialect: "google", clientShape: "google_genai" },
-    digest: "83b0686f9805cd1da5ef3acdc38010fec0a49206a25a20b16fcf03dd6290298a", // 43 rules
-    count: 43,
+    digest: "ac5f7bc6809c988957b0c3b8433300b9178f62a39aefde53fdd5b1d2e08d7f4d", // 101 rules
+    count: 101,
   },
   {
     context: {
@@ -52,12 +52,12 @@ const PINNED_CONTEXTS = [
       dialect: "google",
       clientShape: "google_generativeai",
     },
-    digest: "fbc4ce8f156f0aa9e7434ed0996eab31b9e08b0797b4f20a64ff8c545175c1bd", // 38 rules
+    digest: "5ac00cbbc9599d3267654dac853650026a2f6aa3b31c3136db3d2ed44a97753b", // 38 rules
     count: 38,
   },
   {
     context: { provider: "bedrock", dialect: "bedrock", clientShape: "bedrock_v3" },
-    digest: "e4c5119e39ea86927aabfa24f729bc0de5b62dc68d6baa58ad505ab60180c1f7", // 42 rules
+    digest: "ec2244e35bacabce9d7788dcc9d6d846528afaa2d782e49b92b6448664661918", // 42 rules
     count: 42,
   },
 ] as const satisfies readonly {
@@ -70,7 +70,7 @@ describe("per-context surface contract data", () => {
   it("includes selector-applicable rules in the stable contract data form", () => {
     const data = contextContractData(OPENAI) as readonly Record<string, unknown>[];
 
-    expect(data).toHaveLength(63);
+    expect(data).toHaveLength(100);
     expect(
       data.find((row) => row["id"] === "surface.audio-speech-create.unmetered_spend.tts-model"),
     ).toEqual({

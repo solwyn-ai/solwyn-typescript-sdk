@@ -90,13 +90,12 @@ function subscribe<Event extends EventNames>(event: Event, listener: NativeCallb
 void subscribe;
 
 import type { ResponseStreamParams } from "openai/lib/responses/ResponseStream";
-import type { ExtractParsedContentFromParams } from "openai/lib/ResponsesParser";
-function generic<Params extends ResponseStreamParams>(body: Params) {
-  const native = raw.responses.stream(body).finalResponse();
-  const result = client.responses.stream(body).on("end", () => {}).finalResponse();
+function generic<Params extends ResponseStreamParams, Parsed>(body: Params) {
+  const native = raw.responses.stream<Params, Parsed>(body).finalResponse();
+  const result = client.responses.stream<Params, Parsed>(body).on("end", () => {}).finalResponse();
   const nativeShape: typeof native = result;
   const wrappedShape: typeof result = native;
-  const expected: Promise<ParsedResponse<ExtractParsedContentFromParams<Params>>> = result;
+  const expected: Promise<ParsedResponse<Parsed>> = result;
   return [nativeShape, wrappedShape, expected];
 }
 const explicitParams = { model: "gpt-test", input: [] };

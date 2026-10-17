@@ -210,7 +210,7 @@ describe("README release compatibility guide", () => {
       ["@aws-sdk/client-bedrock-runtime", ">=3.422.0 <4"],
       ["@google/genai", ">=0.3.1 <3"],
       ["ai", ">=7.0.14 <8"],
-      ["openai", ">=4.41.0 <7"],
+      ["openai", ">=4.41.0 <8"],
       ["together-ai", ">=0.16.0 <1"],
     ]) {
       expect(README).toContain(`\`${packageName}\` | \`${peerRange}\``);

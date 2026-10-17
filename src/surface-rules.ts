@@ -212,6 +212,52 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     rows.push(unmeteredRow(path, NATIVE_OPENAI, "arbitrary_endpoint"));
   }
   rows.push(unmeteredRow("withOptions", NATIVE_OPENAI, "client"));
+  rows.push(unmeteredRow("responsePromise", NATIVE_OPENAI, "raw_response"));
+  rows.push(unmeteredRow("parseResponseWithTimeout", NATIVE_OPENAI, "arbitrary_endpoint"));
+
+  for (const path of [
+    "audio.voices",
+    "beta",
+    "beta.agents",
+    "beta.agents.environments",
+    "beta.agents.environments.files",
+    "beta.agents.sessions",
+    "beta.agents.sessions.events",
+    "beta.responses",
+    "contentProvenanceChecks",
+    "decisions",
+    "live",
+    "live.sessions",
+    "realtime",
+    "realtime.calls",
+    "realtime.translations",
+    "realtime.translations.clientSecrets",
+  ]) {
+    rows.push(namespaceRow(path, NATIVE_OPENAI, "native", "raw"));
+  }
+  for (const path of [
+    "audio.voices.create",
+    "beta.agents.environments.create",
+    "beta.agents.environments.files.create",
+    "beta.agents.environments.files.prepare",
+    "beta.agents.environments.files.upload",
+    "beta.agents.sessions.create",
+    "beta.agents.sessions.stream",
+    "beta.agents.sessions.events.create",
+    "beta.agents.sessions.events.stream",
+    "beta.responses.create",
+    "beta.responses.compact",
+    "beta.responses.retrieve",
+    "contentProvenanceChecks.create",
+    "decisions.create",
+    "live.create",
+    "live.sessions.accept",
+    "live.sessions.fork",
+    "realtime.calls.create",
+    "realtime.translations.clientSecrets.create",
+  ]) {
+    rows.push(unmeteredRow(path, NATIVE_OPENAI, "operation"));
+  }
   rows.push(namespaceRow("videos", [TOGETHER_NATIVE], "together-wrapper", "wrapper"));
   rows.push({
     ruleId: rowId("videos.create", "unsupported", "compat-wrapper"),
@@ -251,8 +297,30 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     );
   }
 
+  for (const path of [
+    "beta",
+    "beta.jig",
+    "clusters",
+    "clusters.remediations",
+    "clusters.storage",
+  ]) {
+    rows.push(namespaceRow(path, [TOGETHER_NATIVE], "together", "raw"));
+  }
+  for (const path of [
+    "beta.jig.rollback",
+    "clusters.create",
+    "clusters.update",
+    "clusters.remediations.create",
+    "clusters.remediations.approve",
+    "clusters.storage.create",
+    "clusters.storage.update",
+  ]) {
+    rows.push(unmeteredRow(path, [TOGETHER_NATIVE], "operation"));
+  }
+
   rows.push(namespaceRow("messages", [ANTHROPIC], "anthropic"));
   rows.push(meteredRow("messages.create", [ANTHROPIC], "provider"));
+  rows.push(unmeteredRow("makeTracedRequest", [ANTHROPIC], "arbitrary_endpoint"));
 
   rows.push(namespaceRow("models", [GOOGLE_GENAI], "google"));
   for (const path of ["models.generateContent", "models.generateContentStream"]) {
@@ -261,6 +329,70 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   rows.push(meteredRow("models.embedContent", [GOOGLE_GENAI], "provider_or_estimate"));
   rows.push(meteredRow("models.generateImages", [GOOGLE_GENAI], "request_derived"));
   rows.push(meteredRow("models.generateVideos", [GOOGLE_GENAI], "request_derived"));
+  for (const path of ["chats", "chats.modelsModule", "voices"]) {
+    rows.push(namespaceRow(path, [GOOGLE_GENAI], "google", "raw"));
+  }
+  rows.push({
+    ...namespaceRow("credentials", [GOOGLE_GENAI], "google", "raw"),
+    // Retain the prior unevaluated observation; runtime still validates the returned value.
+    expectedShapes: [
+      ...RESOURCE_SHAPES,
+      { descriptorCategory: "getter", returnShape: "unevaluated_accessor" },
+    ],
+  });
+  for (const path of [
+    "models.generateContentWithContinuation",
+    "models.generateContentStreamWithContinuation",
+    "chats.modelsModule.generateContentWithContinuation",
+    "chats.modelsModule.generateContentStreamWithContinuation",
+    "voices.create",
+  ]) {
+    rows.push(unmeteredRow(path, [GOOGLE_GENAI], "operation"));
+  }
+  for (const path of ["credentials.getClient", "voices.getClient"]) {
+    rows.push(unmeteredRow(path, [GOOGLE_GENAI], "client"));
+  }
+  for (const path of [
+    "credentials.parentClient.apiCall",
+    "credentials.parentClient.request",
+    "credentials.parentClient.requestStream",
+    "credentials.parentClient.streamApiCall",
+    "credentials.parentClient.unaryApiCall",
+    "credentials.parentClient.fetchUploadUrl",
+    "credentials.parentClient.uploadFile",
+    "credentials.parentClient.uploadFileToFileSearchStore",
+    "voices.parentClient.apiCall",
+    "voices.parentClient.request",
+    "voices.parentClient.requestStream",
+    "voices.parentClient.streamApiCall",
+    "voices.parentClient.unaryApiCall",
+    "voices.parentClient.fetchUploadUrl",
+    "voices.parentClient.uploadFile",
+    "voices.parentClient.uploadFileToFileSearchStore",
+  ]) {
+    rows.push(unmeteredRow(path, [GOOGLE_GENAI], "arbitrary_endpoint"));
+  }
+  for (const parent of [
+    "apiClient",
+    "authTokens.apiClient",
+    "batches.apiClient",
+    "caches.apiClient",
+    "chats.apiClient",
+    "chats.modelsModule.apiClient",
+    "credentials.parentClient",
+    "fileSearchStores.apiClient",
+    "fileSearchStores.documents.apiClient",
+    "files.apiClient",
+    "live.apiClient",
+    "live.music.apiClient",
+    "models.apiClient",
+    "operations.apiClient",
+    "tunings.apiClient",
+    "voices.parentClient",
+  ]) {
+    rows.push(namespaceRow(parent, [GOOGLE_GENAI], "google", "raw"));
+    rows.push(unmeteredRow(`${parent}.getFetch`, [GOOGLE_GENAI], "arbitrary_endpoint"));
+  }
   rows.push(meteredRow("generateContent", [GOOGLE_LEGACY], "provider"));
 
   for (const path of ["ConverseCommand", "ConverseStreamCommand"]) {
@@ -363,7 +495,11 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
     rows.push({
       ruleId: rowId(path, "metadata"),
       surface: path,
-      selectors: ALL_CLIENTS,
+      selectors: ALL_CLIENTS.filter(
+        (selector) =>
+          !(path === "organization" && selector === ANTHROPIC) &&
+          !(path === "credentials" && selector === GOOGLE_GENAI),
+      ),
       kind: "metadata",
       source: "raw",
       expectedShapes: INERT_METADATA_SHAPES,
@@ -371,6 +507,7 @@ function curatedRuleInputs(): readonly SurfaceRuleInput[] {
   }
 
   for (const path of [
+    "organization",
     "files",
     "skills",
     "skills.versions",

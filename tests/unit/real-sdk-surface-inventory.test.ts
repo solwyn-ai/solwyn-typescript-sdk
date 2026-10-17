@@ -478,16 +478,16 @@ const fixtureBaselineSchema = z.strictObject({
 
 const EXPECTED_CATALOG_ROWS = [
   ["anthropic", "floor", ["@anthropic-ai/sdk@0.30.0"]],
-  ["anthropic", "latest", ["@anthropic-ai/sdk@0.123.0"]],
+  ["anthropic", "latest", ["@anthropic-ai/sdk@0.135.0"]],
   ["bedrock", "floor", ["@aws-sdk/client-bedrock-runtime@3.422.0"]],
   ["bedrock", "latest", ["@aws-sdk/client-bedrock-runtime@3.1124.0"]],
   ["google-genai", "floor", ["@google/genai@0.3.1"]],
-  ["google-genai", "latest", ["@google/genai@2.20.0"]],
+  ["google-genai", "latest", ["@google/genai@2.30.0"]],
   ["google-generativeai", "latest", ["@google/generative-ai@0.24.1"]],
   ["openai", "floor", ["openai@4.41.0"]],
-  ["openai", "latest", ["openai@6.45.0"]],
+  ["openai", "latest", ["openai@7.36.0"]],
   ["together", "floor", ["together-ai@0.16.0"]],
-  ["together", "latest", ["together-ai@0.50.0"]],
+  ["together", "latest", ["together-ai@0.58.0"]],
 ] as const;
 
 async function readJson(path: string): Promise<unknown> {
@@ -555,7 +555,7 @@ describe("committed provider surface interval evidence", () => {
       "@aws-sdk/client-bedrock-runtime": ">=3.422.0 <4",
       "@google/genai": ">=0.3.1 <3",
       ai: ">=7.0.14 <8",
-      openai: ">=4.41.0 <7",
+      openai: ">=4.41.0 <8",
       "together-ai": ">=0.16.0 <1",
     });
     expect(packageJson.devDependencies["ai"]).toBe("7.0.14");

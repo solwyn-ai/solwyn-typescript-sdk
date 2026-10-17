@@ -16,12 +16,20 @@ type ParseableTextFormat<Parsed, NativeFormat> = NativeFormat & {
   $parseRaw(content: string): Parsed;
 };
 
-// Keep the native indexed conditional (including symbolic Params) exactly intact.
-// Derive its JSON-schema format base from the supplied provider method itself.
-type ParsedFromParams<Params extends TextConfigParams, NativeFormat> =
-  NonNullable<Params["text"]>["format"] extends ParseableTextFormat<infer Parsed, NativeFormat>
+// Raw JSON schemas are parsed without a branded validator; their values are unknown.
+// Distribute optional/union formats so a present helper retains its parsed type.
+type ParsedTextFormat<Format, NativeFormat> = [Format] extends [never]
+  ? null
+  : Format extends ParseableTextFormat<infer Parsed, NativeFormat>
     ? Parsed
-    : null;
+    : Format extends NativeFormat
+      ? unknown
+      : null;
+
+type ParsedFromParams<Params extends TextConfigParams, NativeFormat> = ParsedTextFormat<
+  NonNullable<Params["text"]>["format"],
+  NativeFormat
+>;
 
 type ParsedPart<Part, Parsed> = Part extends { type: "output_text"; parsed: unknown }
   ? { [Key in keyof Part]: Key extends "parsed" ? Parsed | null : Part[Key] }

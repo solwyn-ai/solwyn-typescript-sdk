@@ -1298,7 +1298,7 @@ pnpm build   # dual ESM + CJS + .d.ts
 pnpm test:live # opt-in local control-plane checks with fake providers; build first
 ```
 
-The [verification guide](scripts/verification/README.md) documents package/runtime checks and
+The [verification guide](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/scripts/verification/README.md) documents package/runtime checks and
 the live harness. Live checks require a disposable control plane and explicit credentials;
 they skip when the required URL or key is unset and remain separate from `pnpm test`.
 

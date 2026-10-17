@@ -290,13 +290,26 @@ describe("AI SDK preflight cancellation", () => {
 });
 
 describe("AI SDK middleware shutdown", () => {
-  it("allows abandoned streams to be collected while a reachable stream still settles", async () => {
+  it("settles 32 abandoned streams before closing and still settles a reachable stream", async () => {
     const { stdout } = await promisify(execFile)(
       process.execPath,
       ["--expose-gc", "--import", "tsx", "tests/probes/ai-sdk-stream-retention.mts"],
       { cwd: process.cwd(), timeout: 30_000 },
     );
     expect(JSON.parse(stdout)).toEqual({ collected: true, liveConfirmed: true });
+  }, 35_000);
+
+  it("finalizes abandoned run streams without retaining unclosed handles or settling twice", async () => {
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ["--expose-gc", "--import", "tsx", "tests/probes/ai-sdk-abandoned-stream-retention.mts"],
+      { cwd: process.cwd(), timeout: 30_000 },
+    );
+    expect(JSON.parse(stdout)).toEqual({
+      leases: true,
+      exactlyOnce: true,
+      unclosedCollected: true,
+    });
   }, 35_000);
 
   it.each([
@@ -402,6 +415,25 @@ describe("AI SDK middleware shutdown", () => {
     await expect(next).rejects.toMatchObject({ name: "SolwynError", message: "client is closed" });
     expect(cancel).toHaveBeenCalledOnce();
     expect(plane.confirms).toHaveLength(1);
+  });
+
+  it("does not enqueue settlement when stream setup outlasts reporting shutdown", async () => {
+    const { plane, handle } = fixture({ leaseEnabled: false, reporterShutdownDeadline: 0 });
+    const reportSettlement = vi.spyOn(MetadataReporter.prototype, "reportSettlement");
+    const entered = deferred<void>();
+    const response = deferred<{ stream: ReadableStream<unknown> }>();
+    const call = stream(handle, { prompt: [] }, async () => {
+      entered.resolve();
+      return response.promise;
+    });
+    await entered.promise;
+    await handle.close();
+    response.resolve({ stream: new ReadableStream() });
+    const result = await call;
+    await result.stream.cancel();
+    expect(reportSettlement).not.toHaveBeenCalled();
+    expect(plane.confirms).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(0);
   });
 
   it("retains the reservation floor when closing an unmeasured lease stream", async () => {

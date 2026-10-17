@@ -549,9 +549,11 @@ try {
 
 The middleware handle owns the budget enforcer + reporter; call `solwyn.close()` (or use `await using`) to flush queued telemetry. Attribution is derived from the wrapped model's `provider`/`modelId`; there is no failover here (the AI SDK owns the single model), so every event is a primary hop.
 
-Consume or cancel middleware streams explicitly. Garbage collection does not settle abandoned
-middleware streams or release their funding; a per-call reservation can remain until expiry,
-and a lease claim can remain until the lease is surrendered.
+When garbage collection finalizes an abandoned middleware stream, Solwyn settles its observed
+usage once and releases run and lease ownership, matching the drop-in client. Missing or
+malformed usage retains the reservation floor. Finalization timing is runtime-dependent;
+consume or cancel streams explicitly for deterministic settlement. Closing the middleware
+settles open streams before reporting shuts down; later finalization cannot settle them again.
 
 Run stops are cooperative: the middleware rechecks the captured run after preflight and
 aborts an active stream at its next chunk boundary with `RunStoppedError`. Clearing a stop
@@ -1089,10 +1091,11 @@ need their terminal usage included; provider stream cleanup still belongs to the
 Missing or malformed usage retains the reservation floor during settlement; correcting
 inconsistent cache totals settles the adjusted observed usage.
 
-When garbage collection finalizes an abandoned stream, it settles the usage observed so far
-and releases its run and lease ownership instead of retaining them until client shutdown.
-Missing or malformed usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
-or cancel streams explicitly for deterministic settlement.
+Both the drop-in client and AI SDK middleware settle abandoned streams from observed usage
+when garbage collection finalizes them, releasing run and lease ownership before shutdown.
+Missing or malformed usage keeps the reservation floor. These settlements supply no routing
+latency samples. Finalization timing is runtime-dependent; finish or cancel streams explicitly
+for deterministic settlement.
 
 Or let `await using` do it:
 

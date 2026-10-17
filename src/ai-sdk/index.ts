@@ -656,6 +656,141 @@ async function instrumentReadable<T>(
   }
 }
 
+interface CallContext {
+  provider: ProviderName;
+  model: string;
+  callId: string;
+  run: CurrentRun | undefined;
+  estimatedInputTokens: number;
+  abortSignal: AbortSignal | undefined;
+  /** Immutable process-local settlement/release authority captured from preflight. */
+  funding: Readonly<{
+    reservationId: string | null;
+    leaseId: string | null;
+    leaseClaimToken: number | null;
+  }>;
+}
+
+type StreamSettlementContext = Omit<CallContext, "run" | "abortSignal"> & {
+  run: Pick<CurrentRun, "agentRunId" | "agentRunName" | "tags"> | undefined;
+};
+
+interface StreamSettlementOwner {
+  readonly settlements: Set<MiddlewareStreamSettlement>;
+  readonly logger: Logger;
+  closed: boolean;
+  settleSuccess(
+    ctx: StreamSettlementContext,
+    tokenDetails: TokenDetails,
+    latencyMs: number,
+    usageUnmeasured: boolean,
+  ): void;
+  reportErrorAndRelease(
+    ctx: StreamSettlementContext,
+    failoverErrorClass: string | null,
+    latencyMs: number,
+    possiblySucceeded: boolean | null,
+  ): void;
+  releaseFunding(ctx: StreamSettlementContext): void;
+}
+
+function extractStreamUsage(
+  ctx: StreamSettlementContext,
+  outputChars: number,
+  part: unknown,
+  logger: Logger,
+): ReturnType<typeof extractUsageFailSoft> {
+  let providerUsageAbsent = true;
+  const usageContext = {
+    provider: ctx.provider,
+    estimatedInputTokens: ctx.estimatedInputTokens,
+    outputChars,
+  };
+  return extractUsageFailSoft({
+    extract: () => {
+      const details = reportedUsageToTokenDetails(getProp(part, "usage"), usageContext);
+      providerUsageAbsent = details === null;
+      return details;
+    },
+    estimate: () => (providerUsageAbsent ? estimateUsageFromLength(usageContext) : null),
+    estimatedInputTokens: ctx.estimatedInputTokens,
+    logger,
+  });
+}
+
+/** Held by the finalizer: counts and attribution only, never a stream, source or run lifetime. */
+class MiddlewareStreamSettlement {
+  settled = false;
+  #finishUsage: ReturnType<typeof extractUsageFailSoft> | undefined;
+  #sawErrorPart = false;
+  #outputChars = 0;
+
+  constructor(
+    readonly owner: StreamSettlementOwner,
+    readonly ctx: StreamSettlementContext,
+    readonly started: number,
+    readonly terminationHandle: TerminationHandle | undefined,
+  ) {}
+
+  observe(part: unknown): void {
+    if (this.settled) return;
+    const type = getProp(part, "type");
+    if (type === "finish") {
+      // Normalize immediately: even a usage getter or an extra field can retain the source.
+      this.#finishUsage = extractStreamUsage(this.ctx, this.#outputChars, part, this.owner.logger);
+    } else if (type === "error") {
+      this.#sawErrorPart = true;
+    } else {
+      this.#outputChars += deltaChars(part);
+    }
+  }
+
+  release(): boolean {
+    if (this.settled) return false;
+    this.settled = true;
+    this.owner.settlements.delete(this);
+    collectedStreamSettlements.unregister(this);
+    this.terminationHandle?.release();
+    return true;
+  }
+
+  settle(outcome: "success" | "error" | "interrupted"): void {
+    if (!this.release()) return;
+    if (this.owner.closed) {
+      this.owner.releaseFunding(this.ctx);
+      return;
+    }
+    const latencyMs = performance.now() - this.started;
+    if (
+      outcome === "error" ||
+      (outcome === "success" && this.#sawErrorPart && this.#finishUsage === undefined)
+    ) {
+      this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
+      return;
+    }
+    try {
+      const usage =
+        this.#finishUsage ??
+        extractStreamUsage(this.ctx, this.#outputChars, undefined, this.owner.logger);
+      this.owner.settleSuccess(this.ctx, usage.tokenDetails, latencyMs, usage.usageUnmeasured);
+    } catch (error) {
+      this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
+      throw error;
+    }
+  }
+}
+
+const collectedStreamSettlements = new FinalizationRegistry<MiddlewareStreamSettlement>(
+  (settlement) => {
+    try {
+      // Accounting only: GC timing supplies neither provider health nor routing latency.
+      settlement.settle("success");
+    } catch {
+      // Finalization bookkeeping cannot throw into the host runtime.
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // The factory.
 // ---------------------------------------------------------------------------
@@ -740,11 +875,7 @@ export function createSolwynMiddleware(
 
   let closePromise: Promise<void> | null = null;
   const inFlightCalls = new Set<Promise<void>>();
-  // The stream owns its settlement callback; the handle must not keep abandoned streams alive.
-  const streamSettlements = new Set<WeakRef<() => void>>();
-  const collectedStreamSettlements = new FinalizationRegistry<WeakRef<() => void>>((reference) => {
-    streamSettlements.delete(reference);
-  });
+  const streamSettlements = new Set<MiddlewareStreamSettlement>();
   const safeWarn = (message: string): void => {
     try {
       logger.warn(message);
@@ -768,21 +899,6 @@ export function createSolwynMiddleware(
   };
 
   // --- Per-call attribution + the pre-flight budget decision. ---
-
-  interface CallContext {
-    provider: ProviderName;
-    model: string;
-    callId: string;
-    run: CurrentRun | undefined;
-    estimatedInputTokens: number;
-    abortSignal: AbortSignal | undefined;
-    /** Immutable process-local settlement/release authority captured from preflight. */
-    funding: Readonly<{
-      reservationId: string | null;
-      leaseId: string | null;
-      leaseClaimToken: number | null;
-    }>;
-  }
 
   // Minimal STRUCTURAL views of the wrapped model + call params — the only fields the
   // pre-flight reads (attribution name strings + the prompt to size). Structural (not the
@@ -887,7 +1003,7 @@ export function createSolwynMiddleware(
   };
 
   /** Consume one escaping/non-lease claim boundary without masking its primary outcome. */
-  const releaseFunding = (ctx: CallContext): void => {
+  const releaseFunding = (ctx: StreamSettlementContext): void => {
     if (ctx.funding.leaseClaimToken === null) {
       return;
     }
@@ -1013,7 +1129,7 @@ export function createSolwynMiddleware(
 
   /** Buffered-path settlement uses the same ordered reporter queue as streaming (D18). */
   const settleBufferedSuccess = (
-    ctx: CallContext,
+    ctx: StreamSettlementContext,
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
@@ -1063,7 +1179,7 @@ export function createSolwynMiddleware(
    * possibly-landed, never-confirmed spend).
    */
   const reportError = (
-    ctx: CallContext,
+    ctx: StreamSettlementContext,
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
@@ -1087,7 +1203,7 @@ export function createSolwynMiddleware(
 
   /** Error reporting and capability release are both best effort; callers rethrow original. */
   const reportErrorAndRelease = (
-    ctx: CallContext,
+    ctx: StreamSettlementContext,
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
@@ -1099,6 +1215,15 @@ export function createSolwynMiddleware(
     } finally {
       releaseFunding(ctx);
     }
+  };
+
+  const streamSettlementOwner: StreamSettlementOwner = {
+    settlements: streamSettlements,
+    logger,
+    closed: false,
+    settleSuccess: settleBufferedSuccess,
+    reportErrorAndRelease,
+    releaseFunding,
   };
 
   const meteredMiddleware = {
@@ -1165,109 +1290,28 @@ export function createSolwynMiddleware(
         throw error;
       }
 
-      // Streaming settlement state, settled EXACTLY ONCE at a terminal boundary:
-      // usage settles from the terminal `finish` part; a mid-stream error part or a stream
-      // rejection settles an error event with possibly_succeeded (the stream established).
-      let settled = false;
-      let capturedFinishPart: unknown;
-      let sawErrorPart = false;
-      let outputChars = 0;
-      let streamSettlement: WeakRef<() => void> | undefined;
-
-      const settleStreamSuccess = (): void => {
-        const latencyMs = performance.now() - started;
-        let providerUsageAbsent = true;
-        const usage = extractUsageFailSoft({
-          extract: () => {
-            const details = reportedUsageToTokenDetails(getProp(capturedFinishPart, "usage"), {
-              provider: ctx.provider,
-              estimatedInputTokens: ctx.estimatedInputTokens,
-              outputChars,
-            });
-            providerUsageAbsent = details === null;
-            return details;
-          },
-          estimate: () =>
-            providerUsageAbsent
-              ? estimateUsageFromLength({
-                  provider: ctx.provider,
-                  estimatedInputTokens: ctx.estimatedInputTokens,
-                  outputChars,
-                })
-              : null,
-          estimatedInputTokens: ctx.estimatedInputTokens,
-          logger,
-        });
-        const tokenDetails = usage.tokenDetails;
-        const event = buildEvent({
-          status: "success",
+      // Construct the finalizer's held value outside this frame. It must not reach result,
+      // params, the source reader, the caller signal or the run's ownership token.
+      const settlement = new MiddlewareStreamSettlement(
+        streamSettlementOwner,
+        {
           provider: ctx.provider,
           model: ctx.model,
           callId: ctx.callId,
-          run: ctx.run,
-          inputTokens: tokenDetails.input_tokens,
-          outputTokens: tokenDetails.output_tokens,
-          tokenDetails,
-          latencyMs,
-          failoverErrorClass: null,
-          possiblySucceeded: null,
-        });
-        // Streaming path routes the built confirm + its event through the reporter's queue as
-        // ONE settlement (behavior 26) — never a bare inline confirm.
-        if (hasSettlementFunding(ctx.funding)) {
-          settlePaidSuccess(event, {
-            reservationId: ctx.funding.reservationId,
-            leaseId: ctx.funding.leaseId,
-            leaseClaimToken: ctx.funding.leaseClaimToken,
-            model: ctx.model,
-            tokenDetails,
-            provider: ctx.provider,
-            isProviderFallback: false,
-            callId: ctx.callId,
-            providerRegion: null,
-            serviceTier: null,
-            floorAtReservation: usage.usageUnmeasured,
-          });
-        } else {
-          reporter.report(event);
-        }
-        if (ctx.funding.leaseId === null) {
-          releaseFunding(ctx);
-        }
-      };
-
-      const settleOnce = (outcome: "success" | "error" | "interrupted"): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (streamSettlement !== undefined) {
-          streamSettlements.delete(streamSettlement);
-          collectedStreamSettlements.unregister(streamSettlement);
-        }
-        terminationHandle?.release();
-        // A finish part with usage settles success; a mid-stream error part or a stream
-        // rejection settles an error event (possibly_succeeded — the stream established, so
-        // the provider may have generated billable output) and sends NO confirm. Mid-stream
-        // errors never fail over, so the event carries NO failover_error_class (F9 /
-        // #buildStreamErrorEvent) — passing `null` regardless of the underlying error.
-        // Cooperative stops and caller aborts use success settlement for observed usage.
-        if (
-          outcome === "error" ||
-          (outcome === "success" && sawErrorPart && capturedFinishPart === undefined)
-        ) {
-          reportErrorAndRelease(ctx, null, performance.now() - started, true);
-          return;
-        }
-        try {
-          settleStreamSuccess();
-        } catch (error) {
-          reportErrorAndRelease(ctx, null, performance.now() - started, true);
-          throw error;
-        }
-      };
-
-      const settleOnClose = (): void => settleOnce("interrupted");
+          estimatedInputTokens: ctx.estimatedInputTokens,
+          funding: ctx.funding,
+          run:
+            ctx.run === undefined
+              ? undefined
+              : {
+                  agentRunId: ctx.run.agentRunId,
+                  agentRunName: ctx.run.agentRunName,
+                  tags: ctx.run.tags,
+                },
+        },
+        started,
+        terminationHandle,
+      );
       let abortSetup = (): Promise<void> => cancelReadableSource(result.stream);
       try {
         const instrumented = await instrumentReadable(result.stream, {
@@ -1278,48 +1322,42 @@ export function createSolwynMiddleware(
             if (error !== undefined) throw error;
           },
           onPart(part) {
-            const type = getProp(part, "type");
-            if (type === "finish") {
-              capturedFinishPart = part;
-            } else if (type === "error") {
-              sawErrorPart = true;
-            } else {
-              outputChars += deltaChars(part);
-            }
+            settlement.observe(part);
           },
-          onEnd: () => settleOnce("success"),
+          onEnd: () => settlement.settle("success"),
           onError: (error) => {
             if (
               error instanceof RunStoppedError ||
               ctx.abortSignal?.aborted ||
               closePromise !== null
             ) {
-              settleOnClose();
+              settlement.settle("interrupted");
             } else {
-              settleOnce("error");
+              settlement.settle("error");
             }
           },
           onCancel: () => {
-            if (ctx.abortSignal?.aborted) settleOnClose();
-            else settleOnce("success");
+            if (ctx.abortSignal?.aborted) settlement.settle("interrupted");
+            else settlement.settle("success");
           },
         });
         abortSetup = instrumented.abort;
         const wrappedResult = { ...result, stream: instrumented.stream };
-        if (!settled) {
-          streamSettlement = new WeakRef(settleOnClose);
-          streamSettlements.add(streamSettlement);
-          collectedStreamSettlements.register(settleOnClose, streamSettlement, streamSettlement);
+        if (!settlement.settled) {
+          streamSettlements.add(settlement);
+          collectedStreamSettlements.register(instrumented.stream, settlement, settlement);
         }
         return wrappedResult;
       } catch (error) {
-        terminationHandle?.release();
+        const released = settlement.release();
         try {
           await abortSetup();
         } catch {
           // Non-success setup cleanup is best effort; preserve the original failure.
         }
-        reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        if (released) {
+          reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        }
         throw error;
       }
     },
@@ -1343,15 +1381,15 @@ export function createSolwynMiddleware(
       if (inFlightCalls.size > 0) {
         safeWarn(`middleware.close_inflight_timeout: ${inFlightCalls.size} calls still active`);
       }
-      for (const reference of streamSettlements) {
+      for (const settlement of streamSettlements) {
         try {
-          reference.deref()?.();
+          settlement.settle("interrupted");
         } catch {
           safeWarn("middleware.close_stream_settlement_failed");
         }
-        collectedStreamSettlements.unregister(reference);
       }
       streamSettlements.clear();
+      streamSettlementOwner.closed = true;
       // Reporter first: queued settlement/event delivery precedes the budget
       // enforcer's future lease-surrender point, matching the core client.
       await reporter.close(Math.max(0, deadline - performance.now()));

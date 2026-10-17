@@ -15,6 +15,7 @@ const handle = createSolwynMiddleware({
   leaseEnabled: false,
   breakerReportingEnabled: false,
   budgetCheckCacheTtl: 0,
+  reporterFlushInterval: 0.01,
 });
 const wrap = handle.middleware.wrapStream as unknown as (
   args: unknown,
@@ -49,11 +50,28 @@ for (let attempt = 0; attempt < 60; attempt++) {
   await setImmediate();
   forceGc();
   await setImmediate();
-  if (dropped.every((reference) => reference.deref() === undefined)) break;
+  if (
+    dropped.every((reference) => reference.deref() === undefined) &&
+    plane.confirms.length === 32 &&
+    plane.ingested.length === 32
+  )
+    break;
 }
 assert.ok(dropped.every((reference) => reference.deref() === undefined));
+assert.equal(plane.confirms.length, 32, "abandoned streams settle before handle close");
+assert.equal(plane.ingested.length, 32, "each abandoned stream reports its observed usage");
+assert.ok(
+  plane.ingested.every(
+    (event) =>
+      event.status === "success" &&
+      event.output_tokens === 1 &&
+      event.token_details?.is_estimated === true,
+  ),
+);
 await handle.close();
 await held.stream.cancel().catch(() => {});
+assert.equal(plane.confirms.length, 33, "close settles only the reachable stream");
+assert.equal(plane.ingested.length, 33);
 assert.equal(
   plane.confirms.filter(
     (confirm) =>

@@ -7,6 +7,7 @@ import {
   zeroTokenDetails,
 } from "../../src/token-details";
 import { IngestResponseSchema, LeaseRenewRequestSchema } from "../../src/validation";
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 
@@ -148,6 +149,7 @@ describe("settlement wire contract", () => {
       duplicates: [],
     },
   ])("escalates malformed ingest contracts even when fallback disposition is possible: %j", (body) => {
+    allowIngestContractDrift();
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const reporter = new MetadataReporter("https://api.solwyn.test", API_KEY, { logger });
     for (let count = 0; count < 10; count += 1) reporter._parseIngestRejections(body, 1);
@@ -166,6 +168,7 @@ describe("settlement wire contract", () => {
     ["malformed", true, 2],
     [null, false, 1],
   ] as const)("logs a usable rejection beside a malformed sibling: %j, first=%s, batch=%s", (malformed, first, batchSize) => {
+    allowIngestContractDrift();
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const reporter = new MetadataReporter("https://api.solwyn.test", API_KEY, { logger });
     const rejection = {

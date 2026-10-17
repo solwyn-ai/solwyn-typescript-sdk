@@ -76,7 +76,9 @@ function makeRawCapture(): RawCapture {
       return new Response(null, { status: 204 });
     }
     // Metadata ingest.
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), bodies };
 }

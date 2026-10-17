@@ -204,7 +204,7 @@ Persistent confirmation failures reach ERROR after ten consecutive failing deliv
 A round uses its last non-neutral confirmation verdict in dispatch order, so completion order
 cannot change the count. A success resets it; held admissions and read-only skips do not count.
 Lease-funded metadata includes the same `lease_id` as its confirmation. Cache reads and creation
-buckets must fit within input tokens; normalization preserves those buckets and raises an
+buckets must fit within input tokens; wrapped provider clients preserve those buckets and raise an
 inconsistent input total to their sum, marking it estimated. This correction settles the adjusted
 observed usage without retaining the lease reservation floor. Ingest responses require `ingested`,
 `rejected`, and `duplicates`; malformed responses produce contract-drift diagnostics while usable
@@ -549,7 +549,9 @@ aborts an active stream at its next chunk boundary with `RunStoppedError`. Clear
 allows future work; an already stopped stream retains its stop. Local velocity detection
 is not supported by the AI SDK middleware. Cache writes are reported in the default
 five-minute bucket, and missing usage totals fall back to length estimates for that side
-of the call while preserving reported totals.
+of the call while preserving reported totals. The middleware limits cache reads to input tokens
+and cache writes to the remaining input. Clamped or malformed counters mark usage estimated
+and retain the lease reservation floor.
 
 The call's `abortSignal` also cancels budget preflight. Run stops and caller cancellation
 settle stream usage observed so far, including the part pulled at the cancellation boundary;
@@ -682,7 +684,7 @@ Circuit breakers, latency signals, and failover labeling key off the provider **
 
 Caller cancellation never advances to another provider or counts as a provider failure. A
 cancelled established stream settles the usage observed so far, using the reservation floor
-when usage is estimated. Cancellation of a dispatched request before connection, including
+when usage is missing or malformed. Cancellation of a dispatched request before connection, including
 deferred Responses helpers, reports an error with `possibly_succeeded: true`, releases local
 funding, and does not confirm usage or record latency. Already-aborted requests skip velocity
 detection and budget I/O.
@@ -690,6 +692,9 @@ SDK request-deadline aborts still count as provider failures. A half-open stream
 probe is held for at most `circuitBreakerRecoveryTimeout` seconds after setup, with a one-second
 minimum. Expiry or finalization releases it neutrally, so an unread stream cannot block later
 recovery indefinitely. Its later outcome cannot affect a newer probe.
+
+For established streams, non-429 HTTP 4xx errors are health-neutral; errors without an HTTP
+status count as provider failures unless caused by caller cancellation.
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.
@@ -1077,7 +1082,7 @@ totals settles the adjusted observed usage.
 
 When garbage collection finalizes an abandoned stream, it settles the usage observed so far
 and releases its run and lease ownership instead of retaining them until client shutdown.
-Estimated usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
+Missing or malformed usage keeps the reservation floor. Finalization timing is runtime-dependent; finish
 or cancel streams explicitly for deterministic settlement.
 
 Or let `await using` do it:
@@ -1133,11 +1138,11 @@ Native serialization limits, including circular `_client` references, still appl
 | `reportUntrackedSurfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `true` | Send content-free untracked-surface advisories |
 | `leaseEnabled` | `SOLWYN_LEASE_ENABLED` | `true` | Enable local run-scoped token leases |
 | `leaseOutputBoundDefault` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token reservation when a request has no usable cap |
-| `selectionPolicy` | — | `HealthBasedPolicy` | Injectable candidate-ordering policy |
+| `selectionPolicy` | — | `HealthBasedPolicy` | Injectable candidate-ordering policy with an `order()` method |
 | `failoverIdempotency` | — | `"safe"` | Cross-provider failover idempotency policy |
 | `sameProviderRetries` | — | `0` | Same-provider `Retry-After` retries |
 | `failoverTotalTimeout` | — | `30` | Failover-window seconds; does not cap an in-flight provider read |
-| `failoverHopReadTimeout` | — | `600` | Constant provider request bound in seconds |
+| `failoverHopReadTimeout` | — | `600` | Per-attempt timeout in seconds; covered phases vary by provider (see below) |
 | `circuitBreakerRecoveryTimeoutJitter` | — | `0.2` | Provider-breaker recovery jitter fraction (0–1) |
 | `circuitBreakerFailureThreshold` | `SOLWYN_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive failures before a provider breaker opens |
 | `circuitBreakerRecoveryTimeout` | `SOLWYN_CIRCUIT_BREAKER_RECOVERY_TIMEOUT` | `60` | Provider-breaker recovery timeout in seconds |
@@ -1156,17 +1161,20 @@ Native serialization limits, including circular `_client` references, still appl
 | `reporterMaxSendAttempts` | `SOLWYN_REPORTER_MAX_SEND_ATTEMPTS` | `5` | Ordinary retryable send attempts; HTTP 429 has a separate 20-response cap |
 | `reporterRetryBackoffBase` | `SOLWYN_REPORTER_RETRY_BACKOFF_BASE` | `1` | Exponential retry base in seconds, with half-to-full jitter |
 | `reporterRetryBackoffCap` | `SOLWYN_REPORTER_RETRY_BACKOFF_CAP` | `60` | Retry backoff cap in seconds |
-| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Close deadline for each settlement and untracked reporter in seconds; `0` is valid |
+| `reporterShutdownDeadline` | `SOLWYN_REPORTER_SHUTDOWN_DEADLINE` | `5` | Shared deadline for in-flight calls, settlement, and advisory delivery in seconds; `0` is valid |
 | `breakerReportHeartbeat` | `SOLWYN_BREAKER_REPORT_HEARTBEAT` | `60` | Full breaker-report refresh interval in seconds (greater than 0, at most 60) |
 | `velocityMode` | `SOLWYN_VELOCITY_MODE` | `"warn"` | Local velocity posture: `"off"`, `"warn"`, or `"deny"` |
 | `velocityRepeatCount` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required (2–64) |
 | `velocityRepeatWindowS` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60` | Repeat detection window in seconds |
 | `velocityGrowthStreak` | `SOLWYN_VELOCITY_GROWTH_STREAK` | `8` | Successive calls whose estimated input sizes must strictly increase (3–64) |
 | `velocityGrowthFactor` | `SOLWYN_VELOCITY_GROWTH_FACTOR` | `3` | Latest/first estimated-input ratio |
-| `velocityAccelFloorPerMin` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-minute call count |
+| `velocityAccelFloorPerMin` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-minute call count (1–64) |
 | `velocityAccelFactor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3` | Current/prior-minute call-count ratio |
 
 Env fallback is a **presence check**: an env var is consulted only when the corresponding option is `undefined`. An explicitly-passed `false`, `0`, or `""` always wins over the env var. Client objects, request defaults, routing policies, injected transports, and failover-only knobs remain code-only. Unknown option keys and a present non-function `fetch` fail synchronously with `ConfigurationError`.
+
+An injected `logger` must provide all four `debug`, `info`, `warn`, and `error` methods;
+`selectionPolicy` must provide `order()`. Partial objects are rejected synchronously.
 
 Numeric settings reject booleans and empty strings. Breaker thresholds and reporter counts must
 be positive integers; `sameProviderRetries` permits zero. Timeout, cache, recovery, flush,
@@ -1176,6 +1184,10 @@ waits remain integer seconds. `budgetCheckTimeout`, `failoverHopReadTimeout`, fl
 intervals, and heartbeats must be positive; cache TTLs, recovery waits, and shutdown deadlines
 permit zero. Direct `BudgetEnforcer` options apply the same duration limit to `cacheTtl` and
 per-call `timeout`, with zero allowed only for `cacheTtl`.
+
+Velocity repeat windows must be positive, and growth and acceleration factors must exceed
+one. These three velocity options also accept positive infinity to disable the corresponding
+bound. The acceleration floor must be an integer from 1 through 64.
 
 `failoverTotalTimeout` must be non-negative. A zero value prevents new work from starting after
 call entry. JavaScript provider SDKs expose a single per-request
@@ -1273,7 +1285,12 @@ cardinality rather than silently counting the aggregate as one event.
 pnpm check   # biome lint + format check, tsc --noEmit
 pnpm test    # unit tests (vitest, fully offline, mocked fetch)
 pnpm build   # dual ESM + CJS + .d.ts
+pnpm test:live # opt-in local control-plane checks with fake providers; build first
 ```
+
+The [verification guide](scripts/verification/README.md) documents package/runtime checks and
+the live harness. Live checks require a disposable control plane and explicit credentials;
+they skip when the required URL or key is unset and remain separate from `pnpm test`.
 
 See the public [contributor guide](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/CONTRIBUTING.md)
 for the full workflow and public-content policy. Report vulnerabilities through the

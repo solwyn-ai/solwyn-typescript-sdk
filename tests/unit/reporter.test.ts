@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CircuitBreaker } from "../../src/circuit-breaker";
 import type { Logger } from "../../src/logging";
 import { MetadataReporter } from "../../src/reporter";
@@ -6,6 +6,7 @@ import { createTokenDetails, zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.ai";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -198,6 +199,7 @@ describe("MetadataReporter — throwing diagnostic containment", () => {
   });
 
   it("throwing reporter diagnostic: unparseable warning does not stop a later batch", async () => {
+    allowIngestContractDrift();
     const records: FetchRecord[] = [];
     let attempt = 0;
     const reporter = new MetadataReporter(API_URL, API_KEY, {
@@ -214,6 +216,7 @@ describe("MetadataReporter — throwing diagnostic containment", () => {
   });
 
   it("throwing reporter diagnostic: persistent parse error cannot reject final close", async () => {
+    allowIngestContractDrift();
     const records: FetchRecord[] = [];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       batchSize: 1,
@@ -342,6 +345,7 @@ describe("MetadataReporter — consecutive-failure counters", () => {
   });
 
   it("unparseable-response counter escalates at 10 then resets on a parseable response", () => {
+    allowIngestContractDrift();
     const { reporter, log } = healthyReporter([]);
     for (let i = 0; i < 9; i++) {
       reporter._recordUnparseableResponse(new TypeError("nope"));
@@ -431,6 +435,7 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
   });
 
   it("logs an unrecognized/future rejection code without crashing", async () => {
+    allowIngestContractDrift();
     const log = capturingLogger();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger: log.logger,
@@ -466,6 +471,7 @@ describe("MetadataReporter — ingest 202 rejection logging", () => {
 // ---------------------------------------------------------------------------
 
 describe("MetadataReporter — malformed 202 bodies fail open", () => {
+  beforeEach(allowIngestContractDrift);
   const cases: Array<[string, string]> = [
     ["missing 'rejected' key", JSON.stringify({ ingested: 1 })],
     ["'rejected' is null", JSON.stringify({ ingested: 1, rejected: null })],

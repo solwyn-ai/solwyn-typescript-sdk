@@ -48,7 +48,10 @@ function controlPlane(allowed = true) {
     }
     if (path === "/api/v1/metadata/ingest" && Array.isArray(body)) {
       events.push(...body);
-      return Response.json({ ingested: body.length, rejected: [] }, { status: 202 });
+      return Response.json(
+        { ingested: body.length, rejected: [], duplicates: [] },
+        { status: 202 },
+      );
     }
     throw new Error("unexpected control-plane endpoint");
   };

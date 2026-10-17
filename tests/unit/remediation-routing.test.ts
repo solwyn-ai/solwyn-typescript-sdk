@@ -34,7 +34,10 @@ function options(extra: SolwynOptions = {}): SolwynOptions {
     }
     if (url.endsWith("/metadata/ingest")) {
       const events = JSON.parse(init?.body as string) as unknown[];
-      return Response.json({ ingested: events.length, rejected: [] }, { status: 202 });
+      return Response.json(
+        { ingested: events.length, rejected: [], duplicates: [] },
+        { status: 202 },
+      );
     }
     if (url.includes("/breaker-reports")) return new Response(null, { status: 204 });
     throw new Error("unexpected offline control route");

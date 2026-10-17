@@ -6,6 +6,7 @@ import { zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
@@ -73,10 +74,7 @@ async function flushRounds(reporter: MetadataReporter, maxRounds = 25): Promise<
 }
 
 function response202(body: unknown): Response {
-  return new Response(
-    JSON.stringify(typeof body === "object" && body !== null ? { duplicates: [], ...body } : body),
-    { status: 202 },
-  );
+  return new Response(JSON.stringify(body), { status: 202 });
 }
 
 function loggerSpies(): Logger {
@@ -179,15 +177,16 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
   });
 
   it.each([
-    ["clean", { ingested: 2, rejected: [] }, "clean", [], 0],
+    ["clean", { ingested: 2, rejected: [], duplicates: [] }, "clean", [], 0],
     [
       "exact",
       {
         ingested: 0,
         rejected: [
-          { index: 1, code: "future_code", model: "m", message: "x" },
-          { index: 0, code: "future_code", model: "m", message: "y" },
+          { index: 1, code: "unknown_model", model: "m", message: "x" },
+          { index: 0, code: "unknown_model", model: "m", message: "y" },
         ],
+        duplicates: [],
       },
       "exact",
       [0, 1],
@@ -195,30 +194,54 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     ],
     [
       "supported legacy missing indexes",
-      { ingested: 1, rejected: [{ code: "future_code", model: "m", message: "x" }] },
+      {
+        ingested: 1,
+        rejected: [{ code: "unknown_model", model: "m", message: "x" }],
+        duplicates: [],
+      },
       "legacy",
       [],
       1,
     ],
-    ["malformed missing rejected", { ingested: 1 }, "malformed", [], 0],
-    ["malformed null rejected", { ingested: 1, rejected: null }, "malformed", [], 0],
-    ["malformed non-array rejected", { ingested: 1, rejected: {} }, "malformed", [], 0],
+    ["malformed missing rejected", { ingested: 1, duplicates: [] }, "malformed", [], 0],
+    [
+      "malformed null rejected",
+      { ingested: 1, rejected: null, duplicates: [] },
+      "malformed",
+      [],
+      0,
+    ],
+    [
+      "malformed non-array rejected",
+      { ingested: 1, rejected: {}, duplicates: [] },
+      "malformed",
+      [],
+      0,
+    ],
     [
       "malformed too-long rejected",
       {
         ingested: 0,
         rejected: [
-          { index: 0, code: "x", model: "m", message: "x" },
-          { index: 1, code: "x", model: "m", message: "x" },
-          { index: 2, code: "x", model: "m", message: "x" },
+          { index: 0, code: "unknown_model", model: "m", message: "x" },
+          { index: 1, code: "unknown_model", model: "m", message: "x" },
+          { index: 2, code: "unknown_model", model: "m", message: "x" },
         ],
+        duplicates: [],
       },
       "malformed",
       [],
       0,
     ],
-    ["malformed non-object entry", { ingested: 1, rejected: ["bad"] }, "malformed", [], 0],
+    [
+      "malformed non-object entry",
+      { ingested: 1, rejected: ["bad"], duplicates: [] },
+      "malformed",
+      [],
+      0,
+    ],
   ] as const)("parses %s response bodies", async (_label, body, kind, indexes, count) => {
+    if (kind === "legacy" || kind === "malformed") allowIngestContractDrift();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       fetch: async () => response202(body),
     });
@@ -237,13 +260,15 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     ["negative", -1],
     ["out of range", 2],
   ])("degrades a %s rejection index to legacy and records contract drift", async (_label, index) => {
+    allowIngestContractDrift();
     const logger = loggerSpies();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger,
       fetch: async () =>
         response202({
           ingested: 1,
-          rejected: [{ index, code: "x", model: "m", message: "x" }],
+          rejected: [{ index, code: "unknown_model", model: "m", message: "x" }],
+          duplicates: [],
         }),
     });
 
@@ -251,21 +276,23 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
 
     expect(result.rejections).toEqual({ kind: "legacy", indexes: [], count: 1 });
     expect(logger.warn).toHaveBeenCalledWith(
-      "reporter.ingest_response_unparseable: exc_type=ZodError",
+      `reporter.ingest_response_unparseable: exc_type=${index === 2 ? "RejectionContractError" : "ZodError"}`,
     );
   });
 
   it("degrades duplicate indexes to legacy while missing log identity leaves exact disposition intact", async () => {
+    allowIngestContractDrift();
     const logger = loggerSpies();
     const bodies = [
       {
         ingested: 0,
         rejected: [
-          { index: 0, code: "x", model: "m", message: "x" },
-          { index: 0, code: "x", model: "m", message: "x" },
+          { index: 0, code: "unknown_model", model: "m", message: "x" },
+          { index: 0, code: "unknown_model", model: "m", message: "x" },
         ],
+        duplicates: [],
       },
-      { ingested: 1, rejected: [{ index: 1 }] },
+      { ingested: 1, rejected: [{ index: 1 }], duplicates: [] },
     ];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger,
@@ -285,13 +312,15 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
   });
 
   it("logs contract drift while using mixed indexed and index-less fallback dispositions", async () => {
+    allowIngestContractDrift();
     const logger = loggerSpies();
     const body = {
       ingested: 1,
       rejected: [
-        { index: 1, code: "x", model: "m", message: "indexed" },
-        { code: "x", model: "m", message: "legacy" },
+        { index: 1, code: "unknown_model", model: "m", message: "indexed" },
+        { code: "unknown_model", model: "m", message: "legacy" },
       ],
+      duplicates: [],
     };
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger,
@@ -336,6 +365,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
   });
 
   it("classifies reporter-boundary 408/body I/O as retry but completed invalid JSON as malformed sent", async () => {
+    allowIngestContractDrift();
     vi.useFakeTimers();
     let now = 0;
     const stalled = new Response("ignored", { status: 202 });
@@ -371,14 +401,17 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
   });
 
   it("does not reset malformed-response escalation on missing-index fallback", async () => {
+    allowIngestContractDrift();
     const logger = loggerSpies();
     const invalid = {
       ingested: 0,
-      rejected: [{ index: false, code: "x", model: "m", message: "x" }],
+      rejected: [{ index: false, code: "unknown_model", model: "m", message: "x" }],
+      duplicates: [],
     };
     const supportedLegacy = {
       ingested: 0,
-      rejected: [{ code: "x", model: "m", message: "x" }],
+      rejected: [{ code: "unknown_model", model: "m", message: "x" }],
+      duplicates: [],
     };
     const bodies = [...Array.from({ length: 9 }, () => invalid), supportedLegacy, invalid];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
@@ -394,13 +427,15 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
   });
 
   it("escalates persistent invalid-index legacy on the tenth response", async () => {
+    allowIngestContractDrift();
     const logger = loggerSpies();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       logger,
       fetch: async () =>
         response202({
           ingested: 0,
-          rejected: [{ index: -1, code: "x", model: "m", message: "x" }],
+          rejected: [{ index: -1, code: "unknown_model", model: "m", message: "x" }],
+          duplicates: [],
         }),
     });
 
@@ -427,7 +462,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         if (url.endsWith("/budgets/confirm")) {
           return new Response(null, { status: confirmStatuses.shift() });
         }
-        return response202({ ingested: 1, rejected: [] });
+        return response202({ ingested: 1, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(1), event(1));
@@ -476,7 +511,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         }
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         ingestPayloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(1), event(1));
@@ -705,7 +740,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         payloads.push(body.map((item) => item.call_id));
         const status = statuses.shift();
         return status === 202
-          ? response202({ ingested: body.length, rejected: [] })
+          ? response202({ ingested: body.length, rejected: [], duplicates: [] })
           : new Response(null, { status });
       },
     });
@@ -739,7 +774,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
           started.resolve(undefined);
           return firstAttempt.promise;
         }
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.report(event(1));
@@ -775,7 +810,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         payloads.push(body.map((item) => item.call_id));
         const status = statuses.shift();
         return status === 202
-          ? response202({ ingested: body.length, rejected: [] })
+          ? response202({ ingested: body.length, rejected: [], duplicates: [] })
           : new Response(null, { status });
       },
     });
@@ -954,7 +989,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         urls.push(url);
         return url.endsWith("/budgets/confirm")
           ? new Response(null, { status: 404 })
-          : response202({ ingested: 1, rejected: [] });
+          : response202({ ingested: 1, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(), event());
@@ -973,7 +1008,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         urls.push(url);
         return url.endsWith("/budgets/confirm")
           ? new Response(null, { status: 503 })
-          : response202({ ingested: 1, rejected: [] });
+          : response202({ ingested: 1, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(), event());
@@ -1000,7 +1035,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         urls.push(url);
         return url.endsWith("/budgets/confirm")
           ? new Response(null, { status: 204 })
-          : response202({ ingested: 1, rejected: [] });
+          : response202({ ingested: 1, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(), event());
@@ -1039,7 +1074,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         }
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         ingestPayloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.reportSettlement(confirm(1), event(1));
@@ -1071,21 +1106,31 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
   });
 
   it.each([
-    ["exact", { ingested: 2, rejected: [{ index: 1, code: "x", model: "m", message: "x" }] }, 1],
+    [
+      "exact",
+      {
+        ingested: 2,
+        rejected: [{ index: 1, code: "unknown_model", model: "m", message: "x" }],
+        duplicates: [],
+      },
+      1,
+    ],
     [
       "full legacy",
       {
         ingested: 0,
         rejected: [
-          { code: "x", model: "m", message: "x" },
-          { code: "x", model: "m", message: "x" },
-          { code: "x", model: "m", message: "x" },
+          { code: "unknown_model", model: "m", message: "x" },
+          { code: "unknown_model", model: "m", message: "x" },
+          { code: "unknown_model", model: "m", message: "x" },
         ],
+        duplicates: [],
       },
       3,
     ],
-    ["malformed", { ingested: 3 }, 0],
+    ["malformed", { ingested: 3, duplicates: [] }, 0],
   ] as const)("publishes %s ingest dispositions synchronously", async (_label, body, count) => {
+    if (_label !== "exact") allowIngestContractDrift();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       batchSize: 3,
       fetch: async () => response202(body),
@@ -1117,7 +1162,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       fetch: async (_url, init) => {
         posted.push(...(JSON.parse(String(init?.body)) as Array<Record<string, unknown>>));
-        return response202({ ingested: 1, rejected: [] });
+        return response202({ ingested: 1, rejected: [], duplicates: [] });
       },
     });
     reporter.report({ ...event(1), model: "x".repeat(2049) } as MetadataEvent);
@@ -1137,7 +1182,8 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         posted.push(body.map((item) => item.call_id));
         return response202({
           ingested: 1,
-          rejected: [{ index: 1, code: "x", model: "m", message: "x" }],
+          rejected: [{ index: 1, code: "unknown_model", model: "m", message: "x" }],
+          duplicates: [],
         });
       },
     });
@@ -1166,7 +1212,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
       fetch: async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         payloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.report({
@@ -1202,7 +1248,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
       fetch: async (_url, init) => {
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         payloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.report({ ...event(13), model: "x".repeat(2049) } as MetadataEvent);
@@ -1249,7 +1295,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
           started.resolve(undefined);
           return firstAttempt.promise;
         }
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     const raw = event(15, {
@@ -1360,7 +1406,8 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     response.resolve(
       response202({
         ingested: 1,
-        rejected: [{ index: 1, code: "x", model: "m", message: "x" }],
+        rejected: [{ index: 1, code: "unknown_model", model: "m", message: "x" }],
+        duplicates: [],
       }),
     );
     await flushing;
@@ -1376,6 +1423,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
   // Mutation caught: computing partial-legacy weights from caller-owned events
   // after the await can reverse stable-heaviest disposition after submission.
   it("uses canonical submitted weights for partial legacy disposition", async () => {
+    allowIngestContractDrift();
     const response = deferred<Response>();
     const started = deferred<void>();
     const payloadWeights: number[][] = [];
@@ -1409,7 +1457,8 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
     response.resolve(
       response202({
         ingested: 1,
-        rejected: [{ code: "x", model: "m", message: "x" }],
+        rejected: [{ code: "unknown_model", model: "m", message: "x" }],
+        duplicates: [],
       }),
     );
     await flushing;
@@ -1478,7 +1527,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         }
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         ingestPayloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     const raw = confirm(23);
@@ -1511,7 +1560,7 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
         }
         const body = JSON.parse(String(init?.body)) as MetadataEvent[];
         ingestPayloads.push(body.map((item) => item.call_id));
-        return response202({ ingested: body.length, rejected: [] });
+        return response202({ ingested: body.length, rejected: [], duplicates: [] });
       },
     });
     reporter.report(event(24));
@@ -1535,12 +1584,14 @@ describe("MetadataReporter pending queues, FIFO retry, and dispositions", () => 
   });
 
   it("counts partial legacy by receipt weight and exposes a sparse defensive drop map", async () => {
+    allowIngestContractDrift();
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       batchSize: 2,
       fetch: async () =>
         response202({
           ingested: 1,
-          rejected: [{ code: "x", model: "m", message: "x" }],
+          rejected: [{ code: "unknown_model", model: "m", message: "x" }],
+          duplicates: [],
         }),
     });
     reporter.report(deniedEvent(1, { receipt_aggregate_count: 100 }));

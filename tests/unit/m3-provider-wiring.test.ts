@@ -78,7 +78,9 @@ function makeCaptureFetch(): Capture {
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       events.push(...(raw as Array<Record<string, unknown>>));
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), checks, confirms, events };
 }

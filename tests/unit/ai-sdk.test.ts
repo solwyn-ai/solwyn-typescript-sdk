@@ -448,7 +448,9 @@ describe("ai-sdk middleware options", () => {
     const handle = createSolwynMiddleware({
       apiKey: API_KEY,
       fetch: async () =>
-        new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 }),
+        new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+          status: 202,
+        }),
       budgetCheckTimeout: 0.25,
       controlPlaneFailureThreshold: 1,
       controlPlaneRecoveryTimeout: 30,
@@ -617,7 +619,9 @@ function makeFetch(budget: (call: number) => BudgetCheckResponse | "unreachable"
     if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
       captured.events.push(...(raw as WireEvent[]));
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), captured };
 }
@@ -2312,7 +2316,7 @@ describe("ai-sdk middleware — lease activation identity", () => {
       if (path === "/api/v1/metadata/ingest") {
         events.push(...(body as WireEvent[]));
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           {
             status: 202,
           },

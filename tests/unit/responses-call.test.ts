@@ -46,7 +46,9 @@ function allowFetch(): {
         { status: 200 },
       );
     }
-    return new Response(JSON.stringify({ ingested: 0, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   return { fetchMock: vi.fn(impl), budgetRequests };
 }
@@ -82,7 +84,9 @@ function settlementFetch(): {
     }
     if (url.includes("/api/v1/metadata/ingest")) {
       events.push(...(body as Record<string, unknown>[]));
-      return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     }
     throw new Error(`unexpected control-plane URL: ${url}`);
   };
@@ -955,7 +959,9 @@ describe("Responses stopped-run denial ordering", () => {
       if (url.includes("/api/v1/metadata/ingest") && Array.isArray(raw)) {
         events.push(...(raw as Array<Record<string, unknown>>));
       }
-      return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+      return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
     });
     const order: string[] = [];
     const dispatch = vi.fn(() => {
@@ -1199,7 +1205,7 @@ describe("Responses active-stream run control", () => {
       if (url.includes("/api/v1/metadata/ingest")) {
         events.push(...(body as Array<Record<string, unknown>>));
         return new Response(
-          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [] }),
+          JSON.stringify({ ingested: (body as unknown[]).length, rejected: [], duplicates: [] }),
           { status: 202 },
         );
       }

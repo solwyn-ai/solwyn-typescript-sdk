@@ -104,7 +104,9 @@ function fixture(baseURL = "https://api.openai.com/v1", options: SolwynOptions =
       return new Response(null, { status: 204 });
     }
     events.push(...(body as unknown as Record<string, unknown>[]));
-    return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+    return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+      status: 202,
+    });
   };
   const provider = new OpenAI({ apiKey: "offline", baseURL, fetch: providerFetch });
   const streamCall = vi.spyOn(provider.responses, "stream");

@@ -54,7 +54,10 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
       if (url.endsWith("/metadata/ingest")) {
         const batch = JSON.parse(init?.body as string) as Record<string, unknown>[];
         events.push(...batch);
-        return Response.json({ ingested: batch.length, rejected: [] }, { status: 202 });
+        return Response.json(
+          { ingested: batch.length, rejected: [], duplicates: [] },
+          { status: 202 },
+        );
       }
       if (url.includes("/breaker-reports")) return new Response(null, { status: 204 });
       throw new Error("unexpected offline control route");

@@ -623,7 +623,9 @@ describe("provider breaker report cycles", () => {
       if (url.endsWith("/metadata/ingest")) {
         markIngestStarted?.();
         await ingestBlocked;
-        return new Response(JSON.stringify({ ingested: 1, rejected: [] }), { status: 202 });
+        return new Response(JSON.stringify({ ingested: 1, rejected: [], duplicates: [] }), {
+          status: 202,
+        });
       }
       breakerCalls += 1;
       if (breakerCalls === 2) {
@@ -691,9 +693,12 @@ describe("provider breaker report cycles", () => {
           return new Response(null, { status: 204 });
         }
         const events = JSON.parse(String(init?.body)) as unknown[];
-        return new Response(JSON.stringify({ ingested: events.length, rejected: [] }), {
-          status: 202,
-        });
+        return new Response(
+          JSON.stringify({ ingested: events.length, rejected: [], duplicates: [] }),
+          {
+            status: 202,
+          },
+        );
       },
     });
     instance.observeProjectId(PROJECT_ID);

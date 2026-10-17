@@ -1,3 +1,4 @@
+import { allowIngestContractDrift } from "../helpers/ingest-contract";
 /**
  * Exercises `Solwyn` client wrapping/passthrough, usage extraction wiring into the metadata
  * event, rich
@@ -3006,6 +3007,7 @@ describe("SolwynCore — fail-soft post-success bookkeeping", () => {
 
 describe("SolwynCore — default logger is console-backed (D6/F7)", () => {
   it("routes reporter warnings to the console by default when no logger is injected", async () => {
+    allowIngestContractDrift();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const client = openAIClient(() => ({ usage: { prompt_tokens: 1, completion_tokens: 1 } }));

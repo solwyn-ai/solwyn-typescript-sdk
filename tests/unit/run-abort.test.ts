@@ -138,7 +138,7 @@ describe("public run-abort acceptance", () => {
       if (path === "/api/v1/metadata/ingest") {
         const events = body as MetadataEvent[];
         ingestCalls.push(events);
-        return response({ ingested: events.length, rejected: [] }, 202);
+        return response({ ingested: events.length, rejected: [], duplicates: [] }, 202);
       }
       throw new Error(`unexpected public control-plane path ${path}`);
     };
@@ -360,7 +360,7 @@ describe("public run-abort acceptance", () => {
       if (path === "/api/v1/metadata/ingest") {
         const events = body as MetadataEvent[];
         ingestCalls.push(events);
-        return response({ ingested: events.length, rejected: [] }, 202);
+        return response({ ingested: events.length, rejected: [], duplicates: [] }, 202);
       }
       throw new Error(`unexpected public control-plane path ${path}`);
     };

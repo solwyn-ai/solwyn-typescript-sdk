@@ -36,7 +36,10 @@ function controlPlane(extra: SolwynOptions = {}) {
     if (url.endsWith("/budgets/confirm")) confirms.push(body);
     if (url.endsWith("/metadata/ingest")) {
       events.push(...body);
-      return Response.json({ ingested: body.length, rejected: [] }, { status: 202 });
+      return Response.json(
+        { ingested: body.length, rejected: [], duplicates: [] },
+        { status: 202 },
+      );
     }
     return new Response(null, { status: 204 });
   };

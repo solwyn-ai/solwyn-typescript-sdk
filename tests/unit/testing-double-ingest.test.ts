@@ -69,7 +69,10 @@ describe("FakeControlPlane metadata ingest", () => {
 
     const response = plane.handle("POST", "/api/v1/metadata/ingest", [event({ tags })]);
 
-    expect(response).toMatchObject({ status: 202, body: { ingested: 1, rejected: [] } });
+    expect(response).toMatchObject({
+      status: 202,
+      body: { ingested: 1, rejected: [], duplicates: [] },
+    });
     expect(plane.ingested).toHaveLength(1);
     const recordedTags = plane.ingested[0]?.tags;
     expect(recordedTags).toBeDefined();

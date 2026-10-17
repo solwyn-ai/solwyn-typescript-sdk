@@ -216,16 +216,22 @@ explicitly with the manifest and public documentation:
   so that lane is compatibility evidence, not a maintenance promise;
 - strict ESM/CommonJS declaration consumers pass with TypeScript 5.8.3 (the tested floor) and
   6.0.3 (the tested current compiler), with `skipLibCheck: false`;
-- deeper installed checks exercise OpenAI 6.45.0 and Anthropic 0.123.0 native types, Anthropic
-  0.123.0 runtime, Vercel AI SDK 7.0.14 types/runtime, and Google GenAI 0.3.1 plus 2.20.0 native
-  lifecycle behavior;
+- deeper installed checks exercise the locked native-type fixture with OpenAI 6.45.0 and
+  Anthropic 0.123.0, the runtime matrix with Anthropic 0.123.0, the locked Vercel AI SDK 7.0.14
+  types/runtime fixtures, and separate Google GenAI 0.3.1 plus 2.20.0 installations for native
+  lifecycle behavior. These installed probes retain their own pins; they do not install the
+  development dependencies or the provider-surface matrix's latest cells;
 - provider-surface floor/latest boundary cells separately check OpenAI 4.41.0 and 6.45.0,
   Anthropic 0.30.0 and 0.123.0, Bedrock Runtime 3.422.0 and 3.1124.0, Google GenAI 0.3.1 and
   2.20.0, Together AI 0.16.0 and 0.50.0, plus Google Generative AI 0.24.1 as its reviewed cell.
 
 Do not describe two boundary cells as continuous support evidence or full runtime/type coverage
-for intervening versions. If a floor or current version changes, update the fixtures, lockfiles,
-CI matrix, manifest peer range, README, and release notes together.
+for intervening versions. The quality jobs run the unit suite against the development pins in
+`package.json` and `pnpm-lock.yaml`; each provider-surface job overlays only its cell's package
+from `tests/provider-surface-intervals.json` and runs capture plus the surface canary. The consumer
+jobs test the same tarball using the independent fixture/probe pins described above. When a
+version changes, reconcile the relevant fixtures, lockfiles, CI matrix, manifest peer range,
+README, and release notes together, identifying the evidence each check actually supplies.
 
 Create one candidate tarball in a clean release checkout and a dedicated directory outside that
 checkout. The create command invokes `npm pack` exactly once and writes the tarball plus

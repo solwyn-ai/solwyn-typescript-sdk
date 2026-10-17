@@ -14,15 +14,15 @@ explicitly supply. Prompt and response content is not sent to Solwyn or logged b
 [Providers](#providers) · [Vercel AI SDK](#vercel-ai-sdk) ·
 [Configuration](#configuration) · [Data transparency](#data-transparency)
 
-> **Public preview (`0.1.0-rc.1`).** Published prereleases use npm's `next` tag. If npm does not
-> list this version, registry installation is unavailable. APIs may change before 1.0; breaking
-> changes are announced in the [changelog](CHANGELOG.md) and release notes before users upgrade.
+> **Public preview (`0.1.0`).** Install from npm's default `latest` tag. APIs may change before
+> 1.0; breaking changes are announced in the [changelog](CHANGELOG.md) and release notes before
+> users upgrade.
 
 ## Installation
 
 ```sh
-npm install @solwyn/sdk@next
-# or: pnpm add @solwyn/sdk@next
+npm install @solwyn/sdk
+# or: pnpm add @solwyn/sdk
 ```
 
 The manifest retains **Node.js 20 or later** only for end-of-life (EOL) legacy installed artifact
@@ -180,10 +180,11 @@ estimate. The ordinary check path uses `POST /api/v1/budgets/check`; when it ret
 the reporter settles it through `POST /api/v1/budgets/confirm` with observed usage. Streaming
 settles once, at stream end. Eligible calls can reuse cached authority or a run lease. A hard
 deny throws before provider dispatch and reports a `budget_denied` event carrying the estimate.
-`budgetCheckTimeout` must be at least `0.05` seconds, including when supplied through
+`budgetCheckTimeout` must be at least `0.1` seconds, including when supplied through
 `SOLWYN_BUDGET_CHECK_TIMEOUT`; smaller values fail construction with
-`ConfigurationError(field: "budgetCheckTimeout")`. The timeout is shared by a lease attempt and
-any per-call fallback, and capped by the remaining failover deadline. With less than 50
+`ConfigurationError(field: "budget_check_timeout")`. This minimum leaves setup headroom above
+the 50 ms network skip floor. The timeout is shared by a lease attempt and any per-call
+fallback, and capped by the remaining failover deadline. With less than 50
 milliseconds remaining on that shared deadline, preflight skips network I/O and applies local
 policy, logging `budget.preflight_skipped_deadline` at most once per minute per client. This
 does not record a breaker failure or draw lease headroom. A caller's request `AbortSignal`
@@ -1220,16 +1221,18 @@ Env fallback is a **presence check**: an env var is consulted only when the corr
 
 An injected `logger` must provide all four `debug`, `info`, `warn`, and `error` methods;
 `selectionPolicy` must provide `order()`. Partial objects are rejected synchronously.
+Constructor and environment configuration schema errors identify the internal snake_case
+`ConfigurationError.field`, for example `budget_check_timeout` or `failover_hop_read_timeout`.
 
 Numeric settings reject booleans and empty strings. Breaker thresholds and reporter counts must
 be positive integers; `sameProviderRetries` permits zero. Timeout, cache, recovery, flush,
 backoff, and shutdown durations must be finite and no greater than `2147483.647` seconds, so
 their millisecond delays fit the runtime timer range. Cache TTLs and provider-breaker recovery
-waits remain integer seconds. `budgetCheckTimeout` must be at least `0.05` seconds;
+waits remain integer seconds. `budgetCheckTimeout` must be at least `0.1` seconds;
 `failoverHopReadTimeout`, flush/backoff intervals, and heartbeats must be positive; cache TTLs,
 recovery waits, and shutdown deadlines permit zero. Direct `BudgetEnforcer` options apply the
 same duration limit to `cacheTtl` and per-call `timeout`, with zero allowed only for `cacheTtl`
-and a minimum of `0.05` seconds for `timeout`.
+and a minimum of `0.1` seconds for `timeout`.
 
 Velocity repeat windows must be positive, and growth and acceleration factors must exceed
 one. These three velocity options also accept positive infinity to disable the corresponding

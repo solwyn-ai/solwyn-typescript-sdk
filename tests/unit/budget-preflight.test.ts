@@ -193,10 +193,50 @@ describe("budget preflight deadline and cancellation", () => {
   it("still dispatches an initial grant with exactly 50ms remaining", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify(grant())));
     const budget = enforcer({ fetch, monotonicNow: () => 0 });
-    const result = await budget.checkBudget(options({ timeout: 0.05 }));
+    const result = await budget.checkBudget(
+      options({ timeout: 0.1, deadline: new Deadline(0.05, () => 0) }),
+    );
 
     expect(result).toMatchObject({ allowed: true, leaseId: "lease-preflight", warning: null });
     expect(fetch).toHaveBeenCalledTimes(1);
+    budget.releaseReservation(CALL_ID, result.leaseClaimToken ?? null);
+  });
+
+  it.each([
+    true,
+    false,
+  ])("dispatches at the 100ms timeout minimum after setup overhead with leases=%s", async (leaseEnabled) => {
+    const fetch = vi.fn(
+      async (_url: string) =>
+        new Response(
+          JSON.stringify(
+            leaseEnabled
+              ? grant()
+              : {
+                  allowed: true,
+                  remaining_budget: 100,
+                  reservation_id: "res-preflight",
+                  mode: "hard_deny",
+                  budget_limit: 100,
+                  current_usage: 0,
+                  project_id: PROJECT_ID,
+                },
+          ),
+        ),
+    );
+    const monotonicNow = vi.fn().mockReturnValueOnce(0).mockReturnValue(1);
+    const budget = enforcer({ fetch, leaseEnabled, monotonicNow });
+    const result = await budget.checkBudget(options({ timeout: 0.1 }));
+
+    expect(result).toMatchObject({
+      allowed: true,
+      warning: null,
+      ...(leaseEnabled ? { leaseId: "lease-preflight" } : { reservationId: "res-preflight" }),
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(String(fetch.mock.calls[0]?.[0])).toBe(
+      `${API_URL}/api/v1/budgets/${leaseEnabled ? "lease" : "check"}`,
+    );
     budget.releaseReservation(CALL_ID, result.leaseClaimToken ?? null);
   });
 
@@ -388,6 +428,9 @@ describe("direct budget enforcer safety", () => {
     0.001,
     0.04,
     0.049,
+    0.05,
+    0.075,
+    0.099,
     -1,
     MAX_DELAY_S + 1,
     true,

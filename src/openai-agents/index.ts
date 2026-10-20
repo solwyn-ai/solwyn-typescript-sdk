@@ -43,6 +43,18 @@ function violation(message: string): SolwynError {
   return new SolwynError(`openai-agents: ${message}`);
 }
 
+/** Agents wraps thrown tool/guardrail errors in .error rather than .cause. */
+function unwrapToolDecision(error: unknown): unknown {
+  if (error instanceof Error && error.name === "ToolCallError" && "error" in error) {
+    try {
+      if (error.error instanceof SolwynError) return error.error;
+    } catch {
+      // A foreign error's accessor must not replace the original failure.
+    }
+  }
+  return error;
+}
+
 /** One logical invocation; handles stay stable across tool turns and hand-backs. */
 class Invocation {
   readonly #workflow: DetachedRun;
@@ -80,7 +92,7 @@ class Invocation {
   }
 
   failure(error: unknown): unknown {
-    return this.#violation ?? error;
+    return this.#violation ?? unwrapToolDecision(error);
   }
 
   start(agent: AnyAgent): void {
@@ -128,8 +140,10 @@ class Invocation {
 
   toolEnd(agent: object, tool: object): void {
     this.check();
+    if (agent !== this.#agent) this.fail("unmatched tool end");
     const count = this.#tools.get(tool);
-    if (agent !== this.#agent || count === undefined) this.fail("unmatched tool end");
+    // Agents also emits tool_end when an input guardrail fails before tool_start.
+    if (count === undefined) return;
     if (count === 1) this.#tools.delete(tool);
     else this.#tools.set(tool, count - 1);
   }
@@ -337,13 +351,15 @@ class CompletedStream implements AsyncIterableIterator<RunStreamEvent> {
       return step;
     } catch (error) {
       await this.#completed;
-      throw error;
+      throw unwrapToolDecision(error);
     }
   }
 
   async return(): Promise<IteratorResult<RunStreamEvent>> {
     try {
       return (await this.#iterator.return?.()) ?? { done: true, value: undefined };
+    } catch (error) {
+      throw unwrapToolDecision(error);
     } finally {
       // Cancellation need not wait for a provider ignoring its abort signal.
       // The completed observer owns cleanup once native background work settles.
@@ -362,7 +378,7 @@ class CompletedStream implements AsyncIterableIterator<RunStreamEvent> {
       return step;
     } catch (caught) {
       await this.#completed;
-      throw caught;
+      throw unwrapToolDecision(caught);
     }
   }
 }
@@ -386,6 +402,15 @@ export class SolwynAgents {
         field: "api",
       });
     }
+    if (
+      typeof options.OpenAIProvider !== "function" ||
+      typeof options.OpenAIProvider.prototype !== "object" ||
+      options.OpenAIProvider.prototype === null
+    ) {
+      throw new ConfigurationError("openai-agents: OpenAIProvider must be a constructor", {
+        field: "OpenAIProvider",
+      });
+    }
     const delegate = new options.OpenAIProvider({
       openAIClient: options.client as NonNullable<
         ConstructorParameters<typeof NativeOpenAIProvider>[0]
@@ -394,6 +419,11 @@ export class SolwynAgents {
       // Override the framework's global websocket default. Websockets bypass the wrapped client.
       useResponsesWebSocket: false,
     });
+    if (typeof delegate.getModel !== "function") {
+      throw new ConfigurationError("openai-agents: OpenAIProvider must supply getModel", {
+        field: "OpenAIProvider",
+      });
+    }
     this.modelProvider = {
       getModel: async (name?: string) => {
         const model = await delegate.getModel(name);

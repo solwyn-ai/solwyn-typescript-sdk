@@ -149,7 +149,7 @@ const AGENTS_READABLE_PROPERTIES = new Set([
   "config", // Runner structural configuration.
   "done", // Iterator terminal flag; never inspect its value.
   "end", // Internal agent lifecycle transition.
-  "error", // Only the retry-advice error projection is readable.
+  "error", // Retry-advice projection and branded ToolCallError decision only.
   "fail", // Internal typed violation latch.
   "failure", // Forward latched or original errors unchanged.
   "finally", // Promise cleanup registration.
@@ -165,7 +165,7 @@ const AGENTS_READABLE_PROPERTIES = new Set([
   "name", // Explicit structural agent attribution name.
   "next", // Iterator pull capability.
   "on", // Structural Runner hook registration.
-  "prototype", // Object.prototype identity in the model topology check only.
+  "prototype", // Model topology and supplied provider constructor shape only.
   "return", // Iterator cancellation capability.
   "run", // Native Runner dispatch; never an attribution sink for opaque input.
   "runOptions", // Native invocation options forwarded opaquely.
@@ -301,6 +301,58 @@ function importedType(
   );
 }
 
+/** Only the integration's provider-identity guard admits Runner hooks and dispatch. */
+function isGuardedRunner(node: ts.Expression, checker: ts.TypeChecker): boolean {
+  const declaration = localDeclaration(node, checker);
+  if (
+    !declaration ||
+    !ts.isParameter(declaration) ||
+    !importedType(declaration.type, "Runner", checker)
+  )
+    return false;
+  const owner = enclosingFunction(declaration);
+  if (
+    !owner ||
+    !ts.isMethodDeclaration(owner) ||
+    !owner.body ||
+    !ts.isClassDeclaration(owner.parent) ||
+    owner.parent.name?.text !== "SolwynAgents"
+  )
+    return false;
+  const attach = owner.parent.members.find(
+    (member): member is ts.MethodDeclaration =>
+      ts.isMethodDeclaration(member) && member.name.getText() === "attach",
+  );
+  const guarded = attach?.body?.statements.some(
+    (statement) =>
+      ts.isIfStatement(statement) &&
+      statement.expression.getText().replace(/\s+/g, "") ===
+        "runner.config.modelProvider!==this.modelProvider" &&
+      ts.isThrowStatement(statement.thenStatement),
+  );
+  if (!guarded) return false;
+  if (owner === attach)
+    return owner.body.statements.some(
+      (statement) =>
+        ts.isIfStatement(statement) &&
+        statement.end < node.pos &&
+        statement.expression.getText().replace(/\s+/g, "") ===
+          "runner.config.modelProvider!==this.modelProvider",
+    );
+  return (
+    ["run", "runStreamed"].includes(owner.name.getText()) &&
+    owner.body.statements.some(
+      (statement) =>
+        statement.end < node.pos &&
+        ts.isExpressionStatement(statement) &&
+        ts.isCallExpression(statement.expression) &&
+        statement.expression.expression.getText() === "this.attach" &&
+        !!statement.expression.arguments[0] &&
+        localDeclaration(statement.expression.arguments[0], checker) === declaration,
+    )
+  );
+}
+
 /** Only a symbol guarded by requireSolwynClient can supply the provider leaf. */
 function isWrappedClient(node: ts.Expression, checker: ts.TypeChecker): boolean {
   const declaration = localDeclaration(node, checker);
@@ -337,6 +389,135 @@ function isWrappedClient(node: ts.Expression, checker: ts.TypeChecker): boolean 
   return guarded;
 }
 
+function controlledModel(
+  node: ts.Expression,
+  checker: ts.TypeChecker,
+  seen = new Set<ts.Node>(),
+): boolean {
+  if (seen.has(node)) return false;
+  seen.add(node);
+  if (
+    ts.isAwaitExpression(node) ||
+    ts.isAsExpression(node) ||
+    ts.isParenthesizedExpression(node) ||
+    ts.isNonNullExpression(node)
+  )
+    return controlledModel(node.expression, checker, seen);
+  if (ts.isIdentifier(node)) {
+    const declaration = localDeclaration(node, checker);
+    return !!(
+      declaration &&
+      ts.isVariableDeclaration(declaration) &&
+      declaration.initializer &&
+      controlledModel(declaration.initializer, checker, seen)
+    );
+  }
+  if (
+    !ts.isCallExpression(node) ||
+    !ts.isPropertyAccessExpression(node.expression) ||
+    node.expression.name.text !== "getModel"
+  )
+    return false;
+  const provider = localDeclaration(node.expression.expression, checker);
+  if (
+    !provider ||
+    !ts.isVariableDeclaration(provider) ||
+    !provider.initializer ||
+    !ts.isNewExpression(provider.initializer)
+  )
+    return false;
+  const providerConstructor = provider.initializer.expression;
+  if (
+    !ts.isPropertyAccessExpression(providerConstructor) ||
+    providerConstructor.name.text !== "OpenAIProvider" ||
+    !ts.isIdentifier(providerConstructor.expression)
+  )
+    return false;
+  const owner = enclosingFunction(provider);
+  const options = localDeclaration(providerConstructor.expression, checker);
+  return !!(
+    owner &&
+    ts.isConstructorDeclaration(owner) &&
+    options &&
+    ts.isParameter(options) &&
+    options.parent === owner &&
+    owner.body?.statements.some(
+      (statement) =>
+        statement.end < provider.pos &&
+        ts.isExpressionStatement(statement) &&
+        ts.isCallExpression(statement.expression) &&
+        statement.expression.expression.getText() === "requireSolwynClient" &&
+        statement.expression.arguments[0]?.getText() ===
+          `${providerConstructor.expression.getText()}.client`,
+    )
+  );
+}
+
+/** A Model annotation cannot mint forwarding authority: every constructor caller is checked. */
+function isControlledDelegate(receiver: ts.Expression, checker: ts.TypeChecker): boolean {
+  if (
+    !ts.isPropertyAccessExpression(receiver) ||
+    receiver.expression.kind !== ts.SyntaxKind.ThisKeyword
+  )
+    return false;
+  const field = localDeclaration(receiver.name, checker);
+  if (
+    !field ||
+    !ts.isPropertyDeclaration(field) ||
+    !importedType(field.type, "Model", checker) ||
+    !ts.isClassDeclaration(field.parent)
+  )
+    return false;
+  const owner = field.parent;
+  const providerConstructor = owner.members.find(ts.isConstructorDeclaration);
+  const assignment = providerConstructor?.body?.statements.find(
+    (statement) =>
+      ts.isExpressionStatement(statement) &&
+      ts.isBinaryExpression(statement.expression) &&
+      statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(statement.expression.left) &&
+      localDeclaration(statement.expression.left.name, checker) === field,
+  );
+  if (
+    !assignment ||
+    !ts.isExpressionStatement(assignment) ||
+    !ts.isBinaryExpression(assignment.expression)
+  )
+    return false;
+  const parameter = localDeclaration(assignment.expression.right, checker);
+  if (
+    !parameter ||
+    !ts.isParameter(parameter) ||
+    parameter.parent !== providerConstructor ||
+    !owner.name
+  )
+    return false;
+  const index = providerConstructor.parameters.indexOf(parameter);
+  const symbol = checker.getSymbolAtLocation(owner.name);
+  let used = false;
+  let safe = true;
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isIdentifier(node) &&
+      node !== owner.name &&
+      checker.getSymbolAtLocation(node) === symbol
+    ) {
+      used = true;
+      const call = node.parent;
+      if (
+        !ts.isNewExpression(call) ||
+        call.expression !== node ||
+        !call.arguments?.[index] ||
+        !controlledModel(call.arguments[index], checker)
+      )
+        safe = false;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(receiver.getSourceFile());
+  return used && safe;
+}
+
 function isProviderForward(call: ts.CallExpression, checker: ts.TypeChecker): boolean {
   const callee = call.expression;
   if (!ts.isPropertyAccessExpression(callee)) return false;
@@ -350,23 +531,10 @@ function isProviderForward(call: ts.CallExpression, checker: ts.TypeChecker): bo
   )
     return isWrappedClient(receiver.expression.expression, checker);
   if (["getResponse", "getStreamedResponse", "getRetryAdvice"].includes(callee.name.text)) {
-    const declaration = localDeclaration(
-      ts.isPropertyAccessExpression(receiver) ? receiver.name : receiver,
-      checker,
-    );
-    return !!(
-      declaration &&
-      ts.isPropertyDeclaration(declaration) &&
-      importedType(declaration.type, "Model", checker)
-    );
+    return isControlledDelegate(receiver, checker);
   }
   if (callee.name.text === "run") {
-    const declaration = localDeclaration(receiver, checker);
-    return !!(
-      declaration &&
-      ts.isParameter(declaration) &&
-      importedType(declaration.type, "Runner", checker)
-    );
+    return isGuardedRunner(receiver, checker);
   }
   return false;
 }
@@ -420,13 +588,66 @@ function isModelTopology(node: ts.Node, checker: ts.TypeChecker): boolean {
   );
 }
 
-function isRetryError(node: ts.Node): boolean {
+function isSolwynBrandCheck(node: ts.Node, checker: ts.TypeChecker): boolean {
+  if (
+    !ts.isBinaryExpression(node) ||
+    node.operatorToken.kind !== ts.SyntaxKind.InstanceOfKeyword ||
+    !ts.isIdentifier(node.right)
+  )
+    return false;
+  const imported = checker.getSymbolAtLocation(node.right)?.declarations?.[0];
+  return !!(
+    imported &&
+    ts.isImportSpecifier(imported) &&
+    (imported.propertyName ?? imported.name).text === "SolwynError" &&
+    ts.isImportDeclaration(imported.parent.parent.parent) &&
+    /errors["']$/.test(imported.parent.parent.parent.moduleSpecifier.getText())
+  );
+}
+
+function isRetryError(node: ts.Node, checker: ts.TypeChecker): boolean {
   return (
     ts.isPropertyAccessExpression(node) &&
     node.name.text === "error" &&
     ts.isIdentifier(node.expression) &&
     node.expression.text === "args" &&
-    enclosingFunction(node)?.name?.getText() === "getRetryAdvice"
+    enclosingFunction(node)?.name?.getText() === "getRetryAdvice" &&
+    ts.isBinaryExpression(node.parent) &&
+    node.parent.left === node &&
+    isSolwynBrandCheck(node.parent, checker)
+  );
+}
+
+function isToolDecisionProjection(node: ts.Node, checker: ts.TypeChecker): boolean {
+  if (
+    !ts.isPropertyAccessExpression(node) ||
+    node.name.text !== "error" ||
+    !ts.isIdentifier(node.expression) ||
+    node.expression.text !== "error"
+  )
+    return false;
+  const owner = enclosingFunction(node);
+  if (owner?.name?.getText() !== "unwrapToolDecision") return false;
+  let scope: ts.Node | undefined = node.parent;
+  let toolErrorGuard = false;
+  while (scope && scope !== owner) {
+    if (
+      ts.isIfStatement(scope) &&
+      scope.expression.getText().replace(/\s+/g, "") ===
+        'errorinstanceofError&&error.name==="ToolCallError"&&"error"inerror'
+    )
+      toolErrorGuard = true;
+    scope = scope.parent;
+  }
+  if (!toolErrorGuard) return false;
+  if (ts.isBinaryExpression(node.parent) && node.parent.left === node)
+    return isSolwynBrandCheck(node.parent, checker);
+  return (
+    ts.isReturnStatement(node.parent) &&
+    ts.isIfStatement(node.parent.parent) &&
+    isSolwynBrandCheck(node.parent.parent.expression, checker) &&
+    ts.isBinaryExpression(node.parent.parent.expression) &&
+    node.parent.parent.expression.left.getText() === node.getText()
   );
 }
 
@@ -556,6 +777,114 @@ function findIntegrationViolations(text: string, path: string): string[] {
   const report = (message: string): void => {
     violations.push(`${path}: integration ${message}`);
   };
+  // Propagate returned provider data through local aliases, lifecycle promises, and
+  // iteration bindings. Names and type annotations cannot declassify a response.
+  const opaqueResults = new Set<ts.Symbol>();
+  const opaqueFactories = new Set<ts.Symbol>();
+  const caughtErrors = new Set<ts.Symbol>();
+  const symbolOf = (node: ts.Node): ts.Symbol | undefined => checker.getSymbolAtLocation(node);
+  const derived = (node: ts.Node): boolean => {
+    if (ts.isIdentifier(node)) {
+      const symbol = symbolOf(node);
+      return symbol !== undefined && opaqueResults.has(symbol);
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      if (["completed", "done"].includes(integrationMemberName(node) ?? "")) return false;
+      return derived(node.expression);
+    }
+    if (ts.isCallExpression(node)) {
+      if (isProviderForward(node, checker)) return true;
+      const calleeSymbol = symbolOf(node.expression);
+      if (calleeSymbol && opaqueFactories.has(calleeSymbol)) return true;
+      if (
+        (ts.isPropertyAccessExpression(node.expression) ||
+          ts.isElementAccessExpression(node.expression)) &&
+        derived(node.expression.expression)
+      )
+        return true;
+      return node.arguments.some(derived);
+    }
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      if (!ts.isBlock(node.body)) return derived(node.body);
+      let opaque = false;
+      const returns = (child: ts.Node): void => {
+        if (ts.isReturnStatement(child) && child.expression && derived(child.expression))
+          opaque = true;
+        else if (!ts.isFunctionLike(child)) ts.forEachChild(child, returns);
+      };
+      ts.forEachChild(node.body, returns);
+      return opaque;
+    }
+    if (
+      ts.isAwaitExpression(node) ||
+      ts.isParenthesizedExpression(node) ||
+      ts.isAsExpression(node) ||
+      ts.isNonNullExpression(node)
+    )
+      return derived(node.expression);
+    return false;
+  };
+  let changed = true;
+  const markResult = (name: ts.BindingName, symbols = opaqueResults): void => {
+    if (!ts.isIdentifier(name)) return;
+    const symbol = symbolOf(name);
+    if (symbol && !symbols.has(symbol)) {
+      symbols.add(symbol);
+      changed = true;
+    }
+  };
+  while (changed) {
+    changed = false;
+    const collect = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && node.initializer && derived(node.initializer)) {
+        const initializer = node.initializer;
+        const factory =
+          ts.isArrowFunction(initializer) ||
+          ts.isFunctionExpression(initializer) ||
+          (ts.isCallExpression(initializer) &&
+            integrationMemberName(initializer.expression) === "bind");
+        markResult(node.name, factory ? opaqueFactories : opaqueResults);
+      }
+      if (
+        ts.isForOfStatement(node) &&
+        derived(node.expression) &&
+        ts.isVariableDeclarationList(node.initializer)
+      ) {
+        for (const declaration of node.initializer.declarations) markResult(declaration.name);
+      }
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === "then" &&
+        derived(node.expression.expression)
+      ) {
+        const callback = node.arguments[0];
+        if (callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+          for (const parameter of callback.parameters) markResult(parameter.name);
+        }
+      }
+      if (ts.isCatchClause(node) && node.variableDeclaration) {
+        const symbol = symbolOf(node.variableDeclaration.name);
+        if (symbol) caughtErrors.add(symbol);
+      }
+      ts.forEachChild(node, collect);
+    };
+    collect(source);
+  }
+  const unsafeAttribution = (node: ts.Node, seen = new Set<ts.Node>()): boolean => {
+    if (seen.has(node)) return false;
+    seen.add(node);
+    if (ts.isSpreadAssignment(node)) return true;
+    if (ts.isIdentifier(node)) {
+      const symbol = symbolOf(node);
+      if (symbol && (opaqueResults.has(symbol) || caughtErrors.has(symbol))) return true;
+      const declaration = localDeclaration(node, checker);
+      if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer)
+        return unsafeAttribution(declaration.initializer, seen);
+    }
+    if (ts.isCallExpression(node) && derived(node)) return true;
+    return ts.forEachChild(node, (child) => unsafeAttribution(child, seen) || undefined) === true;
+  };
   const readable = (name: string, node: ts.Node, own = false): void => {
     if (
       !INTEGRATION_READABLE_PROPERTIES.has(name) &&
@@ -579,12 +908,16 @@ function findIntegrationViolations(text: string, path: string): string[] {
           readable(property.name.text, property);
           if (LOGGER_METHODS.has(property.name.text))
             report("logger methods must not be destructured");
+          if (rel.startsWith("openai-agents/") && ["on", "off"].includes(property.name.text))
+            report("Agents hooks must not be destructured");
         } else if (ts.isPropertyAssignment(property)) {
           const name = propertyNameText(property.name);
           if (name === undefined) report("reads a computed property in destructuring");
           else {
             readable(name, property);
             if (LOGGER_METHODS.has(name)) report("logger methods must not be destructured");
+            if (rel.startsWith("openai-agents/") && ["on", "off"].includes(name))
+              report("Agents hooks must not be destructured");
           }
           assignmentPattern(property.initializer);
         }
@@ -686,10 +1019,11 @@ function findIntegrationViolations(text: string, path: string): string[] {
       (!node.arguments[0] ||
         !ts.isStringLiteralLike(node.arguments[0]) ||
         !node.arguments[1] ||
-        !(ts.isArrowFunction(node.arguments[1]) || ts.isFunctionExpression(node.arguments[1])))
+        !ts.isArrowFunction(node.arguments[1]))
     )
       report("Agents hooks require a literal event and inline callback");
     if (
+      rel.startsWith("openai-agents/") &&
       ts.isCallExpression(node) &&
       integrationMemberName(node.expression) === "on" &&
       node.arguments[0] &&
@@ -706,13 +1040,22 @@ function findIntegrationViolations(text: string, path: string): string[] {
         agent_tool_end: { 1: "agent", 2: "tool" },
       };
       const callback = node.arguments[1];
+      if (containsIdentifier(callback.body, "arguments"))
+        report("Agents hook callback references implicit arguments");
       for (const [index, parameter] of callback.parameters.entries()) {
+        if (parameter.dotDotDotToken)
+          report("Agents hook parameters must not collect rest arguments");
         if (!ts.isIdentifier(parameter.name))
           report("Agents hook parameter must not be destructured");
         else if (
           !/^_?opaque/.test(parameter.name.text) &&
           slots[event]?.[index] !== parameter.name.text &&
-          containsIdentifier(callback.body, parameter.name.text)
+          (containsIdentifier(callback.body, parameter.name.text) ||
+            callback.parameters.some(
+              (other) =>
+                other.initializer &&
+                containsIdentifier(other.initializer, parameter.name.getText()),
+            ))
         )
           report(`Agents hook parameter '${parameter.name.text}' must be opaque or unreferenced`);
       }
@@ -755,10 +1098,22 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = integrationMemberName(node);
       if (
+        rel.startsWith("openai-agents/") &&
+        (name === "on" || name === "off") &&
+        !(
+          ts.isCallExpression(node.parent) &&
+          node.parent.expression === node &&
+          isGuardedRunner(node.expression, checker)
+        )
+      ) {
+        report("Agents hooks must be called directly on the guarded Runner parameter");
+      }
+      if (
         name !== undefined &&
         LOGGER_METHODS.has(name) &&
         !(ts.isCallExpression(node.parent) && node.parent.expression === node) &&
-        !isRetryError(node)
+        !isRetryError(node, checker) &&
+        !isToolDecisionProjection(node, checker)
       ) {
         report("logger methods must be called directly, never aliased");
       }
@@ -773,6 +1128,8 @@ function findIntegrationViolations(text: string, path: string): string[] {
         else {
           readable(name, node);
           if (LOGGER_METHODS.has(name)) report("logger methods must not be destructured");
+          if (rel.startsWith("openai-agents/") && (name === "on" || name === "off"))
+            report("Agents hooks must not be destructured");
         }
       }
     }
@@ -782,6 +1139,47 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node, checker)) {
       report(`uses opaque identifier '${node.text}' outside direct forwarding`);
     }
+    const resultSymbol = ts.isIdentifier(node) ? symbolOf(node) : undefined;
+    if (ts.isIdentifier(node) && resultSymbol && opaqueResults.has(resultSymbol)) {
+      const parent = node.parent;
+      const structural =
+        (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+        parent.expression === node &&
+        [
+          "then",
+          "finally",
+          "completed",
+          "asyncIterator",
+          "next",
+          "return",
+          "throw",
+          "done",
+        ].includes(integrationMemberName(parent) ?? "");
+      const alias = ts.isVariableDeclaration(parent) && parent.initializer === node;
+      const iteration = ts.isForOfStatement(parent) && parent.expression === node;
+      const completion =
+        ts.isCallExpression(parent) &&
+        parent.expression.getText() === "Object.defineProperty" &&
+        parent.arguments[0] === node &&
+        ['"completed"', "Symbol.asyncIterator"].includes(parent.arguments[1]?.getText() ?? "");
+      const iteratorBinding =
+        ts.isCallExpression(parent) &&
+        ts.isPropertyAccessExpression(parent.expression) &&
+        parent.expression.name.text === "bind" &&
+        parent.arguments[0] === node &&
+        ts.isElementAccessExpression(parent.expression.expression) &&
+        integrationMemberName(parent.expression.expression) === "asyncIterator" &&
+        symbolOf(parent.expression.expression.expression) === resultSymbol;
+      if (
+        !structural &&
+        !alias &&
+        !iteration &&
+        !completion &&
+        !iteratorBinding &&
+        !isOpaqueForward(node, checker)
+      )
+        report(`uses opaque forward result '${node.text}' outside direct forwarding`);
+    }
     if (
       ts.isIdentifier(node) &&
       node.text === "args" &&
@@ -790,7 +1188,7 @@ function findIntegrationViolations(text: string, path: string): string[] {
       !(
         ts.isPropertyAccessExpression(node.parent) &&
         node.parent.expression === node &&
-        isRetryError(node.parent)
+        isRetryError(node.parent, checker)
       ) &&
       !(
         ts.isCallExpression(node.parent) &&
@@ -816,6 +1214,13 @@ function findIntegrationViolations(text: string, path: string): string[] {
       const name =
         integrationMemberName(node.expression) ??
         (ts.isIdentifier(node.expression) ? node.expression.text : undefined);
+      if (
+        name &&
+        (OPAQUE_ATTRIBUTION_SINKS.has(name.replace(/^#/, "")) || LOGGER_METHODS.has(name)) &&
+        !isProviderForward(node, checker) &&
+        node.arguments.some((argument) => unsafeAttribution(argument))
+      )
+        report("attribution sink receives opaque data, caught errors, or object spreads");
       if (name !== undefined && LOGGER_METHODS.has(name)) {
         for (const arg of node.arguments) {
           if (ts.isStringLiteralLike(arg)) continue;
@@ -1769,6 +2174,51 @@ describe("privacy firewall — banner set equals the content-privileged allowlis
 
 describe("privacy firewall — integration source controls", () => {
   const path = "src/langchain/mutation.ts";
+  const hookEscapes = [
+    [
+      "Agent output slot",
+      `agent.on("agent_end", (_context, agent) => factory(\`agent:\${agent}\`));`,
+    ],
+    [
+      "Agent tool-result slot",
+      'agent.on("agent_tool_end", (_context, agent, tool) => factory(String(tool)));',
+    ],
+    [
+      "bound on alias",
+      'const on = runner.on.bind(runner); on("agent_end", (_c, _a, output) => factory(String(output)));',
+    ],
+    [
+      "bound on call",
+      'runner.on.bind(runner)("agent_end", (_c, _a, output) => factory(String(output)));',
+    ],
+    [
+      "on alias",
+      'const on = runner.on; on("agent_end", (_c, _a, output) => factory(String(output)));',
+    ],
+    [
+      "on call",
+      'runner.on.call(runner, "agent_end", (_c, _a, output) => factory(String(output)));',
+    ],
+    [
+      "on apply",
+      'runner.on.apply(runner, ["agent_end", (_c, _a, output) => factory(String(output))]);',
+    ],
+    [
+      "on destructuring",
+      'const { on } = runner; on("agent_end", (_c, _a, output) => factory(String(output)));',
+    ],
+    ["off alias", "const off = runner.off;"],
+    ["off destructuring", "const { off } = runner;"],
+    [
+      "function hook arguments",
+      'runner.on("agent_end", function (_c, agent) { factory(String([...arguments])); });',
+    ],
+    [
+      "arrow hook arguments",
+      'runner.on("agent_end", (_c, agent) => { factory(String([...arguments])); });',
+    ],
+    ["rest hook arguments", 'runner.on("agent_end", (_c, ...agent) => factory(String(agent)));'],
+  ];
 
   it("scans integration files that exist without requiring framework directories", () => {
     expect(ALL_SOURCES.flatMap((file) => findIntegrationViolations(file.text, file.rel))).toEqual(
@@ -1813,9 +2263,16 @@ describe("privacy firewall — integration source controls", () => {
   });
 
   it.each([
-    'const event = "agent_end"; runner.on(event, (_context, agent, output) => this.#factory(String(output)));',
-    'const leak = (_context: unknown, _agent: unknown, output: unknown) => this.#factory(String(output)); runner.on("agent_end", leak);',
-  ])("rejects indirect Agents hook registration: %s", (mutation) => {
+    [
+      "dynamic event",
+      'const event = "agent_end"; runner.on(event, (_context, agent, output) => this.#factory(String(output)));',
+    ],
+    [
+      "callback alias",
+      'const leak = (_context: unknown, _agent: unknown, output: unknown) => this.#factory(String(output)); runner.on("agent_end", leak);',
+    ],
+    ...hookEscapes,
+  ])("rejects indirect Agents hook registration: %s", (_label, mutation) => {
     const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
     const marker = "if (this.#attached.has(runner)) return;";
     expect(shipped).toContain(marker);
@@ -1874,6 +2331,99 @@ describe("privacy firewall — integration source controls", () => {
     expect(added.filter((line) => line.includes("opaque")).length).toBeGreaterThan(
       baseline.filter((line) => line.includes("opaque")).length,
     );
+  });
+
+  it.each(hookEscapes)("rejects an Agents hook escape via %s", (_label, mutation) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const marker = "if (this.#attached.has(runner)) return;";
+    expect(
+      findIntegrationViolations(
+        shipped.replace(marker, `${mutation}\n${marker}`),
+        "src/openai-agents/index.ts",
+      ),
+    ).not.toEqual([]);
+  });
+
+  it.each([
+    [
+      "streamed forward result",
+      'for await (const ev of this.#delegate.getStreamedResponse(opaqueRequest)) factory("x", { tags: { ...ev } });',
+    ],
+    [
+      "awaited forward result",
+      "const reply = await this.#delegate.getResponse(opaqueRequest); factory(String(reply));",
+    ],
+    [
+      "forward result alias",
+      "const reply = this.#delegate.getStreamedResponse(opaqueRequest); for await (const ev of reply) factory(String(ev));",
+    ],
+    [
+      "forward result promise",
+      "this.#delegate.getResponse(opaqueRequest).then((res) => factory(String(res)));",
+    ],
+    [
+      "forward result structural name",
+      "const reply = await this.#delegate.getResponse(opaqueRequest); factory(reply.name);",
+    ],
+  ])("keeps %s opaque", (_label, mutation) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const marker = "async getResponse(opaqueRequest: ModelRequest) {";
+    expect(
+      findIntegrationViolations(
+        shipped.replace(marker, `${marker}\n${mutation}`),
+        "src/openai-agents/index.ts",
+      ),
+    ).not.toEqual([]);
+  });
+
+  it("rejects a Model-annotated delegate without a controlled getModel origin", () => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const injected =
+      "const leakFn = (value: unknown) => factory(String(value)); new SolwynModel({ getResponse: leakFn } as unknown as Model, () => this.#requireState());";
+    expect(
+      findIntegrationViolations(
+        shipped.replace("this.modelProvider = {", `${injected}\nthis.modelProvider = {`),
+        "src/openai-agents/index.ts",
+      ),
+    ).not.toEqual([]);
+  });
+
+  it("rejects a Runner-annotated forwarding helper without the integration guard", () => {
+    const source =
+      'import type { Runner } from "@openai/agents"; function forward(runner: Runner, opaqueRunInput) { return runner.run(agent, opaqueRunInput); }';
+    expect(findIntegrationViolations(source, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+
+  it("does not allow the retry error projection to become attribution", () => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const mutated = shipped.replace(
+      "if (args.error instanceof SolwynError)",
+      "factory(String(args.error)); if (args.error instanceof SolwynError)",
+    );
+    expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+
+  it("limits the ToolCallError projection to a brand check and a guarded return", () => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const mutated = shipped.replace(
+      "if (error.error instanceof SolwynError)",
+      "factory(String(error.error)); if (error.error instanceof SolwynError)",
+    );
+    expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+
+  it.each([
+    "src/langchain/mutation.ts",
+    "src/openai-agents/mutation.ts",
+  ])("rejects unattributed error and spread data in %s", (path) => {
+    for (const source of [
+      "try { work(); } catch (caughtError) { factory(String(caughtError)); }",
+      'pending.then((res) => factory("x", { tags: { ...res } }));',
+      'const values = pending.then((res) => res); factory("x", { tags: { ...values } });',
+      'const values = { ...result }; factory("x", { tags: values });',
+      "tags({ ...result });",
+    ])
+      expect(findIntegrationViolations(source, path), source).not.toEqual([]);
   });
 
   it.each([

@@ -249,6 +249,123 @@ async function invoke(setupResult: ReturnType<typeof setup>, streamed: boolean, 
 
 describe("OpenAI Agents hierarchy and enforcement", () => {
   it.each([
+    ["tool", "solwyn-test/deny"],
+    ["tool", "solwyn-test/deny-stopped"],
+    ["tool input guardrail", "solwyn-test/deny"],
+    ["tool input guardrail", "solwyn-test/deny-stopped"],
+  ] as const)("surfaces the exact %s decision for %s", async (source, model) => {
+    for (const api of ["chat_completions", "responses"] as const) {
+      for (const streamed of [false, true]) {
+        const state = setup(api, {
+          transport: createAgentsTransport([{ kind: "tool", name: "lookup" }, { kind: "text" }]),
+        });
+        let decision: unknown;
+        const deniedCall = async (): Promise<never> => {
+          try {
+            await state.client.chat.completions.create({ model, messages: [] });
+          } catch (error) {
+            decision = error;
+            throw error;
+          }
+          throw new Error("synthetic denied call unexpectedly succeeded");
+        };
+        const execute = vi.fn(source === "tool" ? deniedCall : () => "Synthetic result.");
+        state.agent.tools = [
+          framework.tool({
+            name: "lookup",
+            description: "Synthetic lookup",
+            parameters: {
+              type: "object",
+              properties: {},
+              required: [],
+              additionalProperties: false,
+            },
+            errorFunction: solwynToolErrorFunction,
+            execute,
+            ...(source === "tool input guardrail"
+              ? {
+                  inputGuardrails: [{ name: "synthetic_guardrail", run: deniedCall }],
+                }
+              : {}),
+          }),
+        ];
+        try {
+          const options = { workflow: "workflow", tags: { team: "support" } };
+          if (streamed) {
+            const result = await state.integration.runStreamed(
+              state.runner,
+              state.agent,
+              "Synthetic input.",
+              options,
+            );
+            const observed = await (async () => {
+              for await (const _event of result) {
+                /* drain */
+              }
+            })().catch((error: unknown) => error);
+            expect(decision).toBeInstanceOf(
+              model.endsWith("stopped") ? RunStoppedError : BudgetExceededError,
+            );
+            expect(observed).toBe(decision);
+            await expect(result.completed).rejects.toBe(decision);
+          } else {
+            const observed = await state.integration
+              .run(state.runner, state.agent, "Synthetic input.", options)
+              .catch((error: unknown) => error);
+            expect(decision).toBeInstanceOf(
+              model.endsWith("stopped") ? RunStoppedError : BudgetExceededError,
+            );
+            expect(observed).toBe(decision);
+          }
+          expect(execute).toHaveBeenCalledTimes(source === "tool" ? 1 : 0);
+          expect(state.transport.requests).toHaveLength(1);
+          expect(state.plane.checks).toHaveLength(2);
+        } finally {
+          await state.client.close();
+        }
+        expect(state.plane.denialReceipts).toHaveLength(1);
+      }
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("preserves an ordinary tool input guardrail failure (streamed=%s)", async (streamed) => {
+    const state = setup("chat_completions", {
+      transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]),
+    });
+    const original = new Error("synthetic guardrail failure");
+    const execute = vi.fn(() => "Synthetic result.");
+    state.agent.tools = [
+      framework.tool({
+        name: "lookup",
+        description: "Synthetic lookup",
+        parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+        errorFunction: solwynToolErrorFunction,
+        execute,
+        inputGuardrails: [
+          {
+            name: "synthetic_guardrail",
+            run: async () => {
+              throw original;
+            },
+          },
+        ],
+      }),
+    ];
+    try {
+      const observed = await invoke(state, streamed).catch((error: unknown) => error);
+      expect(observed).toBeInstanceOf(framework.ToolCallError);
+      expect((observed as Agents.ToolCallError).error).toBe(original);
+      expect(execute).not.toHaveBeenCalled();
+      expect(state.transport.requests).toHaveLength(1);
+    } finally {
+      await state.client.close();
+    }
+  });
+
+  it.each([
     "chat_completions",
     "responses",
   ] as const)("reuses the agent run and one lease through %s tool turns", async (api) => {
@@ -569,6 +686,32 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
 });
 
 describe("OpenAI Agents fail-closed boundaries", () => {
+  it.each([
+    ["missing", undefined],
+    ["non-function", {}],
+    ["non-constructor", () => undefined],
+    ["missing getModel", class {}],
+    [
+      "non-function getModel",
+      class {
+        getModel = true;
+      },
+    ],
+  ])("rejects an invalid OpenAIProvider: %s", async (_label, OpenAIProvider) => {
+    const state = setup();
+    try {
+      expect(
+        () =>
+          new SolwynAgents({
+            client: state.client,
+            OpenAIProvider: OpenAIProvider as typeof Agents.OpenAIProvider,
+          }),
+      ).toThrow(expect.objectContaining({ name: "ConfigurationError", field: "OpenAIProvider" }));
+    } finally {
+      await state.client.close();
+    }
+  });
+
   it.each([
     { background: true },
     { extra_query: { synthetic: "value" } },
@@ -913,6 +1056,43 @@ describe("OpenAI Agents fail-closed boundaries", () => {
   it.each([
     false,
     true,
+  ])("latches a tool end for a different agent (streamed=%s)", async (streamed) => {
+    const state = setup();
+    const lookup = framework.tool({
+      name: "lookup",
+      description: "Synthetic lookup",
+      parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+      execute: () => "Synthetic result.",
+    });
+    state.integration.attach(state.runner);
+    state.runner.on("agent_start", (context, agent) =>
+      state.runner.emit(
+        "agent_tool_end",
+        context,
+        new Proxy(agent, {}),
+        lookup,
+        "Synthetic result.",
+        {
+          toolCall: {
+            type: "function_call",
+            callId: "call_synthetic",
+            name: "lookup",
+            arguments: "{}",
+          },
+        },
+      ),
+    );
+    try {
+      await expect(invoke(state, streamed)).rejects.toThrow("openai-agents: unmatched tool end");
+      expect(state.transport.requests).toHaveLength(0);
+    } finally {
+      await state.client.close();
+    }
+  });
+
+  it.each([
+    false,
+    true,
   ])("rejects RunState resume before invoking the framework (streamed=%s)", async (streamed) => {
     const state = setup();
     const run = vi.spyOn(state.runner, "run");
@@ -935,6 +1115,63 @@ describe("OpenAI Agents fail-closed boundaries", () => {
 });
 
 describe("OpenAI Agents refusal identity", () => {
+  it.each([
+    "next",
+    "return",
+    "throw",
+  ] as const)("unwraps only branded tool decisions from iterator.%s", async (method) => {
+    const state = setup();
+    const nativeRun = state.runner.run.bind(state.runner);
+    const decision = new SolwynError("synthetic decision");
+    let failure: Error = new framework.ToolCallError("synthetic tool failure", decision);
+    vi.spyOn(state.runner, "run").mockImplementation(async (...args) => {
+      const result = await nativeRun(...args);
+      await result.completed;
+      Object.defineProperty(result, Symbol.asyncIterator, {
+        configurable: true,
+        value: () => ({
+          next: async () => {
+            throw failure;
+          },
+          return: async () => {
+            throw failure;
+          },
+          throw: async () => {
+            throw failure;
+          },
+        }),
+      });
+      return result;
+    });
+    try {
+      for (const error of [
+        new framework.ToolCallError("synthetic tool failure", decision),
+        new framework.ToolCallError("synthetic ordinary failure", new Error("synthetic failure")),
+        Object.assign(new Error("synthetic failure"), { error: decision }),
+      ]) {
+        failure = error;
+        const result = await state.integration.runStreamed(
+          state.runner,
+          state.agent,
+          "Synthetic input.",
+          { workflow: "workflow" },
+        );
+        const iterator = result[Symbol.asyncIterator]();
+        const operation =
+          method === "throw"
+            ? iterator.throw?.(new Error("synthetic consumer failure"))
+            : iterator[method]?.();
+        await expect(operation).rejects.toBe(
+          error instanceof framework.ToolCallError && error.error instanceof SolwynError
+            ? decision
+            : error,
+        );
+      }
+    } finally {
+      await state.client.close();
+    }
+  });
+
   it.each([
     false,
     true,

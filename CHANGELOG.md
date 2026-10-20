@@ -17,7 +17,10 @@ corresponding release notes before users upgrade.
   and exact-run stops across iterations. Responses and non-streaming JSON-schema parsing are
   refused; streaming structured output is outside the tested recipe. Failed model callbacks
   preserve the original error, while successful unbound calls raise a bypass diagnostic. Root
-  completion releases remaining model bindings and abort listeners. Scope names replace Unicode
+  completion releases remaining model bindings and abort listeners. Cancellation releases the
+  aborted model's bindings and listeners immediately, without ending sibling work. Early stream
+  termination and Node.js 22 abort-and-drain can omit upstream root callbacks; these paths
+  require an invocation-local handler rather than a reused handler. Scope names replace Unicode
   format and separator characters, and invalid `namePrefix` values are rejected eagerly.
   Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.

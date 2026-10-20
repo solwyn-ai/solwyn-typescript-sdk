@@ -108,7 +108,8 @@ validate arbitrary LangChain call paths. A raw OpenAI client is rejected at leaf
 LangChain must propagate this handler to each model run. Calling the model directly without a
 parent chain fails closed. Do not replace `options.options.signal`: it overrides the per-call
 key on LangChain's non-streaming path and the leaf refuses dispatch. Cancellation propagates
-the upstream signal's reason, and model-end/error callbacks remove its listener.
+the upstream signal's reason. Aborting immediately releases the model binding, signal keys,
+and caller-signal listeners; model-end/error callbacks also perform that cleanup.
 
 ## Admitted and tested
 
@@ -128,8 +129,14 @@ the upstream signal's reason, and model-end/error callbacks remove its listener.
   tested recipe.
 - `_streamChatModelEvents`, LangGraph v3 messages streaming, and `streamEvents` (including v2).
 - Early stream `break`/iterator `return()`: core 1.2.18 can omit the root's terminal callback,
-  retaining handler scopes. Consume streams fully, or abort with the call's `AbortSignal` and
-  continue iteration until the cancellation error so terminal callbacks run.
+  retaining handler scopes. **Abort-and-drain on Node.js 22 is also excluded:** LangChain can
+  reject a pull on an already-aborted signal before resuming its chain/model generators, so
+  draining until the cancellation error and then calling `return()` still omits their terminal
+  callbacks. The earlier prompt-step `handleChainEnd` does not terminate the root. Node.js 24
+  emits the terminal error callbacks in the locked cancellation fixture because its Web Streams
+  implementation pulls ahead earlier; do not rely on that scheduling for every cancellation
+  point. Consume streams fully when reusing a handler. If a stream may be cancelled or ended
+  early, use a handler local to that invocation and release it with the stream afterward.
 - `generate`/`batch`, `__includeRawResponse`, Azure, `@langchain/langgraph/web`, ChatAnthropic,
   and other provider integrations.
 - Parallel graph fan-out with graph-level `maxConcurrency: 1`: LangGraph 1.5.1 can omit
@@ -155,8 +162,10 @@ scope per root, enclosing node scope, and node name across iterations. Nested no
 children; tools and retrievers add no Solwyn runs. Scopes finish when the root ends, deferring
 active work until its activation settles. Root completion also releases any remaining model
 bindings and their abort listeners. Missing root terminal callbacks can retain handler state;
-use well-behaved runnables and consume streams through completion or cancellation errors as
-described above.
+consume streams through completion or use an invocation-local handler for the excluded
+cancellation paths above. Model cancellation releases its bindings even without callbacks, but
+cannot finish the root: sibling model calls may still be active. Scope finishing always waits
+for pending activations to settle.
 
 Under an outer `run(...)`, the root is its child. Calls carry the leaf scope's exact run ID;
 Cloud stops and per-run controls must target that leaf ID. Stopping a parent does not stop its

@@ -121,8 +121,12 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
       expect(transport.requests[0]?.body["stream_options"]).toMatchObject({ include_usage: true });
     expect(plane.untrackedReports).toHaveLength(0);
   });
-  it("cleans up attribution when a stream is aborted and drained", async () => {
-    const { chain, plane, transport, client } = await setup();
+  it("releases aborted stream bindings and finishes scopes when upstream terminates the root", async () => {
+    const { chain, plane, transport, client, handler } = await setup();
+    const starts = vi.spyOn(handler, "handleChainStart");
+    const ends = vi.spyOn(handler, "handleChainEnd");
+    const errors = vi.spyOn(handler, "handleChainError");
+    const bindings = vi.spyOn(handler, "bindModelCall");
     const cancellation = new AbortController();
     const stream = await chain.stream({ question: "fixture" }, { signal: cancellation.signal });
     const iterator = stream[Symbol.asyncIterator]();
@@ -131,7 +135,7 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     await expect(
       (async () => {
         while (!(await iterator.next()).done) {
-          /* drain through terminal callbacks */
+          /* drain until cancellation surfaces */
         }
       })(),
     ).rejects.toThrow();
@@ -139,6 +143,29 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     expect(transport.requests).toHaveLength(1);
     expect(plane.checks).toHaveLength(1);
     expect(plane.ingested).toHaveLength(1);
+    expect((Reflect.get(handler, "models") as Map<unknown, unknown>).size).toBe(0);
+    const options = bindings.mock.results[0]?.value;
+    expect(options?.signal?.aborted).toBe(true);
+    expect(() =>
+      (handler.chatCompletionsLeaf(client) as typeof client).chat.completions.create(
+        { model: "gpt-4.1-mini", messages: [] },
+        options,
+      ),
+    ).toThrow(/not admitted/);
+    const rootRunId = starts.mock.calls.find((call) => call[3] == null)?.[2];
+    expect(rootRunId).toBeDefined();
+    if (!rootRunId) throw new Error("missing fixture root run ID");
+    const terminated = [...ends.mock.calls, ...errors.mock.calls].some(
+      (call) => call[1] === rootRunId,
+    );
+    if (!terminated) {
+      // Core 1.2.18 can reject the pull before resuming the chain generator on Node 22.
+      // Model cancellation cannot infer root termination: a sibling may still be running.
+      expect((Reflect.get(handler, "roots") as Map<unknown, unknown>).size).toBe(1);
+      handler.handleChainError(undefined, rootRunId); // Release the excluded fixture's root.
+    }
+    for (const key of ["runs", "models", "roots"])
+      expect((Reflect.get(handler, key) as Map<unknown, unknown>).size, key).toBe(0);
   });
   it("purges an early-ended model stream when its graph root completes", async () => {
     const { model, handler, transport } = await setup();
@@ -396,6 +423,21 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     expect(transport.requests).toHaveLength(0);
     expect(plane.checks).toHaveLength(0);
     expect(plane.ingested).toHaveLength(0);
+  });
+  it("meters hosted-tool streaming through the Chat Completions leaf", async () => {
+    const { model, handler, plane, transport, client } = await setup();
+    const chain = prompts.ChatPromptTemplate.fromTemplate("Synthetic")
+      .pipe(model.bindTools([{ type: "web_search_preview" }]))
+      .withConfig({ runName: "hosted-tool-chain", callbacks: [handler] });
+    for await (const _ of await chain.stream({})) {
+      /* drain */
+    }
+    await client.close();
+    expect(transport.requests).toHaveLength(1);
+    expect(transport.requests[0]?.url).toMatch(/\/chat\/completions$/);
+    expect(plane.checks).toHaveLength(1);
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]?.agent_run_name).toBe("langchain:hosted-tool-chain");
   });
   it("preserves the chat-model events refusal through the real callback error path", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});

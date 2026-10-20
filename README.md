@@ -439,7 +439,9 @@ stable graph-node attribution; the Solwyn-wrapped OpenAI client supplies enforce
 settlement. The exact recipe admits Chat Completions chain `invoke`/`stream`, compiled graph
 values/updates/messages streaming, parallel nodes, loops, and function-tool binding. Responses
 and non-streaming JSON-schema parsing fail closed; streaming structured output is outside the
-tested recipe. Other paths are listed on the recipe page.
+tested recipe. Early stream termination and Node.js 22 abort-and-drain require an
+invocation-local handler because upstream can omit root callbacks. Other paths are listed on
+the recipe page.
 
 | Framework | Integration | Runtime |
 |---|---|---|

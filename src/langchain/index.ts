@@ -195,7 +195,7 @@ export class SolwynRunScopeHandler {
   }
 
   /** Forward call options unchanged apart from a fresh, linked per-model signal key. */
-  bindModelCall<O extends SignalOptions>(opaqueCallOptions: O, runManager: unknown): O {
+  bindModelCall<O extends SignalOptions>(options: O, runManager: unknown): O {
     if (typeof runManager !== "object" || runManager === null) {
       return refusal("LangChain model call requires its run manager");
     }
@@ -208,24 +208,32 @@ export class SolwynRunScopeHandler {
     ) {
       return refusal("LangChain model call has no matching Solwyn handler and model run");
     }
-    const upstream = signalOf(opaqueCallOptions);
+    const upstream = signalOf(options);
     const controller = new AbortController();
-    const abort = (): void => controller.abort(upstream?.reason);
-    if (upstream?.aborted) abort();
-    else upstream?.addEventListener("abort", abort, { once: true });
     const signal = controller.signal;
+    const abort = (): void => {
+      controller.abort(upstream?.reason);
+      // Cancellation can bypass upstream's terminal callbacks. Retire this model,
+      // but leave the root and siblings to their own lifecycle callbacks.
+      model.bindings.get(signal)?.();
+      model.bindings.delete(signal);
+      this.keys.delete(signal);
+      if (model.bindings.size === 0) this.endModel(manager.runId);
+    };
     model.bindings.set(signal, () => upstream?.removeEventListener("abort", abort));
     this.keys.set(signal, model.scope);
     model.bound = true;
-    return { ...opaqueCallOptions, signal };
+    if (upstream?.aborted) abort();
+    else upstream?.addEventListener("abort", abort, { once: true });
+    return { ...options, signal };
   }
 
   /** Only `chat.completions.create` is admitted; every other property fails closed. */
   chatCompletionsLeaf(client: unknown): object {
     requireSolwynClient(client, "LangChain");
     const wrapped = client as ChatClient;
-    const create = (opaqueRequest: unknown, opaqueOptions?: SignalOptions): Promise<unknown> => {
-      const signal = signalOf(opaqueOptions);
+    const create = (opaqueRequest: unknown, options?: SignalOptions): Promise<unknown> => {
+      const signal = signalOf(options);
       const scope = signal === undefined ? undefined : this.keys.get(signal);
       if (scope === undefined || this.roots.get(scope.rootRunId)?.closed !== false) {
         return refusal("LangChain call has no bound Solwyn signal key; path is not admitted");
@@ -235,7 +243,7 @@ export class SolwynRunScopeHandler {
         const pending = runOutsideRun(() =>
           handle.activate(() =>
             Promise.resolve(
-              wrapped.chat.completions.create(opaqueRequest, opaqueOptions as SignalOptions),
+              wrapped.chat.completions.create(opaqueRequest, options as SignalOptions),
             ),
           ),
         );

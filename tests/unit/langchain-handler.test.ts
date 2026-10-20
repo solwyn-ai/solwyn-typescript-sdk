@@ -186,15 +186,80 @@ describe("LangChain structural run handler", () => {
     upstream.abort("synthetic cancellation");
     expect(options.signal?.aborted).toBe(true);
     expect(options.signal?.reason).toBe("synthetic cancellation");
-    handler.handleLLMEnd(undefined, "m");
+    // Upstream can omit both model and root terminal callbacks on cancellation.
+    expect(counts(handler)).toEqual([1, 0, 1]);
     expect(remove).toHaveBeenCalledTimes(1);
     expect(() => leaf(handler).chat.completions.create({}, options)).toThrow(SolwynError);
+    handler.handleLLMEnd(undefined, "m");
     const pre = new AbortController();
     pre.abort("already cancelled");
     const earlier = bind(handler, "m2", "root", pre.signal);
     expect(earlier.signal?.reason).toBe("already cancelled");
+    expect(counts(handler)).toEqual([1, 0, 1]);
+    expect(() => leaf(handler).chat.completions.create({}, earlier)).toThrow(SolwynError);
     handler.handleLLMError(undefined, "m2");
     handler.handleChainEnd(undefined, "root");
+  });
+  it("cancels only the bound model and keeps its sibling's scope usable", async () => {
+    const handler = new SolwynRunScopeHandler();
+    start(handler);
+    const cancelled = new AbortController();
+    const abandoned = bind(handler, "abandoned", "root", cancelled.signal);
+    const sibling = bind(handler, "sibling");
+    cancelled.abort();
+    expect(counts(handler)).toEqual([1, 1, 1]);
+    const client = leaf(handler);
+    expect(() => client.chat.completions.create({}, abandoned)).toThrow(/not admitted/);
+    await expect(client.chat.completions.create({}, sibling)).resolves.toMatchObject({
+      agentRunName: "langchain:workflow",
+    });
+    handler.handleLLMEnd(undefined, "sibling");
+    handler.handleChainEnd(undefined, "root");
+    expect(counts(handler)).toEqual([0, 0, 0]);
+  });
+  it("propagates cancellation to every binding of the same model", () => {
+    const handler = new SolwynRunScopeHandler();
+    start(handler);
+    const cancellation = new AbortController();
+    const first = bind(handler, "model", "root", cancellation.signal);
+    const second = handler.bindModelCall(
+      { signal: cancellation.signal },
+      {
+        runId: "model",
+        handlers: [handler],
+      },
+    );
+    cancellation.abort("synthetic cancellation");
+    expect(first.signal?.reason).toBe("synthetic cancellation");
+    expect(second.signal?.reason).toBe("synthetic cancellation");
+    expect(counts(handler)).toEqual([1, 0, 1]);
+    const client = leaf(handler);
+    for (const options of [first, second])
+      expect(() => client.chat.completions.create({}, options)).toThrow(/not admitted/);
+    handler.handleChainEnd(undefined, "root");
+    expect(counts(handler)).toEqual([0, 0, 0]);
+  });
+  it("defers finishing a cancelled activation until its pending provider call settles", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handler = new SolwynRunScopeHandler();
+    start(handler);
+    const cancellation = new AbortController();
+    const options = bind(handler, "model", "root", cancellation.signal);
+    let resolve!: (value: unknown) => void;
+    const pending = new Promise((done) => {
+      resolve = done;
+    });
+    const client = leaf(handler, () => pending);
+    const result = client.chat.completions.create({}, options);
+    cancellation.abort();
+    expect(counts(handler)).toEqual([1, 0, 1]);
+    handler.handleChainEnd(undefined, "root");
+    expect(counts(handler)).toEqual([0, 0, 1]);
+    expect(() => client.chat.completions.create({}, options)).toThrow(/not admitted/);
+    resolve("synthetic completion");
+    await expect(result).resolves.toBe("synthetic completion");
+    expect(counts(handler)).toEqual([0, 0, 0]);
+    warn.mockRestore();
   });
   it("handleLLMEnd cleans up and rejects a successful unbound model", () => {
     const handler = new SolwynRunScopeHandler();

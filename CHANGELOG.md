@@ -23,6 +23,7 @@ corresponding release notes before users upgrade.
   their native wrappers.
   Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
   still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
+  Invocation storage uses JavaScript private fields and is absent from instance reflection.
   Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.
 
 - **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
@@ -36,6 +37,8 @@ corresponding release notes before users upgrade.
   termination and Node.js 22 abort-and-drain can omit upstream root callbacks; these paths
   require an invocation-local handler rather than a reused handler. Scope names replace Unicode
   format and separator characters, and invalid `namePrefix` values are rejected eagerly.
+  Internal attribution state uses JavaScript private fields, keeping maps and configured tags
+  out of instance reflection.
   Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.
 

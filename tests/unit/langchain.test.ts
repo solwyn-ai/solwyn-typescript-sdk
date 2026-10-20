@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { BudgetExceededError, RunStoppedError, SolwynError } from "../../src/errors";
 import { SolwynRunScopeHandler } from "../../src/langchain/index";
 import { run } from "../../src/node";
@@ -6,6 +6,7 @@ import { clearRunTermination, markTerminated } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing/index";
 import { createFakeOpenAITransport } from "../helpers/fake-openai-transport";
 import { installIntegrationEnv } from "../helpers/integration-env";
+import { trackIntegrationRuns } from "../helpers/integration-runs";
 import { recipeModel } from "../helpers/langchain-recipe";
 
 const env = installIntegrationEnv();
@@ -23,12 +24,16 @@ beforeAll(async () => {
 });
 afterAll(() => env.restore());
 const clients: Array<{ close(): Promise<void> }> = [];
-const handlers: SolwynRunScopeHandler[] = [];
+let tracker: ReturnType<typeof trackIntegrationRuns>;
+beforeEach(() => {
+  tracker = trackIntegrationRuns();
+});
 afterEach(async () => {
   for (const client of clients.splice(0)) await client.close();
-  for (const handler of handlers.splice(0))
-    for (const key of ["runs", "models", "roots"])
-      expect((Reflect.get(handler, key) as Map<unknown, unknown>).size, key).toBe(0);
+  tracker.restore();
+  expect(tracker.active.size).toBe(0);
+  for (const handle of tracker.handles)
+    expect(() => handle.activate(() => undefined)).toThrow(/finished/);
   expect(env.fetchAttempts).toEqual([]);
   expect(env.socketAttempts()).toBe(0);
   vi.restoreAllMocks();
@@ -47,7 +52,6 @@ async function setup(
   );
   clients.push(client);
   const handler = new SolwynRunScopeHandler(tagged ? { tags: { suite: "synthetic" } } : {});
-  handlers.push(handler);
   const model = await recipeModel(client, handler, fields);
   const chain = prompts.ChatPromptTemplate.fromTemplate("Synthetic {question}")
     .pipe(model)
@@ -58,7 +62,6 @@ async function setup(
 describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
   it("pins runtime chain/tool/retriever argument order with real core", async () => {
     const handler = new SolwynRunScopeHandler();
-    handlers.push(handler);
     const chainStart = vi.spyOn(handler, "handleChainStart");
     const toolStart = vi.spyOn(handler, "handleToolStart");
     const retrieverStart = vi.spyOn(handler, "handleRetrieverStart");
@@ -143,7 +146,6 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     expect(transport.requests).toHaveLength(1);
     expect(plane.checks).toHaveLength(1);
     expect(plane.ingested).toHaveLength(1);
-    expect((Reflect.get(handler, "models") as Map<unknown, unknown>).size).toBe(0);
     const options = bindings.mock.results[0]?.value;
     expect(options?.signal?.aborted).toBe(true);
     expect(() =>
@@ -161,11 +163,10 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     if (!terminated) {
       // Core 1.2.18 can reject the pull before resuming the chain generator on Node 22.
       // Model cancellation cannot infer root termination: a sibling may still be running.
-      expect((Reflect.get(handler, "roots") as Map<unknown, unknown>).size).toBe(1);
+      expect(tracker.active.size).toBe(1);
       handler.handleChainError(undefined, rootRunId); // Release the excluded fixture's root.
     }
-    for (const key of ["runs", "models", "roots"])
-      expect((Reflect.get(handler, key) as Map<unknown, unknown>).size, key).toBe(0);
+    expect(tracker.active.size).toBe(0);
   });
   it("purges an early-ended model stream when its graph root completes", async () => {
     const { model, handler, transport } = await setup();
@@ -183,8 +184,7 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
       workflow.invoke({}, { callbacks: [handler], signal: upstream.signal }),
     ).resolves.toEqual({ done: true });
     expect(transport.requests).toHaveLength(1);
-    for (const key of ["runs", "models", "roots"])
-      expect((Reflect.get(handler, key) as Map<unknown, unknown>).size, key).toBe(0);
+    expect(tracker.active.size).toBe(0);
   });
   it.each([
     "invoke",

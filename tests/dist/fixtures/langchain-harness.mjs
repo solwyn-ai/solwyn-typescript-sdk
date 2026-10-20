@@ -26,6 +26,10 @@ const client = new Solwyn(provider, {
   leaseEnabled: false,
 });
 const handler = new SolwynRunScopeHandler();
+for (const key of ["factory", "prefix", "tags", "runs", "models", "roots", "keys"]) {
+  assert.equal(Object.keys(handler).includes(key), false);
+  assert.equal(Reflect.ownKeys(handler).includes(key), false);
+}
 handler.handleChainStart(
   undefined,
   undefined,

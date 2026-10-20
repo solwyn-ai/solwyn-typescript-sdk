@@ -76,7 +76,8 @@ assert.equal(plane.confirms.length, 1);
 assert.equal(plane.ingested.length, 1);
 assert.equal(plane.ingested[0].agent_run_name, "agent:Worker");
 assert.match(plane.ingested[0].parent_agent_run_id, /^run_/);
-assert.equal(agents.invocations.size, 0);
+assert.deepEqual(Object.keys(agents), ["modelProvider"]);
+assert.deepEqual(Reflect.ownKeys(agents), ["modelProvider"]);
 process.stdout.write(
   JSON.stringify({ loaded: true, nodeRequired: true, dispatches: 1, checks: 1, ingested: 1 }) +
     "\n",

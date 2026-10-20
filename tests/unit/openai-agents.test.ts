@@ -1,6 +1,6 @@
 import type * as Agents from "@openai/agents";
 import type OpenAI from "openai";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BudgetExceededError,
   ConfigurationError,
@@ -10,7 +10,6 @@ import {
 import { noopLogger } from "../../src/logging";
 import { SolwynAgents, solwynToolErrorFunction } from "../../src/openai-agents/index";
 import {
-  type DetachedRun,
   getCurrentRun,
   getDetachedRunFactory,
   resetDetachedRunFactory,
@@ -20,12 +19,13 @@ import { clearRunTermination, markTerminated } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing/index";
 import { createFakeOpenAITransport } from "../helpers/fake-openai-transport";
 import { installIntegrationEnv } from "../helpers/integration-env";
+import { trackIntegrationRuns } from "../helpers/integration-runs";
 import { createAgentsTransport } from "../helpers/openai-agents-transport";
 
 let framework: typeof Agents;
 let OpenAIClient: typeof OpenAI;
 let env: ReturnType<typeof installIntegrationEnv>;
-const instances: SolwynAgents[] = [];
+let runTracker: ReturnType<typeof trackIntegrationRuns>;
 
 beforeAll(async () => {
   env = installIntegrationEnv();
@@ -34,10 +34,15 @@ beforeAll(async () => {
   framework.setTracingDisabled(true);
   OpenAIClient = (await import("openai")).default;
 });
+beforeEach(() => {
+  runTracker = trackIntegrationRuns();
+});
 afterAll(() => env.restore());
 afterEach(() => {
-  for (const instance of instances.splice(0))
-    expect((instance as unknown as { invocations: Map<string, unknown> }).invocations.size).toBe(0);
+  runTracker.restore();
+  expect(runTracker.active.size).toBe(0);
+  for (const handle of runTracker.handles)
+    expect(() => handle.activate(() => undefined)).toThrow(/finished/);
   expect(env.fetchAttempts).toEqual([]);
   expect(env.socketAttempts()).toBe(0);
 });
@@ -59,7 +64,6 @@ function setup(
   });
   const client = plane.wrap(raw, { provider: "openai", onUnmetered: "raise", ...settings.wrap });
   const integration = new SolwynAgents({ client, OpenAIProvider: framework.OpenAIProvider, api });
-  instances.push(integration);
   const runner = new framework.Runner({
     modelProvider: integration.modelProvider,
     tracingDisabled: true,
@@ -70,6 +74,17 @@ function setup(
 }
 
 describe("OpenAI Agents HTTP attribution", () => {
+  it("keeps invocation storage out of instance reflection", async () => {
+    const { integration, client } = setup();
+    try {
+      expect(Object.keys(integration)).toEqual(["modelProvider"]);
+      expect(Reflect.ownKeys(integration)).toEqual(["modelProvider"]);
+      expect(Reflect.get(integration, "invocations")).toBeUndefined();
+    } finally {
+      await client.close();
+    }
+  });
+
   it.each([
     "chat_completions",
     "responses",
@@ -109,9 +124,7 @@ describe("OpenAI Agents HTTP attribution", () => {
       expect(plane.unmatchedRequests).toEqual([]);
       if (streamed && api === "chat_completions")
         expect(transport.requests[0]?.body["stream_options"]).toEqual({ include_usage: true });
-      expect(
-        (integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
+      expect(runTracker.active.size).toBe(0);
     }
   });
 
@@ -643,9 +656,7 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
     const [stopped] = denials;
     expect(stopped?.agent_run_id).toBe(first?.agent_run_id);
     expect(second?.agent_run_id).not.toBe(first?.agent_run_id);
-    expect(
-      (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-    ).toBe(0);
+    expect(runTracker.active.size).toBe(0);
   });
 
   it.each([
@@ -837,9 +848,7 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
         expect(state.transport.requests).toHaveLength(0);
         expect(state.plane.checks).toHaveLength(1);
         expect(state.plane.denialReceipts).toHaveLength(1);
-        expect(
-          (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-        ).toBe(0);
+        expect(runTracker.active.size).toBe(0);
       }
   });
 });
@@ -1170,9 +1179,7 @@ describe("OpenAI Agents fail-closed boundaries", () => {
         await state.client.close();
       }
       expect(state.transport.requests).toHaveLength(1);
-      expect(
-        (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
+      expect(runTracker.active.size).toBe(0);
     }
   });
 
@@ -1401,7 +1408,6 @@ describe("OpenAI Agents refusal identity", () => {
         OpenAIProvider: RefusedProvider,
         api: "responses",
       });
-      instances.push(integration);
       const runner = new framework.Runner({
         modelProvider: integration.modelProvider,
         tracingDisabled: true,
@@ -1438,27 +1444,6 @@ describe("OpenAI Agents refusal identity", () => {
 });
 
 describe("OpenAI Agents stream and handle lifecycle", () => {
-  function trackRuns() {
-    const factory = getDetachedRunFactory();
-    if (factory === undefined) throw new Error("Node test seam missing");
-    const handles: DetachedRun[] = [];
-    const deferred: string[] = [];
-    setDetachedRunFactory((name, options) => {
-      const handle = factory(name, options);
-      handles.push(handle);
-      return {
-        runId: handle.runId,
-        activate: (fn) => handle.activate(fn),
-        tryFinish: () => {
-          const finished = handle.tryFinish();
-          if (!finished) deferred.push(handle.runId);
-          return finished;
-        },
-      };
-    });
-    return { handles, deferred, restore: () => setDetachedRunFactory(factory) };
-  }
-
   it.each([
     "success",
     "error",
@@ -1466,7 +1451,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
     "stream",
     "early-return",
   ])("finishes every handle after %s", async (scenario) => {
-    const tracker = trackRuns();
+    const tracker = trackIntegrationRuns();
     const state = setup(
       "chat_completions",
       scenario === "error"
@@ -1510,9 +1495,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
         );
         expect(result.cancelled).toBe(true);
       } else await invoke(state, scenario === "stream");
-      expect(
-        (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
+      expect(runTracker.active.size).toBe(0);
       for (const handle of tracker.handles)
         expect(() => handle.activate(() => undefined)).toThrow(/finished/);
       if (scenario === "max-turns") expect(tracker.handles).toHaveLength(2);
@@ -1527,7 +1510,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
     true,
   ])("releases invocation state after abort (streamed=%s)", async (streamed) => {
     for (const api of ["chat_completions", "responses"] as const) {
-      const tracker = trackRuns();
+      const tracker = trackIntegrationRuns();
       const controller = new AbortController();
       let started!: () => void;
       const entered = new Promise<void>((resolve) => {
@@ -1634,7 +1617,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
   });
 
   it("defers finishing active handles when completion races provider work and retries after it settles", async () => {
-    const tracker = trackRuns();
+    const tracker = trackIntegrationRuns();
     let release!: () => void;
     let started!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -1676,11 +1659,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
       await result.completed;
       expect(tracker.deferred).not.toHaveLength(0);
       release();
-      await vi.waitFor(() =>
-        expect(
-          (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-        ).toBe(0),
-      );
+      await vi.waitFor(() => expect(runTracker.active.size).toBe(0));
       for (const handle of tracker.handles)
         expect(() => handle.activate(() => undefined)).toThrow(/finished/);
     } finally {

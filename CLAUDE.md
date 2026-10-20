@@ -55,6 +55,8 @@ Build before running distribution or package checks. Unit tests must remain offl
 1. **Privacy firewall.** Only `src/privacy.ts`, `src/providers/translation/`, and `src/ai-sdk/`
    may reference prompt or response content fields. `tests/unit/privacy-firewall.test.ts`
    enforces the boundary. Content must never be logged, persisted, or sent to Solwyn.
+   Framework-integration modules are not content-privileged and are covered by a stricter
+   no-content-read firewall rule.
 2. **Fixed estimate, never provider/model pricing.** Solwyn Cloud owns actual provider/model
    pricing. The SDK's `$0.00003 × estimated input tokens` calculation has exactly two local uses:
    outage decisions/bucketing, and the `estimatedCost` diagnostic on denial errors (including live
@@ -149,6 +151,8 @@ Build before running distribution or package checks. Unit tests must remain offl
 src/
   index.ts              # public exports; edge-safe core only
   node.ts               # Node-only run context
+  integration-support.ts # content-free framework attribution and wrapper guards
+  wrapper-brand.ts      # dependency-free shared wrapper identity
   ai-sdk/               # AI SDK middleware; content-privileged
   testing/              # edge-safe fake control plane and contract probes
   config.ts  types.ts  errors.ts  validation.ts

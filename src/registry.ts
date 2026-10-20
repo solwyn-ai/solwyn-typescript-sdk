@@ -23,29 +23,13 @@ import {
 } from "./providers/index";
 import type { ProviderAdapter } from "./providers/protocol";
 import type { ProviderEntry, ProviderName } from "./types";
+import { isSolwynWrapper } from "./wrapper-brand";
 
 // ---------------------------------------------------------------------------
 // Top-level wrapper brand.
 // ---------------------------------------------------------------------------
 
-/** Shared identity brand; never inferred from provider-visible properties. */
-const WRAPPERS_KEY = Symbol.for("@solwyn/sdk.wrappers");
-interface GlobalWithWrappers {
-  [WRAPPERS_KEY]?: WeakSet<object>;
-}
-const wrapperRegistry = globalThis as GlobalWithWrappers;
-wrapperRegistry[WRAPPERS_KEY] ??= new WeakSet<object>();
-const solwynWrappers = wrapperRegistry[WRAPPERS_KEY];
-
-/** @internal Brand one successfully-created public wrapper proxy. */
-export function brandSolwynWrapper(wrapper: object): void {
-  solwynWrappers.add(wrapper);
-}
-
-/** @internal Truthful identity check shared by `Solwyn[Symbol.hasInstance]` and guards. */
-export function isSolwynWrapper(value: unknown): value is object {
-  return typeof value === "object" && value !== null && solwynWrappers.has(value);
-}
+export { brandSolwynWrapper, isSolwynWrapper } from "./wrapper-brand";
 
 /** @internal Reject wrapper recursion before any adapter lookup or detection. */
 export function assertRawProviderClient(client: unknown): void {

@@ -34,7 +34,12 @@
 import { type AsyncHook, AsyncLocalStorage, createHook } from "node:async_hooks";
 import { SolwynError } from "./errors";
 import type { MetadataReporter } from "./reporter";
-import { type CurrentRun, setCurrentRunReader, setOutsideRunRunner } from "./run-context";
+import {
+  type CurrentRun,
+  setCurrentRunReader,
+  setDetachedRunFactory,
+  setOutsideRunRunner,
+} from "./run-context";
 import { copyTags, type Tags } from "./tags";
 
 const NODE_REPORTER_REGISTRATION = Symbol.for("@solwyn/sdk/node-reporter-registration");
@@ -204,6 +209,7 @@ interface RunIdentity {
 }
 
 let constructRunHandle!: (identity: RunIdentity) => RunHandle;
+let tryFinishRunHandle!: (handle: RunHandle) => boolean;
 
 /** A detached run identity that can be activated explicitly in later call stacks. */
 export class RunHandle {
@@ -228,6 +234,14 @@ export class RunHandle {
 
   static {
     constructRunHandle = (identity) => new RunHandle(identity);
+    // Integration cleanup may race active work and must never mask its result.
+    // Keep this capability private so RunHandle's public API remains unchanged.
+    tryFinishRunHandle = (handle) => {
+      if (handle.#activeActivations > 0) return false;
+      handle.#finished = true;
+      handle.#lifetime = undefined;
+      return true;
+    };
   }
 
   /**
@@ -419,6 +433,17 @@ setCurrentRunReader(() => {
 // Long-lived SDK loops (the reporter's flush timer) start outside any run, so a client
 // constructed inside `run(...)` never makes that run's lifetime token outlive the run.
 setOutsideRunRunner((fn) => runStore.exit(fn));
+
+// Integrations acquire only attribution capabilities; createRun retains validation,
+// creation-parent capture, lifetime ownership, and the activation recursion guard.
+setDetachedRunFactory((name, options) => {
+  const handle = createRun(name, options);
+  return {
+    runId: handle.runId,
+    activate: (fn) => handle.activate(fn),
+    tryFinish: () => tryFinishRunHandle(handle),
+  };
+});
 
 /**
  * Rejects any character in the Unicode general categories Cc (control), Cf (format),

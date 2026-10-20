@@ -16,13 +16,15 @@
  *  - no non-privileged file carries the `PRIVACY-CRITICAL` banner, and every
  *    privileged file that exists DOES (banner set == allowlist);
  *  - structural edge-safety guards: no `node:*` import outside `src/node.ts`, and no
- *    value import of a provider SDK anywhere (type-only / dynamic-in-try allowed).
+ *    value import of a provider/framework SDK anywhere (type-only / dynamic-in-try allowed);
+ *  - integrations read only allowlisted structural properties, forward opaque values
+ *    directly, and have no transport or content-privileged dependencies.
  *
  * This is a source-scanning test — it reads the files off disk, it does not import them.
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { join, posix, relative, sep } from "node:path";
 import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
 
@@ -31,14 +33,346 @@ const SRC_ROOT = join(process.cwd(), "src");
 /** Content-privileged paths (relative to src/, POSIX-style). Everything else is firewalled. */
 const PRIVILEGED_PREFIXES = ["privacy.ts", "providers/translation/", "ai-sdk/"];
 
-/** Provider-SDK packages that must never be VALUE-imported anywhere in core. */
+/** Provider/framework SDKs that must never be VALUE-imported anywhere in core. */
 const PROVIDER_SDK_PACKAGES = [
   "openai",
   "@anthropic-ai/sdk",
   "@google/genai",
   "@google/generative-ai",
   "@aws-sdk/client-bedrock-runtime",
+  "together-ai",
+  "ai",
+  "@langchain/core",
+  "@langchain/openai",
+  "@langchain/langgraph",
+  "@langchain/anthropic",
+  "@openai/agents",
+  "@openai/agents-core",
+  "@openai/agents-openai",
 ];
+
+function providerSdkPackage(specifier: string): string | undefined {
+  return PROVIDER_SDK_PACKAGES.find((pkg) => {
+    const escaped = pkg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`^["']${escaped}(?:/[^"']*)?["']$`).test(JSON.stringify(specifier));
+  });
+}
+
+function findProviderValueImportViolations(text: string, path: string): string[] {
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const violations: string[] = [];
+  const visit = (node: ts.Node): void => {
+    // Whole-declaration type imports/exports erase completely; inline { type X }
+    // remains forbidden because verbatimModuleSyntax can emit a side-effect import.
+    const typeOnly =
+      (ts.isImportDeclaration(node) && node.importClause?.isTypeOnly) ||
+      (ts.isExportDeclaration(node) && node.isTypeOnly) ||
+      (ts.isImportEqualsDeclaration(node) && node.isTypeOnly);
+    const dynamic =
+      ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+    const specifier = importSpecifier(node);
+    if (!typeOnly && !dynamic && specifier !== undefined) {
+      const pkg = providerSdkPackage(specifier);
+      if (pkg !== undefined)
+        violations.push(`${path}: value-imports provider/framework SDK '${pkg}'`);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return violations;
+}
+
+/** Readable integration properties: structural identity, lifecycle, and admitted dispatch only. */
+const INTEGRATION_READABLE_PROPERTIES = new Set([
+  "runId", // Framework run identity.
+  "parentRunId", // Framework hierarchy edge.
+  "handlers", // Handler membership proves the metered leaf was bound.
+  "signal", // Cancellation capability, never request content.
+  "aborted", // Cancellation lifecycle flag.
+  "reason", // Forward an abort reason unchanged; never log it.
+  "name", // Explicit agent name or runName attribution only.
+  "langgraph_node", // The single admitted structural metadata key.
+  "config", // Runner configuration container.
+  "modelProvider", // Runner provider identity verification.
+  "model", // Model selection identity or structural pin validation.
+  "completed", // Stream lifecycle completion promise.
+  "agentRunId", // Core run identity.
+  "parentAgentRunId", // Core hierarchy edge.
+  "chat", // Admitted OpenAI client resource container.
+  "completions", // Admitted Chat Completions resource container.
+  "create", // Admitted wrapped-client dispatch method.
+  "getModel", // Model-provider dispatch method.
+  "getResponse", // Model dispatch method; arguments and result stay opaque.
+  "getStreamedResponse", // Streaming model dispatch method; values stay opaque.
+  "getRetryAdvice", // Delegate retry decisions without inspecting request content.
+  "supportsPromptModelSelection", // Structural model capability flag.
+  "next", // Iterator lifecycle forwarding.
+  "return", // Iterator cleanup forwarding.
+  "throw", // Iterator error forwarding.
+  "then", // Promise lifecycle forwarding.
+  "length", // Structural collection size only.
+  "activate", // Detached-run attribution activation.
+  "tryFinish", // Non-throwing detached-run cleanup.
+  "tags", // Explicit non-sensitive attribution options.
+  "namePrefix", // Explicit attribution scope-name prefix.
+  "workflow", // Explicit workflow attribution name.
+  "runOptions", // Native call options are forwarded opaquely except for signal.
+  "client", // Wrapper capability, verified through the identity brand.
+  "OpenAIProvider", // Injected provider constructor, avoiding framework value imports.
+  "api", // Explicit admitted API selection.
+  "run", // Runner lifecycle dispatch with opaque input forwarding.
+  "runStreamed", // Streaming runner lifecycle dispatch with opaque input forwarding.
+  "addEventListener", // Abort propagation registration.
+  "removeEventListener", // Abort propagation cleanup.
+  "abort", // Cancellation propagation.
+  "on", // Runner lifecycle listener registration.
+  "off", // Runner lifecycle listener removal.
+  "get", // Structural Map/WeakMap lookup.
+  "set", // Structural Map/WeakMap registration.
+  "has", // Structural collection membership.
+  "delete", // Structural collection cleanup.
+  "add", // Structural Set registration.
+  "clear", // Structural collection cleanup.
+  "size", // Structural Map/Set size.
+  "values", // Structural scope collection traversal.
+  "includes", // Handler identity membership check.
+  "debug", // Logger method; direct calls with literal/run-id messages only.
+  "info", // Logger method; direct calls with literal/run-id messages only.
+  "warn", // Logger method; direct calls with literal/run-id messages only.
+  "error", // Logger method; direct calls with literal/run-id messages only.
+  "log", // Logger method; direct calls with literal/run-id messages only.
+]);
+
+const INTEGRATION_CORE_IMPORTS = new Set([
+  "run-context",
+  "errors",
+  "logging",
+  "tags",
+  "validation",
+  "wrapper-brand",
+  "integration-support",
+]);
+const LOGGER_METHODS = new Set(["debug", "info", "warn", "error", "log"]);
+const RUN_ID_IDENTIFIER = /^_?(?:runId|[A-Za-z_$][\w$]*RunId)$/;
+
+function integrationPath(path: string): string | undefined {
+  const rel = path.replace(/\\/g, "/").replace(/^src\//, "");
+  return rel === "integration-support.ts" ||
+    rel.startsWith("langchain/") ||
+    rel.startsWith("openai-agents/")
+    ? rel
+    : undefined;
+}
+
+function isOwnIntegrationMember(node: ts.Node, name: string): boolean {
+  let scope: ts.Node | undefined = node.parent;
+  while (scope !== undefined) {
+    if (ts.isClassDeclaration(scope) || ts.isClassExpression(scope)) {
+      return scope.members.some((member) => member.name?.getText().replace(/["']/g, "") === name);
+    }
+    // Arrow functions inherit this; ordinary functions and object methods do not.
+    if (
+      ts.isFunctionDeclaration(scope) ||
+      ts.isFunctionExpression(scope) ||
+      ((ts.isMethodDeclaration(scope) ||
+        ts.isGetAccessorDeclaration(scope) ||
+        ts.isSetAccessorDeclaration(scope)) &&
+        !ts.isClassDeclaration(scope.parent) &&
+        !ts.isClassExpression(scope.parent))
+    )
+      return false;
+    scope = scope.parent;
+  }
+  return false;
+}
+
+function integrationMemberName(node: ts.Expression): string | undefined {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)) {
+    return node.argumentExpression.text;
+  }
+  return undefined;
+}
+
+function isOpaqueForward(node: ts.Identifier): boolean {
+  const declaration = node.parent;
+  if (
+    (ts.isParameter(declaration) || ts.isVariableDeclaration(declaration)) &&
+    declaration.name === node
+  )
+    return true;
+  let expression: ts.Expression = node;
+  while (
+    ts.isParenthesizedExpression(expression.parent) ||
+    ts.isAsExpression(expression.parent) ||
+    ts.isTypeAssertionExpression(expression.parent) ||
+    ts.isNonNullExpression(expression.parent) ||
+    ts.isSatisfiesExpression(expression.parent)
+  )
+    expression = expression.parent;
+  const parent = expression.parent;
+  if (ts.isCallExpression(parent) && parent.arguments.some((arg) => arg === expression)) {
+    const callee = parent.expression;
+    const name = integrationMemberName(callee);
+    // Known reflection/serialization sinks inspect their arguments rather than forwarding them.
+    if (
+      (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
+      ts.isIdentifier(callee.expression) &&
+      ["Object", "Reflect", "JSON"].includes(callee.expression.text)
+    )
+      return false;
+    return (
+      !(name !== undefined && (LOGGER_METHODS.has(name) || name === "stringify")) &&
+      !(ts.isIdentifier(callee) && (callee.text === "String" || LOGGER_METHODS.has(callee.text)))
+    );
+  }
+  return (
+    (ts.isReturnStatement(parent) && parent.expression === expression) ||
+    (ts.isArrowFunction(parent) && parent.body === expression) ||
+    (ts.isSpreadAssignment(parent) && parent.expression === expression)
+  );
+}
+
+/** Reusable source-string rule; directory discovery is independent and tolerates absent integrations. */
+function findIntegrationViolations(text: string, path: string): string[] {
+  const rel = integrationPath(path);
+  if (rel === undefined) return [];
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  const violations: string[] = [];
+  const report = (message: string): void => {
+    violations.push(`${path}: integration ${message}`);
+  };
+  const readable = (name: string, node: ts.Node, own = false): void => {
+    if (
+      !INTEGRATION_READABLE_PROPERTIES.has(name) &&
+      !(own && isOwnIntegrationMember(node, name))
+    ) {
+      report(`reads unapproved property '${name}'`);
+    }
+  };
+  const assignmentPattern = (pattern: ts.Expression): void => {
+    if (ts.isParenthesizedExpression(pattern)) {
+      assignmentPattern(pattern.expression);
+      return;
+    }
+    if (ts.isArrayLiteralExpression(pattern)) {
+      report("uses array destructuring");
+    } else if (ts.isObjectLiteralExpression(pattern)) {
+      for (const property of pattern.properties) {
+        if (ts.isSpreadAssignment(property)) report("uses rest destructuring");
+        else if (ts.isShorthandPropertyAssignment(property)) {
+          readable(property.name.text, property);
+          if (LOGGER_METHODS.has(property.name.text))
+            report("logger methods must not be destructured");
+        } else if (ts.isPropertyAssignment(property)) {
+          const name = propertyNameText(property.name);
+          if (name === undefined) report("reads a computed property in destructuring");
+          else {
+            readable(name, property);
+            if (LOGGER_METHODS.has(name)) report("logger methods must not be destructured");
+          }
+          assignmentPattern(property.initializer);
+        }
+      }
+    } else if (
+      ts.isBinaryExpression(pattern) &&
+      pattern.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) {
+      assignmentPattern(pattern.left);
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    let specifier = importSpecifier(node);
+    if (
+      ts.isImportTypeNode(node) &&
+      ts.isLiteralTypeNode(node.argument) &&
+      ts.isStringLiteralLike(node.argument.literal)
+    ) {
+      specifier = node.argument.literal.text;
+    }
+    if (specifier !== undefined) {
+      if (specifier.startsWith(".")) {
+        const target = posix
+          .normalize(posix.join(posix.dirname(rel), specifier))
+          .replace(/\.(?:ts|js)$/, "");
+        if (!INTEGRATION_CORE_IMPORTS.has(target) && !integrationPath(target)) {
+          report(`imports forbidden core module '${specifier}'`);
+        }
+      } else if (specifier.startsWith("@solwyn/sdk") || specifier.startsWith("node:")) {
+        report(`imports forbidden core/runtime module '${specifier}'`);
+      }
+      if (
+        ts.isCallExpression(node) &&
+        node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+        providerSdkPackage(specifier)
+      ) {
+        report(`uses dynamic import of provider/framework SDK '${specifier}'`);
+      }
+    }
+    if (ts.isPropertyAccessExpression(node)) {
+      readable(node.name.text, node, node.expression.kind === ts.SyntaxKind.ThisKeyword);
+    }
+    if (ts.isElementAccessExpression(node)) {
+      const name = integrationMemberName(node);
+      if (name === undefined) report("reads a computed property");
+      else readable(name, node, node.expression.kind === ts.SyntaxKind.ThisKeyword);
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const name = integrationMemberName(node);
+      if (
+        name !== undefined &&
+        LOGGER_METHODS.has(name) &&
+        !(ts.isCallExpression(node.parent) && node.parent.expression === node)
+      ) {
+        report("logger methods must be called directly, never aliased");
+      }
+    }
+    if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent)) {
+      if (node.dotDotDotToken) report("uses rest destructuring");
+      else {
+        const name = propertyNameText(
+          node.propertyName ?? (ts.isIdentifier(node.name) ? node.name : undefined),
+        );
+        if (name === undefined) report("reads a computed property in destructuring");
+        else {
+          readable(name, node);
+          if (LOGGER_METHODS.has(name)) report("logger methods must not be destructured");
+        }
+      }
+    }
+    if (ts.isArrayBindingPattern(node)) report("uses array destructuring");
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken)
+      assignmentPattern(node.left);
+    if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node)) {
+      report(`uses opaque identifier '${node.text}' outside direct forwarding`);
+    }
+    if (ts.isIdentifier(node) && node.text === "fetch") report("references fetch");
+    if (ts.isCallExpression(node)) {
+      const name =
+        integrationMemberName(node.expression) ??
+        (ts.isIdentifier(node.expression) ? node.expression.text : undefined);
+      if (name !== undefined && LOGGER_METHODS.has(name)) {
+        for (const arg of node.arguments) {
+          if (ts.isStringLiteralLike(arg)) continue;
+          if (
+            ts.isTemplateExpression(arg) &&
+            arg.templateSpans.every(
+              (span) =>
+                ts.isIdentifier(span.expression) && RUN_ID_IDENTIFIER.test(span.expression.text),
+            )
+          )
+            continue;
+          report(
+            "logger arguments must be literal strings or templates with run-id identifiers only",
+          );
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return violations;
+}
 
 /** Wire content fields that must never be declared on the SDK<->Cloud wire models. */
 const FORBIDDEN_WIRE_FIELDS = [
@@ -512,7 +846,9 @@ function importSpecifier(node: ts.Node): string | undefined {
     ts.isCallExpression(node) &&
     (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
       (ts.isIdentifier(node.expression) && node.expression.text === "require")) &&
-    node.arguments.length === 1 &&
+    // import() accepts optional attributes; require() ignores extra arguments.
+    // Neither form may hide a banned dependency behind a second argument.
+    node.arguments.length >= 1 &&
     ts.isStringLiteralLike(node.arguments[0] as ts.Expression)
   ) {
     return (node.arguments[0] as ts.StringLiteralLike).text;
@@ -966,6 +1302,204 @@ describe("privacy firewall — banner set equals the content-privileged allowlis
 // Structural edge-safety guards.
 // ---------------------------------------------------------------------------
 
+describe("privacy firewall — integration source controls", () => {
+  const path = "src/langchain/mutation.ts";
+
+  it("scans integration files that exist without requiring framework directories", () => {
+    expect(ALL_SOURCES.flatMap((file) => findIntegrationViolations(file.text, file.rel))).toEqual(
+      [],
+    );
+  });
+
+  it.each([
+    "src/langchain/nested/leaf.ts",
+    "src/openai-agents/index.ts",
+    "src/integration-support.ts",
+  ])("applies the stricter rule to %s", (path) => {
+    expect(findIntegrationViolations("const value = request.prediction;", path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("property 'prediction'")]),
+    );
+  });
+
+  it("does not extend integration privileges or restrictions to other core files", () => {
+    expect(
+      findIntegrationViolations("const value = request.prediction;", "src/registry.ts"),
+    ).toEqual([]);
+    expect(isPrivileged("langchain/index.ts")).toBe(false);
+    expect(isPrivileged("openai-agents/index.ts")).toBe(false);
+    expect(isPrivileged("integration-support.ts")).toBe(false);
+  });
+
+  it.each([
+    ["property read", "const result = callOptions.prediction;", "property 'prediction'"],
+    ["optional property read", "const result = callOptions?.prediction;", "property 'prediction'"],
+    ["literal element read", 'const result = request["tools"];', "property 'tools'"],
+    ["computed element read", "const result = request[key];", "computed property"],
+    ["binding shorthand", "const { messages } = request;", "property 'messages'"],
+    ["aliased binding", "const { input: alias } = request;", "property 'input'"],
+    ["nested binding", "const { config: { prompt: alias } } = request;", "property 'prompt'"],
+    ["rest binding", "const { runId, ...rest } = request;", "rest destructuring"],
+    ["assignment shorthand", "({ response } = request);", "property 'response'"],
+    ["assignment alias", "({ content: alias } = request);", "property 'content'"],
+    ["array binding", "const [first] = request;", "array destructuring"],
+    ["array assignment", "[first] = request;", "array destructuring"],
+    [
+      "undeclared own member",
+      "class Handler { f() { return this.payload; } }",
+      "property 'payload'",
+    ],
+    [
+      "foreign class member",
+      "class Handler { payload = 1; f(other) { return other.payload; } }",
+      "property 'payload'",
+    ],
+    [
+      "nested class receiver",
+      "class A { payload = 1; f() { return class B { g() { return this.payload; } }; } }",
+      "property 'payload'",
+    ],
+    [
+      "non-arrow receiver",
+      "class A { payload = 1; f() { return function() { return this.payload; }; } }",
+      "property 'payload'",
+    ],
+  ])("rejects integration %s", (_label, source, diagnostic) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining(diagnostic)]),
+    );
+  });
+
+  it.each([
+    ["property access", "function f(opaque) { return opaque.runId; }"],
+    ["binding", "function f(_opaque) { const { runId } = _opaque; }"],
+    ["iteration", "function f(opaqueItems) { for (const item of opaqueItems) consume(item); }"],
+    ["aliasing", "function f(opaque) { const renamed = opaque; }"],
+    ["stringification", "function f(opaque) { return String(opaque); }"],
+    ["JSON stringification", "function f(opaque) { return JSON.stringify(opaque); }"],
+    ["reflection", "function f(opaque) { return Reflect.get(opaque, 'runId'); }"],
+    ["Object iteration", "function f(opaque) { return Object.values(opaque); }"],
+    ["template interpolation", `function f(opaque) { return \`\${opaque}\`; }`],
+    ["logging", "function f(opaque) { logger.warn(opaque); }"],
+    ["nested call argument", "function f(opaque) { return forward({ data: opaque }); }"],
+    ["argument spread", "function f(opaque) { return forward(...opaque); }"],
+  ])("rejects opaque %s", (_label, source) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("opaque")]),
+    );
+  });
+
+  it.each([
+    "transport",
+    "reporter",
+    "budget",
+    "lease",
+    "client",
+    "privacy",
+    "providers/openai",
+    "ai-sdk/index",
+    "registry",
+  ])("rejects integration imports of %s", (module) => {
+    for (const source of [
+      `import { x } from "../${module}";`,
+      `import type { X } from "../${module}";`,
+      `export { x } from "../${module}";`,
+      `const x = require("../${module}");`,
+      `const x = import("../${module}");`,
+      `const x = import("../${module}", {});`,
+      `type X = import("../${module}").X;`,
+    ]) {
+      expect(findIntegrationViolations(source, path), source).toEqual(
+        expect.arrayContaining([expect.stringContaining("import")]),
+      );
+    }
+  });
+
+  it.each([
+    "fetch(url)",
+    "const send = fetch;",
+    'globalThis["fetch"](url)',
+    "client.fetch(url)",
+  ])("rejects integration network capability %s", (source) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("fetch")]),
+    );
+  });
+
+  it.each([
+    "logger.warn(message)",
+    "this.#logger.warn(error)",
+    `logger.warn(\`failed \${reason}\`)`,
+    `logger.warn(\`failed \${scope.runId}\`)`,
+    "logger.warn('failed', { runId })",
+    "logger['warn'](error)",
+    "logger?.warn?.(error)",
+    "const warn = logger.warn; warn(error)",
+    "const { warn: emit } = logger; emit(error)",
+    "({ warn: emit } = logger); emit(error)",
+  ])("rejects integration logger arguments in %s", (source) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("logger")]),
+    );
+  });
+
+  it("permits structural reads, own members, opaque forwarding, and literal/run-id logs", () => {
+    const source = `
+      import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
+      import { requireDetachedRunFactory } from "../integration-support";
+      class Handler {
+        #scopes = new Map();
+        localCount = 0;
+        f(opaqueRequest, options, manager) {
+          const { runId, parentRunId: parent, config: { model } } = manager;
+          const signal = options["signal"];
+          this.localCount++;
+          const readOwn = () => this.#scopes;
+          logger.warn('closing a scope');
+          this.logger.warn(\`closing \${runId} under \${parentRunId}\`);
+          return forward(opaqueRequest, { ...opaqueOptions, signal });
+        }
+        logger;
+        passthrough(_opaqueResult) { return _opaqueResult; }
+        arrow = (opaqueResult) => opaqueResult;
+      }
+    `;
+    expect(findIntegrationViolations(source, path)).toEqual([]);
+  });
+
+  it.each(PROVIDER_SDK_PACKAGES)("blocks value imports and subpaths of %s", (pkg) => {
+    for (const specifier of [pkg, `${pkg}/resources/example`]) {
+      for (const source of [
+        `import X from "${specifier}";`,
+        `import {\n X,\n Y\n} from '${specifier}';`,
+        `import * as sdk from "${specifier}";`,
+        `import "${specifier}";`,
+        `import { type X } from "${specifier}";`,
+        `export { X } from "${specifier}";`,
+        `const X = require("${specifier}");`,
+        `const X = require("${specifier}", {});`,
+        `import X = require("${specifier}");`,
+      ]) {
+        expect(findProviderValueImportViolations(source, path), source).not.toEqual([]);
+      }
+      expect(
+        findProviderValueImportViolations(`import type { X } from "${specifier}";`, path),
+      ).toEqual([]);
+      expect(
+        findProviderValueImportViolations(`export type { X } from "${specifier}";`, path),
+      ).toEqual([]);
+      expect(findIntegrationViolations(`const X = import("${specifier}");`, path)).toEqual(
+        expect.arrayContaining([expect.stringContaining("dynamic import")]),
+      );
+      expect(findIntegrationViolations(`const X = import("${specifier}", {});`, path)).toEqual(
+        expect.arrayContaining([expect.stringContaining("dynamic import")]),
+      );
+      expect(
+        findProviderValueImportViolations(`const X = import("${specifier}");`, "src/registry.ts"),
+      ).toEqual([]);
+    }
+  });
+});
+
 describe("privacy firewall — structural edge-safety guards", () => {
   it("keeps every testing module non-privileged and inside the firewalled set", () => {
     expect(TESTING_SOURCES.map((file) => file.rel).sort()).toEqual([
@@ -1087,30 +1621,10 @@ describe("privacy firewall — structural edge-safety guards", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("no value import of a provider SDK anywhere in src (type-only / dynamic-in-try allowed)", () => {
-    const offenders: string[] = [];
-    for (const file of ALL_SOURCES) {
-      // Keep string literals (the package specifier); drop comment mentions of SDK names.
-      const code = stripComments(file.text);
-      for (const pkg of PROVIDER_SDK_PACKAGES) {
-        const escaped = pkg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        // Every static VALUE-import form that pulls the SDK into the module graph
-        // (all break invariant 3 with the peer absent); `import type` and
-        // `import("pkg")` dynamic-in-try are the only exempt forms:
-        //  - `import ... from "pkg"`      (default / named / namespace value import)
-        //  - `export ... from "pkg"`      (re-export — a value import + re-export)
-        //  - `import "pkg";`              (bare side-effect import)
-        const staticImports = [
-          new RegExp(`import\\s+(?!type\\b)[^;\\n]*?from\\s*["']${escaped}["']`),
-          new RegExp(`export\\s+(?!type\\b)[^;\\n]*?from\\s*["']${escaped}["']`),
-          new RegExp(`import\\s*["']${escaped}["']`),
-        ];
-        if (staticImports.some((re) => re.test(code))) {
-          offenders.push(`${file.rel}: value-imports provider SDK '${pkg}'`);
-        }
-      }
-    }
-    expect(offenders).toEqual([]);
+  it("no value import of a provider/framework SDK anywhere in src (whole-declaration type-only allowed)", () => {
+    expect(
+      ALL_SOURCES.flatMap((file) => findProviderValueImportViolations(file.text, file.rel)),
+    ).toEqual([]);
   });
 });
 

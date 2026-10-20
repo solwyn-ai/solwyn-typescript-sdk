@@ -94,3 +94,37 @@ export function runOutsideRun<T>(fn: () => T): T {
 export function setOutsideRunRunner(runner: OutsideRunRunner): void {
   (globalThis as GlobalWithOutsideRun)[OUTSIDE_RUN_KEY] = runner;
 }
+
+/** Internal, content-free run capability for framework attribution. */
+export interface DetachedRun {
+  readonly runId: string;
+  activate<T>(fn: () => T): T;
+  /** True if finished now or already finished; false while activations are active. */
+  tryFinish(): boolean;
+}
+
+export type DetachedRunFactory = (
+  name: string,
+  options?: { readonly tags?: Record<string, string> | null },
+) => DetachedRun;
+
+const DETACHED_RUN_FACTORY_KEY = Symbol.for("@solwyn/sdk.node.detachedRunFactory.v1");
+
+interface GlobalWithDetachedRunFactory {
+  [DETACHED_RUN_FACTORY_KEY]?: DetachedRunFactory;
+}
+
+/** Read the Node-installed factory without importing any Node-specific code. */
+export function getDetachedRunFactory(): DetachedRunFactory | undefined {
+  return (globalThis as GlobalWithDetachedRunFactory)[DETACHED_RUN_FACTORY_KEY];
+}
+
+/** Install the factory at Node entry import time, shared across module copies. */
+export function setDetachedRunFactory(factory: DetachedRunFactory): void {
+  (globalThis as GlobalWithDetachedRunFactory)[DETACHED_RUN_FACTORY_KEY] = factory;
+}
+
+/** Remove the factory to exercise runtimes without Node attribution (tests only). */
+export function resetDetachedRunFactory(): void {
+  delete (globalThis as GlobalWithDetachedRunFactory)[DETACHED_RUN_FACTORY_KEY];
+}

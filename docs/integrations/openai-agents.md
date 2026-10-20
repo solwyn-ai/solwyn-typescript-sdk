@@ -174,11 +174,31 @@ overlapping calls fail closed. Prefer separate, explicitly configured workflows.
 Agents normally turns tool exceptions into a fixed tool-result message. Set
 `errorFunction: solwynToolErrorFunction` on every function tool to preserve Solwyn denial and stop
 errors, including errors wrapped in a bounded `cause` chain. Agents wraps a rethrown decision in
-`ToolCallError.error`; `SolwynAgents.run`, streamed async iteration, and `completed` unwrap that
-branded Solwyn decision and reject with the exact original object. This also preserves denials
-and stops from a tool input guardrail's direct wrapped-client call, even when the guardrail fails
-before the tool starts. Catch `BudgetExceededError` or `RunStoppedError` around those integration
-entry points as you would around a direct wrapped-client call.
+`ToolCallError.error`. Agent input/output guardrail exceptions use `GuardrailExecutionError.error`;
+function-tool input/output guardrail exceptions use `ToolCallError.error`, including input
+guardrails that fail before the tool starts. Direct wrapped-client calls inside these guardrails
+retain core enforcement; their exceptions do not pass through the tool's `errorFunction`.
+
+`SolwynAgents.run`, streamed async iteration, and `completed` unwrap either wrapper when its
+immediate `.error` is a branded `SolwynError`, rejecting with that exact original object. Catch
+`BudgetExceededError` or `RunStoppedError` around these entry points as you would around a direct
+wrapped-client call. Recognition uses an `Error` with own `error` and `state` fields, preserving
+the behavior under class-name minification without importing Agents at runtime. The integration
+does not read `state` or recursively search guardrail exceptions' `cause` chains.
+
+**Blocked terminal tool output:** in Agents 0.20.0, when final output comes from a tool result
+(for example, with `toolUseBehavior: "stop_on_first_tool"`) and another output guardrail in the
+same batch trips, Agents sanitizes the failure before Solwyn receives it. Its
+`sanitizeBlockedOutputGuardrailError` rebuilds `GuardrailExecutionError` with a redacted plain
+`Error` in `.error`, replacing any original Solwyn denial or stop. Solwyn preserves that native
+wrapper, so exact error identity and typed `BudgetExceededError`/`RunStoppedError` catches are
+unavailable on this path. The wrapped-client call still enforces the denial or stop.
+
+Non-Solwyn guardrail exceptions retain their native `GuardrailExecutionError` or `ToolCallError`
+wrapper. Guardrail tripwire results also retain Agents' behavior: agent input/output tripwires
+remain `InputGuardrailTripwireTriggered`/`OutputGuardrailTripwireTriggered`, and tool input/output
+tripwires remain `ToolInputGuardrailTripwireTriggered`/`ToolOutputGuardrailTripwireTriggered`
+inside `ToolCallError.error`. Foreign failures with throwing accessors are preserved.
 
 Other tool exceptions receive Agents' unchanged default message. `errorFunction: null` is another
 option when every exception should propagate; ordinary failures retain Agents' `ToolCallError`

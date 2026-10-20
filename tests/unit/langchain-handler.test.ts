@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigurationError, SolwynError } from "../../src/errors";
 import { SolwynRunScopeHandler } from "../../src/langchain/index";
 import { createRun } from "../../src/node";
@@ -9,11 +9,24 @@ import {
   setDetachedRunFactory,
 } from "../../src/run-context";
 import { brandSolwynWrapper } from "../../src/wrapper-brand";
+import { trackIntegrationRuns } from "../helpers/integration-runs";
 
 const installedFactory = getDetachedRunFactory();
 if (!installedFactory) throw new Error("Node entry did not install the detached-run factory");
 const factory = installedFactory;
-afterEach(() => setDetachedRunFactory(factory));
+let tracker: ReturnType<typeof trackIntegrationRuns>;
+beforeEach(() => {
+  tracker = trackIntegrationRuns();
+});
+afterEach(() => {
+  try {
+    expect(tracker.active.size).toBe(0);
+    for (const handle of tracker.handles)
+      expect(() => handle.activate(() => undefined)).toThrow(/finished/);
+  } finally {
+    tracker.restore();
+  }
+});
 function start(
   handler: SolwynRunScopeHandler,
   id = "root",
@@ -44,13 +57,29 @@ function leaf(
   brandSolwynWrapper(client);
   return handler.chatCompletionsLeaf(client) as typeof client;
 }
-function counts(handler: SolwynRunScopeHandler) {
-  return ["runs", "models", "roots"].map(
-    (key) => (Reflect.get(handler, key) as Map<unknown, unknown>).size,
-  );
-}
 
 describe("LangChain structural run handler", () => {
+  it("keeps attribution state out of instance reflection", () => {
+    const handler = new SolwynRunScopeHandler({ tags: { suite: "synthetic" } });
+    start(handler);
+    bind(handler);
+    const publicKeys = [
+      "name",
+      "awaitHandlers",
+      "raiseError",
+      "ignoreLLM",
+      "ignoreChain",
+      "ignoreAgent",
+      "ignoreRetriever",
+      "ignoreCustomEvent",
+    ];
+    expect(Object.keys(handler)).toEqual(publicKeys);
+    expect(Reflect.ownKeys(handler)).toEqual(publicKeys);
+    for (const key of ["factory", "prefix", "tags", "runs", "models", "roots", "keys"])
+      expect(Reflect.get(handler, key)).toBeUndefined();
+    handler.handleChainEnd(undefined, "root");
+  });
+
   it("requires Node attribution and a branded client", () => {
     resetDetachedRunFactory();
     expect(() => new SolwynRunScopeHandler()).toThrow(ConfigurationError);
@@ -92,7 +121,7 @@ describe("LangChain structural run handler", () => {
     expect(root?.agentRunName).toBe("langchain:root_____");
     expect(node?.agentRunName).toBe("langchain:node_____");
     expect(node?.parentAgentRunId).toBe(root?.agentRunId);
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("fails closed on duplicate and missing hierarchy", () => {
     const handler = new SolwynRunScopeHandler();
@@ -102,10 +131,10 @@ describe("LangChain structural run handler", () => {
     expect(() => handler.handleChatModelStart(undefined, undefined, "m")).toThrow(SolwynError);
     expect(() => handler.handleLLMStart(undefined, undefined, "m", "unknown")).toThrow(SolwynError);
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("creates handles lazily, reuses node scopes, and keeps nested scopes distinct", async () => {
-    const make = vi.fn(factory);
+    const make = vi.fn(getDetachedRunFactory() ?? factory);
     setDetachedRunFactory(make);
     const handler = new SolwynRunScopeHandler({ tags: { suite: "synthetic" } });
     const client = leaf(handler);
@@ -136,7 +165,7 @@ describe("LangChain structural run handler", () => {
     expect(a?.tags).toEqual({ suite: "synthetic" });
     expect(make).toHaveBeenCalledTimes(3);
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("maps tools and retrievers as transparent structural edges", async () => {
     const handler = new SolwynRunScopeHandler();
@@ -154,7 +183,7 @@ describe("LangChain structural run handler", () => {
     handler.handleRetrieverEnd(undefined, "retriever");
     handler.handleToolEnd(undefined, "tool");
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("requires the matching handler and per-call signal key", async () => {
     const handler = new SolwynRunScopeHandler();
@@ -175,7 +204,36 @@ describe("LangChain structural run handler", () => {
     handler.bindModelCall({}, { runId: "m", handlers: [handler] });
     handler.handleLLMError(undefined, "m");
     handler.handleChainError(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
+  });
+  it("retires model keys and permits framework IDs to be reused after completion", async () => {
+    const handler = new SolwynRunScopeHandler();
+    const client = leaf(handler);
+    start(handler);
+    const oldOptions = bind(handler);
+    const first = (await client.chat.completions.create({}, oldOptions)) as NonNullable<
+      ReturnType<typeof getCurrentRun>
+    >;
+    handler.handleLLMEnd(undefined, "model");
+    expect(() => handler.bindModelCall({}, { runId: "model", handlers: [handler] })).toThrow(
+      /no matching/,
+    );
+    expect(() => client.chat.completions.create({}, oldOptions)).toThrow(/not admitted/);
+    bind(handler);
+    handler.handleChainEnd(undefined, "root");
+    expect(() => handler.bindModelCall({}, { runId: "model", handlers: [handler] })).toThrow(
+      /no matching/,
+    );
+    expect(tracker.active.size).toBe(0);
+
+    start(handler);
+    const second = (await client.chat.completions.create({}, bind(handler))) as NonNullable<
+      ReturnType<typeof getCurrentRun>
+    >;
+    expect(second.agentRunId).not.toBe(first.agentRunId);
+    expect(() => client.chat.completions.create({}, oldOptions)).toThrow(/not admitted/);
+    handler.handleChainError(undefined, "root");
+    expect(tracker.active.size).toBe(0);
   });
   it("links abort reasons, removes listeners, and invalidates finished model keys", async () => {
     const handler = new SolwynRunScopeHandler();
@@ -187,7 +245,7 @@ describe("LangChain structural run handler", () => {
     expect(options.signal?.aborted).toBe(true);
     expect(options.signal?.reason).toBe("synthetic cancellation");
     // Upstream can omit both model and root terminal callbacks on cancellation.
-    expect(counts(handler)).toEqual([1, 0, 1]);
+    expect(tracker.active.size).toBe(1);
     expect(remove).toHaveBeenCalledTimes(1);
     expect(() => leaf(handler).chat.completions.create({}, options)).toThrow(SolwynError);
     handler.handleLLMEnd(undefined, "m");
@@ -195,7 +253,7 @@ describe("LangChain structural run handler", () => {
     pre.abort("already cancelled");
     const earlier = bind(handler, "m2", "root", pre.signal);
     expect(earlier.signal?.reason).toBe("already cancelled");
-    expect(counts(handler)).toEqual([1, 0, 1]);
+    expect(tracker.active.size).toBe(1);
     expect(() => leaf(handler).chat.completions.create({}, earlier)).toThrow(SolwynError);
     handler.handleLLMError(undefined, "m2");
     handler.handleChainEnd(undefined, "root");
@@ -207,7 +265,7 @@ describe("LangChain structural run handler", () => {
     const abandoned = bind(handler, "abandoned", "root", cancelled.signal);
     const sibling = bind(handler, "sibling");
     cancelled.abort();
-    expect(counts(handler)).toEqual([1, 1, 1]);
+    expect(tracker.active.size).toBe(1);
     const client = leaf(handler);
     expect(() => client.chat.completions.create({}, abandoned)).toThrow(/not admitted/);
     await expect(client.chat.completions.create({}, sibling)).resolves.toMatchObject({
@@ -215,7 +273,7 @@ describe("LangChain structural run handler", () => {
     });
     handler.handleLLMEnd(undefined, "sibling");
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("propagates cancellation to every binding of the same model", () => {
     const handler = new SolwynRunScopeHandler();
@@ -232,12 +290,12 @@ describe("LangChain structural run handler", () => {
     cancellation.abort("synthetic cancellation");
     expect(first.signal?.reason).toBe("synthetic cancellation");
     expect(second.signal?.reason).toBe("synthetic cancellation");
-    expect(counts(handler)).toEqual([1, 0, 1]);
+    expect(tracker.active.size).toBe(1);
     const client = leaf(handler);
     for (const options of [first, second])
       expect(() => client.chat.completions.create({}, options)).toThrow(/not admitted/);
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("defers finishing a cancelled activation until its pending provider call settles", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -252,13 +310,13 @@ describe("LangChain structural run handler", () => {
     const client = leaf(handler, () => pending);
     const result = client.chat.completions.create({}, options);
     cancellation.abort();
-    expect(counts(handler)).toEqual([1, 0, 1]);
+    expect(tracker.active.size).toBe(1);
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 1]);
+    expect(tracker.active.size).toBe(1);
     expect(() => client.chat.completions.create({}, options)).toThrow(/not admitted/);
     resolve("synthetic completion");
     await expect(result).resolves.toBe("synthetic completion");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
     warn.mockRestore();
   });
   it("handleLLMEnd cleans up and rejects a successful unbound model", () => {
@@ -267,7 +325,7 @@ describe("LangChain structural run handler", () => {
     handler.handleChatModelStart(undefined, undefined, "m", "root");
     expect(() => handler.handleLLMEnd(undefined, "m")).toThrow(/not metered/);
     handler.handleChainError(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("handleLLMError cleans up an unbound model without masking its failure", () => {
     const handler = new SolwynRunScopeHandler();
@@ -275,7 +333,7 @@ describe("LangChain structural run handler", () => {
     handler.handleChatModelStart(undefined, undefined, "m", "root");
     expect(() => handler.handleLLMError(new Error("synthetic refusal"), "m")).not.toThrow();
     handler.handleChainError(undefined, "root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it.each([
     "handleChainEnd",
@@ -289,13 +347,13 @@ describe("LangChain structural run handler", () => {
     const options = bind(handler, "abandoned", "root", upstream.signal);
     const other = bind(handler, "other-model", "other-root");
     handler[method](undefined, "root");
-    expect(counts(handler)).toEqual([1, 1, 1]);
+    expect(tracker.active.size).toBe(1);
     expect(remove).toHaveBeenCalledExactlyOnceWith("abort", expect.any(Function));
     expect(() => leaf(handler).chat.completions.create({}, options)).toThrow(/not admitted/);
     expect(other.signal).toBeDefined();
     handler.handleLLMEnd(undefined, "other-model");
     handler.handleChainEnd(undefined, "other-root");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
   });
   it("finishes deferred scopes after an activation without masking its rejection", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -307,13 +365,13 @@ describe("LangChain structural run handler", () => {
     start(handler);
     const result = leaf(handler, () => pending).chat.completions.create({}, bind(handler));
     handler.handleChainEnd(undefined, "root");
-    expect(counts(handler)[2]).toBe(1);
+    expect(tracker.active.size).toBe(1);
     const failure = new SolwynError("synthetic denial");
     reject(failure);
     await expect(result).rejects.toBe(failure);
     expect(Reflect.get(failure, Symbol.for("langchain.errors.retryable"))).toBe(false);
     handler.handleLLMError(undefined, "model");
-    expect(counts(handler)).toEqual([0, 0, 0]);
+    expect(tracker.active.size).toBe(0);
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
   });

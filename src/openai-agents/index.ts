@@ -43,7 +43,12 @@ function violation(message: string): SolwynError {
   return new SolwynError(`openai-agents: ${message}`);
 }
 
-/** Agents wraps thrown tool/guardrail errors in .error rather than .cause. */
+/**
+ * Agents' ToolCallError (tools and their input/output guardrails) and
+ * GuardrailExecutionError (agent input/output guardrails) have own error/state fields.
+ * Unwrap only an immediate branded Solwyn decision. Ordinary failures and tripwires
+ * stay wrapped; tripwire classes carry result instead of error. State stays opaque.
+ */
 function unwrapToolDecision(error: unknown): unknown {
   try {
     // Agents' own error/state fields survive class-name minification; state stays opaque.
@@ -394,7 +399,7 @@ export class SolwynAgents {
   readonly modelProvider: ModelProvider;
   readonly #factory: DetachedRunFactory;
   readonly #attached = new WeakSet<Runner>();
-  private readonly invocations = new Map<string, Invocation>();
+  readonly #invocations = new Map<string, Invocation>();
 
   constructor(options: SolwynAgentsOptions) {
     this.#factory = requireDetachedRunFactory("openai-agents");
@@ -463,8 +468,8 @@ export class SolwynAgents {
     const frame = getCurrentRun();
     if (frame === undefined) return undefined;
     return (
-      this.invocations.get(frame.agentRunId) ??
-      (frame.parentAgentRunId == null ? undefined : this.invocations.get(frame.parentAgentRunId))
+      this.#invocations.get(frame.agentRunId) ??
+      (frame.parentAgentRunId == null ? undefined : this.#invocations.get(frame.parentAgentRunId))
     );
   }
 
@@ -494,12 +499,12 @@ export class SolwynAgents {
     const state = new Invocation(
       workflow,
       this.#factory,
-      (runId) => this.invocations.set(runId, state),
+      (runId) => this.#invocations.set(runId, state),
       (runId) => {
-        this.invocations.delete(runId);
+        this.#invocations.delete(runId);
       },
     );
-    this.invocations.set(workflow.runId, state);
+    this.#invocations.set(workflow.runId, state);
     return state;
   }
 

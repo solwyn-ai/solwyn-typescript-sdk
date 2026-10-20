@@ -1,6 +1,6 @@
 import type * as Agents from "@openai/agents";
 import type OpenAI from "openai";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BudgetExceededError,
   ConfigurationError,
@@ -10,7 +10,6 @@ import {
 import { noopLogger } from "../../src/logging";
 import { SolwynAgents, solwynToolErrorFunction } from "../../src/openai-agents/index";
 import {
-  type DetachedRun,
   getCurrentRun,
   getDetachedRunFactory,
   resetDetachedRunFactory,
@@ -20,12 +19,13 @@ import { clearRunTermination, markTerminated } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing/index";
 import { createFakeOpenAITransport } from "../helpers/fake-openai-transport";
 import { installIntegrationEnv } from "../helpers/integration-env";
+import { trackIntegrationRuns } from "../helpers/integration-runs";
 import { createAgentsTransport } from "../helpers/openai-agents-transport";
 
 let framework: typeof Agents;
 let OpenAIClient: typeof OpenAI;
 let env: ReturnType<typeof installIntegrationEnv>;
-const instances: SolwynAgents[] = [];
+let runTracker: ReturnType<typeof trackIntegrationRuns>;
 
 beforeAll(async () => {
   env = installIntegrationEnv();
@@ -34,10 +34,15 @@ beforeAll(async () => {
   framework.setTracingDisabled(true);
   OpenAIClient = (await import("openai")).default;
 });
+beforeEach(() => {
+  runTracker = trackIntegrationRuns();
+});
 afterAll(() => env.restore());
 afterEach(() => {
-  for (const instance of instances.splice(0))
-    expect((instance as unknown as { invocations: Map<string, unknown> }).invocations.size).toBe(0);
+  runTracker.restore();
+  expect(runTracker.active.size).toBe(0);
+  for (const handle of runTracker.handles)
+    expect(() => handle.activate(() => undefined)).toThrow(/finished/);
   expect(env.fetchAttempts).toEqual([]);
   expect(env.socketAttempts()).toBe(0);
 });
@@ -59,7 +64,6 @@ function setup(
   });
   const client = plane.wrap(raw, { provider: "openai", onUnmetered: "raise", ...settings.wrap });
   const integration = new SolwynAgents({ client, OpenAIProvider: framework.OpenAIProvider, api });
-  instances.push(integration);
   const runner = new framework.Runner({
     modelProvider: integration.modelProvider,
     tracingDisabled: true,
@@ -70,6 +74,17 @@ function setup(
 }
 
 describe("OpenAI Agents HTTP attribution", () => {
+  it("keeps invocation storage out of instance reflection", async () => {
+    const { integration, client } = setup();
+    try {
+      expect(Object.keys(integration)).toEqual(["modelProvider"]);
+      expect(Reflect.ownKeys(integration)).toEqual(["modelProvider"]);
+      expect(Reflect.get(integration, "invocations")).toBeUndefined();
+    } finally {
+      await client.close();
+    }
+  });
+
   it.each([
     "chat_completions",
     "responses",
@@ -109,9 +124,7 @@ describe("OpenAI Agents HTTP attribution", () => {
       expect(plane.unmatchedRequests).toEqual([]);
       if (streamed && api === "chat_completions")
         expect(transport.requests[0]?.body["stream_options"]).toEqual({ include_usage: true });
-      expect(
-        (integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
+      expect(runTracker.active.size).toBe(0);
     }
   });
 
@@ -247,22 +260,76 @@ async function invoke(setupResult: ReturnType<typeof setup>, streamed: boolean, 
   return result;
 }
 
+/** Observe the real Runner's rejection before the integration processes it. */
+function recordRunnerFailures(runner: Agents.Runner): unknown[] {
+  const failures: unknown[] = [];
+  const nativeRun = runner.run.bind(runner);
+  vi.spyOn(runner, "run").mockImplementation(async (...args) => {
+    try {
+      const result = await nativeRun(...args);
+      if (args[2]?.stream)
+        void result.completed.catch((error: unknown) => {
+          failures.push(error);
+        });
+      return result;
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  });
+  return failures;
+}
+
+async function observeFailure(state: ReturnType<typeof setup>, streamed: boolean) {
+  if (!streamed) return invoke(state, false).catch((error: unknown) => error);
+  const result = await state.integration.runStreamed(
+    state.runner,
+    state.agent,
+    "Synthetic input.",
+    {
+      workflow: "workflow",
+      tags: { team: "support" },
+    },
+  );
+  const failure = await (async () => {
+    for await (const _event of result) {
+      /* drain */
+    }
+  })().catch((error: unknown) => error);
+  await expect(result.completed).rejects.toBe(failure);
+  return failure;
+}
+
 describe("OpenAI Agents hierarchy and enforcement", () => {
   it.each([
     ["tool", "solwyn-test/deny"],
     ["tool", "solwyn-test/deny-stopped"],
     ["tool input guardrail", "solwyn-test/deny"],
     ["tool input guardrail", "solwyn-test/deny-stopped"],
+    ["tool output guardrail", "solwyn-test/deny"],
+    ["tool output guardrail", "solwyn-test/deny-stopped"],
+    ["input guardrail", "solwyn-test/deny"],
+    ["input guardrail", "solwyn-test/deny-stopped"],
+    ["output guardrail", "solwyn-test/deny"],
+    ["output guardrail", "solwyn-test/deny-stopped"],
   ] as const)("surfaces the exact %s decision for %s", async (source, model) => {
     for (const api of ["chat_completions", "responses"] as const) {
       for (const streamed of [false, true]) {
         const state = setup(api, {
-          transport: createAgentsTransport([{ kind: "tool", name: "lookup" }, { kind: "text" }]),
+          ...(source.startsWith("tool")
+            ? {
+                transport: createAgentsTransport([
+                  { kind: "tool", name: "lookup" },
+                  { kind: "text" },
+                ]),
+              }
+            : {}),
         });
         let decision: unknown;
         const deniedCall = async (): Promise<never> => {
           try {
-            await state.client.chat.completions.create({ model, messages: [] });
+            if (api === "responses") await state.client.responses.create({ model, input: [] });
+            else await state.client.chat.completions.create({ model, messages: [] });
           } catch (error) {
             decision = error;
             throw error;
@@ -287,8 +354,20 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
                   inputGuardrails: [{ name: "synthetic_guardrail", run: deniedCall }],
                 }
               : {}),
+            ...(source === "tool output guardrail"
+              ? {
+                  outputGuardrails: [{ name: "synthetic_guardrail", run: deniedCall }],
+                }
+              : {}),
           }),
         ];
+        if (source === "input guardrail")
+          state.agent.inputGuardrails = [
+            { name: "synthetic_guardrail", runInParallel: false, execute: deniedCall },
+          ];
+        if (source === "output guardrail")
+          state.agent.outputGuardrails = [{ name: "synthetic_guardrail", execute: deniedCall }];
+        const nativeFailures = recordRunnerFailures(state.runner);
         try {
           const options = { workflow: "workflow", tags: { team: "support" } };
           if (streamed) {
@@ -317,9 +396,16 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
             );
             expect(observed).toBe(decision);
           }
-          expect(execute).toHaveBeenCalledTimes(source === "tool" ? 1 : 0);
-          expect(state.transport.requests).toHaveLength(1);
-          expect(state.plane.checks).toHaveLength(2);
+          expect(nativeFailures).toHaveLength(1);
+          expect(nativeFailures[0]).toBeInstanceOf(
+            source.startsWith("tool") ? framework.ToolCallError : framework.GuardrailExecutionError,
+          );
+          expect((nativeFailures[0] as Agents.ToolCallError).error).toBe(decision);
+          expect(execute).toHaveBeenCalledTimes(
+            source === "tool" || source === "tool output guardrail" ? 1 : 0,
+          );
+          expect(state.transport.requests).toHaveLength(source === "input guardrail" ? 0 : 1);
+          expect(state.plane.checks).toHaveLength(source === "input guardrail" ? 1 : 2);
         } finally {
           await state.client.close();
         }
@@ -331,38 +417,190 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
   it.each([
     false,
     true,
-  ])("preserves an ordinary tool input guardrail failure (streamed=%s)", async (streamed) => {
-    const state = setup("chat_completions", {
-      transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]),
-    });
-    const original = new Error("synthetic guardrail failure");
-    const execute = vi.fn(() => "Synthetic result.");
-    state.agent.tools = [
-      framework.tool({
-        name: "lookup",
-        description: "Synthetic lookup",
-        parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
-        errorFunction: solwynToolErrorFunction,
-        execute,
-        inputGuardrails: [
-          {
+  ])("preserves Agents' sanitized wrapper when a sibling guardrail blocks terminal tool output (streamed=%s)", async (streamed) => {
+    for (const api of ["chat_completions", "responses"] as const) {
+      const state = setup(api, {
+        transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]),
+      });
+      let decision: unknown;
+      state.agent.toolUseBehavior = "stop_on_first_tool";
+      state.agent.tools = [
+        framework.tool({
+          name: "lookup",
+          description: "Synthetic lookup",
+          parameters: {
+            type: "object",
+            properties: {},
+            required: [],
+            additionalProperties: false,
+          },
+          execute: () => "Synthetic result.",
+        }),
+      ];
+      state.agent.outputGuardrails = [
+        {
+          name: "synthetic_denial",
+          execute: async () => {
+            try {
+              if (api === "responses")
+                await state.client.responses.create({ model: "solwyn-test/deny", input: [] });
+              else
+                await state.client.chat.completions.create({
+                  model: "solwyn-test/deny",
+                  messages: [],
+                });
+            } catch (error) {
+              decision = error;
+              throw error;
+            }
+            throw new Error("synthetic denied call unexpectedly succeeded");
+          },
+        },
+        {
+          name: "synthetic_tripwire",
+          execute: async () => ({ tripwireTriggered: true, outputInfo: undefined }),
+        },
+      ];
+      const nativeFailures = recordRunnerFailures(state.runner);
+      try {
+        const observed = await observeFailure(state, streamed);
+        expect(decision).toBeInstanceOf(BudgetExceededError);
+        expect(observed).toBeInstanceOf(framework.GuardrailExecutionError);
+        expect(nativeFailures).toHaveLength(1);
+        expect(observed).toBe(nativeFailures[0]);
+        const redacted = (observed as Agents.GuardrailExecutionError).error;
+        expect(redacted).toBeInstanceOf(Error);
+        expect((redacted as Error).constructor).toBe(Error);
+        expect(redacted).not.toBe(decision);
+        expect(state.transport.requests).toHaveLength(1);
+      } finally {
+        await state.client.close();
+      }
+      expect(state.plane.denialReceipts).toHaveLength(1);
+    }
+  });
+
+  it.each([
+    ["input", false],
+    ["input", true],
+    ["output", false],
+    ["output", true],
+    ["tool input", false],
+    ["tool input", true],
+    ["tool output", false],
+    ["tool output", true],
+  ] as const)("preserves %s guardrail failures (tripwire=%s)", async (source, tripwire) => {
+    for (const api of ["chat_completions", "responses"] as const)
+      for (const streamed of [false, true]) {
+        const state = setup(api, {
+          ...(source.startsWith("tool")
+            ? { transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]) }
+            : {}),
+        });
+        const original = new Error("synthetic guardrail failure");
+        const outputInfo = { marker: "synthetic" };
+        const execute = vi.fn(() => "Synthetic result.");
+        const guardrail = {
+          name: "synthetic_guardrail",
+          execute: async () => {
+            if (!tripwire) throw original;
+            return { tripwireTriggered: true, outputInfo };
+          },
+        };
+        if (source === "input")
+          state.agent.inputGuardrails = [{ ...guardrail, runInParallel: false }];
+        if (source === "output") state.agent.outputGuardrails = [guardrail];
+        if (source.startsWith("tool")) {
+          const toolGuardrail = {
             name: "synthetic_guardrail",
             run: async () => {
-              throw original;
+              if (!tripwire) throw original;
+              return framework.ToolGuardrailFunctionOutputFactory.throwException(outputInfo);
             },
+          };
+          state.agent.tools = [
+            framework.tool({
+              name: "lookup",
+              description: "Synthetic lookup",
+              parameters: {
+                type: "object",
+                properties: {},
+                required: [],
+                additionalProperties: false,
+              },
+              errorFunction: solwynToolErrorFunction,
+              execute,
+              ...(source === "tool input"
+                ? { inputGuardrails: [toolGuardrail] }
+                : { outputGuardrails: [toolGuardrail] }),
+            }),
+          ];
+        }
+        const nativeFailures = recordRunnerFailures(state.runner);
+        try {
+          const observed = await observeFailure(state, streamed);
+          expect(nativeFailures).toEqual([observed]);
+          expect(observed).toBe(nativeFailures[0]);
+          if (tripwire) {
+            const classes = {
+              input: framework.InputGuardrailTripwireTriggered,
+              output: framework.OutputGuardrailTripwireTriggered,
+              "tool input": framework.ToolInputGuardrailTripwireTriggered,
+              "tool output": framework.ToolOutputGuardrailTripwireTriggered,
+            };
+            const tripwireError = source.startsWith("tool")
+              ? (observed as Agents.ToolCallError).error
+              : observed;
+            expect(tripwireError).toBeInstanceOf(classes[source]);
+            expect(
+              (tripwireError as Agents.InputGuardrailTripwireTriggered).result.output.outputInfo,
+            ).toBe(outputInfo);
+            expect(Object.hasOwn(tripwireError as object, "error")).toBe(false);
+          } else {
+            expect(observed).toBeInstanceOf(
+              source.startsWith("tool")
+                ? framework.ToolCallError
+                : framework.GuardrailExecutionError,
+            );
+            expect((observed as Agents.ToolCallError).error).toBe(original);
+          }
+          expect(execute).toHaveBeenCalledTimes(source === "tool output" ? 1 : 0);
+          expect(state.transport.requests).toHaveLength(source === "input" ? 0 : 1);
+        } finally {
+          await state.client.close();
+        }
+      }
+  });
+
+  it.each([
+    "error",
+    "state",
+  ] as const)("preserves foreign errors with a throwing %s accessor", async (field) => {
+    for (const api of ["chat_completions", "responses"] as const)
+      for (const streamed of [false, true]) {
+        const state = setup(api);
+        const original = Object.assign(new Error("synthetic foreign failure"), {
+          error: new Error("synthetic ordinary failure"),
+          state: undefined,
+        });
+        Object.defineProperty(original, field, {
+          get() {
+            throw new Error("synthetic accessor failure");
           },
-        ],
-      }),
-    ];
-    try {
-      const observed = await invoke(state, streamed).catch((error: unknown) => error);
-      expect(observed).toBeInstanceOf(framework.ToolCallError);
-      expect((observed as Agents.ToolCallError).error).toBe(original);
-      expect(execute).not.toHaveBeenCalled();
-      expect(state.transport.requests).toHaveLength(1);
-    } finally {
-      await state.client.close();
-    }
+        });
+        state.runner.on("agent_start", () => {
+          throw original;
+        });
+        const nativeFailures = recordRunnerFailures(state.runner);
+        try {
+          await expect(observeFailure(state, streamed)).resolves.toBe(original);
+          expect(nativeFailures).toHaveLength(1);
+          expect(nativeFailures[0]).toBe(original);
+          expect(state.transport.requests).toHaveLength(0);
+        } finally {
+          await state.client.close();
+        }
+      }
   });
 
   it.each([
@@ -484,9 +722,7 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
     const [stopped] = denials;
     expect(stopped?.agent_run_id).toBe(first?.agent_run_id);
     expect(second?.agent_run_id).not.toBe(first?.agent_run_id);
-    expect(
-      (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-    ).toBe(0);
+    expect(runTracker.active.size).toBe(0);
   });
 
   it.each([
@@ -678,9 +914,7 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
         expect(state.transport.requests).toHaveLength(0);
         expect(state.plane.checks).toHaveLength(1);
         expect(state.plane.denialReceipts).toHaveLength(1);
-        expect(
-          (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-        ).toBe(0);
+        expect(runTracker.active.size).toBe(0);
       }
   });
 });
@@ -1011,9 +1245,7 @@ describe("OpenAI Agents fail-closed boundaries", () => {
         await state.client.close();
       }
       expect(state.transport.requests).toHaveLength(1);
-      expect(
-        (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
+      expect(runTracker.active.size).toBe(0);
     }
   });
 
@@ -1242,7 +1474,6 @@ describe("OpenAI Agents refusal identity", () => {
         OpenAIProvider: RefusedProvider,
         api: "responses",
       });
-      instances.push(integration);
       const runner = new framework.Runner({
         modelProvider: integration.modelProvider,
         tracingDisabled: true,
@@ -1279,27 +1510,6 @@ describe("OpenAI Agents refusal identity", () => {
 });
 
 describe("OpenAI Agents stream and handle lifecycle", () => {
-  function trackRuns() {
-    const factory = getDetachedRunFactory();
-    if (factory === undefined) throw new Error("Node test seam missing");
-    const handles: DetachedRun[] = [];
-    const deferred: string[] = [];
-    setDetachedRunFactory((name, options) => {
-      const handle = factory(name, options);
-      handles.push(handle);
-      return {
-        runId: handle.runId,
-        activate: (fn) => handle.activate(fn),
-        tryFinish: () => {
-          const finished = handle.tryFinish();
-          if (!finished) deferred.push(handle.runId);
-          return finished;
-        },
-      };
-    });
-    return { handles, deferred, restore: () => setDetachedRunFactory(factory) };
-  }
-
   it.each([
     "success",
     "error",
@@ -1307,7 +1517,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
     "stream",
     "early-return",
   ])("finishes every handle after %s", async (scenario) => {
-    const tracker = trackRuns();
+    const tracker = trackIntegrationRuns();
     const state = setup(
       "chat_completions",
       scenario === "error"
@@ -1316,6 +1526,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
           ? { transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]) }
           : {},
     );
+    const deletedEntries = vi.spyOn(Map.prototype, "delete");
     if (scenario === "max-turns") {
       state.agent.tools = [
         framework.tool({
@@ -1351,13 +1562,18 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
         );
         expect(result.cancelled).toBe(true);
       } else await invoke(state, scenario === "stream");
-      expect(
-        (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-      ).toBe(0);
-      for (const handle of tracker.handles)
+      expect(runTracker.active.size).toBe(0);
+      expect(tracker.handles.length).toBeGreaterThan(0);
+      for (const handle of tracker.handles) {
         expect(() => handle.activate(() => undefined)).toThrow(/finished/);
+        expect(
+          deletedEntries.mock.calls.some(([runId]) => runId === handle.runId),
+          "finished runs must be removed from invocation storage",
+        ).toBe(true);
+      }
       if (scenario === "max-turns") expect(tracker.handles).toHaveLength(2);
     } finally {
+      deletedEntries.mockRestore();
       tracker.restore();
       await state.client.close();
     }
@@ -1368,7 +1584,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
     true,
   ])("releases invocation state after abort (streamed=%s)", async (streamed) => {
     for (const api of ["chat_completions", "responses"] as const) {
-      const tracker = trackRuns();
+      const tracker = trackIntegrationRuns();
       const controller = new AbortController();
       let started!: () => void;
       const entered = new Promise<void>((resolve) => {
@@ -1475,7 +1691,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
   });
 
   it("defers finishing active handles when completion races provider work and retries after it settles", async () => {
-    const tracker = trackRuns();
+    const tracker = trackIntegrationRuns();
     let release!: () => void;
     let started!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -1517,11 +1733,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
       await result.completed;
       expect(tracker.deferred).not.toHaveLength(0);
       release();
-      await vi.waitFor(() =>
-        expect(
-          (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
-        ).toBe(0),
-      );
+      await vi.waitFor(() => expect(runTracker.active.size).toBe(0));
       for (const handle of tracker.handles)
         expect(() => handle.activate(() => undefined)).toThrow(/finished/);
     } finally {

@@ -90,16 +90,16 @@ export class SolwynRunScopeHandler {
   readonly ignoreRetriever = false;
   readonly ignoreCustomEvent = true;
 
-  private readonly factory: DetachedRunFactory;
-  private readonly prefix: string;
-  private readonly tags: Record<string, string> | undefined;
-  private readonly runs = new Map<string, StructuralRun>();
-  private readonly models = new Map<string, ModelRun>();
-  private readonly roots = new Map<string, Root>();
-  private readonly keys = new WeakMap<AbortSignal, Scope>();
+  readonly #factory: DetachedRunFactory;
+  readonly #prefix: string;
+  readonly #tags: Record<string, string> | undefined;
+  readonly #runs = new Map<string, StructuralRun>();
+  readonly #models = new Map<string, ModelRun>();
+  readonly #roots = new Map<string, Root>();
+  readonly #keys = new WeakMap<AbortSignal, Scope>();
 
   constructor(options: SolwynRunScopeHandlerOptions = {}) {
-    this.factory = requireDetachedRunFactory("LangChain");
+    this.#factory = requireDetachedRunFactory("LangChain");
     const prefix = options.namePrefix ?? "langchain";
     if (
       typeof prefix !== "string" ||
@@ -110,8 +110,8 @@ export class SolwynRunScopeHandler {
         field: null,
       });
     }
-    this.prefix = prefix;
-    this.tags = copyTags(options.tags, "tags");
+    this.#prefix = prefix;
+    this.#tags = copyTags(options.tags, "tags");
   }
 
   copy(): this {
@@ -200,7 +200,7 @@ export class SolwynRunScopeHandler {
       return refusal("LangChain model call requires its run manager");
     }
     const manager = runManager as RunManagerLike;
-    const model = this.models.get(manager.runId);
+    const model = this.#models.get(manager.runId);
     if (
       !Array.isArray(manager.handlers) ||
       !manager.handlers.includes(this) ||
@@ -217,11 +217,11 @@ export class SolwynRunScopeHandler {
       // but leave the root and siblings to their own lifecycle callbacks.
       model.bindings.get(signal)?.();
       model.bindings.delete(signal);
-      this.keys.delete(signal);
+      this.#keys.delete(signal);
       if (model.bindings.size === 0) this.endModel(manager.runId);
     };
     model.bindings.set(signal, () => upstream?.removeEventListener("abort", abort));
-    this.keys.set(signal, model.scope);
+    this.#keys.set(signal, model.scope);
     model.bound = true;
     if (upstream?.aborted) abort();
     else upstream?.addEventListener("abort", abort, { once: true });
@@ -234,8 +234,8 @@ export class SolwynRunScopeHandler {
     const wrapped = client as ChatClient;
     const create = (opaqueRequest: unknown, options?: SignalOptions): Promise<unknown> => {
       const signal = signalOf(options);
-      const scope = signal === undefined ? undefined : this.keys.get(signal);
-      if (scope === undefined || this.roots.get(scope.rootRunId)?.closed !== false) {
+      const scope = signal === undefined ? undefined : this.#keys.get(signal);
+      if (scope === undefined || this.#roots.get(scope.rootRunId)?.closed !== false) {
         return refusal("LangChain call has no bound Solwyn signal key; path is not admitted");
       }
       try {
@@ -288,11 +288,11 @@ export class SolwynRunScopeHandler {
   }
 
   private assertNew(runId: string): void {
-    if (this.runs.has(runId) || this.models.has(runId) || this.roots.has(runId))
+    if (this.#runs.has(runId) || this.#models.has(runId) || this.#roots.has(runId))
       refusal("LangChain duplicate run ID");
   }
   private parent(parentRunId: string | undefined): StructuralRun {
-    const parent = parentRunId == null ? undefined : this.runs.get(parentRunId);
+    const parent = parentRunId == null ? undefined : this.#runs.get(parentRunId);
     if (parent === undefined) return refusal("LangChain run requires a mapped parent chain");
     return parent;
   }
@@ -307,13 +307,13 @@ export class SolwynRunScopeHandler {
       const scope: Scope = {
         rootRunId: runId,
         scopeName: scopeName(
-          this.prefix,
+          this.#prefix,
           typeof runName === "string" && runName.length > 0 ? runName : "chain",
         ),
         nodeScopes: new Map(),
       };
-      this.roots.set(runId, { scopes: new Set([scope]), closed: false });
-      this.runs.set(runId, { rootRunId: runId, scope });
+      this.#roots.set(runId, { scopes: new Set([scope]), closed: false });
+      this.#runs.set(runId, { rootRunId: runId, scope });
       return;
     }
     const parent = this.parent(parentRunId);
@@ -326,28 +326,28 @@ export class SolwynRunScopeHandler {
         nodeScope = {
           rootRunId: parent.rootRunId,
           nodeName,
-          scopeName: scopeName(this.prefix, nodeName),
+          scopeName: scopeName(this.#prefix, nodeName),
           parentScope: scope,
           nodeScopes: new Map(),
         };
         scope.nodeScopes.set(nodeName, nodeScope);
-        this.roots.get(parent.rootRunId)?.scopes.add(nodeScope);
+        this.#roots.get(parent.rootRunId)?.scopes.add(nodeScope);
       }
       scope = nodeScope;
     }
-    this.runs.set(runId, { rootRunId: parent.rootRunId, scope });
+    this.#runs.set(runId, { rootRunId: parent.rootRunId, scope });
   }
   private startEdge(runId: string, parentRunId: string | undefined): void {
     this.assertNew(runId);
-    this.runs.set(runId, this.parent(parentRunId));
+    this.#runs.set(runId, this.parent(parentRunId));
   }
   private materialize(scope: Scope): DetachedRun {
     if (scope.handle === undefined) {
       if (scope.parentScope === undefined)
-        scope.handle = this.factory(scope.scopeName, { tags: this.tags });
+        scope.handle = this.#factory(scope.scopeName, { tags: this.#tags });
       else {
         const parent = this.materialize(scope.parentScope);
-        scope.handle = runOutsideRun(() => parent.activate(() => this.factory(scope.scopeName)));
+        scope.handle = runOutsideRun(() => parent.activate(() => this.#factory(scope.scopeName)));
       }
     }
     return scope.handle;
@@ -356,38 +356,38 @@ export class SolwynRunScopeHandler {
     this.assertNew(runId);
     const parent = this.parent(parentRunId);
     this.materialize(parent.scope);
-    this.models.set(runId, { ...parent, bound: false, bindings: new Map() });
+    this.#models.set(runId, { ...parent, bound: false, bindings: new Map() });
   }
   private endModel(runId: string): ModelRun | undefined {
-    const model = this.models.get(runId);
+    const model = this.#models.get(runId);
     if (model === undefined) return;
-    this.models.delete(runId);
+    this.#models.delete(runId);
     for (const signal of model.bindings.keys()) {
       model.bindings.get(signal)?.();
-      this.keys.delete(signal);
+      this.#keys.delete(signal);
     }
     this.finishClosedRoot(model.rootRunId);
     return model;
   }
   private end(runId: string): void {
-    const run = this.runs.get(runId);
+    const run = this.#runs.get(runId);
     if (run === undefined) return;
-    this.runs.delete(runId);
+    this.#runs.delete(runId);
     if (run.rootRunId === runId) {
-      const root = this.roots.get(runId);
+      const root = this.#roots.get(runId);
       if (root === undefined) return;
       root.closed = true;
-      for (const childRunId of this.runs.keys()) {
-        if (this.runs.get(childRunId)?.rootRunId === runId) this.runs.delete(childRunId);
+      for (const childRunId of this.#runs.keys()) {
+        if (this.#runs.get(childRunId)?.rootRunId === runId) this.#runs.delete(childRunId);
       }
-      for (const modelRunId of this.models.keys()) {
-        if (this.models.get(modelRunId)?.rootRunId === runId) this.endModel(modelRunId);
+      for (const modelRunId of this.#models.keys()) {
+        if (this.#models.get(modelRunId)?.rootRunId === runId) this.endModel(modelRunId);
       }
       this.finishClosedRoot(runId);
     }
   }
   private finishClosedRoot(rootRunId: string): void {
-    const root = this.roots.get(rootRunId);
+    const root = this.#roots.get(rootRunId);
     if (root === undefined || !root.closed) return;
     for (const scope of root.scopes) {
       if (scope.handle === undefined || scope.handle.tryFinish()) root.scopes.delete(scope);
@@ -400,6 +400,6 @@ export class SolwynRunScopeHandler {
         }
       }
     }
-    if (root.scopes.size === 0) this.roots.delete(rootRunId);
+    if (root.scopes.size === 0) this.#roots.delete(rootRunId);
   }
 }

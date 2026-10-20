@@ -17,10 +17,15 @@ corresponding release notes before users upgrade.
   wrapped client alone owns enforcement and settlement. Nested agent-as-tool calls, unexpected
   models, missing hierarchy, and concurrent attempts fail closed with typed errors. Streaming
   completion and iteration preserve latched decisions and release state after completion or
-  cancellation. Tool-code and tool-input-guardrail denials and stops surface the exact original
-  Solwyn error from `run`, streamed iteration, and `completed`, including in minified bundles.
+  cancellation. Tool-code, agent input/output guardrail, and tool input/output guardrail denials
+  and stops surface the exact original Solwyn error from `run`, streamed iteration, and
+  `completed` when Agents preserves the branded decision, including in minified bundles.
+  Agents 0.20.0 redacts the decision to a plain error when a sibling output guardrail trips on
+  terminal tool output; that native wrapper is preserved. Non-Solwyn failures and guardrail
+  tripwires retain their native wrappers.
   Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
   still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
+  Invocation storage uses JavaScript private fields and is absent from instance reflection.
   Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.
 
 - **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
@@ -34,6 +39,8 @@ corresponding release notes before users upgrade.
   termination and Node.js 22 abort-and-drain can omit upstream root callbacks; these paths
   require an invocation-local handler rather than a reused handler. Scope names replace Unicode
   format and separator characters, and invalid `namePrefix` values are rejected eagerly.
+  Internal attribution state uses JavaScript private fields, keeping maps and configured tags
+  out of instance reflection.
   Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.
 

@@ -28,6 +28,7 @@ class HttpProvider {
 }
 assert.throws(() => new SolwynAgents({ client: {}, OpenAIProvider: HttpProvider }), {
   name: "ConfigurationError",
+  field: null,
 });
 const { Solwyn } = await import(nodeEntry);
 const { FakeControlPlane } = await import(testingEntry);

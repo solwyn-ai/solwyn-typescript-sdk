@@ -140,9 +140,9 @@ import {SolwynRunScopeHandler} from '@solwyn/sdk/langchain';
 import {SolwynAgents} from '@solwyn/sdk/openai-agents';
 globalThis.reviewDone=(async()=>{
   let langchainNodeRequired=false;
-  try{new SolwynRunScopeHandler();}catch(failure){if(!(failure instanceof ConfigurationError))throw failure;langchainNodeRequired=true;}
+  try{new SolwynRunScopeHandler();}catch(failure){if(!(failure instanceof ConfigurationError)||failure.field!==null)throw failure;langchainNodeRequired=true;}
   let openaiAgentsNodeRequired=false;
-  try{new SolwynAgents({client:{},OpenAIProvider:class {}});}catch(failure){if(!(failure instanceof ConfigurationError))throw failure;openaiAgentsNodeRequired=true;}
+  try{new SolwynAgents({client:{},OpenAIProvider:class {}});}catch(failure){if(!(failure instanceof ConfigurationError)||failure.field!==null)throw failure;openaiAgentsNodeRequired=true;}
   if(!openaiAgentsNodeRequired)throw new Error('Agents attribution must require the Node entry');
   if(!langchainNodeRequired)throw new Error('LangChain attribution must require the Node entry');
   let unexpectedFetch=0;

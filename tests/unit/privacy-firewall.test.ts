@@ -696,7 +696,8 @@ function isOpaqueExpressionForward(
     ts.isAsExpression(expression.parent) ||
     ts.isTypeAssertionExpression(expression.parent) ||
     ts.isNonNullExpression(expression.parent) ||
-    ts.isSatisfiesExpression(expression.parent)
+    ts.isSatisfiesExpression(expression.parent) ||
+    ts.isAwaitExpression(expression.parent)
   )
     expression = expression.parent;
   const parent = expression.parent;
@@ -780,7 +781,18 @@ function isOpaqueExpressionForward(
   return used && safe;
 }
 
-/** Reusable source-string rule; directory discovery is independent and tolerates absent integrations. */
+/**
+ * Single-file, conservative source rule, not a general TypeScript information-flow proof.
+ * Symbol taint is monotonic across branches, loops, and scopes: a fresh assignment never
+ * declassifies a value. Local helper returns/arguments reach a fixed point, including cycles.
+ * Opaque-result writes and guarded-binding mutations/assignment aliases fail closed rather
+ * than attempting path-sensitive heap or control-flow analysis. Computed reads, reflection,
+ * unresolved opaque helpers, and escaping opaque closures remain rejected by the rules below.
+ * Imports/ambient types cannot grant authority; provider guards and structural capabilities
+ * still depend on the reviewed source shapes/property lists. This is no whole-program proof
+ * against arbitrary JavaScript metaprogramming or side effects hidden in external code.
+ * Directory discovery is independent and tolerates absent integrations.
+ */
 function findIntegrationViolations(text: string, path: string): string[] {
   const rel = integrationPath(path);
   if (rel === undefined) return [];
@@ -803,16 +815,87 @@ function findIntegrationViolations(text: string, path: string): string[] {
   // iteration bindings. Names and type annotations cannot declassify a response.
   const opaqueResults = new Set<ts.Symbol>();
   const opaqueFactories = new Set<ts.Symbol>();
+  const opaqueHelpers = new Set<ts.Symbol>();
   const caughtErrors = new Set<ts.Symbol>();
-  const symbolOf = (node: ts.Node): ts.Symbol | undefined => checker.getSymbolAtLocation(node);
-  const derived = (node: ts.Node): boolean => {
+  const guardedBindings = new Set<ts.Symbol>();
+  const guardInitializations = new Set<ts.Node>();
+  const symbolOf = (node: ts.Node): ts.Symbol | undefined =>
+    ts.isIdentifier(node) && ts.isShorthandPropertyAssignment(node.parent)
+      ? checker.getShorthandAssignmentValueSymbol(node.parent)
+      : checker.getSymbolAtLocation(node);
+  const unwrap = (node: ts.Node): ts.Node => {
+    while (
+      ts.isAwaitExpression(node) ||
+      ts.isParenthesizedExpression(node) ||
+      ts.isAsExpression(node) ||
+      ts.isTypeAssertionExpression(node) ||
+      ts.isNonNullExpression(node) ||
+      ts.isSatisfiesExpression(node)
+    )
+      node = node.expression;
+    return node;
+  };
+  const assignment = (node: ts.Node): node is ts.BinaryExpression =>
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+    node.operatorToken.kind <= ts.SyntaxKind.LastAssignment;
+  const targets = (node: ts.Node): ts.Node[] => {
+    node = unwrap(node);
+    if (ts.isObjectLiteralExpression(node))
+      return node.properties.flatMap((property) =>
+        ts.isShorthandPropertyAssignment(property)
+          ? targets(property.name)
+          : ts.isPropertyAssignment(property)
+            ? targets(property.initializer)
+            : ts.isSpreadAssignment(property)
+              ? targets(property.expression)
+              : [],
+      );
+    if (ts.isArrayLiteralExpression(node)) return node.elements.flatMap(targets);
+    if (ts.isObjectBindingPattern(node) || ts.isArrayBindingPattern(node))
+      return node.elements.flatMap(targets);
+    if (ts.isBindingElement(node)) return targets(node.name);
+    if (ts.isSpreadElement(node)) return targets(node.expression);
+    if (assignment(node)) return targets(node.left);
+    return ts.isIdentifier(node) ||
+      ts.isPropertyAccessExpression(node) ||
+      ts.isElementAccessExpression(node)
+      ? [node]
+      : [];
+  };
+  const guarded = (node: ts.Node): boolean => {
+    node = unwrap(node);
+    const symbol = symbolOf(ts.isPropertyAccessExpression(node) ? node.name : node);
+    return (
+      !!(symbol && guardedBindings.has(symbol)) ||
+      ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) &&
+        guarded(node.expression))
+    );
+  };
+  const returned = (fn: ts.SignatureDeclaration | ts.JSDocSignature): ts.Expression[] => {
+    if (!("body" in fn) || !fn.body) return [];
+    const body = fn.body as ts.ConciseBody;
+    if (!ts.isBlock(body)) return [body];
+    const values: ts.Expression[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isReturnStatement(node) && node.expression) values.push(node.expression);
+      else if (!ts.isFunctionLike(node)) ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(body, visit);
+    return values;
+  };
+  const derived = (node: ts.Node, seen = new Set<ts.Node>()): boolean => {
+    node = unwrap(node);
+    if (seen.has(node)) return false;
+    const next = new Set(seen).add(node);
     if (ts.isIdentifier(node)) {
       const symbol = symbolOf(node);
       return symbol !== undefined && opaqueResults.has(symbol);
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       if (["completed", "done"].includes(integrationMemberName(node) ?? "")) return false;
-      return derived(node.expression);
+      const symbol = symbolOf(ts.isPropertyAccessExpression(node) ? node.name : node);
+      return !!(symbol && opaqueResults.has(symbol)) || derived(node.expression, next);
     }
     if (ts.isCallExpression(node)) {
       if (isProviderForward(node, checker)) return true;
@@ -821,43 +904,112 @@ function findIntegrationViolations(text: string, path: string): string[] {
       if (
         (ts.isPropertyAccessExpression(node.expression) ||
           ts.isElementAccessExpression(node.expression)) &&
-        derived(node.expression.expression)
+        derived(node.expression.expression, next)
       )
         return true;
-      return node.arguments.some(derived);
+      const target = checker.getResolvedSignature(node)?.declaration;
+      if (
+        target?.getSourceFile() === source &&
+        returned(target).some((value) => derived(value, next))
+      )
+        return true;
+      return node.arguments.some((arg) => derived(arg, next));
     }
-    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
-      if (!ts.isBlock(node.body)) return derived(node.body);
-      let opaque = false;
-      const returns = (child: ts.Node): void => {
-        if (ts.isReturnStatement(child) && child.expression && derived(child.expression))
-          opaque = true;
-        else if (!ts.isFunctionLike(child)) ts.forEachChild(child, returns);
-      };
-      ts.forEachChild(node.body, returns);
-      return opaque;
-    }
+    if (ts.isFunctionLike(node)) return returned(node).some((value) => derived(value, next));
     if (
-      ts.isAwaitExpression(node) ||
-      ts.isParenthesizedExpression(node) ||
-      ts.isAsExpression(node) ||
-      ts.isNonNullExpression(node)
+      ts.isConditionalExpression(node) ||
+      ts.isBinaryExpression(node) ||
+      ts.isObjectLiteralExpression(node) ||
+      ts.isArrayLiteralExpression(node) ||
+      ts.isPropertyAssignment(node) ||
+      ts.isShorthandPropertyAssignment(node) ||
+      ts.isSpreadAssignment(node) ||
+      ts.isSpreadElement(node) ||
+      ts.isTemplateExpression(node) ||
+      ts.isTemplateSpan(node)
     )
-      return derived(node.expression);
+      return ts.forEachChild(node, (child) => derived(child, next) || undefined) === true;
     return false;
   };
   let changed = true;
-  const markResult = (name: ts.BindingName, symbols = opaqueResults): void => {
-    if (!ts.isIdentifier(name)) return;
+  const markResult = (name: ts.Node, symbols = opaqueResults): void => {
     const symbol = symbolOf(name);
     if (symbol && !symbols.has(symbol)) {
       symbols.add(symbol);
       changed = true;
     }
   };
+  const markTargets = (node: ts.Node, symbols = opaqueResults): void => {
+    for (const target of targets(node)) {
+      if (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+        markResult(ts.isPropertyAccessExpression(target) ? target.name : target, symbols);
+        // Heap writes reject below; taint the root too so aliases cannot hide the write.
+        markTargets(target.expression, symbols);
+      } else markResult(target, symbols);
+    }
+  };
   while (changed) {
     changed = false;
     const collect = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node)) {
+        if (
+          (ts.isIdentifier(node.name) &&
+            (isWrappedClient(node.name, checker) || controlledModel(node.name, checker))) ||
+          (node.initializer &&
+            ts.isNewExpression(node.initializer) &&
+            integrationMemberName(node.initializer.expression) === "OpenAIProvider")
+        )
+          markTargets(node.name, guardedBindings);
+        if (node.initializer && guarded(node.initializer)) markTargets(node.name, guardedBindings);
+        if (node.initializer) {
+          const origin = symbolOf(unwrap(node.initializer));
+          if (origin && opaqueFactories.has(origin)) markTargets(node.name, opaqueFactories);
+          if (origin && opaqueHelpers.has(origin)) markTargets(node.name, opaqueHelpers);
+        }
+      }
+      if (ts.isPropertyAccessExpression(node)) {
+        if (isGuardedRunner(node.expression, checker))
+          markTargets(node.expression, guardedBindings);
+        if (isControlledDelegate(node, checker)) {
+          markResult(node.name, guardedBindings);
+          const field = localDeclaration(node.name, checker);
+          if (field && ts.isPropertyDeclaration(field) && ts.isClassDeclaration(field.parent)) {
+            const ctor = field.parent.members.find(ts.isConstructorDeclaration);
+            const statement = ctor?.body?.statements.find(
+              (statement) =>
+                ts.isExpressionStatement(statement) &&
+                assignment(statement.expression) &&
+                ts.isPropertyAccessExpression(statement.expression.left) &&
+                localDeclaration(statement.expression.left.name, checker) === field,
+            );
+            if (
+              statement &&
+              ts.isExpressionStatement(statement) &&
+              assignment(statement.expression)
+            ) {
+              guardInitializations.add(statement.expression);
+              markTargets(statement.expression.right, guardedBindings);
+            }
+          }
+        }
+      }
+      if (
+        ts.isCallExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "requireSolwynClient"
+      ) {
+        const imported = checker.getSymbolAtLocation(node.expression)?.declarations?.[0];
+        if (
+          imported &&
+          ts.isImportSpecifier(imported) &&
+          ts.isImportDeclaration(imported.parent.parent.parent) &&
+          /integration-support["']$/.test(
+            imported.parent.parent.parent.moduleSpecifier.getText(),
+          ) &&
+          node.arguments[0]
+        )
+          markTargets(node.arguments[0], guardedBindings);
+      }
       if (ts.isVariableDeclaration(node) && node.initializer && derived(node.initializer)) {
         const initializer = node.initializer;
         const factory =
@@ -865,14 +1017,55 @@ function findIntegrationViolations(text: string, path: string): string[] {
           ts.isFunctionExpression(initializer) ||
           (ts.isCallExpression(initializer) &&
             integrationMemberName(initializer.expression) === "bind");
-        markResult(node.name, factory ? opaqueFactories : opaqueResults);
+        markTargets(node.name, factory ? opaqueFactories : opaqueResults);
+        if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))
+          markTargets(node.name, opaqueHelpers);
+      }
+      if (
+        (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) &&
+        node.name &&
+        derived(node)
+      ) {
+        markResult(node.name, opaqueFactories);
+        markResult(node.name, opaqueHelpers);
+      }
+      if (assignment(node)) {
+        if (derived(node.right)) markTargets(node.left);
+        const origin = symbolOf(unwrap(node.right));
+        if (origin && opaqueFactories.has(origin)) markTargets(node.left, opaqueFactories);
+        if (origin && opaqueHelpers.has(origin)) markTargets(node.left, opaqueHelpers);
       }
       if (
         ts.isForOfStatement(node) &&
         derived(node.expression) &&
         ts.isVariableDeclarationList(node.initializer)
       ) {
-        for (const declaration of node.initializer.declarations) markResult(declaration.name);
+        for (const declaration of node.initializer.declarations) markTargets(declaration.name);
+      }
+      if (
+        ts.isForOfStatement(node) &&
+        derived(node.expression) &&
+        !ts.isVariableDeclarationList(node.initializer)
+      )
+        markTargets(node.initializer);
+      if (ts.isCallExpression(node)) {
+        const target = checker.getResolvedSignature(node)?.declaration;
+        if (target?.getSourceFile() === source) {
+          for (const [index, argument] of node.arguments.entries()) {
+            const parameter = target.parameters[index];
+            const value = unwrap(argument);
+            const symbol = symbolOf(value);
+            if (parameter && (derived(argument) || (symbol && opaqueFactories.has(symbol))))
+              markTargets(
+                parameter.name,
+                ts.isArrowFunction(value) ||
+                  ts.isFunctionExpression(value) ||
+                  (symbol && opaqueFactories.has(symbol))
+                  ? opaqueFactories
+                  : opaqueResults,
+              );
+          }
+        }
       }
       if (
         ts.isCallExpression(node) &&
@@ -1005,7 +1198,37 @@ function findIntegrationViolations(text: string, path: string): string[] {
       visitMetadata(callback.body);
     }
   };
+  // The same reviewed lifecycle-only reads admitted for result identifiers below.
+  const resultLifecycle = new Set([
+    "then",
+    "finally",
+    "completed",
+    "asyncIterator",
+    "next",
+    "return",
+    "throw",
+    "done",
+  ]);
   const visit = (node: ts.Node): void => {
+    if (assignment(node)) {
+      const left = targets(node.left);
+      if (derived(node.right) || left.some((target) => derived(target)))
+        report("assigns opaque result outside direct forwarding");
+      if (!guardInitializations.has(node) && (left.some(guarded) || guarded(node.right)))
+        report("reassigns or aliases a guarded binding outside its declaration");
+    }
+    if (
+      (ts.isForOfStatement(node) || ts.isForInStatement(node)) &&
+      !ts.isVariableDeclarationList(node.initializer) &&
+      targets(node.initializer).some(guarded)
+    )
+      report("reassigns a guarded binding in a loop");
+    if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      [ts.SyntaxKind.PlusPlusToken, ts.SyntaxKind.MinusMinusToken].includes(node.operator) &&
+      guarded(node.operand)
+    )
+      report("updates a guarded binding");
     if (
       ts.isMethodDeclaration(node) ||
       ts.isGetAccessorDeclaration(node) ||
@@ -1119,6 +1342,10 @@ function findIntegrationViolations(text: string, path: string): string[] {
     }
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = integrationMemberName(node);
+      const iteratorBind =
+        name === "bind" && integrationMemberName(node.expression) === "asyncIterator";
+      if (derived(node.expression) && !resultLifecycle.has(name ?? "") && !iteratorBind)
+        report(`reads opaque result property '${name ?? "computed"}'`);
       if (
         rel.startsWith("openai-agents/") &&
         (name === "on" || name === "off") &&
@@ -1161,22 +1388,59 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node, checker)) {
       report(`uses opaque identifier '${node.text}' outside direct forwarding`);
     }
+    if (ts.isIdentifier(node) || ts.isPropertyAccessExpression(node)) {
+      const symbol = symbolOf(node);
+      // A returned-data helper may be called or aliased locally; handing the callable
+      // to an unknown consumer would hide all subsequent reads from this source rule.
+      if (
+        symbol &&
+        opaqueHelpers.has(symbol) &&
+        !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)
+      ) {
+        let value: ts.Node = node;
+        while (value.parent && unwrap(value.parent) !== value.parent) value = value.parent;
+        const parent = value.parent;
+        const declaration = "name" in parent && parent.name === node;
+        const alias =
+          (ts.isVariableDeclaration(parent) && parent.initializer === value) ||
+          (assignment(parent) && (parent.left === value || parent.right === value));
+        const call = ts.isCallExpression(parent) && parent.expression === value;
+        // The public LangChain leaf must expose its forwarding capability to the caller.
+        // Admit only its literal create arm in a Proxy getter, never an arbitrary consumer.
+        // The closure's opaque request and guarded wrapped client are checked independently.
+        const getter = ts.isConditionalExpression(parent) ? parent.parent : undefined;
+        const property = getter?.parent;
+        const object = property?.parent;
+        const proxy = object?.parent;
+        const leafExposure =
+          rel.startsWith("langchain/") &&
+          node.getText() === "create" &&
+          ts.isConditionalExpression(parent) &&
+          parent.whenTrue === value &&
+          parent.condition.getText().replace(/\s+/g, "") === 'member==="create"' &&
+          getter &&
+          ts.isArrowFunction(getter) &&
+          getter.body === parent &&
+          property &&
+          ts.isPropertyAssignment(property) &&
+          property.name.getText() === "get" &&
+          object &&
+          ts.isObjectLiteralExpression(object) &&
+          proxy &&
+          ts.isNewExpression(proxy) &&
+          proxy.expression.getText() === "Proxy" &&
+          enclosingFunction(getter)?.name?.getText() === "chatCompletionsLeaf";
+        if (!declaration && !alias && !call && !leafExposure)
+          report("escapes an opaque helper reference");
+      }
+    }
     const resultSymbol = ts.isIdentifier(node) ? symbolOf(node) : undefined;
     if (ts.isIdentifier(node) && resultSymbol && opaqueResults.has(resultSymbol)) {
       const parent = node.parent;
       const structural =
         (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
         parent.expression === node &&
-        [
-          "then",
-          "finally",
-          "completed",
-          "asyncIterator",
-          "next",
-          "return",
-          "throw",
-          "done",
-        ].includes(integrationMemberName(parent) ?? "");
+        resultLifecycle.has(integrationMemberName(parent) ?? "");
       const alias = ts.isVariableDeclaration(parent) && parent.initializer === node;
       const iteration = ts.isForOfStatement(parent) && parent.expression === node;
       const completion =
@@ -1234,6 +1498,27 @@ function findIntegrationViolations(text: string, path: string): string[] {
       report("references Object outside defineProperty");
     if (ts.isIdentifier(node) && node.text === "fetch") report("references fetch");
     if (ts.isCallExpression(node)) {
+      const target = checker.getResolvedSignature(node)?.declaration;
+      const symbol = symbolOf(node.expression);
+      const helper =
+        (symbol && opaqueHelpers.has(symbol)) ||
+        (target?.getSourceFile() === source && returned(target).some((value) => derived(value)));
+      if (helper) {
+        let value: ts.Node = node;
+        while (value.parent && unwrap(value.parent) !== value.parent) value = value.parent;
+        const parent = value.parent;
+        const alias = ts.isVariableDeclaration(parent) && parent.initializer === value;
+        const lifecycle =
+          (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+          parent.expression === value &&
+          resultLifecycle.has(integrationMemberName(parent) ?? "");
+        if (
+          !alias &&
+          !lifecycle &&
+          !isOpaqueExpressionForward(node, checker, enclosingFunction(node))
+        )
+          report("uses opaque helper result outside direct forwarding");
+      }
       const name =
         integrationMemberName(node.expression) ??
         (ts.isIdentifier(node.expression) ? node.expression.text : undefined);
@@ -2397,6 +2682,202 @@ describe("privacy firewall — integration source controls", () => {
         "src/openai-agents/index.ts",
       ),
     ).not.toEqual([]);
+  });
+
+  const modelMutation = (mutation: string): string => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const marker = "async getResponse(opaqueRequest: ModelRequest) {";
+    expect(shipped).toContain(marker);
+    return shipped.replace(marker, `${marker}\n${mutation}`);
+  };
+  const dispatch = "await this.#delegate.getResponse(opaqueRequest)";
+  it.each([
+    ["later assignment", `let reply; reply = ${dispatch}; factory(String(reply.name));`],
+    ["logical-or assignment", `let reply; reply ||= ${dispatch}; factory(String(reply.name));`],
+    [
+      "logical-and assignment",
+      `let reply = true; reply &&= ${dispatch}; factory(String(reply.name));`,
+    ],
+    ["nullish assignment", `let reply; reply ??= ${dispatch}; factory(String(reply.name));`],
+    ["compound assignment", `let reply = ""; reply += ${dispatch}; factory(reply);`],
+    ["destructuring assignment", `let name; ({ name } = ${dispatch}); factory(name);`],
+    [
+      "aliased destructuring assignment",
+      `let value; ({ name: value } = ${dispatch}); factory(value);`,
+    ],
+    [
+      "nested destructuring assignment",
+      `let value; ({ config: { name: value } } = ${dispatch}); factory(value);`,
+    ],
+    ["array destructuring assignment", `let value; [value] = ${dispatch}; factory(value);`],
+    [
+      "object member assignment",
+      `const box = {}; box.name = ${dispatch}; factory(String(box.name));`,
+    ],
+    [
+      "literal member assignment",
+      `const box = {}; box["name"] = ${dispatch}; factory(String(box["name"]));`,
+    ],
+    ["array member assignment", `const box = []; box[0] = ${dispatch}; factory(String(box[0]));`],
+    [
+      "fresh reassignment",
+      `let reply; reply = ${dispatch}; reply = fresh; factory(String(reply.name));`,
+    ],
+    ["assignment expression", `let reply; factory(String((reply = ${dispatch}).name));`],
+  ])("rejects opaque result flow through %s", (_label, mutation) => {
+    const violations = findIntegrationViolations(
+      modelMutation(mutation),
+      "src/openai-agents/index.ts",
+    );
+    // Both writes must be rejected even when the second RHS is apparently fresh.
+    expect(violations.filter((line) => line.includes("assigns opaque result"))).toHaveLength(
+      _label === "fresh reassignment" ? 2 : 1,
+    );
+  });
+
+  it.each([
+    [
+      "function return",
+      `async function get() { return await dispatchResult(); } const reply = await get(); factory(String(reply.name));`,
+    ],
+    [
+      "function property return",
+      `async function get() { return (await dispatchResult()).name; } factory(String(await get()));`,
+    ],
+    [
+      "arrow parameter projection",
+      `async function get() { return await dispatchResult(); } const project = (r) => r.name; factory(String(project(await get())));`,
+    ],
+    [
+      "function parameter projection",
+      `async function get() { return await dispatchResult(); } function project(r) { return r.name; } factory(String(project(await get())));`,
+    ],
+    [
+      "captured helper return",
+      `async function get() { return await dispatchResult(); } const reply = await get(); function captured() { return reply; } factory(String(captured()));`,
+    ],
+    [
+      "helper alias",
+      `async function get() { return await dispatchResult(); } const read = get; factory(String(await read()));`,
+    ],
+    [
+      "later helper assignment",
+      `async function get() { return await dispatchResult(); } let read; read = get; factory(String(await read()));`,
+    ],
+    [
+      "recursive helper",
+      `function get() { return again(); } function again() { return flag ? get() : dispatchResult(); } factory(String(await get()));`,
+    ],
+    [
+      "helper object return",
+      `async function get() { return { name: await dispatchResult() }; } factory(String((await get()).name));`,
+    ],
+    [
+      "unresolved helper consumer",
+      `async function get() { return await dispatchResult(); } consume(await get());`,
+    ],
+    [
+      "unresolved alias consumer",
+      `async function get() { return await dispatchResult(); } let read; read = get; consume(await read());`,
+    ],
+    [
+      "direct helper property read",
+      `async function get() { return await dispatchResult(); } return (await get()).name;`,
+    ],
+    [
+      "escaping helper reference",
+      `async function get() { return await dispatchResult(); } consume(get);`,
+    ],
+    [
+      "later method alias",
+      `class Helpers { static async get() { return await dispatchResult(); } } let read; read = Helpers.get; consume(await read());`,
+    ],
+  ])("rejects opaque result flow through %s", (_label, mutation) => {
+    expect(
+      findIntegrationViolations(
+        modelMutation(
+          `const dispatchResult = () => this.#delegate.getResponse(opaqueRequest); ${mutation}`,
+        ),
+        "src/openai-agents/index.ts",
+      ),
+    ).toEqual(expect.arrayContaining([expect.stringContaining("opaque")]));
+  });
+
+  it.each([
+    ["guarded client", "client = other;"],
+    ["wrapped client alias", "wrapped = other;"],
+    ["later client alias", "let alias; alias = wrapped;"],
+    ["initialized client alias", "let alias = wrapped; alias = other;"],
+    ["guard input before alias", "client = other; const alias = client;"],
+    ["destructured guarded client", "({ client } = other);"],
+    ["compound guarded client", "wrapped ||= other;"],
+    ["loop guarded client", "for (wrapped of others) {}"],
+    ["updated guarded client", "wrapped++;"],
+  ])("rejects reassignment of %s", (_label, mutation) => {
+    const source = `import { requireSolwynClient } from "../integration-support";
+      function leaf(client) { requireSolwynClient(client, "test"); let wrapped = client;
+        ${mutation}
+        return wrapped.chat.completions.create(request);
+      }`;
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("guarded binding")]),
+    );
+  });
+
+  it.each([
+    ["controlled provider", "delegate = other;", "this.modelProvider = {"],
+    ["controlled model", "model = other;", "return new SolwynModel(model,"],
+    ["later model alias", "let alias; alias = model;", "return new SolwynModel(model,"],
+    [
+      "model delegate field",
+      "this.#delegate = foreign;",
+      "async getResponse(opaqueRequest: ModelRequest) {",
+    ],
+    ["model constructor parameter", "delegate = foreign;", "this.#delegate = delegate;"],
+    ["second model field write", "this.#delegate = foreign;", "this.#state = state;"],
+    ["guarded Runner", "runner = foreign;", "if (this.#attached.has(runner)) return;"],
+    ["later Runner alias", "let alias; alias = runner;", "if (this.#attached.has(runner)) return;"],
+    ["Runner after attach", "runner = foreign;", "this.attach(runner);"],
+    ["guarded options member", "options.client = foreign;", "this.modelProvider = {"],
+  ])("rejects reassignment of %s", (_label, mutation, marker) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    expect(shipped).toContain(marker);
+    const isHeader = marker.endsWith("{");
+    const mutated = shipped.replace(
+      marker,
+      isHeader && marker.startsWith("async ") ? `${marker}\n${mutation}` : `${mutation}\n${marker}`,
+    );
+    expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).toEqual(
+      expect.arrayContaining([expect.stringContaining("guarded binding")]),
+    );
+  });
+
+  it("permits local helper result forwarding and unrelated structural bindings", () => {
+    const source = modelMutation(`
+      const dispatchResult = () => this.#delegate.getResponse(opaqueRequest);
+      async function get() { return await dispatchResult(); }
+      {
+        function get() { return "structural"; }
+        let name; name = get(); factory(name);
+      }
+      return await (get() as Promise<unknown>);
+    `);
+    expect(findIntegrationViolations(source, "src/openai-agents/index.ts")).toEqual([]);
+  });
+
+  it("permits integration state stored in JS-private fields", () => {
+    for (const [path, fields] of [
+      ["langchain/index.ts", ["factory", "prefix", "tags", "runs", "models", "roots", "keys"]],
+      ["openai-agents/index.ts", ["invocations"]],
+    ] as const) {
+      let source = readFileSync(join(SRC_ROOT, path), "utf8");
+      for (const field of fields) {
+        source = source
+          .replace(new RegExp(`private readonly ${field}\\b`, "g"), `readonly #${field}`)
+          .replaceAll(`this.${field}`, `this.#${field}`);
+      }
+      expect(findIntegrationViolations(source, `src/${path}`)).toEqual([]);
+    }
   });
 
   it("rejects a Model-annotated delegate without a controlled getModel origin", () => {

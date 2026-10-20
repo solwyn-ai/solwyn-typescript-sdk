@@ -78,6 +78,7 @@ function jobConditionMatches(
   draft = false,
   catalogOutcome = "success",
   needsResult = "success",
+  cancelled = false,
 ): boolean {
   const condition = workflowJob.if ?? "true";
   // Actions implicitly requires successful dependencies unless a status function is used.
@@ -96,6 +97,7 @@ function jobConditionMatches(
         "provider-surface-inventory": { result: needsResult, outputs: { catalog: catalogOutcome } },
       },
       always: () => true,
+      cancelled: () => cancelled,
     }) === true
   );
 }
@@ -609,9 +611,10 @@ describe("CI workflow contract", () => {
     const { model } = await parseWorkflow(ciPath);
     const canary = semanticJob(model, "framework-canary");
     expect(canary.if).toBe(
-      "always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs['provider-surface-inventory'].outputs.catalog == 'success'",
+      "!cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs['provider-surface-inventory'].outputs.catalog == 'success'",
     );
     expect(canary.needs).toBe("provider-surface-inventory");
+    expect(canary["timeout-minutes"]).toBe(20);
     const overlay = namedStep(canary, "Overlay latest framework packages");
     expect(overlay.run).toContain(
       "pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest",
@@ -622,6 +625,24 @@ describe("CI workflow contract", () => {
     );
     expect(semanticJob(model, "required").needs).not.toContain("framework-canary");
     expect(await readFile(ciPath, "utf8")).toContain('cron: "0 6 * * 1"');
+  });
+
+  it.each([
+    "schedule",
+    "workflow_dispatch",
+  ])("skips cancelled framework checks for %s", async (eventName) => {
+    const { model } = await parseWorkflow(ciPath);
+    expect(
+      jobConditionMatches(
+        semanticJob(model, "framework-canary"),
+        eventName,
+        "refs/heads/main",
+        false,
+        "success",
+        "success",
+        true,
+      ),
+    ).toBe(false);
   });
 
   it.each([

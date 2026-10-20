@@ -177,6 +177,7 @@ export function assertEdgeResult(result) {
     ambientRunAbsent: true,
     nodeGlobalAbsent: true,
     bufferAbsent: true,
+    langchainNodeRequired: true,
     coreClosed: { checks: 2, confirms: 2, ingested: 2 },
     warnings: [],
   });

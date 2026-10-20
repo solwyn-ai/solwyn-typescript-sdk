@@ -82,6 +82,7 @@ const sdk=await load('@solwyn/sdk');
 const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
+const langchain=await load('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const plane=new testing.FakeControlPlane();

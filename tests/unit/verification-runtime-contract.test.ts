@@ -15,6 +15,7 @@ const edge = {
   ambientRunAbsent: true,
   nodeGlobalAbsent: true,
   bufferAbsent: true,
+  langchainNodeRequired: true,
   coreClosed: { checks: 2, confirms: 2, ingested: 2 },
   warnings: [],
 };
@@ -92,6 +93,7 @@ const allSdkEntries = [
   "@solwyn/sdk/node",
   "@solwyn/sdk/testing",
   "@solwyn/sdk/ai-sdk",
+  "@solwyn/sdk/langchain",
 ];
 const artifactEntries = {
   "provider-free-runtime": allSdkEntries,
@@ -217,6 +219,7 @@ const contracts = [
       "checks.edgeVm.providerCalls=0",
       "checks.edgeVm.coreClosed.confirms=0",
       "checks.edgeVm.ambientRunAbsent=false",
+      "checks.edgeVm.langchainNodeRequired=false",
       "checks.externalImports.push('node:fs')",
       "checks.bundleSha256='missing'",
     ],

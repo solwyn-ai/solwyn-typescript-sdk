@@ -127,6 +127,9 @@ the upstream signal's reason, and model-end/error callbacks remove its listener.
 - `_streamChatModelEvents`, LangGraph v3 messages streaming, and `streamEvents` (including v2).
 - `generate`/`batch`, `__includeRawResponse`, Azure, `@langchain/langgraph/web`, ChatAnthropic,
   and other provider integrations.
+- Parallel graph fan-out with graph-level `maxConcurrency: 1`: LangGraph 1.5.1 can omit
+  pending tasks. The queue bound tested here is the model's `maxConcurrency`; a separate
+  sequential-node graph is tested with graph-level `maxConcurrency: 1`.
 - Model calls inside tools or retrievers are outside the tested recipe. Their lifecycle IDs
   are transparent hierarchy edges, so a model using the leaf can resolve its scope; an unbound
   model ends with a post-hoc error. Tool frameworks may turn thrown errors into tool results.

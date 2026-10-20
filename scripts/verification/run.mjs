@@ -23,6 +23,7 @@ const probes = [
   "package-consumers",
   "native-type-consumer",
   "ai-type-consumer",
+  "langchain-type-consumer",
   "bundle-proofs",
   "browser-proof",
   "runtime-matrix",
@@ -53,6 +54,7 @@ function assertEdgeResult(result) {
       ambientRunAbsent: true,
       nodeGlobalAbsent: true,
       bufferAbsent: true,
+      langchainNodeRequired: true,
       coreClosed: { checks: 2, confirms: 2, ingested: 2 },
       warnings: [],
     },
@@ -81,7 +83,7 @@ async function validateChecks(probe, report, out) {
       checks.readmeAiTypes.installedPackages["@ai-sdk/openai"],
     );
     assert.equal(checks.inventory?.verified, true, "Missing package inventory proof");
-    assert.equal(checks.inventory.actualCount, 88);
+    assert.equal(checks.inventory.actualCount, 106);
     for (const format of ["esm", "cjs"]) {
       const cell = checks.runtime?.find((cell) => cell.format === format);
       assert.ok(cell, `Missing ${format} package runtime`);
@@ -90,6 +92,17 @@ async function validateChecks(probe, report, out) {
       assert.equal(cell.aiBuffered, true);
       assert.equal(cell.aiStreaming, true);
     }
+    assert.deepEqual(
+      checks.langchainRuntime,
+      ["esm", "cjs"].map((format) => ({
+        format,
+        loaded: true,
+        nodeRequired: true,
+        dispatches: 1,
+        checks: 1,
+        ingested: 1,
+      })),
+    );
     for (const field of [
       "openaiCannotResolve",
       "missingExportRejected",
@@ -105,6 +118,26 @@ async function validateChecks(probe, report, out) {
     assert.equal(
       checks.aiDependencyLock.sha256,
       sha256(path.join(out, "ai-smoke-package-lock.json")),
+    );
+  } else if (probe === "langchain-type-consumer") {
+    for (const peer of ["core", "langchainOpenai", "langgraph", "openai", "typesNode", "zod"])
+      version(versions[peer], peer);
+    const { assertTypeConsumerChecks } = await import("./type-consumer-support.mjs");
+    assertTypeConsumerChecks(report, "langchain");
+    for (const cell of checks.cells) {
+      assert.equal(cell.compiler.version, versions.typescript?.[cell.compiler.label]);
+      assert.equal(cell.strict, true);
+      assert.equal(cell.skipLibCheck, false);
+      assert.deepEqual(cell.files, [`recipe.${cell.format === "esm" ? "mts" : "cts"}`]);
+    }
+    assert.equal(checks.singleOpenai, true);
+    assert.deepEqual(checks.recipe, {
+      compiled: true,
+      result: { dispatches: 3, checks: 3, ingested: 3, unexpectedFetch: 0, socketAttempts: 0 },
+    });
+    assert.equal(
+      checks.fixture.lockSha256,
+      sha256(path.join(out, "langchain-smoke-package-lock.json")),
     );
   } else if (probe === "native-type-consumer" || probe === "ai-type-consumer") {
     if (probe === "ai-type-consumer") {

@@ -1,0 +1,16 @@
+{
+  "name": "@solwyn/verification-langchain-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@langchain/core": "1.2.18",
+    "@langchain/langgraph": "1.5.1",
+    "@langchain/openai": "1.6.2",
+    "@types/node": "22.15.30",
+    "openai": "7.36.0",
+    "typescript-current": "npm:typescript@6.0.3",
+    "typescript-floor": "npm:typescript@5.8.3",
+    "zod": "4.4.3"
+  }
+}

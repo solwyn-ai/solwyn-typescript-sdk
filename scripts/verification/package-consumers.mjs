@@ -11,6 +11,7 @@ import {
   runValidationFixtures,
   runValidationWrapperSource,
 } from "./artifact-identity.mjs";
+import { langchainHarnessArguments } from "./langchain-consumer.mjs";
 import { classifyCommandFailure, runBoundedCommand } from "./process.mjs";
 import {
   extractReadmeAiConsumer,
@@ -57,7 +58,7 @@ export function assertPackageInventory(listing) {
     "package/CHANGELOG.md",
     "package/package.json",
   ];
-  for (const entry of ["index", "node", "ai-sdk/index", "testing/index"])
+  for (const entry of ["index", "node", "ai-sdk/index", "testing/index", "langchain/index"])
     for (const extension of ["js", "cjs", "js.map", "cjs.map", "d.ts", "d.cts"])
       expected.push(`package/dist/${entry}.${extension}`);
   for (const provider of [
@@ -70,7 +71,7 @@ export function assertPackageInventory(listing) {
   ])
     for (const extension of ["js", "cjs", "js.map", "cjs.map"])
       expected.push(`package/dist/${provider}-HASH.${extension}`);
-  for (let index = 0; index < 8; index++)
+  for (let index = 0; index < 11; index++)
     for (const extension of ["js", "cjs", "js.map", "cjs.map"])
       expected.push(`package/dist/chunk-HASH.${extension}`);
   for (const declaration of ["proxies", "types"])
@@ -86,7 +87,7 @@ export function assertPackageInventory(listing) {
   assert.deepEqual(
     normalized.sort(),
     expected.sort(),
-    "Package inventory differs from the reviewed 88-file publication shape",
+    "Package inventory differs from the reviewed 106-file publication shape",
   );
   return { expectedCount: expected.length, actualCount: files.length, verified: true };
 }
@@ -152,6 +153,7 @@ const sdk=await load('@solwyn/sdk');
 const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
+const langchain=await load('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 process.stdout.write(JSON.stringify({format,...artifactIdentity})+'\\n');
@@ -170,6 +172,7 @@ const sdk=await load('@solwyn/sdk');
 const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
+const langchain=await load('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const packageRoot=fs.realpathSync(path.dirname(req.resolve('@solwyn/sdk/package.json')));
@@ -192,6 +195,7 @@ const sdk = await load('@solwyn/sdk');
 const node = await load('@solwyn/sdk/node');
 const testing = await load('@solwyn/sdk/testing');
 const ai = await load('@solwyn/sdk/ai-sdk');
+const langchain = await load('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const plane = new testing.FakeControlPlane();
@@ -378,6 +382,7 @@ const sdk=await import('@solwyn/sdk');
 const node=await import('@solwyn/sdk/node');
 const testing=await import('@solwyn/sdk/testing');
 const ai=await import('@solwyn/sdk/ai-sdk');
+const langchain=await import('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "'esm'")}
 for(const name of ${JSON.stringify(forbidden)})assert.throws(()=>consumerRequire.resolve(name),{code:'MODULE_NOT_FOUND'});
@@ -423,6 +428,25 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
           (await run(`runtime-${format}`, process.execPath, ["runtime.mjs", format], app)).stdout,
         ),
       );
+    fs.copyFileSync(
+      path.join(root, "tests/dist/fixtures/langchain-harness.mjs"),
+      path.join(app, "langchain-harness.mjs"),
+    );
+    report.details.langchainRuntime = [];
+    for (const format of ["esm", "cjs"])
+      report.details.langchainRuntime.push({
+        format,
+        ...JSON.parse(
+          (
+            await run(
+              `langchain-${format}`,
+              process.execPath,
+              langchainHarnessArguments(sdkPath, format),
+              app,
+            )
+          ).stdout,
+        ),
+      });
     for (const ext of ["mts", "cts"]) fs.writeFileSync(path.join(app, `consumer.${ext}`), types);
     const strictTypeScriptConfig = {
       compilerOptions: {
@@ -551,7 +575,7 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
     aiConfig.compilerOptions.types = ["node"];
     fs.writeFileSync(path.join(aiApp, "tsconfig.json"), JSON.stringify(aiConfig));
     await run(
-      "strict-all-four-entries-mts-cts",
+      "strict-core-and-ai-entries-mts-cts",
       process.execPath,
       [repositoryRequire.resolve("typescript/bin/tsc"), "-p", "tsconfig.json"],
       aiApp,
@@ -769,6 +793,7 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
     report.checks = {
       inventory: report.details.inventory,
       runtime: report.details.runtime,
+      langchainRuntime: report.details.langchainRuntime,
       artifactIdentity: report.details.artifactIdentity,
       negativeControls: report.details.negativeControls,
       aiDependencyLock: {

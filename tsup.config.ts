@@ -13,6 +13,8 @@ export default defineConfig({
     // to match the `./ai-sdk` export map.
     "ai-sdk/index": "src/ai-sdk/index.ts",
     "testing/index": "src/testing/index.ts",
+    // Content-free and edge-safe to load; Node attribution is installed via the Node entry.
+    "langchain/index": "src/langchain/index.ts",
   },
   format: ["esm", "cjs"],
   dts: true,

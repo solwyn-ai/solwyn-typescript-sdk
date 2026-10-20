@@ -65,6 +65,7 @@ it.each([
     "package-consumers": "solwyn-consumer-",
     "native-type-consumer": "solwyn-native-types-",
     "ai-type-consumer": "solwyn-ai-types-",
+    "langchain-type-consumer": "solwyn-langchain-types-",
     "bundle-proofs": "solwyn-consumer-bundle-",
     "browser-proof": "solwyn-consumer-browser-",
     "runtime-matrix": "solwyn-consumer-matrix-native-",
@@ -100,7 +101,7 @@ it.each([
     );
   }
   expect(child.status, child.stderr).toBe(1);
-  expect(evidence.details.probes).toHaveLength(7);
+  expect(evidence.details.probes).toHaveLength(8);
   for (const entry of evidence.details.probes) {
     const root = entry.result?.details.actualRoot;
     expect(entry.command.timedOut).toBe(true);

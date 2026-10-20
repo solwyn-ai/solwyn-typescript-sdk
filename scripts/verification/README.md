@@ -91,9 +91,10 @@ actually ran; one local version does not establish coverage of the full supporte
 
 | Probe | Durable assertions |
 | --- | --- |
-| `package-consumers` | Installed manifest realpath beneath each consumer and dynamic core/`./node` `VERSION` equality in ESM/CJS while core, node, testing, and AI entries resolve beneath that manifest; optional provider/tokenizer absence by module resolution; export targets and package file inventory; provider-free core/node/testing `.mts` and `.cts`; `ESNext.Disposable` positive and missing-lib negative controls; separate AI-peer consumer checking all four strict declarations and runtime entries; a clean strict compile of the README `ai` + `@ai-sdk/openai` imports; core and AI buffered/streaming dispatch, check, confirmation, ingest; manifest-bound mixed-format run enforcement, wrapper brands and error families in both import orders; copied-tarball missing-export rejection. |
+| `package-consumers` | Installed manifest realpath beneath each consumer and dynamic core/`./node` `VERSION` equality in ESM/CJS while core, node, testing, AI, and LangChain entries resolve beneath that manifest; optional provider/tokenizer absence by module resolution; export targets and package file inventory; provider-free core/node/testing `.mts` and `.cts`; `ESNext.Disposable` positive and missing-lib negative controls; separate AI-peer consumer checking core plus AI strict declarations and all runtime entries; a clean strict compile of the README `ai` + `@ai-sdk/openai` imports; core and AI buffered/streaming dispatch, check, confirmation, ingest; manifest-bound mixed-format run enforcement, wrapper brands and error families in both import orders; copied-tarball missing-export rejection. |
 | `native-type-consumer` | Genuinely installed OpenAI/Anthropic native typing, strict installed Responses fixtures, explicit compiler floor/current cells. |
 | `ai-type-consumer` | Strict installed AI consumer and upstream baseline diagnostics; explicit compiler floor/current cells. The separate TypeScript 5.7.3 CJS diagnostic must be `upstream-invalid` with a normal nonzero compiler exit and TS1479. It never replaces a required floor/current cell or masks an SDK consumer failure. |
+| `langchain-type-consumer` | Locked `langchain-smoke` fixture; strict complete docs recipe compilation under TypeScript 5.8.3/6.0.3 in ESM/CJS; offline execution with real LangChain/LangGraph; one OpenAI 7.36.0; immutable lock hash and installed tree. |
 | `bundle-proofs` | Sixteen Node bundle controls, browser-target VM controls, edge bundle generation and artifact/bundle hashes. |
 | `browser-proof` | Actual headless browser executes the verified edge bundle; no browser or missing bundle is a failure. |
 | `runtime-matrix` | Every configured Node binary in ESM/CJS: installed-manifest realpath and dynamic `VERSION` identity across the entries each cell loads; package operation; manifest-bound mixed-format identity/run enforcement; native Anthropic promise behavior; foreign AWS Bedrock-control/S3 clients and subclasses rejected without requests; and all 11 error families with denial/stop/middleware enforcement. |
@@ -153,7 +154,7 @@ elapsed time, the configured deadline, timeout flag and termination diagnostics.
 command record is written by `package-consumers` before setup starts. Its setup timeouts and
 recognized npm network errors (including DNS `ENOTFOUND`) are marked separately in
 `failure` as retryable setup failures, not artifact-check failures. The aggregate records
-its own outer timeout and preserves any structured failure a child supplies. The native and AI
+its own outer timeout and preserves any structured failure a child supplies. The native, AI, and LangChain
 type probes likewise persist the failing setup step, retryability, artifact-failure attribution,
 and command error code before exiting. Raw command output remains diagnostic; the aggregate does
 not infer that every failure is a network fault. The gate exits
@@ -165,8 +166,10 @@ an artifact-check failure; the classifier does not conflate a spawn error with a
 The package smoke uses the checkout's installed TypeScript compiler but resolves every SDK type
 from its temporary consumer. The full type probes establish the explicit compiler floor/current
 matrix. AI types require a separate consumer with the genuine AI and Node declaration packages;
-the provider-free runtime still loads the AI entry with no AI peer. No declaration stub or
-`skipLibCheck` escape is used. A separate clean README-shaped consumer extracts the install fence
+the provider-free runtime still loads the AI and LangChain entries with no peers. LangChain
+construction requires the Node entry; the edge VM proves this fails with `ConfigurationError`
+when that entry is absent. The legacy Node 20 lane excludes both integration entries. No
+declaration stub or `skipLibCheck` escape is used. A separate clean README-shaped consumer extracts the install fence
 and TypeScript fence from the supplied artifact's own README. The customer command remains
 `npm install ai @ai-sdk/openai`; the verifier requires those extracted names to exactly match its
 reviewed lock map, then installs `ai@7.0.14` and `@ai-sdk/openai@4.0.65` alongside the candidate SDK
@@ -195,9 +198,9 @@ enabled while manifest and lockfile writes stay disabled. Both copies must remai
 to the fixtures, and the complete installed dependency tree must remain unchanged except for the
 SDK itself. New transitive registry releases do not refresh the reviewed fixture versions.
 
-Package inventory is a complete reviewed 88-file shape, not just a shipping allowlist: four
-metadata files; four public entries in both runtime, declaration and sourcemap formats; six
-provider chunks in both runtime formats with maps; eight shared chunks per runtime format with
+Package inventory is a complete reviewed 106-file shape, not just a shipping allowlist: four
+metadata files; five public entries in both runtime, declaration and sourcemap formats; six
+provider chunks in both runtime formats with maps; eleven shared chunks per runtime format with
 maps; and two shared declarations in both formats. Hashed filename suffixes may change with
 content. LF and CRLF tar listings are normalized before inventory comparison. Missing entries,
 duplicate entries, new unexpected files, and unmatched sourcemaps fail.
@@ -252,7 +255,7 @@ claim to prove console-event delivery.
   compile evidence. `package-consumers.mjs` compiles that exact extracted source; it does not keep
   a second approximation of the README example.
 - `package-consumers.mjs` owns package execution plus its inventory, dependency-tree, and AI
-  harness helpers; `pack-smoke.mjs` delegates to it. AI harness entry arguments use file URLs so
+  harness helpers; `pack-smoke.mjs` delegates to it. AI and LangChain harness entry arguments use file URLs so
   native Windows paths and URL-sensitive characters are loaded correctly.
 
 ## Assertion migration
@@ -261,6 +264,6 @@ The previous package-consumer export/file checks, optional-peer policy, ESM/CJS 
 strict declarations now live in `package-consumers.mjs`. The former pack smoke's legacy budget
 result shape, materialized lease fields, testing helpers, local health seam and provider-free
 dispatch are retained there. Repository fixtures `package-identity-remediation.mjs`,
-`post-remediation-errors.mjs`, and `ai-sdk-harness.mjs` run from copies in the installed consumer.
+`post-remediation-errors.mjs`, `langchain-harness.mjs`, and `ai-sdk-harness.mjs` run from copies in the installed consumer.
 The native and AI typing, bundle, real-browser, runtime and Google proofs retain their dedicated
 probe names. All paths to repository fixtures are resolved from script location.

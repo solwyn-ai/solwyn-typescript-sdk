@@ -526,7 +526,7 @@ describe("CI workflow contract", () => {
     expect(legacy).toContain("nodeSdk.VERSION");
     expect(legacy).toContain("manifest.version");
     expect(legacy).not.toMatch(
-      /pnpm|(?:test:consumers|test:pack)|ai-sdk|@anthropic-ai|@aws-sdk|@google|openai|together-ai|\bbuild\b/,
+      /pnpm|(?:test:consumers|test:pack)|ai-sdk|langchain|@anthropic-ai|@aws-sdk|@google|openai|together-ai|\bbuild\b/,
     );
   });
 
@@ -547,6 +547,25 @@ describe("CI workflow contract", () => {
     expect(namedStep(inventory, "Run every selected provider interval").run).toBe(
       "node scripts/run-provider-surfaces.mjs",
     );
+  });
+
+  it("checks latest frameworks only on weekly/manual runs behind the catalog guard", async () => {
+    const { model } = await parseWorkflow(ciPath);
+    const canary = semanticJob(model, "framework-canary");
+    expect(canary.if).toBe(
+      "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+    );
+    expect(canary.needs).toBe("provider-surface-matrix");
+    const overlay = namedStep(canary, "Overlay latest framework packages");
+    expect(overlay.run).toContain(
+      "pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest",
+    );
+    expect(overlay.run).toContain("git diff --exit-code -- pnpm-lock.yaml");
+    expect(namedStep(canary, "Exercise the offline framework recipe").run).toContain(
+      "tests/unit/langchain-docs.test.ts",
+    );
+    expect(semanticJob(model, "required").needs).not.toContain("framework-canary");
+    expect(await readFile(ciPath, "utf8")).toContain('cron: "0 6 * * 1"');
   });
 
   it("runs a pinned actionlint binary as part of the required quality result", async () => {

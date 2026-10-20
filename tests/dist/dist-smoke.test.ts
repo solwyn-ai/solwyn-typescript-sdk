@@ -194,3 +194,25 @@ describe("dist smoke — built ./ai-sdk entry resolves its code-split chunks", (
     expect(result.hasDispose).toBe(true);
   });
 });
+
+describe("dist smoke — built ./langchain entry and Node seam", () => {
+  it.each(["esm", "cjs"])("meters through the %s build", async (format) => {
+    const { langchainHarnessArguments } = await import(
+      new URL("../../scripts/verification/langchain-consumer.mjs", import.meta.url).href
+    );
+    const result = await execFileAsync(
+      process.execPath,
+      langchainHarnessArguments(fileURLToPath(new URL("../../", import.meta.url)), format),
+      {
+        cwd: fileURLToPath(new URL("./fixtures/", import.meta.url)),
+      },
+    );
+    expect(JSON.parse(result.stdout)).toEqual({
+      loaded: true,
+      nodeRequired: true,
+      dispatches: 1,
+      checks: 1,
+      ingested: 1,
+    });
+  });
+});

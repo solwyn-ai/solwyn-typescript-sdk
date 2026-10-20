@@ -154,6 +154,7 @@ src/
   integration-support.ts # content-free framework attribution and wrapper guards
   wrapper-brand.ts      # dependency-free shared wrapper identity
   ai-sdk/               # AI SDK middleware; content-privileged
+  langchain/            # content-free LangChain/LangGraph run-scope attribution
   testing/              # edge-safe fake control plane and contract probes
   config.ts  types.ts  errors.ts  validation.ts
   privacy.ts            # content-privileged estimation helpers

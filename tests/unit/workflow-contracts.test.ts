@@ -19,7 +19,6 @@ import { parseDocument } from "yaml";
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const ciPath = join(repositoryRoot, ".github", "workflows", "ci.yml");
 const publishPath = join(repositoryRoot, ".github", "workflows", "publish.yml");
-const surfaceCatalogPath = join(repositoryRoot, "tests", "provider-surface-intervals.json");
 
 interface WorkflowStep {
   readonly name?: string;
@@ -34,12 +33,17 @@ interface WorkflowJob {
   readonly needs?: string | readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly if?: string;
+  readonly outputs?: Readonly<Record<string, string>>;
   readonly permissions?: Readonly<Record<string, string>>;
   readonly steps?: readonly WorkflowStep[];
+  readonly "timeout-minutes"?: number;
 }
 
 interface WorkflowModel {
-  readonly concurrency?: { readonly group?: string; readonly "cancel-in-progress"?: boolean };
+  readonly concurrency?: {
+    readonly group?: string;
+    readonly "cancel-in-progress"?: boolean | string;
+  };
   readonly on: Readonly<Record<string, unknown>>;
   readonly jobs: Readonly<Record<string, WorkflowJob>>;
   readonly permissions?: Readonly<Record<string, string>>;
@@ -71,13 +75,18 @@ function jobConditionMatches(
   workflowJob: WorkflowJob,
   eventName: string,
   ref: string,
-  matrixResult = "success",
+  draft = false,
+  catalogOutcome = "success",
 ): boolean {
   return (
     runInNewContext(workflowJob.if ?? "true", {
       // Actions compares strings case-insensitively against these lowercase literals.
-      github: { event_name: eventName.toLowerCase(), ref: ref.toLowerCase() },
-      needs: { "provider-surface-matrix": { result: matrixResult } },
+      github: {
+        event_name: eventName.toLowerCase(),
+        ref: ref.toLowerCase(),
+        event: { pull_request: { draft } },
+      },
+      needs: { "provider-surface-inventory": { outputs: { catalog: catalogOutcome } } },
       always: () => true,
     }) === true
   );
@@ -306,12 +315,27 @@ describe("workflow YAML semantics", () => {
 });
 
 describe("CI workflow contract", () => {
-  it("accepts manual dispatches and keeps both provider canary jobs ungated", async () => {
+  it("starts a full run when a draft becomes ready for review", async () => {
     const { model } = await parseWorkflow(ciPath);
 
+    expect(model.on["pull_request"]).toEqual({
+      types: ["opened", "synchronize", "reopened", "ready_for_review"],
+    });
     expect(model.on).toHaveProperty("workflow_dispatch", null);
-    expect(semanticJob(model, "provider-surface-matrix").if).toBeUndefined();
-    expect(semanticJob(model, "provider-surface-inventory").if).toBeUndefined();
+  });
+
+  it.each([
+    ["pull_request", "refs/pull/11/merge", false],
+    ["pull_request", "refs/pull/11/merge", true],
+    ["push", "refs/heads/main", false],
+  ] as const)("runs every gate except deferred draft work for %s on %s (draft=%s)", async (eventName, ref, draft) => {
+    const { model } = await parseWorkflow(ciPath);
+
+    for (const [id, value] of Object.entries(model.jobs)) {
+      expect(jobConditionMatches(value, eventName, ref, draft), id).toBe(
+        !draft || id === "required",
+      );
+    }
   });
 
   it.each([
@@ -321,28 +345,47 @@ describe("CI workflow contract", () => {
     "legacy-installed-core",
   ])("skips %s for scheduled and manually dispatched canaries", async (id) => {
     const { model } = await parseWorkflow(ciPath);
+    const value = semanticJob(model, id);
+    for (const eventName of ["schedule", "workflow_dispatch"]) {
+      expect(jobConditionMatches(value, eventName, "refs/heads/main"), eventName).toBe(false);
+    }
+  });
 
-    expect(semanticJob(model, id).if).toBe(
-      "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
-    );
+  it.each([
+    ["schedule", "refs/heads/main", ["provider-surface-inventory"]],
+    ["workflow_dispatch", "refs/heads/main", ["provider-surface-inventory"]],
+    ["workflow_dispatch", "refs/heads/feature", ["provider-surface-inventory", "required"]],
+  ])("runs the consolidated canaries and any required failure gate for %s on %s", async (eventName, ref, expectedJobs) => {
+    const { model } = await parseWorkflow(ciPath);
+    expect(
+      Object.entries(model.jobs)
+        .filter(([, value]) => jobConditionMatches(value, eventName, ref))
+        .map(([id]) => id),
+    ).toEqual(expectedJobs);
   });
 
   it.each([
     ["schedule", "refs/heads/main", "success", false, false],
+    ["schedule", "refs/heads/main", "failure", false, false],
     ["workflow_dispatch", "refs/heads/main", "success", false, false],
     ["workflow_dispatch", "refs/heads/main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/main", "cancelled", true, false],
+    ["workflow_dispatch", "refs/heads/main", "skipped", true, false],
+    ["workflow_dispatch", "refs/heads/main", "", true, false],
     ["workflow_dispatch", "refs/heads/Main", "failure", true, false],
     ["workflow_dispatch", "refs/heads/feature", "failure", true, false],
-    ["workflow_dispatch", "refs/heads/main-canary", "failure", true, false],
-    ["workflow_dispatch", "refs/tags/main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/feature", "success", true, false],
+    ["workflow_dispatch", "refs/heads/main-canary", "success", true, false],
+    ["workflow_dispatch", "refs/tags/main", "success", true, false],
     ["pull_request", "refs/pull/11/merge", "success", true, true],
     ["push", "refs/heads/main", "success", true, true],
-  ] as const)("allows only validated main dispatches to skip Required / CI: %s on %s (catalog %s)", async (eventName, ref, matrixResult, requiredRuns, fullCiRuns) => {
+    ["push", "refs/heads/main", "failure", true, true],
+  ] as const)("allows only validated main dispatches to skip Required / CI: %s on %s (catalog %s)", async (eventName, ref, catalogOutcome, requiredRuns, fullCiRuns) => {
     const { model } = await parseWorkflow(ciPath);
 
-    expect(jobConditionMatches(semanticJob(model, "required"), eventName, ref, matrixResult)).toBe(
-      requiredRuns,
-    );
+    expect(
+      jobConditionMatches(semanticJob(model, "required"), eventName, ref, false, catalogOutcome),
+    ).toBe(requiredRuns);
     for (const id of [
       "quality",
       "package-artifact",
@@ -353,22 +396,75 @@ describe("CI workflow contract", () => {
     }
   });
 
-  it("fails Required / CI when a non-main dispatch skips full CI even if both canary jobs pass", async () => {
+  it.each([
+    "refs/heads/Main",
+    "refs/heads/feature",
+    "refs/heads/main-canary",
+    "refs/tags/main",
+  ])("fails Required / CI when a non-main dispatch skips full CI even if catalog and provider canaries pass: %s", async (ref) => {
     const { model } = await parseWorkflow(ciPath);
     const required = semanticJob(model, "required");
     const gate = namedStep(required, "Require every launch gate");
+    const catalogOutcome = ref === "refs/heads/Main" ? "failure" : "success";
 
-    expect(jobConditionMatches(required, "workflow_dispatch", "refs/heads/feature")).toBe(true);
-    expect(
-      runBash(gate.run ?? "", {
-        QUALITY: "skipped",
-        PACKAGE_ARTIFACT: "skipped",
-        ARTIFACT_CONSUMERS: "skipped",
-        LEGACY_INSTALLED_CORE: "skipped",
-        PROVIDER_SURFACE_MATRIX: "success",
-        PROVIDER_SURFACE_INVENTORY: "success",
-      }).status,
-    ).toBe(1);
+    expect(jobConditionMatches(required, "workflow_dispatch", ref, false, catalogOutcome)).toBe(
+      true,
+    );
+    const result = runBash(gate.run ?? "", {
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: ref,
+      DRAFT_PR: "false",
+      QUALITY: "skipped",
+      PACKAGE_ARTIFACT: "skipped",
+      ARTIFACT_CONSUMERS: "skipped",
+      LEGACY_INSTALLED_CORE: "skipped",
+      PROVIDER_SURFACE_INVENTORY: "success",
+    });
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      "workflow_dispatch on a non-main ref runs canaries only and cannot satisfy Required / CI",
+    );
+  });
+
+  it("cancels only superseded runs of the same pull request", async () => {
+    const { model } = await parseWorkflow(ciPath);
+    const concurrency = model.concurrency;
+    expect(concurrency).toBeDefined();
+    function settings(eventName: string, number: number | undefined, runId: number) {
+      const context = {
+        github: {
+          workflow: "CI",
+          event_name: eventName,
+          event: { pull_request: { number } },
+          run_id: runId,
+        },
+      };
+      const group = concurrency?.group?.replace(/\$\{\{(.*?)\}\}/g, (_match, expression) =>
+        String(runInNewContext(expression, context)),
+      );
+      const cancel = concurrency?.["cancel-in-progress"];
+      return {
+        group,
+        cancel:
+          typeof cancel === "string"
+            ? runInNewContext(cancel.replace(/^\$\{\{|\}\}$/g, ""), context)
+            : cancel,
+      };
+    }
+    const first = settings("pull_request", 11, 100);
+    expect(first.cancel).toBe(true);
+    expect(first.group).toBe(settings("pull_request", 11, 101).group);
+    expect(first.group).not.toBe(settings("pull_request", 12, 102).group);
+    const groups = new Set([first.group]);
+    for (const eventName of ["push", "schedule", "workflow_dispatch"]) {
+      const a = settings(eventName, undefined, 100);
+      const b = settings(eventName, undefined, 101);
+      expect(a.cancel).toBe(false);
+      expect(b.cancel).toBe(false);
+      groups.add(a.group);
+      groups.add(b.group);
+    }
+    expect(groups.size).toBe(7);
   });
 
   it("runs every full source gate on exact Node 22 and 24 releases", async () => {
@@ -434,21 +530,23 @@ describe("CI workflow contract", () => {
     );
   });
 
-  it("preserves all provider cells and the scheduled latest canary", async () => {
-    const [workflow, catalogText] = await Promise.all([
-      readFile(ciPath, "utf8"),
-      readFile(surfaceCatalogPath, "utf8"),
-    ]);
-    const catalog = JSON.parse(catalogText) as { include: readonly unknown[] };
-    const inventory = job(workflow, "provider-surface-inventory");
+  it("runs the unchanged interval selector inside one provider job", async () => {
+    const { model, source } = await parseWorkflow(ciPath);
+    const inventory = semanticJob(model, "provider-surface-inventory");
 
-    expect(catalog.include).toHaveLength(11);
-    expect(workflow).toContain('cron: "0 6 * * 1"');
-    expect(workflow).toContain("node scripts/provider-surface-matrix.mjs");
-    expect(inventory).toContain("fromJSON(needs.provider-surface-matrix.outputs.include)");
-    expect(inventory).toContain("pnpm add --no-lockfile -D");
-    expect(inventory).toContain("git diff --exit-code -- pnpm-lock.yaml");
-    expect(inventory).toContain("pnpm vitest run tests/unit/surface-canary.test.ts");
+    expect(model.on["schedule"]).toEqual([{ cron: "0 6 * * 1" }]);
+    expect(Object.keys(model.jobs).filter((id) => id.startsWith("provider-surface"))).toEqual([
+      "provider-surface-inventory",
+    ]);
+    expect(inventory["timeout-minutes"]).toBe(15);
+    expect(inventory.outputs).toEqual({ catalog: `\${{ steps.catalog.outcome }}` });
+    expect(source).toContain("node scripts/provider-surface-matrix.mjs");
+    expect(namedStep(inventory, "Run every selected provider interval").env).toEqual({
+      SURFACE_INTERVALS: `\${{ steps.catalog.outputs.include }}`,
+    });
+    expect(namedStep(inventory, "Run every selected provider interval").run).toBe(
+      "node scripts/run-provider-surfaces.mjs",
+    );
   });
 
   it("runs a pinned actionlint binary as part of the required quality result", async () => {
@@ -472,15 +570,15 @@ describe("CI workflow contract", () => {
     );
   });
 
-  it("fans the stable required result into exactly six jobs and fails every non-success state", async () => {
+  it("fans the stable required result into every gate and fails every non-success state", async () => {
     const { model } = await parseWorkflow(ciPath);
     const required = semanticJob(model, "required");
+    expect(required.name).toBe("Required / CI");
     const expectedNeeds = [
       "quality",
       "package-artifact",
       "artifact-consumers",
       "legacy-installed-core",
-      "provider-surface-matrix",
       "provider-surface-inventory",
     ];
     const expectedEnvironment = {
@@ -488,31 +586,56 @@ describe("CI workflow contract", () => {
       PACKAGE_ARTIFACT: `\${{ needs.package-artifact.result }}`,
       ARTIFACT_CONSUMERS: `\${{ needs.artifact-consumers.result }}`,
       LEGACY_INSTALLED_CORE: `\${{ needs.legacy-installed-core.result }}`,
-      PROVIDER_SURFACE_MATRIX: `\${{ needs.provider-surface-matrix.result }}`,
       PROVIDER_SURFACE_INVENTORY: `\${{ needs.provider-surface-inventory.result }}`,
+      DRAFT_PR: `\${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}`,
     };
     const gate = namedStep(required, "Require every launch gate");
 
     expect(required.if).toBe(
-      "always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-matrix'].result == 'success')",
+      "always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-inventory'].outputs.catalog == 'success')",
     );
     expect(required.needs).toEqual(expectedNeeds);
     expect(gate.env).toEqual(expectedEnvironment);
     expect(
-      runBash(
-        gate.run ?? "",
-        Object.fromEntries(Object.keys(expectedEnvironment).map((key) => [key, "success"])),
-      ).status,
+      runBash(gate.run ?? "", {
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_REF: "refs/heads/main",
+        ...Object.fromEntries(
+          expectedNeeds.map((key) => [key.replaceAll("-", "_").toUpperCase(), "success"]),
+        ),
+        DRAFT_PR: "false",
+      }).status,
     ).toBe(0);
-    for (const key of Object.keys(expectedEnvironment)) {
+    for (const key of Object.keys(expectedEnvironment).filter((name) => name !== "DRAFT_PR")) {
       for (const state of ["failure", "cancelled", "skipped"]) {
         const env = Object.fromEntries(
           Object.keys(expectedEnvironment).map((name) => [name, "success"]),
         );
+        env["DRAFT_PR"] = "false";
+        env["GITHUB_EVENT_NAME"] = "push";
+        env["GITHUB_REF"] = "refs/heads/main";
         env[key] = state;
         expect(runBash(gate.run ?? "", env).status, `${key}=${state} must fail`).not.toBe(0);
       }
     }
+  });
+
+  it("fails the required draft check with an explanation while dependencies are deferred", async () => {
+    const { model } = await parseWorkflow(ciPath);
+    const required = semanticJob(model, "required");
+    expect(jobConditionMatches(required, "pull_request", "refs/pull/11/merge", true)).toBe(true);
+    const result = runBash(namedStep(required, "Require every launch gate").run ?? "", {
+      DRAFT_PR: "true",
+      QUALITY: "skipped",
+      PACKAGE_ARTIFACT: "skipped",
+      ARTIFACT_CONSUMERS: "skipped",
+      LEGACY_INSTALLED_CORE: "skipped",
+      PROVIDER_SURFACE_INVENTORY: "skipped",
+    });
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      "Draft PR: CI deferred until ready for review",
+    );
   });
 
   it.each([

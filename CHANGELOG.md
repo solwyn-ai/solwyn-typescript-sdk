@@ -35,6 +35,11 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
+- **OpenAI Agents tool decisions.** Tool-code and tool-input-guardrail denials and stops now
+  surface the exact original Solwyn error from `run`, streamed iteration, and `completed`.
+  Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
+  still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
+
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
   it agrees with the initial usage split, including streams that start without cache writes.
   Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
@@ -56,7 +61,8 @@ corresponding release notes before users upgrade.
   npm `ERESOLVE` when an application already installs an out-of-range framework version, even
   when it does not use the integration. Upgrade that dependency or retain the previous SDK
   release. Runtime imports and the provider-free core still work without Agents installed;
-  the Agents entry's native declarations require the framework package.
+  the Agents entry's native declarations require the framework package. The Agents recipe
+  requires `openai >=7.2.0 <8` and `zod` 4; upgrade OpenAI 6 applications to keep one SDK copy.
 
 - **Public-preview compatibility:** The new optional `@langchain/core >=1.2.14 <2` peer can cause
   npm `ERESOLVE` when an application already installs an out-of-range version, even if the

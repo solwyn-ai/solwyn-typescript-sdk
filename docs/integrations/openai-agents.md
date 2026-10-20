@@ -9,14 +9,17 @@ model selection, and lifecycle signals. It never reads prompts, responses, tool 
 tool results, and creates no budget checks or settlement events itself.
 
 Use Node.js 22 or newer. This recipe is tested with `@openai/agents@0.20.0` and `openai@7.36.0`.
-Install `@solwyn/sdk`, `openai`, and **`@openai/agents`**. Installing only `@openai/agents-core`
+Install `@solwyn/sdk`, **`@openai/agents`**, `openai >=7.2.0 <8` (Agents' own dependency range,
+so npm installs a single copy), and `zod` 4, which Agents requires as a peer. An application on
+`openai` 6 must upgrade for this recipe to avoid a nested OpenAI 7 copy and incompatible types.
+Installing only `@openai/agents-core`
 and `@openai/agents-openai` does not supply the public types imported by this entry.
 
 ## Support matrix
 
 | Framework | Enforcement | Attribution | Hierarchy | Admitted and tested calls | Install and dependency posture | Churn posture |
 |---|---|---|---|---|---|---|
-| OpenAI Agents JS | Wrapped OpenAI Chat Completions and Responses HTTP generation. | Content-free detached workflow and agent handles. | Stable child per agent object; siblings on handoff; reuse on hand-back. | `run`/`runStreamed`, function tools, handoffs/hand-backs, concurrency, retries, denials, stops, abort and iterator return. | Node 22+; install `@openai/agents >=0.20.0 <1` and `openai`. Native declarations require the umbrella framework package. | Locked 0.20.0; weekly/manual latest-framework canary; unexpected shapes refuse dispatch. |
+| OpenAI Agents JS | Wrapped OpenAI Chat Completions and Responses HTTP generation. | Content-free detached workflow and agent handles. | Stable child per agent object; siblings on handoff; reuse on hand-back. | `run`/`runStreamed`, function tools, handoffs/hand-backs, concurrency, retries, denials, stops, abort and iterator return. | Node 22+; install `@openai/agents >=0.20.0 <1`, `openai >=7.2.0 <8`, and `zod` 4. Native declarations require the umbrella framework package. | Locked 0.20.0; weekly/manual latest-framework canary; unexpected shapes refuse dispatch. |
 
 ## Complete example
 
@@ -155,6 +158,8 @@ providers, `runner.config.model` or `Agent.model` set to a `Model` instance, inv
 and `RunState` resume are refused. Keep model selection as strings or leave it unset. HTTP model
 admission uses controlled provider configuration and structural prototype checks; websocket
 models and unexpected delegate shapes are refused without relying on class names.
+An absent or invalid `OpenAIProvider` constructor, or a provider without `getModel`, raises
+`ConfigurationError(field: "OpenAIProvider")` during construction.
 
 The following are not admitted: Responses websocket transport, Realtime, hosted multi-agent
 execution, sandbox agents, and HITL resume. Custom providers/models are unsupported: pass the
@@ -168,9 +173,17 @@ overlapping calls fail closed. Prefer separate, explicitly configured workflows.
 
 Agents normally turns tool exceptions into a fixed tool-result message. Set
 `errorFunction: solwynToolErrorFunction` on every function tool to preserve Solwyn denial and stop
-errors, including errors wrapped in a bounded `cause` chain. Other exceptions receive Agents'
-unchanged default message. `errorFunction: null` is another option when every exception should
-propagate. The integration's nested-run latch works independently of a tool's error function.
+errors, including errors wrapped in a bounded `cause` chain. Agents wraps a rethrown decision in
+`ToolCallError.error`; `SolwynAgents.run`, streamed async iteration, and `completed` unwrap that
+branded Solwyn decision and reject with the exact original object. This also preserves denials
+and stops from a tool input guardrail's direct wrapped-client call, even when the guardrail fails
+before the tool starts. Catch `BudgetExceededError` or `RunStoppedError` around those integration
+entry points as you would around a direct wrapped-client call.
+
+Other tool exceptions receive Agents' unchanged default message. `errorFunction: null` is another
+option when every exception should propagate; ordinary failures retain Agents' `ToolCallError`
+wrapper. The integration's nested-run latch works independently of a tool's error function and
+takes precedence over tool errors.
 
 **Agents tracing is outside Solwyn's privacy boundary.** Framework tracing can export prompts,
 responses, and tool content to OpenAI unless disabled. Keep `setTracingDisabled(true)`,

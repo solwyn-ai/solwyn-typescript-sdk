@@ -17,8 +17,10 @@ corresponding release notes before users upgrade.
   wrapped client alone owns enforcement and settlement. Nested agent-as-tool calls, unexpected
   models, missing hierarchy, and concurrent attempts fail closed with typed errors. Streaming
   completion and iteration preserve latched decisions and release state after completion or
-  cancellation. Tool-code and tool-input-guardrail denials and stops surface the exact original
-  Solwyn error from `run`, streamed iteration, and `completed`, including in minified bundles.
+  cancellation. Tool-code, agent input/output guardrail, and tool input/output guardrail denials
+  and stops surface the exact original Solwyn error from `run`, streamed iteration, and
+  `completed`, including in minified bundles. Non-Solwyn failures and guardrail tripwires retain
+  their native wrappers.
   Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
   still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
   Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.

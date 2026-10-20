@@ -43,7 +43,12 @@ function violation(message: string): SolwynError {
   return new SolwynError(`openai-agents: ${message}`);
 }
 
-/** Agents wraps thrown tool/guardrail errors in .error rather than .cause. */
+/**
+ * Agents' ToolCallError (tools and their input/output guardrails) and
+ * GuardrailExecutionError (agent input/output guardrails) have own error/state fields.
+ * Unwrap only an immediate branded Solwyn decision. Ordinary failures and tripwires
+ * stay wrapped; tripwire classes carry result instead of error. State stays opaque.
+ */
 function unwrapToolDecision(error: unknown): unknown {
   try {
     // Agents' own error/state fields survive class-name minification; state stays opaque.

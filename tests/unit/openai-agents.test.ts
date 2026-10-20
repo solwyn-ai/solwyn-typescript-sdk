@@ -247,22 +247,76 @@ async function invoke(setupResult: ReturnType<typeof setup>, streamed: boolean, 
   return result;
 }
 
+/** Observe the real Runner's rejection before the integration processes it. */
+function recordRunnerFailures(runner: Agents.Runner): unknown[] {
+  const failures: unknown[] = [];
+  const nativeRun = runner.run.bind(runner);
+  vi.spyOn(runner, "run").mockImplementation(async (...args) => {
+    try {
+      const result = await nativeRun(...args);
+      if (args[2]?.stream)
+        void result.completed.catch((error: unknown) => {
+          failures.push(error);
+        });
+      return result;
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  });
+  return failures;
+}
+
+async function observeFailure(state: ReturnType<typeof setup>, streamed: boolean) {
+  if (!streamed) return invoke(state, false).catch((error: unknown) => error);
+  const result = await state.integration.runStreamed(
+    state.runner,
+    state.agent,
+    "Synthetic input.",
+    {
+      workflow: "workflow",
+      tags: { team: "support" },
+    },
+  );
+  const failure = await (async () => {
+    for await (const _event of result) {
+      /* drain */
+    }
+  })().catch((error: unknown) => error);
+  await expect(result.completed).rejects.toBe(failure);
+  return failure;
+}
+
 describe("OpenAI Agents hierarchy and enforcement", () => {
   it.each([
     ["tool", "solwyn-test/deny"],
     ["tool", "solwyn-test/deny-stopped"],
     ["tool input guardrail", "solwyn-test/deny"],
     ["tool input guardrail", "solwyn-test/deny-stopped"],
+    ["tool output guardrail", "solwyn-test/deny"],
+    ["tool output guardrail", "solwyn-test/deny-stopped"],
+    ["input guardrail", "solwyn-test/deny"],
+    ["input guardrail", "solwyn-test/deny-stopped"],
+    ["output guardrail", "solwyn-test/deny"],
+    ["output guardrail", "solwyn-test/deny-stopped"],
   ] as const)("surfaces the exact %s decision for %s", async (source, model) => {
     for (const api of ["chat_completions", "responses"] as const) {
       for (const streamed of [false, true]) {
         const state = setup(api, {
-          transport: createAgentsTransport([{ kind: "tool", name: "lookup" }, { kind: "text" }]),
+          ...(source.startsWith("tool")
+            ? {
+                transport: createAgentsTransport([
+                  { kind: "tool", name: "lookup" },
+                  { kind: "text" },
+                ]),
+              }
+            : {}),
         });
         let decision: unknown;
         const deniedCall = async (): Promise<never> => {
           try {
-            await state.client.chat.completions.create({ model, messages: [] });
+            if (api === "responses") await state.client.responses.create({ model, input: [] });
+            else await state.client.chat.completions.create({ model, messages: [] });
           } catch (error) {
             decision = error;
             throw error;
@@ -287,8 +341,20 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
                   inputGuardrails: [{ name: "synthetic_guardrail", run: deniedCall }],
                 }
               : {}),
+            ...(source === "tool output guardrail"
+              ? {
+                  outputGuardrails: [{ name: "synthetic_guardrail", run: deniedCall }],
+                }
+              : {}),
           }),
         ];
+        if (source === "input guardrail")
+          state.agent.inputGuardrails = [
+            { name: "synthetic_guardrail", runInParallel: false, execute: deniedCall },
+          ];
+        if (source === "output guardrail")
+          state.agent.outputGuardrails = [{ name: "synthetic_guardrail", execute: deniedCall }];
+        const nativeFailures = recordRunnerFailures(state.runner);
         try {
           const options = { workflow: "workflow", tags: { team: "support" } };
           if (streamed) {
@@ -317,9 +383,16 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
             );
             expect(observed).toBe(decision);
           }
-          expect(execute).toHaveBeenCalledTimes(source === "tool" ? 1 : 0);
-          expect(state.transport.requests).toHaveLength(1);
-          expect(state.plane.checks).toHaveLength(2);
+          expect(nativeFailures).toHaveLength(1);
+          expect(nativeFailures[0]).toBeInstanceOf(
+            source.startsWith("tool") ? framework.ToolCallError : framework.GuardrailExecutionError,
+          );
+          expect((nativeFailures[0] as Agents.ToolCallError).error).toBe(decision);
+          expect(execute).toHaveBeenCalledTimes(
+            source === "tool" || source === "tool output guardrail" ? 1 : 0,
+          );
+          expect(state.transport.requests).toHaveLength(source === "input guardrail" ? 0 : 1);
+          expect(state.plane.checks).toHaveLength(source === "input guardrail" ? 1 : 2);
         } finally {
           await state.client.close();
         }
@@ -329,40 +402,126 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
   });
 
   it.each([
-    false,
-    true,
-  ])("preserves an ordinary tool input guardrail failure (streamed=%s)", async (streamed) => {
-    const state = setup("chat_completions", {
-      transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]),
-    });
-    const original = new Error("synthetic guardrail failure");
-    const execute = vi.fn(() => "Synthetic result.");
-    state.agent.tools = [
-      framework.tool({
-        name: "lookup",
-        description: "Synthetic lookup",
-        parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
-        errorFunction: solwynToolErrorFunction,
-        execute,
-        inputGuardrails: [
-          {
+    ["input", false],
+    ["input", true],
+    ["output", false],
+    ["output", true],
+    ["tool input", false],
+    ["tool input", true],
+    ["tool output", false],
+    ["tool output", true],
+  ] as const)("preserves %s guardrail failures (tripwire=%s)", async (source, tripwire) => {
+    for (const api of ["chat_completions", "responses"] as const)
+      for (const streamed of [false, true]) {
+        const state = setup(api, {
+          ...(source.startsWith("tool")
+            ? { transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]) }
+            : {}),
+        });
+        const original = new Error("synthetic guardrail failure");
+        const outputInfo = { marker: "synthetic" };
+        const execute = vi.fn(() => "Synthetic result.");
+        const guardrail = {
+          name: "synthetic_guardrail",
+          execute: async () => {
+            if (!tripwire) throw original;
+            return { tripwireTriggered: true, outputInfo };
+          },
+        };
+        if (source === "input")
+          state.agent.inputGuardrails = [{ ...guardrail, runInParallel: false }];
+        if (source === "output") state.agent.outputGuardrails = [guardrail];
+        if (source.startsWith("tool")) {
+          const toolGuardrail = {
             name: "synthetic_guardrail",
             run: async () => {
-              throw original;
+              if (!tripwire) throw original;
+              return framework.ToolGuardrailFunctionOutputFactory.throwException(outputInfo);
             },
+          };
+          state.agent.tools = [
+            framework.tool({
+              name: "lookup",
+              description: "Synthetic lookup",
+              parameters: {
+                type: "object",
+                properties: {},
+                required: [],
+                additionalProperties: false,
+              },
+              errorFunction: solwynToolErrorFunction,
+              execute,
+              ...(source === "tool input"
+                ? { inputGuardrails: [toolGuardrail] }
+                : { outputGuardrails: [toolGuardrail] }),
+            }),
+          ];
+        }
+        const nativeFailures = recordRunnerFailures(state.runner);
+        try {
+          const observed = await observeFailure(state, streamed);
+          expect(nativeFailures).toEqual([observed]);
+          expect(observed).toBe(nativeFailures[0]);
+          if (tripwire) {
+            const classes = {
+              input: framework.InputGuardrailTripwireTriggered,
+              output: framework.OutputGuardrailTripwireTriggered,
+              "tool input": framework.ToolInputGuardrailTripwireTriggered,
+              "tool output": framework.ToolOutputGuardrailTripwireTriggered,
+            };
+            const tripwireError = source.startsWith("tool")
+              ? (observed as Agents.ToolCallError).error
+              : observed;
+            expect(tripwireError).toBeInstanceOf(classes[source]);
+            expect(
+              (tripwireError as Agents.InputGuardrailTripwireTriggered).result.output.outputInfo,
+            ).toBe(outputInfo);
+            expect(Object.hasOwn(tripwireError as object, "error")).toBe(false);
+          } else {
+            expect(observed).toBeInstanceOf(
+              source.startsWith("tool")
+                ? framework.ToolCallError
+                : framework.GuardrailExecutionError,
+            );
+            expect((observed as Agents.ToolCallError).error).toBe(original);
+          }
+          expect(execute).toHaveBeenCalledTimes(source === "tool output" ? 1 : 0);
+          expect(state.transport.requests).toHaveLength(source === "input" ? 0 : 1);
+        } finally {
+          await state.client.close();
+        }
+      }
+  });
+
+  it.each([
+    "error",
+    "state",
+  ] as const)("preserves foreign errors with a throwing %s accessor", async (field) => {
+    for (const api of ["chat_completions", "responses"] as const)
+      for (const streamed of [false, true]) {
+        const state = setup(api);
+        const original = Object.assign(new Error("synthetic foreign failure"), {
+          error: new Error("synthetic ordinary failure"),
+          state: undefined,
+        });
+        Object.defineProperty(original, field, {
+          get() {
+            throw new Error("synthetic accessor failure");
           },
-        ],
-      }),
-    ];
-    try {
-      const observed = await invoke(state, streamed).catch((error: unknown) => error);
-      expect(observed).toBeInstanceOf(framework.ToolCallError);
-      expect((observed as Agents.ToolCallError).error).toBe(original);
-      expect(execute).not.toHaveBeenCalled();
-      expect(state.transport.requests).toHaveLength(1);
-    } finally {
-      await state.client.close();
-    }
+        });
+        state.runner.on("agent_start", () => {
+          throw original;
+        });
+        const nativeFailures = recordRunnerFailures(state.runner);
+        try {
+          await expect(observeFailure(state, streamed)).resolves.toBe(original);
+          expect(nativeFailures).toHaveLength(1);
+          expect(nativeFailures[0]).toBe(original);
+          expect(state.transport.requests).toHaveLength(0);
+        } finally {
+          await state.client.close();
+        }
+      }
   });
 
   it.each([

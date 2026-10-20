@@ -68,6 +68,32 @@ describe("LangChain structural run handler", () => {
     expect(() => new SolwynRunScopeHandler({ namePrefix: "" })).toThrow(ConfigurationError);
     expect(() => new SolwynRunScopeHandler({ tags: { bad: 3 } } as never)).toThrow(SolwynError);
   });
+  it.each(["\u200b", "\u2028", "\u2029"])("rejects invalid prefix %j eagerly", (character) => {
+    expect(() => new SolwynRunScopeHandler({ namePrefix: `scope${character}` })).toThrow(
+      ConfigurationError,
+    );
+  });
+  it("sanitizes every Node-disallowed name category on roots and nodes", async () => {
+    const handler = new SolwynRunScopeHandler();
+    const client = leaf(handler);
+    start(handler, "root", undefined, undefined, "root\u0000\u200b\u2028\u2029\ud800");
+    const root = (await client.chat.completions.create(
+      {},
+      bind(handler, "root-model"),
+    )) as ReturnType<typeof getCurrentRun>;
+    handler.handleLLMEnd(undefined, "root-model");
+    start(handler, "node", "root", "node\u0000\u200b\u2028\u2029\ud800");
+    const node = (await client.chat.completions.create(
+      {},
+      bind(handler, "node-model", "node"),
+    )) as ReturnType<typeof getCurrentRun>;
+    handler.handleLLMEnd(undefined, "node-model");
+    handler.handleChainEnd(undefined, "root");
+    expect(root?.agentRunName).toBe("langchain:root_____");
+    expect(node?.agentRunName).toBe("langchain:node_____");
+    expect(node?.parentAgentRunId).toBe(root?.agentRunId);
+    expect(counts(handler)).toEqual([0, 0, 0]);
+  });
   it("fails closed on duplicate and missing hierarchy", () => {
     const handler = new SolwynRunScopeHandler();
     start(handler);

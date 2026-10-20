@@ -20,6 +20,9 @@ corresponding release notes before users upgrade.
 
 ### Fixed
 
+- **LangChain scope names.** Replace Unicode format and separator characters in framework run
+  names before creating Node scopes, and reject those characters in `namePrefix` eagerly.
+
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
   it agrees with the initial usage split, including streams that start without cache writes.
   Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage

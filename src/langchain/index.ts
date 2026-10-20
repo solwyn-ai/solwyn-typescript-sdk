@@ -58,10 +58,12 @@ function nonRetryable(failure: unknown): unknown {
 function refusal(detail: string): never {
   throw nonRetryable(new SolwynError(detail));
 }
+// Match Node run-name validation and also replace unpaired surrogate code points.
+const DISALLOWED_SCOPE_NAME_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
 function scopeName(prefix: string, name: string): string {
   let sanitized = "";
   for (const character of `${prefix}:${name}`) {
-    const safe = /[\p{Cc}\p{Cs}]/u.test(character) ? "_" : character;
+    const safe = DISALLOWED_SCOPE_NAME_CHARS.test(character) ? "_" : character;
     if (sanitized.length + safe.length > 255) break;
     sanitized += safe;
   }
@@ -99,7 +101,11 @@ export class SolwynRunScopeHandler {
   constructor(options: SolwynRunScopeHandlerOptions = {}) {
     this.factory = requireDetachedRunFactory("LangChain");
     const prefix = options.namePrefix ?? "langchain";
-    if (typeof prefix !== "string" || prefix.length === 0 || /[\p{Cc}\p{Cs}]/u.test(prefix)) {
+    if (
+      typeof prefix !== "string" ||
+      prefix.length === 0 ||
+      DISALLOWED_SCOPE_NAME_CHARS.test(prefix)
+    ) {
       throw new ConfigurationError("namePrefix must be a nonempty, non-sensitive scope prefix", {
         field: null,
       });

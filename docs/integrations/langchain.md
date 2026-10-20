@@ -125,6 +125,9 @@ the upstream signal's reason, and model-end/error callbacks remove its listener.
 - Responses API, including explicit selection and automatic switching: typed refusal before
   dispatch. JSON-schema structured output uses `chat.completions.parse`, which is refused.
 - `_streamChatModelEvents`, LangGraph v3 messages streaming, and `streamEvents` (including v2).
+- Early stream `break`/iterator `return()`: core 1.2.18 can omit the root's terminal callback,
+  retaining handler scopes. Consume streams fully, or abort with the call's `AbortSignal` and
+  continue iteration until the cancellation error so terminal callbacks run.
 - `generate`/`batch`, `__includeRawResponse`, Azure, `@langchain/langgraph/web`, ChatAnthropic,
   and other provider integrations.
 - Parallel graph fan-out with graph-level `maxConcurrency: 1`: LangGraph 1.5.1 can omit
@@ -147,14 +150,15 @@ Ordinary chains attribute model calls to a lazily created root scope. LangGraph 
 scope per root, enclosing node scope, and node name across iterations. Nested node scopes are
 children; tools and retrievers add no Solwyn runs. Scopes finish when the root ends, deferring
 active work until its activation settles. Missing terminal framework callbacks can retain
-handler state; use well-behaved runnables and finish/cancel streams.
+handler state; use well-behaved runnables and consume streams through completion or cancellation
+errors as described above.
 
 Under an outer `run(...)`, the root is its child. Calls carry the leaf scope's exact run ID;
 Cloud stops and per-run controls must target that leaf ID. Stopping a parent does not stop its
 children. Stable node IDs preserve lease reuse and velocity history across loop iterations.
 Scope names (`runName`, node names, and `namePrefix`) must contain only non-sensitive attribution.
-Names replace controls/lone surrogates and clamp without splitting Unicode code points, within
-the Node run-name limit of 255 UTF-16 units.
+Names replace controls, format characters, line/paragraph separators, and lone surrogates, and
+clamp without splitting Unicode code points, within the Node run-name limit of 255 UTF-16 units.
 
 `new SolwynRunScopeHandler({ tags: { workflow: "support" } })` applies explicit tags at the root;
 children inherit them. Tags are sent verbatim, must be non-sensitive, and make calls ineligible

@@ -121,6 +121,25 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
       expect(transport.requests[0]?.body["stream_options"]).toMatchObject({ include_usage: true });
     expect(plane.untrackedReports).toHaveLength(0);
   });
+  it("cleans up attribution when a stream is aborted and drained", async () => {
+    const { chain, plane, transport, client } = await setup();
+    const cancellation = new AbortController();
+    const stream = await chain.stream({ question: "fixture" }, { signal: cancellation.signal });
+    const iterator = stream[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    cancellation.abort(new Error("Synthetic stream cancellation"));
+    await expect(
+      (async () => {
+        while (!(await iterator.next()).done) {
+          /* drain through terminal callbacks */
+        }
+      })(),
+    ).rejects.toThrow();
+    await client.close();
+    expect(transport.requests).toHaveLength(1);
+    expect(plane.checks).toHaveLength(1);
+    expect(plane.ingested).toHaveLength(1);
+  });
   it.each([
     "invoke",
     "values",
@@ -193,8 +212,16 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
       .compile()
       .invoke({}, { callbacks: [handler], ...(serial ? { maxConcurrency: 1 } : {}) });
     await client.close();
-    expect(plane.ingested).toHaveLength(6);
-    expect(plane.ingested.filter((e) => e.agent_run_name === "langchain:pair")).toHaveLength(2);
+    expect(plane.checks).toHaveLength(6);
+    expect(plane.ingested.map((e) => e.agent_run_name).sort()).toEqual([
+      "langchain:four",
+      "langchain:one",
+      "langchain:pair",
+      "langchain:pair",
+      "langchain:three",
+      "langchain:two",
+    ]);
+    expect(plane.ingested.every((e) => e.status === "success")).toBe(true);
     expect(
       new Set(
         plane.ingested

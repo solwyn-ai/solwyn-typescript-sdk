@@ -206,14 +206,30 @@ function integrationMemberName(node: ts.Expression): string | undefined {
   return undefined;
 }
 
-function isOpaqueForward(node: ts.Identifier): boolean {
+const OPAQUE_ATTRIBUTION_SINKS = new Set([
+  "factory",
+  "createRun",
+  "run",
+  "scopeName",
+  "namePrefix",
+  "copyTags",
+  "tags",
+  "setTags",
+  "withTags",
+]);
+
+function isOpaqueForward(node: ts.Identifier, checker: ts.TypeChecker): boolean {
   const declaration = node.parent;
   if (
     (ts.isParameter(declaration) || ts.isVariableDeclaration(declaration)) &&
     declaration.name === node
   )
     return true;
-  let expression: ts.Expression = node;
+  return isOpaqueExpressionForward(node, checker);
+}
+
+function isOpaqueExpressionForward(value: ts.Expression, checker: ts.TypeChecker): boolean {
+  let expression = value;
   while (
     ts.isParenthesizedExpression(expression.parent) ||
     ts.isAsExpression(expression.parent) ||
@@ -225,23 +241,41 @@ function isOpaqueForward(node: ts.Identifier): boolean {
   const parent = expression.parent;
   if (ts.isCallExpression(parent) && parent.arguments.some((arg) => arg === expression)) {
     const callee = parent.expression;
-    const name = integrationMemberName(callee);
-    // Known reflection/serialization sinks inspect their arguments rather than forwarding them.
+    const name = integrationMemberName(callee) ?? (ts.isIdentifier(callee) ? callee.text : "");
+    // Never declassify callback data as attribution, even through an opaque-named helper.
+    if (LOGGER_METHODS.has(name) || OPAQUE_ATTRIBUTION_SINKS.has(name)) return false;
+    if (callee.getText().replace(/\s+/g, "") === "wrapped.chat.completions.create") return true;
+    const target = checker.getResolvedSignature(parent)?.declaration;
     if (
-      (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
-      ts.isIdentifier(callee.expression) &&
-      ["Object", "Reflect", "JSON"].includes(callee.expression.text)
+      target === undefined ||
+      target.getSourceFile() !== expression.getSourceFile() ||
+      !(
+        ts.isFunctionDeclaration(target) ||
+        ts.isMethodDeclaration(target) ||
+        ts.isFunctionExpression(target) ||
+        ts.isArrowFunction(target)
+      ) ||
+      !target.body
     )
       return false;
-    return (
-      !(name !== undefined && (LOGGER_METHODS.has(name) || name === "stringify")) &&
-      !(ts.isIdentifier(callee) && (callee.text === "String" || LOGGER_METHODS.has(callee.text)))
+    const parameter = target.parameters[parent.arguments.indexOf(expression)];
+    // Resolve the actual local implementation, including shadowing and this.method calls.
+    // Its parameter must remain opaque, and its result must remain opaque at the caller.
+    return !!(
+      parameter &&
+      !parameter.dotDotDotToken &&
+      ts.isIdentifier(parameter.name) &&
+      /^_?opaque/.test(parameter.name.text) &&
+      isOpaqueExpressionForward(parent, checker)
     );
   }
+  if (ts.isSpreadAssignment(parent))
+    return isOpaqueExpressionForward(parent.parent as ts.ObjectLiteralExpression, checker);
   return (
     (ts.isReturnStatement(parent) && parent.expression === expression) ||
     (ts.isArrowFunction(parent) && parent.body === expression) ||
-    (ts.isSpreadAssignment(parent) && parent.expression === expression)
+    // Discarding a local forwarding helper's result cannot expose it.
+    (ts.isExpressionStatement(parent) && ts.isCallExpression(expression))
   );
 }
 
@@ -250,6 +284,16 @@ function findIntegrationViolations(text: string, path: string): string[] {
   const rel = integrationPath(path);
   if (rel === undefined) return [];
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+  // Only bind this source: imports and ambient types cannot grant forwarding privileges.
+  const program = ts.createProgram(
+    [path],
+    { noLib: true, noResolve: true },
+    {
+      ...ts.createCompilerHost({}),
+      getSourceFile: (file) => (file === path ? source : undefined),
+    },
+  );
+  const checker = program.getTypeChecker();
   const violations: string[] = [];
   const report = (message: string): void => {
     violations.push(`${path}: integration ${message}`);
@@ -295,7 +339,12 @@ function findIntegrationViolations(text: string, path: string): string[] {
   };
   const callbackParameters = (
     name: string,
-    callback: ts.MethodDeclaration | ts.ArrowFunction | ts.FunctionExpression,
+    callback:
+      | ts.MethodDeclaration
+      | ts.ArrowFunction
+      | ts.FunctionExpression
+      | ts.GetAccessorDeclaration
+      | ts.SetAccessorDeclaration,
   ): void => {
     if (!/^(?:handle[A-Z]|on[A-Z_])/.test(name)) return;
     const structural = rel.startsWith("langchain/")
@@ -341,12 +390,28 @@ function findIntegrationViolations(text: string, path: string): string[] {
     }
   };
   const visit = (node: ts.Node): void => {
-    if (ts.isMethodDeclaration(node)) {
+    if (
+      ts.isMethodDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)
+    ) {
       const name = propertyNameText(node.name);
-      if (name !== undefined) callbackParameters(name, node);
+      if (name !== undefined) {
+        callbackParameters(name, node);
+        if (ts.isGetAccessorDeclaration(node) && /^(?:handle[A-Z]|on[A-Z_])/.test(name)) {
+          const returnedCallback = (child: ts.Node): void => {
+            if (ts.isReturnStatement(child) && child.expression) {
+              if (ts.isArrowFunction(child.expression) || ts.isFunctionExpression(child.expression))
+                callbackParameters(name, child.expression);
+              else report(`callback getter '${name}' must return a function expression directly`);
+            } else if (!ts.isFunctionLike(child)) ts.forEachChild(child, returnedCallback);
+          };
+          if (node.body) ts.forEachChild(node.body, returnedCallback);
+        }
+      }
     }
     if (
-      ts.isPropertyDeclaration(node) &&
+      (ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) &&
       node.initializer &&
       (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
     ) {
@@ -414,7 +479,7 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isArrayBindingPattern(node)) report("uses array destructuring");
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken)
       assignmentPattern(node.left);
-    if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node)) {
+    if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node, checker)) {
       report(`uses opaque identifier '${node.text}' outside direct forwarding`);
     }
     if (ts.isIdentifier(node) && node.text === "Reflect") report("references Reflect");
@@ -1394,6 +1459,42 @@ describe("privacy firewall — integration source controls", () => {
   });
 
   it.each([
+    [
+      "class helper",
+      "this.end(this.leak(_opaqueOutput));",
+      `leak(value: unknown) { return \`\${value}\`; }`,
+      "",
+    ],
+    [
+      "module helper",
+      "this.end(leak(_opaqueOutput));",
+      "",
+      "function leak(value: Iterable<unknown>) { for (const item of value) {} }",
+    ],
+    ["run name", "this.factory(_opaqueOutput as string);", "", ""],
+    [
+      "object callback",
+      "this.end(runId);",
+      "",
+      `const handler = { handleChainEnd: (output: unknown) => \`\${output}\` };`,
+    ],
+    [
+      "callback getter",
+      "this.end(runId);",
+      `get handleText() { return (text: unknown) => \`\${text}\`; }`,
+      "",
+    ],
+  ])("rejects a content-reading %s added to the shipped handler", (_label, call, member, helper) => {
+    const shipped = readFileSync(join(SRC_ROOT, "langchain/index.ts"), "utf8");
+    const mutated = shipped
+      .replace("this.end(runId);", call)
+      .replace("private assertNew(", `${member}\n  private assertNew(`);
+    expect(
+      findIntegrationViolations(`${mutated}\n${helper}`, "src/langchain/index.ts"),
+    ).not.toEqual([]);
+  });
+
+  it.each([
     "src/langchain/nested/leaf.ts",
     "src/openai-agents/index.ts",
     "src/integration-support.ts",
@@ -1540,10 +1641,92 @@ describe("privacy firewall — integration source controls", () => {
     ["logging", "function f(opaque) { logger.warn(opaque); }"],
     ["nested call argument", "function f(opaque) { return forward({ data: opaque }); }"],
     ["argument spread", "function f(opaque) { return forward(...opaque); }"],
+    [
+      "formatting through a class helper",
+      `class Handler { handleChainEnd(_opaqueOutput) { this.end(this.leak(_opaqueOutput)); } end(runId) {} leak(value) { return \`\${value}\`; } }`,
+    ],
+    [
+      "iteration through a module helper",
+      "function leak(value) { for (const item of value) {} } class Handler { handleChainEnd(_opaqueOutput) { leak(_opaqueOutput); } }",
+    ],
+    [
+      "a run factory argument",
+      "class Handler { factory; handleChainEnd(_opaqueOutput) { this.factory(_opaqueOutput as string); } }",
+    ],
+    [
+      "formatting in an opaque-named helper",
+      `function leak(opaqueValue) { return \`\${opaqueValue}\`; } function f(opaque) { return leak(opaque); }`,
+    ],
+    [
+      "a run factory through a passthrough helper",
+      "function pass(opaqueValue) { return opaqueValue; } class Handler { factory; handleChainEnd(_opaqueOutput) { this.factory(pass(_opaqueOutput)); } }",
+    ],
+    [
+      "a run factory through object spread",
+      "class Handler { factory; handleChainEnd(_opaqueOutput) { this.factory({ ..._opaqueOutput }); } }",
+    ],
+    [
+      "a naming sink with an opaque parameter",
+      "function scopeName(opaqueName) { return opaqueName; } function f(opaque) { return scopeName(opaque); }",
+    ],
+    [
+      "a tag sink with an opaque parameter",
+      "function copyTags(opaqueTags) { return opaqueTags; } function f(opaque) { return copyTags(opaque); }",
+    ],
+    ["an unresolved helper", "function f(opaque) { return forward(opaque); }"],
+    [
+      "a shadowed helper",
+      `function forward(opaqueValue) { return opaqueValue; } function f(opaque) { const forward = (value) => \`\${value}\`; return forward(opaque); }`,
+    ],
   ])("rejects opaque %s", (_label, source) => {
     expect(findIntegrationViolations(source, path)).toEqual(
       expect.arrayContaining([expect.stringContaining("opaque")]),
     );
+  });
+
+  it.each([
+    ["object arrow", `const handler = { handleChainEnd: (output) => \`\${output}\` };`],
+    ["object method", `const handler = { handleChainEnd(output) { return \`\${output}\`; } };`],
+    [
+      "object function",
+      `const handler = { handleChainEnd: function(output) { return \`\${output}\`; } };`,
+    ],
+    ["class arrow", `class Handler { handleChainEnd = (output) => \`\${output}\`; }`],
+    ["getter arrow", `class Handler { get handleText() { return (text) => \`\${text}\`; } }`],
+    ["object getter", `const handler = { get handleText() { return (text) => \`\${text}\`; } };`],
+    [
+      "getter function",
+      `class Handler { get handleText() { return function(text) { return \`\${text}\`; }; } }`,
+    ],
+    [
+      "getter alias",
+      `class Handler { get handleText() { const render = (text) => \`\${text}\`; return render; } }`,
+    ],
+    ["setter", `class Handler { set handleText(text) { const result = \`\${text}\`; } }`],
+  ])("rejects content in a callback %s", (_label, source) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("callback")]),
+    );
+  });
+
+  it.each([
+    "function forward(opaqueRequest, opaqueOptions) { return wrapped.chat.completions.create(opaqueRequest, opaqueOptions); }",
+    "const forward = (opaqueRequest, opaqueOptions) => wrapped.chat.completions.create(opaqueRequest, opaqueOptions);",
+  ])("permits opaque forwarding through a local helper: %s", (helper) => {
+    const source = `${helper}\nfunction f(opaqueRequest, opaqueOptions) { return forward(opaqueRequest, { ...opaqueOptions }); }`;
+    expect(findIntegrationViolations(source, path)).toEqual([]);
+  });
+
+  it("permits opaque forwarding through local methods and callback accessors", () => {
+    const source = `class Handler {
+      pass(opaqueValue) { return opaqueValue; }
+      passArrow = (opaqueValue) => opaqueValue;
+      f(opaqueValue) { return this.pass(this.passArrow(opaqueValue)); }
+      get handleText() { return (_opaqueText) => {}; }
+      set handleText(_opaqueCallback) {}
+    }
+    const handler = { handleChainEnd: (_opaqueOutput, runId) => end(runId) };`;
+    expect(findIntegrationViolations(source, path)).toEqual([]);
   });
 
   it.each([
@@ -1604,6 +1787,9 @@ describe("privacy firewall — integration source controls", () => {
     const source = `
       import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
       import { requireDetachedRunFactory } from "../integration-support";
+      function forward(opaqueRequest, opaqueOptions) {
+        return wrapped.chat.completions.create(opaqueRequest, opaqueOptions);
+      }
       class Handler {
         #scopes = new Map();
         localCount = 0;

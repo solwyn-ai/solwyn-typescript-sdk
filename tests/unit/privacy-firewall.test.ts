@@ -84,6 +84,24 @@ function findProviderValueImportViolations(text: string, path: string): string[]
 
 /** Readable integration properties: structural identity, lifecycle, and admitted dispatch only. */
 const INTEGRATION_READABLE_PROPERTIES = new Set([
+  // Integration-owned structural state, never fields from opaque framework values.
+  "rootRunId",
+  "scope",
+  "scopes",
+  "scopeName",
+  "parentScope",
+  "nodeScopes",
+  "nodeName",
+  "handle",
+  "closed",
+  "bound",
+  "bindings",
+  "keys", // Structural Map key traversal for cleanup.
+  "resolve", // Promise normalization; provider values stay opaque.
+  "defineProperty", // Stamp only the LangChain retryability symbol on typed SDK errors.
+  "for", // Registered, content-free retryability symbol.
+  "isArray", // Validate handler collection shape.
+  "test", // Validate/sanitize explicit attribution names only.
   "runId", // Framework run identity.
   "parentRunId", // Framework hierarchy edge.
   "handlers", // Handler membership proves the metered leaf was bound.

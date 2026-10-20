@@ -378,6 +378,8 @@ export async function runPackageConsumers({ tarball, out }) {
         ),
         "js-tiktoken",
         "vitest",
+        // Trace correlation reads the OpenTelemetry global registry; it never resolves the API.
+        "@opentelemetry/api",
       ]),
     ];
     fs.writeFileSync(
@@ -417,6 +419,16 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
       "peerDependenciesMeta",
     ])
       assert.ok(!Object.hasOwn(manifest[section] ?? {}, "js-tiktoken"));
+    for (const section of [
+      "dependencies",
+      "optionalDependencies",
+      "peerDependencies",
+      "peerDependenciesMeta",
+    ])
+      assert.ok(
+        !Object.keys(manifest[section] ?? {}).some((name) => name.startsWith("@opentelemetry/")),
+        `OpenTelemetry must not be a runtime, optional, or peer dependency (${section})`,
+      );
     assert.ok(consumerRequire.resolve("zod"));
     function checkTargets(value) {
       if (typeof value === "string")

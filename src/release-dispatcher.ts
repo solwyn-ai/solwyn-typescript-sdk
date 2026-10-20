@@ -20,6 +20,7 @@
  * Edge-safe: no `node:*` imports, and no prompt or response content is ever seen here.
  */
 
+import { withoutTraceContext } from "./trace-context";
 import type { LeaseSurrenderRequest } from "./types";
 
 /** Maximum concurrent surrender requests for one enforcer. */
@@ -284,7 +285,8 @@ export class ReleaseDispatcher {
       this.#active += 1;
       this.#peakActive = Math.max(this.#peakActive, this.#active);
       try {
-        void this.#work(item);
+        // Surrenders outlive the call that submitted them; keep them out of its trace.
+        void withoutTraceContext(() => this.#work(item));
       } catch {
         this.#active -= 1;
         this.#finish(item, dropped("dispatch_failed"));

@@ -235,6 +235,7 @@ const ENV_CONFIG_TO_OPTION: Readonly<Record<string, keyof SolwynOptions>> = Obje
   velocity_growth_factor: "velocityGrowthFactor",
   velocity_accel_floor_per_min: "velocityAccelFloorPerMin",
   velocity_accel_factor: "velocityAccelFactor",
+  trace_correlation: "traceCorrelation",
 });
 
 type WrapOptions = Omit<SolwynOptions, "apiKey" | "apiUrl" | "fetch">;

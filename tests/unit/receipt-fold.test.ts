@@ -475,6 +475,9 @@ describe("ReceiptFoldState", () => {
       agent_run_name: "secret-run-name",
       failover_error_class: "SecretException",
       tags: { private_tag: "secret-tag-value" },
+      trace_id: "0af7651916cd43dd8448eb211c80319c",
+      span_id: "b7ad6b7169203331",
+      trace_sampled: true,
     });
     const allowed = new Set([
       "status",
@@ -510,6 +513,37 @@ describe("ReceiptFoldState", () => {
     expect(retained).not.toContain("secret-run-name");
     expect(retained).not.toContain("SecretException");
     expect(retained).not.toContain("secret-tag-value");
+    expect(retained).not.toContain("0af7651916cd43dd8448eb211c80319c");
+    expect(retained).not.toContain("b7ad6b7169203331");
+  });
+
+  it("folds denials from different traces into one entry", () => {
+    const state = new ReceiptFoldState();
+    state.fold(
+      deniedEvent({
+        call_id: testCallId(81),
+        trace_id: "0af7651916cd43dd8448eb211c80319c",
+        span_id: "b7ad6b7169203331",
+        trace_sampled: true,
+      }),
+    );
+    state.fold(
+      deniedEvent({
+        call_id: testCallId(82),
+        trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
+        span_id: "00f067aa0ba902b7",
+        trace_sampled: false,
+      }),
+    );
+    state.fold(deniedEvent({ call_id: testCallId(83) }));
+
+    expect(state.snapshot()).toHaveLength(1);
+    const { key, fold } = onlyEntry(state);
+    const [replay] = buildReceiptReplayEvents(key, fold, null);
+    expect(replay?.receipt_aggregate_count).toBe(3);
+    for (const field of ["trace_id", "span_id", "trace_sampled"]) {
+      expect(Object.hasOwn(replay ?? {}, field)).toBe(false);
+    }
   });
 
   it("uses clean-cycle proof as a one-shot gate for the following cycle", () => {
@@ -659,6 +693,9 @@ describe("receipt replay splitting and building", () => {
     expect(Object.hasOwn(replay, "agent_run_name")).toBe(false);
     expect(Object.hasOwn(replay, "tags")).toBe(false);
     expect(Object.hasOwn(replay, "requested_model")).toBe(false);
+    expect(Object.hasOwn(replay, "trace_id")).toBe(false);
+    expect(Object.hasOwn(replay, "span_id")).toBe(false);
+    expect(Object.hasOwn(replay, "trace_sampled")).toBe(false);
     expect(MetadataEventSchema.safeParse(replay).success).toBe(true);
 
     const [emptySdkIdReplay] = buildReceiptReplayEvents(key, fold, "");

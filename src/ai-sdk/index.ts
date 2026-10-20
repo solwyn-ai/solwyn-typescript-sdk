@@ -48,6 +48,7 @@ import {
   type TerminationHandle,
 } from "../run-control";
 import { buildTokenDetails, isUsageCount, type TokenDetails } from "../token-details";
+import { applyTraceFields, captureTrace, type TraceSnapshot } from "../trace-context";
 import type { FetchLike } from "../transport";
 import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
 
@@ -411,6 +412,11 @@ export interface SolwynMiddlewareOptions {
   budgetMode?: BudgetMode;
   /** Enable run-scoped local token leases (default true). */
   leaseEnabled?: boolean;
+  /**
+   * Attach the active OpenTelemetry trace id, span id, and sampled flag (when the application
+   * already has an active span) to metadata events (default true).
+   */
+  traceCorrelation?: boolean;
   /** Output-token reservation when `maxOutputTokens` is absent (default 4096). */
   leaseOutputBoundDefault?: number;
   /** Allow-decision cache TTL in SECONDS (default 5). */
@@ -456,6 +462,7 @@ const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
   "failOpen",
   "budgetMode",
   "leaseEnabled",
+  "traceCorrelation",
   "leaseOutputBoundDefault",
   "budgetCheckCacheTtl",
   "budgetCheckTimeout",
@@ -498,6 +505,9 @@ function toConfigOptions(options: SolwynMiddlewareOptions): SolwynConfigOptions 
   if (options.failOpen !== undefined) config.fail_open = options.failOpen;
   if (options.budgetMode !== undefined) config.budget_mode = options.budgetMode;
   if (options.leaseEnabled !== undefined) config.lease_enabled = options.leaseEnabled;
+  if (options.traceCorrelation !== undefined) {
+    config.trace_correlation = options.traceCorrelation;
+  }
   if (options.leaseOutputBoundDefault !== undefined) {
     config.lease_output_bound_default = options.leaseOutputBoundDefault;
   }
@@ -661,6 +671,8 @@ interface CallContext {
   model: string;
   callId: string;
   run: CurrentRun | undefined;
+  /** OpenTelemetry identifiers captured once at call start; never re-read during a stream. */
+  trace: TraceSnapshot | undefined;
   estimatedInputTokens: number;
   abortSignal: AbortSignal | undefined;
   /** Immutable process-local settlement/release authority captured from preflight. */
@@ -936,6 +948,8 @@ export function createSolwynMiddleware(
             tags: current.tags == null ? current.tags : { ...current.tags },
           };
     budget.observeRun(run);
+    // Read synchronously on the caller's path before the first await, exactly once per call.
+    const trace = config.trace_correlation ? captureTrace() : undefined;
 
     // Content -> integer (privacy.ts), then the length ratio keyed off the resolved
     // provider. Zero content estimates 0 (bypassing the min-1 floor, D8).
@@ -968,6 +982,7 @@ export function createSolwynMiddleware(
             model: modelId,
             callId,
             run,
+            trace,
             inputTokens: estimatedInputTokens,
             outputTokens: 0,
             tokenDetails: null,
@@ -987,6 +1002,7 @@ export function createSolwynMiddleware(
       model: modelId,
       callId,
       run,
+      trace,
       estimatedInputTokens,
       abortSignal: params.abortSignal,
       funding: Object.freeze({
@@ -1042,6 +1058,7 @@ export function createSolwynMiddleware(
           model: ctx.model,
           callId: ctx.callId,
           run: ctx.run,
+          trace: ctx.trace,
           inputTokens: ctx.estimatedInputTokens,
           outputTokens: 0,
           tokenDetails: null,
@@ -1065,6 +1082,7 @@ export function createSolwynMiddleware(
     model: string;
     callId: string;
     run: CurrentRun | undefined;
+    trace: TraceSnapshot | undefined;
     inputTokens: number;
     outputTokens: number;
     tokenDetails: TokenDetails | null;
@@ -1099,6 +1117,7 @@ export function createSolwynMiddleware(
       event.agent_run_name = fields.run.agentRunName;
       if (fields.run.tags != null) event.tags = { ...fields.run.tags };
     }
+    applyTraceFields(event, fields.trace);
     return event;
   }
 
@@ -1135,6 +1154,7 @@ export function createSolwynMiddleware(
       model: ctx.model,
       callId: ctx.callId,
       run: ctx.run,
+      trace: ctx.trace,
       inputTokens: tokenDetails.input_tokens,
       outputTokens: tokenDetails.output_tokens,
       tokenDetails,
@@ -1186,6 +1206,7 @@ export function createSolwynMiddleware(
         model: ctx.model,
         callId: ctx.callId,
         run: ctx.run,
+        trace: ctx.trace,
         inputTokens: 0,
         outputTokens: 0,
         tokenDetails: null,
@@ -1293,6 +1314,7 @@ export function createSolwynMiddleware(
           callId: ctx.callId,
           estimatedInputTokens: ctx.estimatedInputTokens,
           funding: ctx.funding,
+          trace: ctx.trace,
           run:
             ctx.run === undefined
               ? undefined

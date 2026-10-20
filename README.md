@@ -784,6 +784,9 @@ the metadata-event fields; it is not the complete control-plane wire inventory:
 | `sdk_instance_id` | Per-process UUID for deduplication |
 | `timestamp` | When the call completed (UTC) |
 | `agent_run_id` / `agent_run_name` / `parent_agent_run_id` | From the active `run(...)` scope, if any |
+| `trace_id` | Random OpenTelemetry trace identifier active when the call started (32 lowercase hex characters), if any |
+| `span_id` | Random OpenTelemetry span identifier active when the call started (16 lowercase hex characters), if any |
+| `trace_sampled` | Whether that trace was sampled; an unsampled trace may be absent from your tracing backend |
 | `tags` | Explicit attribution tags supplied by the customer, if any |
 | `provider_region` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region) |
 | `deny_source` / `deny_reason` / `denied_by_period` | Structural attribution for a denied call |
@@ -794,6 +797,28 @@ Other content-free control-plane messages include budget checks and settlement c
 lease grant/renew/surrender requests, untracked-surface advisories, and provider-breaker reports.
 They carry only the structural request, accounting, run, and explicit attribution context needed
 for those operations — never prompt or response content.
+
+Optional fields are omitted entirely when unset (never sent as `null`), so events for calls that
+do not use them have the same shape as in earlier releases.
+
+**OpenTelemetry trace correlation.** When your application already has an active OpenTelemetry
+span at the moment it calls a wrapped client or the AI SDK middleware, Solwyn records that span's
+trace ID, span ID, and sampled flag on every event for the call, so each Solwyn event can be
+joined to your own trace. These are random identifiers, never content. They are captured once
+when the call starts and reused for every event of that call, including streaming, failover
+hops, errors, and denials. The span ID identifies the span that was active when the call
+started, which is the parent of any span your provider SDK creates for it. Aggregated denial replays carry no trace because
+they span calls.
+
+Solwyn does not depend on or install `@opentelemetry/api`; it reads the active span through the
+API's process-global registry, which requires a registered context manager (OpenTelemetry's
+Node.js SDK and `@vercel/otel` register one). Solwyn creates no spans and reads nothing from a
+span except its trace ID, span ID, and sampled flag: never attributes, events, trace state, or
+baggage. Its own code never injects trace context, baggage, or `tracestate` into requests, and
+background reporting and lease renewals run without the caller's span or baggage. Your
+application's own fetch instrumentation may still add `traceparent` or `baggage` to Solwyn's
+budget checks, which run in the caller's context. Disable capture with
+`traceCorrelation: false` or `SOLWYN_TRACE_CORRELATION=false`.
 
 Your LLM calls go directly to your provider. Solwyn receives usage and operational metadata, plus
 tags you explicitly supply. Prompt and response content is not sent to Solwyn or logged by the

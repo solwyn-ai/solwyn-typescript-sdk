@@ -18,6 +18,7 @@
 | `onUnmetered` | `SOLWYN_ON_UNMETERED` | `"warn"` | `"warn"`, `"raise"`, or `"allow"` for untracked spend surfaces |
 | `acknowledgeUntracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | `[]` | Exact reviewed terminal surface tokens; env form is comma-separated |
 | `reportUntrackedSurfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `true` | Send content-free untracked-surface advisories |
+| `traceCorrelation` | `SOLWYN_TRACE_CORRELATION` | `true` | Include the active OpenTelemetry trace ID, span ID, and sampled flag in metadata events when your application has an active span; set `false` to disable capture. Also accepted by `createSolwynMiddleware` |
 | `leaseEnabled` | `SOLWYN_LEASE_ENABLED` | `true` | Enable local run-scoped token leases |
 | `leaseOutputBoundDefault` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token reservation when a request has no usable cap |
 | `selectionPolicy` | — | `HealthBasedPolicy` | Injectable candidate-ordering policy with an `order()` method |

@@ -177,6 +177,12 @@ import {
 import { captureTags } from "./tags";
 import type { TokenDetails } from "./token-details";
 import { buildTokenDetails, isUsageUnmeasured, zeroTokenDetails } from "./token-details";
+import {
+  applyTraceFields,
+  captureTrace,
+  type TraceSnapshot,
+  withoutTraceContext,
+} from "./trace-context";
 import { type FetchLike, requireFetchLike } from "./transport";
 import type {
   BudgetMode,
@@ -259,6 +265,8 @@ interface CallAttribution {
   readonly agentRunName: string | undefined;
   readonly tags: Readonly<Record<string, string>> | undefined;
   readonly parentAgentRunId: string | undefined;
+  /** OpenTelemetry identifiers active at issuance; closed over by every event of the call. */
+  readonly trace: TraceSnapshot | undefined;
 }
 
 type AttributionSnapshot = RunSnapshot | CallAttribution;
@@ -304,14 +312,20 @@ function tagCaptureLogger(logger: Logger): Logger {
   };
 }
 
-/** Capture complete intercepted-call attribution once, before asynchronous admission work. */
+/**
+ * Capture complete intercepted-call attribution once, before asynchronous admission work.
+ * The trace snapshot is read here, synchronously on the caller's path, and nowhere else in
+ * the core: builders only ever stamp this closed-over value.
+ */
 function captureCallAttribution(
   perCallTags: unknown,
   defaultTags: unknown,
   logger: Logger,
   budget: BudgetEnforcer,
+  traceCorrelation: boolean,
 ): CallAttribution {
   const run = snapshotCurrentRun(budget);
+  const trace = traceCorrelation ? captureTrace() : undefined;
   const tags = captureTags({
     perCallTags,
     runTags: run?.tags,
@@ -324,6 +338,7 @@ function captureCallAttribution(
     agentRunName: run?.agentRunName,
     tags: tags === undefined ? undefined : Object.freeze({ ...tags }),
     parentAgentRunId: run?.parentAgentRunId ?? undefined,
+    trace,
   });
 }
 
@@ -467,6 +482,11 @@ export interface SolwynOptions {
   acknowledgeUntracked?: string[];
   /** Send content-free untracked-surface advisories to Solwyn Cloud (default true). */
   reportUntrackedSurfaces?: boolean;
+  /**
+   * Attach the active OpenTelemetry trace id, span id, and sampled flag (when the application
+   * already has an active span) to metadata events (default true).
+   */
+  traceCorrelation?: boolean;
   /** Enable run-scoped local token leases (default true). */
   leaseEnabled?: boolean;
   /** Output-token reservation when a request has no usable structural cap (default 4096). */
@@ -558,6 +578,7 @@ const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
   "onUnmetered",
   "acknowledgeUntracked",
   "reportUntrackedSurfaces",
+  "traceCorrelation",
   "leaseEnabled",
   "leaseOutputBoundDefault",
   "selectionPolicy",
@@ -998,6 +1019,9 @@ function toConfigOptions(options: SolwynOptions): SolwynConfigOptions {
   }
   if (options.reportUntrackedSurfaces !== undefined) {
     configOptions.report_untracked_surfaces = options.reportUntrackedSurfaces;
+  }
+  if (options.traceCorrelation !== undefined) {
+    configOptions.trace_correlation = options.traceCorrelation;
   }
   if (options.leaseEnabled !== undefined) configOptions.lease_enabled = options.leaseEnabled;
   if (options.leaseOutputBoundDefault !== undefined) {
@@ -1800,7 +1824,8 @@ export class SolwynCore {
   #ensureInit(issuanceProvider?: string): Promise<InitState> {
     if (this.#initPromise === null) {
       this.#refreshSurfaceRuntimesBeforeInit(true);
-      this.#initPromise = this.#buildInit(issuanceProvider);
+      // The memoized promise outlives the first call, so it must not retain that call's span.
+      this.#initPromise = withoutTraceContext(() => this.#buildInit(issuanceProvider));
     }
     return this.#initPromise;
   }
@@ -2106,6 +2131,8 @@ export class SolwynCore {
     if (run.tags !== null && run.tags !== undefined) {
       event.tags = { ...run.tags };
     }
+    // Trace identifiers are omitted entirely (never null) when none was captured at issuance.
+    if ("trace" in run) applyTraceFields(event, run.trace);
   }
 
   /**
@@ -2143,6 +2170,7 @@ export class SolwynCore {
       this.#config.tags,
       this.#tagLogger,
       this.#budget,
+      this.#config.trace_correlation,
     );
     const callId = crypto.randomUUID();
     return this.#executeInterceptedCall(
@@ -2167,6 +2195,7 @@ export class SolwynCore {
       this.#config.tags,
       this.#tagLogger,
       this.#budget,
+      this.#config.trace_correlation,
     );
     const callId = crypto.randomUUID();
     const effective = this.#mergeResponsesKwargs(
@@ -2410,6 +2439,7 @@ export class SolwynCore {
       this.#config.tags,
       this.#tagLogger,
       this.#budget,
+      this.#config.trace_correlation,
     );
     const { primary } = await this.#ensureInit();
     return this.#resolveMediaRequest(primary, callerKwargs, attribution, markers);
@@ -2448,6 +2478,7 @@ export class SolwynCore {
         this.#config.tags,
         this.#tagLogger,
         this.#budget,
+        this.#config.trace_correlation,
       );
     const callId = crypto.randomUUID();
     const deadline = new Deadline(this.#config.failover_total_timeout);
@@ -4149,7 +4180,11 @@ export class SolwynCore {
     // covers synchronous re-entry from a lifecycle hook or hostile thenable getter.
     if (this.#closePromise === null) {
       const deadline = nowMs() + this.#config.reporter_shutdown_deadline * 1000;
-      this.#closePromise = Promise.resolve().then(() => this.#closeOnce(deadline));
+      // Shutdown is client-owned work, and the shared promise must not retain the closing
+      // caller's span.
+      this.#closePromise = withoutTraceContext(() =>
+        Promise.resolve().then(() => this.#closeOnce(deadline)),
+      );
     }
     return this.#closePromise;
   }

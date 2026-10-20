@@ -1535,6 +1535,53 @@
             "title": "Lease Id",
             "description": "Budget lease whose claim funded this call's admission, from LeaseGrantResponse; the same id the call's confirm carries. None when the call was funded by a per-call reservation, admitted from the allow cache, admitted fail-open or uncounted, or denied. Server-minted opaque id (lse_...), never content; bounded by LEASE_ID_MAX_LENGTH exactly as BudgetConfirmRequest.lease_id (D7)."
           },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id",
+            "description": "Optional W3C trace identifier; malformed values are dropped at ingest."
+          },
+          "span_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Span Id",
+            "description": "Optional OTel span identifier; malformed or orphaned values are dropped."
+          },
+          "trace_sampled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Sampled",
+            "description": "Optional W3C sampled flag; only JSON booleans survive. Other scalars and flags without a valid trace_id are dropped at ingest."
+          },
           "provider_region": {
             "anyOf": [
               {
@@ -1685,7 +1732,7 @@
           "timestamp"
         ],
         "title": "IngestMetadataEvent",
-        "description": "Ingest request item whose tag bounds produce per-event dispositions.\n\nEvery non-tag field inherits the strict shared/SDK contract. Tags retain a\nstrict plaintext mapping at the envelope while their 10/64/256 policy is\napplied by the ingest service, allowing one bad tag event to reject without\nfailing well-formed siblings."
+        "description": "Ingest request item whose tag bounds produce per-event dispositions.\n\nOTel identifiers accept bounded plain strings; malformed or orphaned trace\ncontext is dropped by the service, never at the expense of a spend event.\nThe sampled flag accepts JSON scalars; only booleans survive sanitization.\nOther non-tag fields inherit the strict shared/SDK contract. Tags retain a\nstrict plaintext mapping at the envelope while their 10/64/256 policy is\napplied by the ingest service, allowing one bad tag event to reject without\nfailing well-formed siblings."
       },
       "IngestRejection": {
         "properties": {

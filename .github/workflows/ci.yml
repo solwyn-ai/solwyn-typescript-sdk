@@ -308,8 +308,9 @@ jobs:
 
   framework-canary:
     name: Latest LangChain / LangGraph canary
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: provider-surface-matrix
+    # Provider drift must not suppress the framework check after catalog validation.
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs['provider-surface-inventory'].outputs.catalog == 'success'
+    needs: provider-surface-inventory
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

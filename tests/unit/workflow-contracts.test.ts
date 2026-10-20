@@ -77,16 +77,24 @@ function jobConditionMatches(
   ref: string,
   draft = false,
   catalogOutcome = "success",
+  needsResult = "success",
 ): boolean {
+  const condition = workflowJob.if ?? "true";
+  // Actions implicitly requires successful dependencies unless a status function is used.
+  if (!/\b(?:always|cancelled|failure|success)\s*\(/.test(condition) && needsResult !== "success") {
+    return false;
+  }
   return (
-    runInNewContext(workflowJob.if ?? "true", {
+    runInNewContext(condition, {
       // Actions compares strings case-insensitively against these lowercase literals.
       github: {
         event_name: eventName.toLowerCase(),
         ref: ref.toLowerCase(),
         event: { pull_request: { draft } },
       },
-      needs: { "provider-surface-inventory": { outputs: { catalog: catalogOutcome } } },
+      needs: {
+        "provider-surface-inventory": { result: needsResult, outputs: { catalog: catalogOutcome } },
+      },
       always: () => true,
     }) === true
   );
@@ -311,6 +319,12 @@ describe("workflow YAML semantics", () => {
 
     expect(Object.keys(model.jobs).length).toBeGreaterThan(0);
     expect(model.permissions).toBeTypeOf("object");
+    for (const [id, value] of Object.entries(model.jobs)) {
+      const dependencies = typeof value.needs === "string" ? [value.needs] : (value.needs ?? []);
+      for (const dependency of dependencies) {
+        expect(model.jobs[dependency], `${id} needs missing job ${dependency}`).toBeDefined();
+      }
+    }
   });
 });
 
@@ -325,17 +339,41 @@ describe("CI workflow contract", () => {
   });
 
   it.each([
-    ["pull_request", "refs/pull/11/merge", false],
-    ["pull_request", "refs/pull/11/merge", true],
-    ["push", "refs/heads/main", false],
-  ] as const)("runs every gate except deferred draft work for %s on %s (draft=%s)", async (eventName, ref, draft) => {
+    [
+      "pull_request",
+      "refs/pull/11/merge",
+      false,
+      [
+        "quality",
+        "package-artifact",
+        "artifact-consumers",
+        "legacy-installed-core",
+        "provider-surface-inventory",
+        "required",
+      ],
+    ],
+    ["pull_request", "refs/pull/11/merge", true, ["required"]],
+    [
+      "push",
+      "refs/heads/main",
+      false,
+      [
+        "quality",
+        "package-artifact",
+        "artifact-consumers",
+        "legacy-installed-core",
+        "provider-surface-inventory",
+        "required",
+      ],
+    ],
+  ] as const)("runs the exact launch gates for %s on %s (draft=%s)", async (eventName, ref, draft, expectedJobs) => {
     const { model } = await parseWorkflow(ciPath);
 
-    for (const [id, value] of Object.entries(model.jobs)) {
-      expect(jobConditionMatches(value, eventName, ref, draft), id).toBe(
-        !draft || id === "required",
-      );
-    }
+    expect(
+      Object.entries(model.jobs)
+        .filter(([, value]) => jobConditionMatches(value, eventName, ref, draft))
+        .map(([id]) => id),
+    ).toEqual(expectedJobs);
   });
 
   it.each([
@@ -352,14 +390,32 @@ describe("CI workflow contract", () => {
   });
 
   it.each([
-    ["schedule", "refs/heads/main", ["provider-surface-inventory"]],
-    ["workflow_dispatch", "refs/heads/main", ["provider-surface-inventory"]],
-    ["workflow_dispatch", "refs/heads/feature", ["provider-surface-inventory", "required"]],
-  ])("runs the consolidated canaries and any required failure gate for %s on %s", async (eventName, ref, expectedJobs) => {
+    ["schedule", "refs/heads/main", "success", ["provider-surface-inventory", "framework-canary"]],
+    [
+      "workflow_dispatch",
+      "refs/heads/main",
+      "success",
+      ["provider-surface-inventory", "framework-canary"],
+    ],
+    [
+      "workflow_dispatch",
+      "refs/heads/feature",
+      "success",
+      ["provider-surface-inventory", "framework-canary", "required"],
+    ],
+    ["schedule", "refs/heads/main", "failure", ["provider-surface-inventory"]],
+    ["workflow_dispatch", "refs/heads/main", "failure", ["provider-surface-inventory", "required"]],
+    [
+      "workflow_dispatch",
+      "refs/heads/feature",
+      "failure",
+      ["provider-surface-inventory", "required"],
+    ],
+  ])("runs the canaries and any required failure gate for %s on %s (catalog %s)", async (eventName, ref, catalogOutcome, expectedJobs) => {
     const { model } = await parseWorkflow(ciPath);
     expect(
       Object.entries(model.jobs)
-        .filter(([, value]) => jobConditionMatches(value, eventName, ref))
+        .filter(([, value]) => jobConditionMatches(value, eventName, ref, false, catalogOutcome))
         .map(([id]) => id),
     ).toEqual(expectedJobs);
   });
@@ -553,9 +609,9 @@ describe("CI workflow contract", () => {
     const { model } = await parseWorkflow(ciPath);
     const canary = semanticJob(model, "framework-canary");
     expect(canary.if).toBe(
-      "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+      "always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs['provider-surface-inventory'].outputs.catalog == 'success'",
     );
-    expect(canary.needs).toBe("provider-surface-matrix");
+    expect(canary.needs).toBe("provider-surface-inventory");
     const overlay = namedStep(canary, "Overlay latest framework packages");
     expect(overlay.run).toContain(
       "pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest",
@@ -566,6 +622,29 @@ describe("CI workflow contract", () => {
     );
     expect(semanticJob(model, "required").needs).not.toContain("framework-canary");
     expect(await readFile(ciPath, "utf8")).toContain('cron: "0 6 * * 1"');
+  });
+
+  it.each([
+    "schedule",
+    "workflow_dispatch",
+  ])("keeps framework checks independent of provider failures after catalog validation for %s", async (eventName) => {
+    const { model } = await parseWorkflow(ciPath);
+    const canary = semanticJob(model, "framework-canary");
+    for (const needsResult of ["success", "failure", "cancelled", "skipped"]) {
+      for (const catalogOutcome of ["success", "failure", "cancelled", "skipped", ""]) {
+        expect(
+          jobConditionMatches(
+            canary,
+            eventName,
+            "refs/heads/main",
+            false,
+            catalogOutcome,
+            needsResult,
+          ),
+          `provider inventory ${needsResult}, catalog ${catalogOutcome}`,
+        ).toBe(catalogOutcome === "success");
+      }
+    }
   });
 
   it("runs a pinned actionlint binary as part of the required quality result", async () => {

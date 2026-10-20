@@ -40,13 +40,17 @@ it("compiles and executes the published OpenAI Agents recipe with offline transp
     );
     source = replaceOnce(
       source,
-      "{ apiKey: process.env.SOLWYN_API_KEY! }",
+      '{ apiKey: process.env["SOLWYN_API_KEY"]! }',
       '{ apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, onUnmetered: "raise" }',
     );
     source = `import { FakeControlPlane } from "../../../src/testing/index";
-import { createFakeOpenAITransport } from "../../helpers/fake-openai-transport";
+import { createAgentsTransport } from "../../helpers/openai-agents-transport";
 const plane = new FakeControlPlane();
-const transport = createFakeOpenAITransport();
+const transport = createAgentsTransport([
+  { kind: "tool", name: "transfer_to_Specialist" },
+  { kind: "tool", name: "lookup" },
+  { kind: "text" },
+]);
 ${source}
 export { plane, transport };
 `;
@@ -80,12 +84,19 @@ export { plane, transport };
       plane: FakeControlPlane;
       transport: FakeOpenAITransport;
     };
-    expect(fixture.transport.requests).toHaveLength(1);
-    expect(fixture.plane.checks).toHaveLength(1);
-    expect(fixture.plane.confirms).toHaveLength(1);
+    expect(fixture.transport.requests).toHaveLength(3);
+    expect(fixture.plane.checks).toHaveLength(3);
+    expect(fixture.plane.confirms).toHaveLength(3);
+    expect(fixture.plane.leaseGrants).toEqual([]);
     expect(fixture.plane.ingested).toMatchObject([
       { status: "success", agent_run_name: "agent:Triage", tags: { team: "support" } },
+      { status: "success", agent_run_name: "agent:Specialist", tags: { team: "support" } },
+      { status: "success", agent_run_name: "agent:Specialist", tags: { team: "support" } },
     ]);
+    const [triage, toolTurn, finalTurn] = fixture.plane.ingested;
+    expect(triage?.agent_run_id).not.toBe(toolTurn?.agent_run_id);
+    expect(toolTurn?.agent_run_id).toBe(finalTurn?.agent_run_id);
+    expect(new Set(fixture.plane.ingested.map((event) => event.parent_agent_run_id)).size).toBe(1);
     expect(fixture.plane.untrackedReports).toEqual([]);
     expect(fixture.plane.unmatchedRequests).toEqual([]);
     expect(env.fetchAttempts).toEqual([]);

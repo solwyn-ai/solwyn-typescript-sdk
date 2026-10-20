@@ -32,7 +32,7 @@ import {
 import { Solwyn } from "@solwyn/sdk/node";
 import { SolwynAgents, solwynToolErrorFunction } from "@solwyn/sdk/openai-agents";
 
-const client = new Solwyn(new OpenAI({ maxRetries: 0 }), { apiKey: process.env.SOLWYN_API_KEY! });
+const client = new Solwyn(new OpenAI({ maxRetries: 0 }), { apiKey: process.env["SOLWYN_API_KEY"]! });
 // The proxy preserves OpenAI at runtime; this cast accommodates OpenAI's private-field types.
 setDefaultOpenAIClient(client as unknown as OpenAI);
 setOpenAIAPI("chat_completions");
@@ -87,6 +87,13 @@ pull. Abandoned background runs retain attribution until they settle. If using n
 views such as `toTextStream()` or `toStream()`, also await `completed` to observe a swallowed
 tool-level attribution violation.
 
+The module exports `SolwynAgents`, `SolwynAgentsOptions`, `SolwynAgentsRunOptions`, and
+`solwynToolErrorFunction`. Constructor options are `client`, `OpenAIProvider`, and optional `api`
+(`"chat_completions"` by default, or `"responses"`). Each invocation requires `workflow` and
+accepts optional `tags` and native `runOptions`; `stream` is selected by `run` or `runStreamed`.
+Both methods preserve the native agent output and context types and attach the Runner's hooks
+automatically. Explicit `attach(runner)` is safe to repeat.
+
 ## Hierarchy and enforcement
 
 Each invocation creates a detached workflow in the caller's current Solwyn frame. A workflow
@@ -117,6 +124,13 @@ turns and hand-backs. Do not put prompts, responses, secrets, or sensitive ident
 Pass `agents.modelProvider` to the Runner, attach it, and invoke through `agents.run` or
 `agents.runStreamed`. Calling `runner.run` directly with this provider fails closed at model
 dispatch. Attachment is idempotent and revalidates the provider and runner-level model selection.
+
+Keep `maxRetries: 0` on the underlying OpenAI client and configure retries on the Runner. Each
+Runner retry crosses the wrapped client as a separate attempt. A retryable provider error without
+usable usage produces an error event without a settlement confirmation; the successful retry
+settles normally. Eligible untagged retries reuse the agent's lease, while tagged attempts each
+receive per-call admission. Solwyn budget and stop errors veto even a permissive Runner retry
+policy.
 
 ## Refused and unsupported paths
 
@@ -179,6 +193,8 @@ Node seam with a `ConfigurationError`.
 
 Agents is a fast-moving 0.x dependency. The tested version is **0.20.0**; runtime shape checks
 refuse unexpected models and hierarchy. Validate the admitted paths again when upgrading.
+CI uses the committed lockfile with that exact version. A latest-version canary will be added
+during packaging; it is not active yet.
 For strict declaration checking with this Agents version, use `@types/node` 22.15.30 or 24:
 `@types/node` 26 exposes upstream TS2416 errors in Agents' lifecycle and Realtime declarations.
 Include DOM types when checking the umbrella package, which also exports Realtime declarations.

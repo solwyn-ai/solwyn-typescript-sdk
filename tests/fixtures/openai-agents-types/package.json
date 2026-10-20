@@ -1,6 +1,9 @@
 {
   "name": "solwyn-openai-agents-type-test",
   "private": true,
+  "scripts": {
+    "check": "node check.mjs"
+  },
   "devDependencies": {
     "@types/node": "22.15.30"
   }

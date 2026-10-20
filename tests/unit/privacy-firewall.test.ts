@@ -103,62 +103,31 @@ const INTEGRATION_READABLE_PROPERTIES = new Set([
   "isArray", // Validate handler collection shape.
   "test", // Validate/sanitize explicit attribution names only.
   "runId", // Framework run identity.
-  "parentRunId", // Framework hierarchy edge.
   "handlers", // Handler membership proves the metered leaf was bound.
   "signal", // Cancellation capability, never request content.
   "aborted", // Cancellation lifecycle flag.
   "reason", // Forward an abort reason unchanged; never log it.
-  "name", // Explicit agent name or runName attribution only.
   "langgraph_node", // The single admitted structural metadata key.
-  "config", // Runner configuration container.
-  "modelProvider", // Runner provider identity verification.
-  "model", // Model selection identity or structural pin validation.
-  "completed", // Stream lifecycle completion promise.
-  "agentRunId", // Core run identity.
-  "parentAgentRunId", // Core hierarchy edge.
   "chat", // Admitted OpenAI client resource container.
   "completions", // Admitted Chat Completions resource container.
   "create", // Admitted wrapped-client dispatch method.
-  "getModel", // Model-provider dispatch method.
-  "getResponse", // Model dispatch method; arguments and result stay opaque.
-  "getStreamedResponse", // Streaming model dispatch method; values stay opaque.
-  "getRetryAdvice", // Delegate retry decisions without inspecting request content.
-  "supportsPromptModelSelection", // Structural model capability flag.
-  "next", // Iterator lifecycle forwarding.
-  "return", // Iterator cleanup forwarding.
-  "throw", // Iterator error forwarding.
   "then", // Promise lifecycle forwarding.
   "length", // Structural collection size only.
   "activate", // Detached-run attribution activation.
   "tryFinish", // Non-throwing detached-run cleanup.
   "tags", // Explicit non-sensitive attribution options.
   "namePrefix", // Explicit attribution scope-name prefix.
-  "workflow", // Explicit workflow attribution name.
-  "runOptions", // Native call options are forwarded opaquely except for signal.
-  "client", // Wrapper capability, verified through the identity brand.
-  "OpenAIProvider", // Injected provider constructor, avoiding framework value imports.
-  "api", // Explicit admitted API selection.
-  "run", // Runner lifecycle dispatch with opaque input forwarding.
-  "runStreamed", // Streaming runner lifecycle dispatch with opaque input forwarding.
   "addEventListener", // Abort propagation registration.
   "removeEventListener", // Abort propagation cleanup.
   "abort", // Cancellation propagation.
-  "on", // Runner lifecycle listener registration.
-  "off", // Runner lifecycle listener removal.
   "get", // Structural Map/WeakMap lookup.
   "set", // Structural Map/WeakMap registration.
   "has", // Structural collection membership.
   "delete", // Structural collection cleanup.
   "add", // Structural Set registration.
-  "clear", // Structural collection cleanup.
   "size", // Structural Map/Set size.
-  "values", // Structural scope collection traversal.
   "includes", // Handler identity membership check.
-  "debug", // Logger method; direct calls with literal/run-id messages only.
-  "info", // Logger method; direct calls with literal/run-id messages only.
   "warn", // Logger method; direct calls with literal/run-id messages only.
-  "error", // Logger method; direct calls with literal/run-id messages only.
-  "log", // Logger method; direct calls with literal/run-id messages only.
 ]);
 
 const INTEGRATION_CORE_IMPORTS = new Set([
@@ -172,6 +141,31 @@ const INTEGRATION_CORE_IMPORTS = new Set([
 ]);
 const LOGGER_METHODS = new Set(["debug", "info", "warn", "error", "log"]);
 const RUN_ID_IDENTIFIER = /^_?(?:runId|[A-Za-z_$][\w$]*RunId)$/;
+
+// Callback arguments are framework-owned. Pin structural names to their runtime positions;
+// a content parameter cannot become readable by renaming it to another structural name.
+// Unknown handle*/on* callbacks have no structural slots until their contract is reviewed.
+const LANGCHAIN_CALLBACK_PARAMETERS: Readonly<Record<string, Readonly<Record<number, string>>>> = {
+  handleChainStart: { 2: "runId", 3: "parentRunId", 5: "metadata", 7: "runName" },
+  handleToolStart: { 2: "runId", 3: "parentRunId" },
+  handleRetrieverStart: { 2: "runId", 3: "parentRunId" },
+  handleChatModelStart: { 2: "runId", 3: "parentRunId" },
+  handleLLMStart: { 2: "runId", 3: "parentRunId" },
+  handleChainEnd: { 1: "runId" },
+  handleChainError: { 1: "runId" },
+  handleToolEnd: { 1: "runId" },
+  handleToolError: { 1: "runId" },
+  handleRetrieverEnd: { 1: "runId" },
+  handleRetrieverError: { 1: "runId" },
+  handleLLMEnd: { 1: "runId" },
+  handleLLMError: { 1: "runId" },
+};
+
+function containsIdentifier(node: ts.Node, name: string): boolean {
+  // Conservative by design: even a shadowed identifier counts as a possible reference.
+  if (ts.isIdentifier(node) && node.text === name) return true;
+  return ts.forEachChild(node, (child) => containsIdentifier(child, name) || undefined) === true;
+}
 
 function integrationPath(path: string): string | undefined {
   const rel = path.replace(/\\/g, "/").replace(/^src\//, "");
@@ -299,7 +293,66 @@ function findIntegrationViolations(text: string, path: string): string[] {
       assignmentPattern(pattern.left);
     }
   };
+  const callbackParameters = (
+    name: string,
+    callback: ts.MethodDeclaration | ts.ArrowFunction | ts.FunctionExpression,
+  ): void => {
+    if (!/^(?:handle[A-Z]|on[A-Z_])/.test(name)) return;
+    const structural = rel.startsWith("langchain/")
+      ? LANGCHAIN_CALLBACK_PARAMETERS[name]
+      : undefined;
+    for (const [index, parameter] of callback.parameters.entries()) {
+      if (!ts.isIdentifier(parameter.name)) {
+        report(`callback parameter in '${name}' must not be destructured`);
+        continue;
+      }
+      const identifier = parameter.name.text;
+      if (/^_?opaque/.test(identifier) || structural?.[index] === identifier) continue;
+      if (
+        (callback.body && containsIdentifier(callback.body, identifier)) ||
+        callback.parameters.some(
+          (other) => other.initializer && containsIdentifier(other.initializer, identifier),
+        )
+      ) {
+        report(`callback parameter '${identifier}' in '${name}' must be opaque or unreferenced`);
+      }
+    }
+    if (callback.body && containsIdentifier(callback.body, "arguments")) {
+      report("callback references implicit arguments");
+    }
+    // The metadata container is not opaque, but only this one structural key is readable.
+    // Keep the origin restriction even if another integration admits a property of the same name.
+    if (structural?.[5] === "metadata" && callback.body) {
+      const visitMetadata = (node: ts.Node): void => {
+        if (
+          ts.isIdentifier(node) &&
+          node.text === "metadata" &&
+          !(
+            (ts.isPropertyAccessExpression(node.parent) ||
+              ts.isElementAccessExpression(node.parent)) &&
+            node.parent.expression === node &&
+            integrationMemberName(node.parent) === "langgraph_node"
+          )
+        )
+          report("callback metadata may only read langgraph_node directly");
+        ts.forEachChild(node, visitMetadata);
+      };
+      visitMetadata(callback.body);
+    }
+  };
   const visit = (node: ts.Node): void => {
+    if (ts.isMethodDeclaration(node)) {
+      const name = propertyNameText(node.name);
+      if (name !== undefined) callbackParameters(name, node);
+    }
+    if (
+      ts.isPropertyDeclaration(node) &&
+      node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+    ) {
+      const name = propertyNameText(node.name);
+      if (name !== undefined) callbackParameters(name, node.initializer);
+    }
     let specifier = importSpecifier(node);
     if (
       ts.isImportTypeNode(node) &&
@@ -364,6 +417,17 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node)) {
       report(`uses opaque identifier '${node.text}' outside direct forwarding`);
     }
+    if (ts.isIdentifier(node) && node.text === "Reflect") report("references Reflect");
+    if (
+      ts.isIdentifier(node) &&
+      node.text === "Object" &&
+      !(
+        (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent)) &&
+        node.parent.expression === node &&
+        integrationMemberName(node.parent) === "defineProperty"
+      )
+    )
+      report("references Object outside defineProperty");
     if (ts.isIdentifier(node) && node.text === "fetch") report("references fetch");
     if (ts.isCallExpression(node)) {
       const name =
@@ -1388,6 +1452,82 @@ describe("privacy firewall — integration source controls", () => {
   });
 
   it.each([
+    [
+      "renamed callback reflection",
+      'class Handler { handleChainStart(_serialized, input) { return String(Reflect.get(input, "question")); } }',
+      "callback parameter 'input'",
+    ],
+    [
+      "renamed callback Object iteration",
+      "class Handler { handleChainStart(_serialized, input) { return String(Object.values(input)); } }",
+      "callback parameter 'input'",
+    ],
+    [
+      "renamed callback interpolation",
+      `class Handler { handleChainStart(_serialized, input) { return \`\${input}\`; } }`,
+      "callback parameter 'input'",
+    ],
+    [
+      "renamed callback iteration",
+      "class Handler { handleChainStart(_serialized, input) { for (const value of input) consume(value); } }",
+      "callback parameter 'input'",
+    ],
+    [
+      "widened callback metadata",
+      "class Handler { handleChainStart(a, b, runId, parentRunId, tags, metadata?: Record<string, unknown>) { return metadata?.values; } }",
+      "metadata",
+    ],
+    [
+      "structural name in a content slot",
+      "class Handler { handleChainStart(_serialized, runName) { return runName; } }",
+      "callback parameter 'runName'",
+    ],
+    [
+      "destructured callback content",
+      "class Handler { handleChainStart(_serialized, { runId }) { return runId; } }",
+      "callback parameter",
+    ],
+    [
+      "renamed callback arrow parameter",
+      `class Handler { handleChainStart = (_serialized, input) => \`\${input}\`; }`,
+      "callback parameter 'input'",
+    ],
+    [
+      "unknown callback parameter",
+      `class Handler { handleAgentAction(input) { return \`\${input}\`; } }`,
+      "callback parameter 'input'",
+    ],
+    [
+      "implicit callback arguments",
+      `class Handler { handleChainStart(_serialized, input) { return \`\${arguments}\`; } }`,
+      "arguments",
+    ],
+    ["Reflect alias", "const reflect = Reflect;", "Reflect"],
+    ["Object alias", "const object = Object;", "Object"],
+    ["Object lookup", "const result = Object.get(request);", "Object"],
+    ["Object iteration", "const result = Object.values(request);", "Object"],
+  ])("rejects integration %s", (_label, source, diagnostic) => {
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining(diagnostic)]),
+    );
+  });
+
+  it("permits unused callback parameters and positional structural arguments", () => {
+    const source = `
+      class Handler {
+        handleChainStart(serialized, input, runId, parentRunId, tags, metadata, runType, runName) {
+          start(runId, parentRunId, runName, metadata?.langgraph_node);
+        }
+        handleLLMError(error, runId) { end(runId); }
+        handleAgentAction(input) {}
+        handleToolStart = (serialized, input, runId, parentRunId) => start(runId, parentRunId);
+      }
+      Object.defineProperty(failure, Symbol.for("langchain.errors.retryable"), { value: false });
+    `;
+    expect(findIntegrationViolations(source, path)).toEqual([]);
+  });
+
+  it.each([
     ["property access", "function f(opaque) { return opaque.runId; }"],
     ["binding", "function f(_opaque) { const { runId } = _opaque; }"],
     ["iteration", "function f(opaqueItems) { for (const item of opaqueItems) consume(item); }"],
@@ -1468,7 +1608,7 @@ describe("privacy firewall — integration source controls", () => {
         #scopes = new Map();
         localCount = 0;
         f(opaqueRequest, options, manager) {
-          const { runId, parentRunId: parent, config: { model } } = manager;
+          const { runId, handlers } = manager;
           const signal = options["signal"];
           this.localCount++;
           const readOwn = () => this.#scopes;

@@ -7,6 +7,7 @@ import {
   RunStoppedError,
   SolwynError,
 } from "../../src/errors";
+import { noopLogger } from "../../src/logging";
 import { SolwynAgents, solwynToolErrorFunction } from "../../src/openai-agents/index";
 import {
   type DetachedRun,
@@ -283,6 +284,90 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
   it.each([
     false,
     true,
+  ])("enforces velocity across a hand-back on the original agent run (streamed=%s)", async (streamed) => {
+    const transport = createAgentsTransport([
+      { kind: "tool", name: "transfer_to_Specialist" },
+      { kind: "tool", name: "transfer_to_Worker" },
+      { kind: "text" },
+    ]);
+    const state = setup("chat_completions", {
+      transport,
+      wrap: { velocityMode: "deny", velocityRepeatCount: 2, logger: noopLogger },
+    });
+    const specialist = new framework.Agent({
+      name: "Specialist",
+      model: "gpt-4.1-mini",
+      handoffs: [state.agent],
+    });
+    state.agent.handoffs = [specialist];
+    try {
+      const execute = async () => {
+        // Keep the small handoff additions within the core's size-repeat tolerance.
+        const input = "Synthetic input. ".repeat(4_000);
+        const options = { workflow: "workflow", tags: { team: "support" } };
+        if (!streamed) return state.integration.run(state.runner, state.agent, input, options);
+        const result = await state.integration.runStreamed(
+          state.runner,
+          state.agent,
+          input,
+          options,
+        );
+        for await (const _event of result) {
+          /* drain */
+        }
+        return result;
+      };
+      await expect(execute()).rejects.toBeInstanceOf(RunStoppedError);
+    } finally {
+      await state.client.close();
+      for (const event of state.plane.ingested)
+        if (typeof event.agent_run_id === "string") clearRunTermination(event.agent_run_id);
+    }
+    expect(transport.requests).toHaveLength(2);
+    const successes = state.plane.ingested.filter((event) => event.status === "success");
+    const denials = state.plane.ingested.filter((event) => event.status === "budget_denied");
+    expect(successes).toHaveLength(2);
+    expect(denials).toHaveLength(1);
+    expect(denials[0]).toMatchObject({
+      deny_source: "local_velocity",
+      deny_reason: "velocity:repeat_size",
+      velocity_flags: ["repeat_size"],
+    });
+    const [first, second] = successes;
+    const [stopped] = denials;
+    expect(stopped?.agent_run_id).toBe(first?.agent_run_id);
+    expect(second?.agent_run_id).not.toBe(first?.agent_run_id);
+    expect(
+      (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
+    ).toBe(0);
+  });
+
+  it("keeps distinct same-named agent objects in separate runs", async () => {
+    const state = setup("chat_completions", {
+      transport: createAgentsTransport([
+        { kind: "tool", name: "transfer_to_Worker" },
+        { kind: "text" },
+      ]),
+    });
+    state.agent.handoffs = [new framework.Agent({ name: "Worker", model: "gpt-4.1-mini" })];
+    try {
+      await invoke(state, false, false);
+    } finally {
+      await state.client.close();
+    }
+    expect(state.plane.ingested).toHaveLength(2);
+    expect(state.plane.ingested.map((event) => event.agent_run_name)).toEqual([
+      "agent:Worker",
+      "agent:Worker",
+    ]);
+    expect(new Set(state.plane.ingested.map((event) => event.agent_run_id)).size).toBe(2);
+    expect(new Set(state.plane.ingested.map((event) => event.parent_agent_run_id)).size).toBe(1);
+    expect(state.plane.leaseGrants).toHaveLength(2);
+  });
+
+  it.each([
+    false,
+    true,
   ])("isolates three concurrent invocations (streamed=%s)", async (streamed) => {
     const state = setup();
     try {
@@ -462,34 +547,36 @@ describe("OpenAI Agents fail-closed boundaries", () => {
   it.each([
     false,
     true,
-  ])("refuses explicitly nested integration workflows (inner streamed=%s)", async (streamed) => {
-    const state = setup("chat_completions", {
-      transport: createAgentsTransport([{ kind: "tool", name: "nested" }, { kind: "text" }]),
-    });
-    const inner = new framework.Agent({ name: "Inner", model: "gpt-4.1-mini" });
-    state.agent.tools = [
-      framework.tool({
-        name: "nested",
-        description: "Synthetic nested workflow",
-        parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
-        execute: async () => {
-          if (!streamed)
-            return state.integration.run(state.runner, inner, "Synthetic input.", {
+  ])("refuses explicitly nested integration workflows (outer streamed=%s)", async (outerStreamed) => {
+    for (const streamed of [false, true]) {
+      const state = setup("chat_completions", {
+        transport: createAgentsTransport([{ kind: "tool", name: "nested" }, { kind: "text" }]),
+      });
+      const inner = new framework.Agent({ name: "Inner", model: "gpt-4.1-mini" });
+      state.agent.tools = [
+        framework.tool({
+          name: "nested",
+          description: "Synthetic nested workflow",
+          parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+          execute: async () => {
+            if (!streamed)
+              return state.integration.run(state.runner, inner, "Synthetic input.", {
+                workflow: "nested",
+              });
+            return state.integration.runStreamed(state.runner, inner, "Synthetic input.", {
               workflow: "nested",
             });
-          return state.integration.runStreamed(state.runner, inner, "Synthetic input.", {
-            workflow: "nested",
-          });
-        },
-      }),
-    ];
-    state.agent.toolUseBehavior = "stop_on_first_tool";
-    try {
-      await expect(invoke(state, false)).rejects.toThrow(/nested/);
-    } finally {
-      await state.client.close();
+          },
+        }),
+      ];
+      state.agent.toolUseBehavior = "stop_on_first_tool";
+      try {
+        await expect(invoke(state, outerStreamed)).rejects.toThrow(/nested/);
+      } finally {
+        await state.client.close();
+      }
+      expect(state.transport.requests).toHaveLength(1);
     }
-    expect(state.transport.requests).toHaveLength(1);
   });
   it("forces HTTP even when the global Responses transport selects websockets", async () => {
     framework.setOpenAIResponsesTransport("websocket");

@@ -415,6 +415,72 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
   });
 
   it.each([
+    false,
+    true,
+  ])("preserves Agents' sanitized wrapper when a sibling guardrail blocks terminal tool output (streamed=%s)", async (streamed) => {
+    for (const api of ["chat_completions", "responses"] as const) {
+      const state = setup(api, {
+        transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]),
+      });
+      let decision: unknown;
+      state.agent.toolUseBehavior = "stop_on_first_tool";
+      state.agent.tools = [
+        framework.tool({
+          name: "lookup",
+          description: "Synthetic lookup",
+          parameters: {
+            type: "object",
+            properties: {},
+            required: [],
+            additionalProperties: false,
+          },
+          execute: () => "Synthetic result.",
+        }),
+      ];
+      state.agent.outputGuardrails = [
+        {
+          name: "synthetic_denial",
+          execute: async () => {
+            try {
+              if (api === "responses")
+                await state.client.responses.create({ model: "solwyn-test/deny", input: [] });
+              else
+                await state.client.chat.completions.create({
+                  model: "solwyn-test/deny",
+                  messages: [],
+                });
+            } catch (error) {
+              decision = error;
+              throw error;
+            }
+            throw new Error("synthetic denied call unexpectedly succeeded");
+          },
+        },
+        {
+          name: "synthetic_tripwire",
+          execute: async () => ({ tripwireTriggered: true, outputInfo: undefined }),
+        },
+      ];
+      const nativeFailures = recordRunnerFailures(state.runner);
+      try {
+        const observed = await observeFailure(state, streamed);
+        expect(decision).toBeInstanceOf(BudgetExceededError);
+        expect(observed).toBeInstanceOf(framework.GuardrailExecutionError);
+        expect(nativeFailures).toHaveLength(1);
+        expect(observed).toBe(nativeFailures[0]);
+        const redacted = (observed as Agents.GuardrailExecutionError).error;
+        expect(redacted).toBeInstanceOf(Error);
+        expect((redacted as Error).constructor).toBe(Error);
+        expect(redacted).not.toBe(decision);
+        expect(state.transport.requests).toHaveLength(1);
+      } finally {
+        await state.client.close();
+      }
+      expect(state.plane.denialReceipts).toHaveLength(1);
+    }
+  });
+
+  it.each([
     ["input", false],
     ["input", true],
     ["output", false],
@@ -1460,6 +1526,7 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
           ? { transport: createAgentsTransport([{ kind: "tool", name: "lookup" }]) }
           : {},
     );
+    const deletedEntries = vi.spyOn(Map.prototype, "delete");
     if (scenario === "max-turns") {
       state.agent.tools = [
         framework.tool({
@@ -1496,10 +1563,17 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
         expect(result.cancelled).toBe(true);
       } else await invoke(state, scenario === "stream");
       expect(runTracker.active.size).toBe(0);
-      for (const handle of tracker.handles)
+      expect(tracker.handles.length).toBeGreaterThan(0);
+      for (const handle of tracker.handles) {
         expect(() => handle.activate(() => undefined)).toThrow(/finished/);
+        expect(
+          deletedEntries.mock.calls.some(([runId]) => runId === handle.runId),
+          "finished runs must be removed from invocation storage",
+        ).toBe(true);
+      }
       if (scenario === "max-turns") expect(tracker.handles).toHaveLength(2);
     } finally {
+      deletedEntries.mockRestore();
       tracker.restore();
       await state.client.close();
     }

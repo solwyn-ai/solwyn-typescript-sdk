@@ -186,6 +186,14 @@ wrapped-client call. Recognition uses an `Error` with own `error` and `state` fi
 the behavior under class-name minification without importing Agents at runtime. The integration
 does not read `state` or recursively search guardrail exceptions' `cause` chains.
 
+**Blocked terminal tool output:** in Agents 0.20.0, when final output comes from a tool result
+(for example, with `toolUseBehavior: "stop_on_first_tool"`) and another output guardrail in the
+same batch trips, Agents sanitizes the failure before Solwyn receives it. Its
+`sanitizeBlockedOutputGuardrailError` rebuilds `GuardrailExecutionError` with a redacted plain
+`Error` in `.error`, replacing any original Solwyn denial or stop. Solwyn preserves that native
+wrapper, so exact error identity and typed `BudgetExceededError`/`RunStoppedError` catches are
+unavailable on this path. The wrapped-client call still enforces the denial or stop.
+
 Non-Solwyn guardrail exceptions retain their native `GuardrailExecutionError` or `ToolCallError`
 wrapper. Guardrail tripwire results also retain Agents' behavior: agent input/output tripwires
 remain `InputGuardrailTripwireTriggered`/`OutputGuardrailTripwireTriggered`, and tool input/output

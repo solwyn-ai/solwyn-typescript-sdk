@@ -354,7 +354,13 @@ function isGuardedRunner(node: ts.Expression, checker: ts.TypeChecker): boolean 
 }
 
 /** Only a symbol guarded by requireSolwynClient can supply the provider leaf. */
-function isWrappedClient(node: ts.Expression, checker: ts.TypeChecker): boolean {
+function isWrappedClient(
+  node: ts.Expression,
+  checker: ts.TypeChecker,
+  guardedBindings?: ReadonlySet<ts.Symbol>,
+): boolean {
+  const binding = checker.getSymbolAtLocation(node);
+  if (binding && guardedBindings?.has(binding)) return true;
   const declaration = localDeclaration(node, checker);
   if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer)
     return false;
@@ -518,7 +524,11 @@ function isControlledDelegate(receiver: ts.Expression, checker: ts.TypeChecker):
   return used && safe;
 }
 
-function isProviderForward(call: ts.CallExpression, checker: ts.TypeChecker): boolean {
+function isProviderForward(
+  call: ts.CallExpression,
+  checker: ts.TypeChecker,
+  guardedBindings?: ReadonlySet<ts.Symbol>,
+): boolean {
   const callee = call.expression;
   if (!ts.isPropertyAccessExpression(callee)) return false;
   const receiver = callee.expression;
@@ -529,7 +539,7 @@ function isProviderForward(call: ts.CallExpression, checker: ts.TypeChecker): bo
     ts.isPropertyAccessExpression(receiver.expression) &&
     receiver.expression.name.text === "chat"
   )
-    return isWrappedClient(receiver.expression.expression, checker);
+    return isWrappedClient(receiver.expression.expression, checker, guardedBindings);
   if (["getResponse", "getStreamedResponse", "getRetryAdvice"].includes(callee.name.text)) {
     return isControlledDelegate(receiver, checker);
   }
@@ -782,15 +792,20 @@ function isOpaqueExpressionForward(
 }
 
 /**
- * Single-file, conservative source rule, not a general TypeScript information-flow proof.
+ * Single-file, syntax-limited source rule, not a general TypeScript information-flow proof.
  * Symbol taint is monotonic across branches, loops, and scopes: a fresh assignment never
- * declassifies a value. Local helper returns/arguments reach a fixed point, including cycles.
- * Opaque-result writes and guarded-binding mutations/assignment aliases fail closed rather
- * than attempting path-sensitive heap or control-flow analysis. Computed reads, reflection,
- * unresolved opaque helpers, and escaping opaque closures remain rejected by the rules below.
+ * declassifies a value. Local helper returns and positional CallExpression arguments reach
+ * a fixed point, including cycles. Argument propagation does not cover constructors, tagged
+ * templates, or parameter defaults. Promise callback propagation covers only inline `.then`
+ * fulfillment callbacks, not named callbacks or rejection callbacks.
+ * Opaque-result heap writes are rejected for assignment syntax, not collection mutators such
+ * as Map.set/Set.add. Guarded-binding mutations/assignment aliases fail closed; declaration
+ * aliases retain guard provenance for wrapped-client result recognition. Separate checks
+ * restrict computed reads, reflection, helper escapes, and explicitly opaque identifiers.
  * Imports/ambient types cannot grant authority; provider guards and structural capabilities
- * still depend on the reviewed source shapes/property lists. This is no whole-program proof
- * against arbitrary JavaScript metaprogramming or side effects hidden in external code.
+ * still depend on reviewed source shapes. Property allowlists and the literal/run-id-only
+ * logger rule remain defences where result tracking does not reach. This is no whole-program
+ * proof against arbitrary JavaScript metaprogramming or side effects hidden in external code.
  * Directory discovery is independent and tolerates absent integrations.
  */
 function findIntegrationViolations(text: string, path: string): string[] {
@@ -898,7 +913,7 @@ function findIntegrationViolations(text: string, path: string): string[] {
       return !!(symbol && opaqueResults.has(symbol)) || derived(node.expression, next);
     }
     if (ts.isCallExpression(node)) {
-      if (isProviderForward(node, checker)) return true;
+      if (isProviderForward(node, checker, guardedBindings)) return true;
       const calleeSymbol = symbolOf(node.expression);
       if (calleeSymbol && opaqueFactories.has(calleeSymbol)) return true;
       if (
@@ -2801,6 +2816,19 @@ describe("privacy firewall — integration source controls", () => {
         "src/openai-agents/index.ts",
       ),
     ).toEqual(expect.arrayContaining([expect.stringContaining("opaque")]));
+  });
+
+  it("keeps results from initialized wrapped-client aliases opaque", () => {
+    const source = `import { requireSolwynClient } from "../integration-support";
+      async function leaf(client) { requireSolwynClient(client, "test");
+        const wrapped = client;
+        const alias = wrapped;
+        const reply = await alias.chat.completions.create(request);
+        factory("x", { tags: reply });
+      }`;
+    expect(findIntegrationViolations(source, path)).toEqual(
+      expect.arrayContaining([expect.stringContaining("attribution sink receives opaque data")]),
+    );
   });
 
   it.each([

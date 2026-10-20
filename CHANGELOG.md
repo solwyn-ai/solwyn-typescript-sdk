@@ -19,8 +19,10 @@ corresponding release notes before users upgrade.
   completion and iteration preserve latched decisions and release state after completion or
   cancellation. Tool-code, agent input/output guardrail, and tool input/output guardrail denials
   and stops surface the exact original Solwyn error from `run`, streamed iteration, and
-  `completed`, including in minified bundles. Non-Solwyn failures and guardrail tripwires retain
-  their native wrappers.
+  `completed` when Agents preserves the branded decision, including in minified bundles.
+  Agents 0.20.0 redacts the decision to a plain error when a sibling output guardrail trips on
+  terminal tool output; that native wrapper is preserved. Non-Solwyn failures and guardrail
+  tripwires retain their native wrappers.
   Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
   still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
   Invocation storage uses JavaScript private fields and is absent from instance reflection.

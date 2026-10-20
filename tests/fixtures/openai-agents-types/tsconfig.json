@@ -1,0 +1,10 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "skipLibCheck": false,
+    "types": ["node"],
+    "typeRoots": ["./node_modules/@types"],
+    "lib": ["ES2023", "DOM", "ESNext.Disposable"]
+  },
+  "include": ["fixture.ts"]
+}

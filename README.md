@@ -29,11 +29,11 @@ The manifest retains **Node.js 20 or later** only for end-of-life (EOL) legacy i
 support in the provider-free core, or a compatible [server-side edge runtime](#edge-runtimes).
 Node.js 22 and 24 are the full development and release lanes. The current development toolchain,
 provider integrations, and Vercel AI SDK 7 middleware require their own supported Node versions;
-in particular, AI SDK 7 and the LangChain/OpenAI recipe require Node.js 22 or newer. Declarations are consumer-tested with
-TypeScript 5.8.3 and 6.0.3 under `strict: true`, `skipLibCheck: false`, and a lib set that includes
-`ESNext.Disposable` (for `Symbol.asyncDispose`) alongside the runtime libraries your application
-uses. Supports ESM and CommonJS. Keep your existing provider package; Solwyn bundles no provider
-clients.
+in particular, AI SDK 7 and the LangChain/OpenAI recipe require Node.js 22 or newer. Declarations
+are consumer-tested with TypeScript 5.8.3 and 6.0.3 under `strict: true`, `skipLibCheck: false`,
+and a lib set that includes `ESNext.Disposable` (for `Symbol.asyncDispose`) alongside the runtime
+libraries your application uses. Supports ESM and CommonJS. Keep your existing provider package;
+Solwyn bundles no provider clients.
 
 ## Quick start
 
@@ -182,6 +182,7 @@ for preflight deadlines, reporter delivery, and lease eligibility and renewal.
 | I want to… | Start here |
 |------------|------------|
 | Use another provider | [Provider examples](#providers) or [Vercel AI SDK middleware](#vercel-ai-sdk) |
+| Use LangChain or LangGraph | [Framework integrations](#framework-integrations) |
 | Block over-budget requests | [Budget enforcement](#budget-enforcement) |
 | Group usage by workflow or customer | [Agent runs and attribution tags](#tagging-calls-with-agent-runs) |
 | Recover from provider failures | [Failover](#failover) |
@@ -437,7 +438,8 @@ with `@solwyn/sdk/langchain` on Node.js 22+. `SolwynRunScopeHandler` adds conten
 stable graph-node attribution; the Solwyn-wrapped OpenAI client supplies enforcement and
 settlement. The exact recipe admits Chat Completions chain `invoke`/`stream`, compiled graph
 values/updates/messages streaming, parallel nodes, loops, and function-tool binding. Responses
-and JSON-schema parsing fail closed; other paths are listed on the recipe page.
+and non-streaming JSON-schema parsing fail closed; streaming structured output is outside the
+tested recipe. Other paths are listed on the recipe page.
 
 | Framework | Integration | Runtime |
 |---|---|---|

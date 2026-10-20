@@ -215,8 +215,8 @@ explicitly with the manifest and public documentation:
   provider-free installed core, `./node`, and `./testing` lane and document that the current
   development toolchain, Vercel AI SDK 7, and `@langchain/openai` require Node.js 22 or newer.
   The `./ai-sdk` and `./langchain` entries are deliberately excluded from the Node 20 lane
-  because their integration peers require Node 22. Node.js 20 is end-of-life,
-  so that lane is compatibility evidence, not a maintenance promise;
+  because their integration peers require Node 22. Node.js 20 is end-of-life, so that lane is
+  compatibility evidence, not a maintenance promise;
 - strict ESM/CommonJS declaration consumers pass with TypeScript 5.8.3 (the tested floor) and
   6.0.3 (the tested current compiler), with `skipLibCheck: false`;
 - deeper installed checks exercise the locked native-type fixture with OpenAI 6.45.0 and
@@ -224,8 +224,9 @@ explicitly with the manifest and public documentation:
   types/runtime fixtures, the locked LangChain recipe fixture (core 1.2.18, OpenAI integration
   1.6.2, LangGraph 1.5.1, OpenAI 7.36.0, and `@types/node` 22.15.30) with strict TypeScript
   5.8.3/6.0.3 ESM/CommonJS compilation and offline execution, and separate Google GenAI
-  0.3.1 plus 2.20.0 installations for native lifecycle behavior. These installed probes retain their own pins; they do not install the
-  development dependencies or the provider-surface matrix's latest cells;
+  0.3.1 plus 2.20.0 installations for native lifecycle behavior. These installed probes retain
+  their own pins; they do not install the development dependencies or the provider-surface
+  matrix's latest cells;
 - provider-surface floor/latest boundary cells separately check OpenAI 4.41.0 and 7.36.0,
   Anthropic 0.30.0 and 0.135.0, Bedrock Runtime 3.422.0 and 3.1124.0, Google GenAI 0.3.1 and
   2.30.0, Together AI 0.16.0 and 0.58.0, plus Google Generative AI 0.24.1 as its reviewed cell.

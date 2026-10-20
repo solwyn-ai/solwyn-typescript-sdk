@@ -14,14 +14,15 @@ corresponding release notes before users upgrade.
 - **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
   a content-free run-scope handler and a guarded Chat Completions leaf for the documented
   Node.js 22+ OpenAI recipe. Stable graph-node scopes preserve lease reuse, velocity history,
-  and exact-run stops across iterations. Responses and JSON-schema parsing are refused.
+  and exact-run stops across iterations. Responses and non-streaming JSON-schema parsing are
+  refused; streaming structured output is outside the tested recipe. Failed model callbacks
+  preserve the original error, while successful unbound calls raise a bypass diagnostic. Root
+  completion releases remaining model bindings and abort listeners. Scope names replace Unicode
+  format and separator characters, and invalid `namePrefix` values are rejected eagerly.
   Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.
 
 ### Fixed
-
-- **LangChain scope names.** Replace Unicode format and separator characters in framework run
-  names before creating Node scopes, and reject those characters in `namePrefix` eagerly.
 
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
   it agrees with the initial usage split, including streams that start without cache writes.

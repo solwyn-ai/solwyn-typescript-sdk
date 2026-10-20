@@ -123,7 +123,9 @@ the upstream signal's reason, and model-end/error callbacks remove its listener.
 ## Not admitted
 
 - Responses API, including explicit selection and automatic switching: typed refusal before
-  dispatch. JSON-schema structured output uses `chat.completions.parse`, which is refused.
+  dispatch. Non-streaming JSON-schema structured output uses `chat.completions.parse`, which
+  is refused. Streaming structured output can use `chat.completions.create` and is outside the
+  tested recipe.
 - `_streamChatModelEvents`, LangGraph v3 messages streaming, and `streamEvents` (including v2).
 - Early stream `break`/iterator `return()`: core 1.2.18 can omit the root's terminal callback,
   retaining handler scopes. Consume streams fully, or abort with the call's `AbortSignal` and
@@ -140,18 +142,21 @@ the upstream signal's reason, and model-end/error callbacks remove its listener.
   handler without importing `@solwyn/sdk/node` throws `ConfigurationError`. Edge applications
   can use a wrapped provider client directly for enforcement without framework attribution.
 
-A model that ends without binding this handler's leaf raises `SolwynError`: the call was not
-metered. This diagnostic happens after the call and cannot undo provider work. It is a guard
-against accidental bypass, not an admission of arbitrary models or cache configurations.
+A model that succeeds without binding this handler's leaf raises `SolwynError`: the call was
+not metered. This diagnostic happens after the call and cannot undo provider work. Failed model
+callbacks clean up without replacing the original error, including pre-dispatch refusals.
+The success diagnostic guards against accidental bypass; arbitrary models and cache
+configurations remain outside the tested recipe.
 
 ## Scopes, tags, and tracing
 
 Ordinary chains attribute model calls to a lazily created root scope. LangGraph nodes reuse a
 scope per root, enclosing node scope, and node name across iterations. Nested node scopes are
 children; tools and retrievers add no Solwyn runs. Scopes finish when the root ends, deferring
-active work until its activation settles. Missing terminal framework callbacks can retain
-handler state; use well-behaved runnables and consume streams through completion or cancellation
-errors as described above.
+active work until its activation settles. Root completion also releases any remaining model
+bindings and their abort listeners. Missing root terminal callbacks can retain handler state;
+use well-behaved runnables and consume streams through completion or cancellation errors as
+described above.
 
 Under an outer `run(...)`, the root is its child. Calls carry the leaf scope's exact run ID;
 Cloud stops and per-run controls must target that leaf ID. Stopping a parent does not stop its

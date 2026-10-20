@@ -126,7 +126,7 @@ async function validateChecks(probe, report, out) {
   } else if (probe === "langchain-type-consumer" || probe === "openai-agents-type-consumer") {
     const agents = probe === "openai-agents-type-consumer";
     for (const peer of agents
-      ? ["agents", "openai", "typesNode", "zod"]
+      ? ["agents", "mcp", "openai", "typesNode", "zod"]
       : ["core", "langchainOpenai", "langgraph", "openai", "typesNode", "zod"])
       version(versions[peer], peer);
     const { assertTypeConsumerChecks } = await import("./type-consumer-support.mjs");

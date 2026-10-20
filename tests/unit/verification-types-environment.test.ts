@@ -186,6 +186,7 @@ const fixtureGraphs = [
   {
     name: "openai-agents-smoke",
     dependencies: {
+      "@modelcontextprotocol/client": "2.3.1",
       "@openai/agents": "0.20.0",
       "@types/node": "22.15.30",
       openai: "7.36.0",

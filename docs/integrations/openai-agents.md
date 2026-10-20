@@ -210,6 +210,9 @@ its declarations use native Agents types, so importing them requires installing 
 For strict declaration checking with this Agents version, use `@types/node` 22.15.30 or 24:
 `@types/node` 26 exposes upstream TS2416 errors in Agents' lifecycle and Realtime declarations.
 Include DOM types when checking the umbrella package, which also exports Realtime declarations.
+Agents also imports its optional `@modelcontextprotocol/client` from a declaration file. Keep that
+optional dependency installed for strict checking. The locked verification fixture pins it at
+2.3.1 explicitly so the proof also works when optional dependencies are omitted.
 This limitation does not require changing an application's source-level strictness settings.
 
 TypeScript ships the attribution module at `@solwyn/sdk/openai-agents`. The Python SDK's OpenAI

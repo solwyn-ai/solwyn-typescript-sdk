@@ -205,7 +205,7 @@ if(probe==='package-consumers'){
   details.openaiAgentsPeerRequired=true;
 }else if(probe==='langchain-type-consumer'||probe==='openai-agents-type-consumer'){
   const agents=probe==='openai-agents-type-consumer';
-  Object.assign(versions,{agents:'0.20.0',typescript:compiler,core:'1.2.18',langchainOpenai:'1.6.2',langgraph:'1.5.1',openai:'7.36.0',typesNode:'22.15.30',zod:'4.4.3'});
+  Object.assign(versions,{agents:'0.20.0',mcp:'2.3.1',typescript:compiler,core:'1.2.18',langchainOpenai:'1.6.2',langgraph:'1.5.1',openai:'7.36.0',typesNode:'22.15.30',zod:'4.4.3'});
   fs.writeFileSync(path.join(out,agents?'openai-agents-smoke-package-lock.json':'langchain-smoke-package-lock.json'),'locked langchain');
   Object.assign(details,{strict:true,skipLibCheck:false,cells:compilerCells.map(cell=>({...cell,files:[cell.format==='esm'?'recipe.mts':'recipe.cts']})),fixture:{copiesPreserved:true,manifestSha256:'a'.repeat(64),lockSha256:hash('locked langchain')},isolation:{nodePathCleared:true,sdkResolvedInsideConsumer:true,installedPackagesAreReal:true},dependencyTree:{preservedAfterSdkInstall:true,lockedPackageCount:10},singleOpenai:true,recipe:{compiled:true,result:{dispatches:3,checks:3,ingested:3,unexpectedFetch:0,socketAttempts:0}}});
   if(${JSON.stringify(selected && ["langchain-missing-recipe", "agents-missing-recipe"].includes(scenario))})delete details.recipe;

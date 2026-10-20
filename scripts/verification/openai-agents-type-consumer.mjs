@@ -20,11 +20,12 @@ const dependencyFixture = path.join(
   "scripts/verification/fixtures/openai-agents-smoke",
 );
 const fixtureHashes = {
-  manifest: "34a14201a8db19f04666572a99f245a1853ef5c211554f9077ab725b15c60750",
-  lock: "2760e15b13f6218aa6db9e1ea1ec8c47bf431d55a73846a28bcc8567fa8e4e1e",
+  manifest: "c9059eff4b85b0651b944e31a01b40124cf113480275b4aebaf01c914c55da65",
+  lock: "f99e9b8c7edb70466643f63f6ac615b2a28031dc729e40e2a671e911e076e68a",
 };
 const compilerVersions = { floor: "5.8.3", current: "6.0.3" };
 const peerVersions = {
+  mcp: "2.3.1",
   agents: "0.20.0",
   openai: "7.36.0",
   typesNode: "22.15.30",
@@ -45,6 +46,7 @@ try {
     async (context) => {
       const { consumerRoot, report } = context;
       const packages = {
+        mcp: "@modelcontextprotocol/client",
         agents: "@openai/agents",
         openai: "openai",
         typesNode: "@types/node",

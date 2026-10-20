@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { noopLogger } from "../../src/logging";
 import { MetadataReporter } from "../../src/reporter";
 import { FakeControlPlane } from "../../src/testing";
@@ -404,6 +404,77 @@ describe("withoutTraceContext", () => {
     } satisfies MetadataEvent);
     await reporter.close();
     expect(plane.ingested).toHaveLength(1);
+  });
+
+  it("runs the callback once when the manager defers or repeats the invocation", () => {
+    const manager = installWithSpan(spanWith({}));
+    const deferred: Array<() => unknown> = [];
+    manager.with = (_context, fn) => {
+      deferred.push(fn);
+      return undefined as never;
+    };
+    let runs = 0;
+    expect(
+      withoutTraceContext(() => {
+        runs += 1;
+        return "ran";
+      }),
+    ).toBe("ran");
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]?.()).toBe("ran");
+    expect(deferred[0]?.()).toBe("ran");
+    expect(runs).toBe(1);
+
+    const failure = new Error("callback failure");
+    expect(() =>
+      withoutTraceContext(() => {
+        runs += 1;
+        throw failure;
+      }),
+    ).toThrow(failure);
+    expect(() => deferred[1]?.()).toThrow(failure);
+    expect(runs).toBe(2);
+  });
+
+  it("settles reporter close once when the manager invokes the callback late", async () => {
+    const manager = installWithSpan(spanWith({}));
+    const deferred: Array<() => unknown> = [];
+    manager.with = (_context, fn) => {
+      deferred.push(fn);
+      return undefined as never;
+    };
+    const plane = new FakeControlPlane();
+    const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      fetch: plane.fetch,
+      sdkInstanceId: "late-manager",
+      logger: noopLogger,
+    });
+    const closing = reporter.close();
+    for (const fn of deferred.splice(0)) fn();
+    await closing;
+    expect(reporter.close()).toBe(closing);
+  });
+
+  it("handles a rejection on a promise the manager derived from the callback's result", async () => {
+    const manager = installWithSpan(spanWith({}));
+    let derived: Promise<unknown> | undefined;
+    let observed: ReturnType<typeof vi.spyOn> | undefined;
+    manager.with = (context, fn) => {
+      const result = FakeContextManager.prototype.with.call(
+        manager,
+        context,
+        fn,
+      ) as Promise<unknown>;
+      derived = result.then((value) => value);
+      observed = vi.spyOn(derived, "then");
+      return derived as never;
+    };
+    const failure = new Error("provider close failure");
+    const original = withoutTraceContext(() => Promise.reject(failure));
+    await expect(original).rejects.toBe(failure);
+    expect(observed).toHaveBeenCalledWith(undefined, expect.any(Function));
+    observed?.mockRestore();
+    await expect(derived).rejects.toBe(failure);
   });
 
   it("runs directly when the context cannot drop its span", () => {

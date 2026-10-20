@@ -163,21 +163,16 @@ export function withoutTraceContext<T>(fn: () => T): T {
     detached = undefined;
   }
   if (manager === undefined || detached === undefined) return fn();
-  // `fn` runs at most once, and its own outcome is authoritative: a context manager can
+  // `fn` runs exactly once, and its own outcome is authoritative: a context manager can
   // neither replace its result nor turn its success into a failure (for example by
-  // throwing while restoring the previous context).
+  // throwing while restoring the previous context), and a manager that defers or repeats
+  // the callback cannot run `fn` again.
   let ran = false;
   let failed = false;
   let result: T | undefined;
   let failure: unknown;
   const settled = (): T => {
-    if (!ran) return fn();
-    if (failed) throw failure;
-    return result as T;
-  };
-  try {
-    manager.with(detached, () => {
-      if (ran) return settled();
+    if (!ran) {
       ran = true;
       try {
         result = fn();
@@ -185,14 +180,26 @@ export function withoutTraceContext<T>(fn: () => T): T {
         failed = true;
         failure = error;
       }
-      return settled();
-    });
+    }
+    if (failed) throw failure;
+    return result as T;
+  };
+  let returned: unknown;
+  try {
+    returned = manager.with(detached, settled);
   } catch {
     // Either `fn`'s own failure (rethrown below) or a manager failure. A manager that
     // failed before entering falls back to running `fn` in the current context.
   }
+  if (returned !== result && returned !== null && typeof returned === "object") {
+    // The caller handles `fn`'s own result; a distinct promise the manager derived from it
+    // must not surface as an unhandled rejection.
+    Promise.resolve(returned).then(undefined, ignoreRejection);
+  }
   return settled();
 }
+
+function ignoreRejection(): void {}
 
 /** A copy of `context` without `key`, or `undefined` for anything that is not a context. */
 function deleteContextValue(context: unknown, key: symbol): unknown {

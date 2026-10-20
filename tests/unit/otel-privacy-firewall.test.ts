@@ -308,6 +308,9 @@ describe("OpenTelemetry privacy firewall", () => {
         "freeze",
         "repeat",
         "apply",
+        // Observes a promise a context manager derived from the callback's result.
+        "resolve",
+        "then",
       ].sort(),
     );
   });

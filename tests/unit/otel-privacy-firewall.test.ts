@@ -341,10 +341,13 @@ describe("OpenTelemetry privacy firewall", () => {
     }
   });
 
-  it("background work launched from a caller's path runs outside the caller's trace", () => {
+  it("background work and memoized lifecycle promises run outside the caller's trace", () => {
     expect(ALL_SOURCES.flatMap((file) => callSites(file, "withoutTraceContext")).sort()).toEqual([
       "budget.ts:launchRenewal",
+      "client.ts:#ensureInit",
+      "client.ts:close",
       "release-dispatcher.ts:#pump",
+      "reporter.ts:close",
       "reporter.ts:close",
       "reporter.ts:start",
       "untracked-reporter.ts:#requestFlush",

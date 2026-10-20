@@ -2156,9 +2156,13 @@ export class MetadataReporter {
     if (this.closePromise !== null) return this.closePromise;
 
     let resolveClose!: () => void;
-    const shared = new Promise<void>((resolve) => {
-      resolveClose = resolve;
-    });
+    // Later close() callers share this promise; it must not retain the first caller's span.
+    const shared = withoutTraceContext(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveClose = resolve;
+        }),
+    );
     // Publish identity and the enqueue fence before consulting any injected clock.
     // An ordinary round may still own a confirm while close joins it; from here on
     // its event transfer must not evict ready metadata to make room.

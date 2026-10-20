@@ -576,10 +576,9 @@ describe("background control-plane I/O with a real context manager", () => {
     expect(seen.filter(({ path }) => tail(path) === "surrender")).toHaveLength(1);
   });
 
-  // KNOWN GAP (reported, not fixed here): MetadataReporter.close() runs its final flush
-  // and forced breaker-report cycle in the context of whoever calls close(), so closing
-  // from inside a span sends those requests with the caller's span and baggage active.
-  // The Python SDK test asserts an empty context for close-time breaker reports too.
+  // MetadataReporter.close() runs its final flush and forced breaker-report cycle as the
+  // reporter's own work, so closing from inside a span sends neither the span nor baggage
+  // (matching the Python SDK's empty context for close-time breaker reports).
   it("detaches close-time reporter delivery from the closing caller's span", async () => {
     const { seen } = await driveUnderCallerSpan();
     const closeTime = seen.filter(

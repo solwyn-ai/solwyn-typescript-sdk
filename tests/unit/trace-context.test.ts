@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { noopLogger } from "../../src/logging";
+import { MetadataReporter } from "../../src/reporter";
+import { FakeControlPlane } from "../../src/testing";
 import {
   applyTraceFields,
   captureTrace,
@@ -314,6 +317,93 @@ describe("withoutTraceContext", () => {
       }),
     ).toBe("ran");
     expect(runs).toBe(1);
+  });
+
+  it("keeps the callback's result when the manager fails after running it", () => {
+    const manager = installWithSpan(spanWith({}));
+    manager.with = (context, fn) => {
+      FakeContextManager.prototype.with.call(manager, context, fn);
+      throw new Error("manager failure while restoring");
+    };
+    const result = Promise.resolve("delivered");
+    let runs = 0;
+    expect(
+      withoutTraceContext(() => {
+        runs += 1;
+        return result;
+      }),
+    ).toBe(result);
+    expect(runs).toBe(1);
+  });
+
+  it("propagates the callback's own error, not the manager's, when both fail", () => {
+    const manager = installWithSpan(spanWith({}));
+    manager.with = (context, fn) => {
+      try {
+        FakeContextManager.prototype.with.call(manager, context, fn);
+      } finally {
+        // biome-ignore lint/correctness/noUnsafeFinally: simulates a hostile manager.
+        throw new Error("manager failure while restoring");
+      }
+    };
+    const failure = new Error("callback failure");
+    let runs = 0;
+    expect(() =>
+      withoutTraceContext(() => {
+        runs += 1;
+        throw failure;
+      }),
+    ).toThrow(failure);
+    expect(runs).toBe(1);
+  });
+
+  it("ignores a substituted return value and a repeated invocation from the manager", () => {
+    const manager = installWithSpan(spanWith({}));
+    manager.with = (context, fn) => {
+      FakeContextManager.prototype.with.call(manager, context, fn);
+      FakeContextManager.prototype.with.call(manager, context, fn);
+      return "substituted" as never;
+    };
+    let runs = 0;
+    expect(
+      withoutTraceContext(() => {
+        runs += 1;
+        return "original";
+      }),
+    ).toBe("original");
+    expect(runs).toBe(1);
+  });
+
+  it("still delivers close-time spend when the manager fails while restoring", async () => {
+    const manager = installWithSpan(
+      spanWith({ traceId: TRACE_ID, spanId: SPAN_ID, traceFlags: 1 }),
+    );
+    manager.with = (context, fn) => {
+      const result = FakeContextManager.prototype.with.call(manager, context, fn);
+      throw new Error(`manager failure while restoring ${typeof result}`);
+    };
+    const plane = new FakeControlPlane();
+    const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      fetch: plane.fetch,
+      sdkInstanceId: "manager-failure",
+      logger: noopLogger,
+    });
+    reporter.report({
+      model: "gpt-5-mini",
+      provider: "openai",
+      input_tokens: 1,
+      output_tokens: 1,
+      latency_ms: 0,
+      status: "success",
+      is_model_fallback: false,
+      is_provider_fallback: false,
+      attempt_index: 0,
+      sdk_instance_id: "manager-failure",
+      call_id: crypto.randomUUID(),
+      timestamp: reporter.nextEventTimestamp(),
+    } satisfies MetadataEvent);
+    await reporter.close();
+    expect(plane.ingested).toHaveLength(1);
   });
 
   it("runs directly when the context cannot drop its span", () => {

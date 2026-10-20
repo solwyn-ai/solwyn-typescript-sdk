@@ -163,18 +163,35 @@ export function withoutTraceContext<T>(fn: () => T): T {
     detached = undefined;
   }
   if (manager === undefined || detached === undefined) return fn();
-  let entered = false;
+  // `fn` runs at most once, and its own outcome is authoritative: a context manager can
+  // neither replace its result nor turn its success into a failure (for example by
+  // throwing while restoring the previous context).
+  let ran = false;
+  let failed = false;
+  let result: T | undefined;
+  let failure: unknown;
+  const settled = (): T => {
+    if (!ran) return fn();
+    if (failed) throw failure;
+    return result as T;
+  };
   try {
-    return manager.with(detached, () => {
-      entered = true;
-      return fn();
-    }) as T;
-  } catch (error) {
-    // A failure raised by `fn` itself propagates unchanged; only a context manager that
+    manager.with(detached, () => {
+      if (ran) return settled();
+      ran = true;
+      try {
+        result = fn();
+      } catch (error) {
+        failed = true;
+        failure = error;
+      }
+      return settled();
+    });
+  } catch {
+    // Either `fn`'s own failure (rethrown below) or a manager failure. A manager that
     // failed before entering falls back to running `fn` in the current context.
-    if (entered) throw error;
-    return fn();
   }
+  return settled();
 }
 
 /** A copy of `context` without `key`, or `undefined` for anything that is not a context. */

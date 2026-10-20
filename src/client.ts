@@ -177,7 +177,12 @@ import {
 import { captureTags } from "./tags";
 import type { TokenDetails } from "./token-details";
 import { buildTokenDetails, isUsageUnmeasured, zeroTokenDetails } from "./token-details";
-import { applyTraceFields, captureTrace, type TraceSnapshot } from "./trace-context";
+import {
+  applyTraceFields,
+  captureTrace,
+  type TraceSnapshot,
+  withoutTraceContext,
+} from "./trace-context";
 import { type FetchLike, requireFetchLike } from "./transport";
 import type {
   BudgetMode,
@@ -1819,7 +1824,8 @@ export class SolwynCore {
   #ensureInit(issuanceProvider?: string): Promise<InitState> {
     if (this.#initPromise === null) {
       this.#refreshSurfaceRuntimesBeforeInit(true);
-      this.#initPromise = this.#buildInit(issuanceProvider);
+      // The memoized promise outlives the first call, so it must not retain that call's span.
+      this.#initPromise = withoutTraceContext(() => this.#buildInit(issuanceProvider));
     }
     return this.#initPromise;
   }
@@ -4174,7 +4180,11 @@ export class SolwynCore {
     // covers synchronous re-entry from a lifecycle hook or hostile thenable getter.
     if (this.#closePromise === null) {
       const deadline = nowMs() + this.#config.reporter_shutdown_deadline * 1000;
-      this.#closePromise = Promise.resolve().then(() => this.#closeOnce(deadline));
+      // Shutdown is client-owned work, and the shared promise must not retain the closing
+      // caller's span.
+      this.#closePromise = withoutTraceContext(() =>
+        Promise.resolve().then(() => this.#closeOnce(deadline)),
+      );
     }
     return this.#closePromise;
   }

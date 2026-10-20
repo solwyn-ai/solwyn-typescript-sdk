@@ -5,6 +5,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
+const stageTimeoutMs = Number(process.env.SURFACE_STAGE_TIMEOUT_MS ?? 300_000);
+if (!Number.isSafeInteger(stageTimeoutMs) || stageTimeoutMs <= 0) {
+  throw new Error("SURFACE_STAGE_TIMEOUT_MS must be a positive integer");
+}
 const include = JSON.parse(process.env.SURFACE_INTERVALS ?? "null");
 const labelPattern = /^[a-z0-9][a-z0-9._-]*$/;
 if (
@@ -53,12 +57,17 @@ for (const cell of include) {
     function run(stage, args) {
       const result = spawnSync("pnpm", args, {
         cwd: workspace,
-        env: { ...process.env, SOLWYN_SURFACE_CANARY_FAMILY: cell.family },
+        env: {
+          ...process.env,
+          SOLWYN_SURFACE_CANARY_FAMILY: stage === "canary" ? cell.family : undefined,
+        },
         stdio: "inherit",
+        timeout: stageTimeoutMs,
+        killSignal: "SIGKILL",
       });
       if (result.status === 0) return true;
       console.error(
-        `${label}: ${stage} failed (${result.error?.message ?? result.signal ?? result.status})`,
+        `${label}: ${stage} failed (${result.signal ?? result.error?.message ?? result.status})`,
       );
       failures.push(stage);
       return false;
@@ -97,7 +106,10 @@ for (const cell of include) {
     if (workspace !== undefined) rmSync(workspace, { recursive: true, force: true });
     console.log("::endgroup::");
   }
-  if (failures.length > 0) failed.push(`${label}: ${failures.join(", ")}`);
+  if (failures.length > 0) {
+    console.error(`::error title=Provider surface ${label}::${failures.join(", ")}`);
+    failed.push(`${label}: ${failures.join(", ")}`);
+  }
 }
 
 if (failed.length > 0) {

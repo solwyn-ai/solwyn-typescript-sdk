@@ -28,7 +28,9 @@ interface RecordEntry {
   readonly overlay?: readonly string[];
 }
 
-function executeIntervals(options: { readonly fail?: string; readonly input?: string } = {}) {
+function executeIntervals(
+  options: { readonly fail?: string; readonly hang?: string; readonly input?: string } = {},
+) {
   const scratch = mkdtempSync(join(tmpdir(), "provider intervals "));
   const root = join(scratch, "repo");
   const bin = join(scratch, "bin");
@@ -50,6 +52,13 @@ const args = process.argv.slice(2);
 const manifest = JSON.parse(readFileSync("package.json", "utf8"));
 appendFileSync(process.env.TRACE_FILE, JSON.stringify({ cwd: process.cwd(), args,
   family: process.env.SOLWYN_SURFACE_CANARY_FAMILY, overlay: manifest.overlay }) + "\n");
+if (process.env.HANG_COMMAND === args[0] && !existsSync(process.env.HANG_MARKER)) {
+  writeFileSync(process.env.HANG_MARKER, "started");
+  process.on("SIGTERM", () => {});
+  // Bound the fixture even if the runner regresses and stops killing hung children.
+  setTimeout(() => process.exit(95), 2_000);
+  await new Promise(() => {});
+}
 if (args[0] === "install") {
   if (manifest.overlay || existsSync("node_modules")) process.exit(98);
   mkdirSync("node_modules");
@@ -83,6 +92,10 @@ if (args[0] === "install") {
           SURFACE_INTERVALS: options.input ?? JSON.stringify(intervals),
           TRACE_FILE: trace,
           FAIL_STAGE: options.fail ?? "",
+          HANG_COMMAND: options.hang ?? "",
+          HANG_MARKER: join(scratch, "hung"),
+          SURFACE_STAGE_TIMEOUT_MS: "1000",
+          SOLWYN_SURFACE_CANARY_FAMILY: "inherited-family",
         },
       },
     );
@@ -126,6 +139,9 @@ describe("consolidated provider surface runner", () => {
     expect(
       result.records.filter(({ args }) => args[0] === "vitest").map(({ family }) => family),
     ).toEqual(["anthropic", "anthropic", "openai"]);
+    expect(
+      result.records.filter(({ args }) => args[0] !== "vitest").map(({ family }) => family),
+    ).toEqual(Array(9).fill(undefined));
     expect(result.reports).toEqual(intervals.map(({ packages }) => packages));
     expect(result.cleaned).toBe(true);
     expect(result.manifest).toBe('{"name":"synthetic","private":true}');
@@ -141,6 +157,26 @@ describe("consolidated provider surface runner", () => {
     expect(result.records.filter(({ args }) => args[0] === "tsx")).toHaveLength(3);
     expect(result.stderr).toContain("anthropic / floor: capture");
     expect(result.stderr).toContain("anthropic / latest: canary");
+    expect(result.stderr).toContain("::error title=Provider surface anthropic / floor::capture");
+    expect(result.stderr).toContain("::error title=Provider surface anthropic / latest::canary");
+    expect(result.stderr).not.toContain("::error title=Provider surface openai / floor::");
+    expect(result.reports[2]).toEqual(["openai@4.41.0"]);
+    expect(result.cleaned).toBe(true);
+  });
+
+  it.each([
+    ["install", "install"],
+    ["overlay", "add"],
+    ["capture", "tsx"],
+    ["canary", "vitest"],
+  ])("kills a hung %s and continues to later intervals", (stage, command) => {
+    const result = executeIntervals({ hang: command });
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain(`anthropic / floor: ${stage} failed (SIGKILL)`);
+    expect(result.stderr).toContain(`::error title=Provider surface anthropic / floor::${stage}`);
+    expect(result.records.filter(({ args }) => args[0] === "install")).toHaveLength(3);
+    expect(result.records.filter(({ args }) => args[0] === "vitest")).toHaveLength(3);
+    expect(result.reports[1]).toEqual(["@anthropic-ai/sdk@0.135.0"]);
     expect(result.reports[2]).toEqual(["openai@4.41.0"]);
     expect(result.cleaned).toBe(true);
   });

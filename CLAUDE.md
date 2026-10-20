@@ -155,6 +155,7 @@ src/
   wrapper-brand.ts      # dependency-free shared wrapper identity
   ai-sdk/               # AI SDK middleware; content-privileged
   langchain/            # content-free LangChain/LangGraph run-scope attribution
+  openai-agents/        # content-free OpenAI Agents workflow and agent attribution
   testing/              # edge-safe fake control plane and contract probes
   config.ts  types.ts  errors.ts  validation.ts
   privacy.ts            # content-privileged estimation helpers

@@ -66,6 +66,7 @@ it.each([
     "native-type-consumer": "solwyn-native-types-",
     "ai-type-consumer": "solwyn-ai-types-",
     "langchain-type-consumer": "solwyn-langchain-types-",
+    "openai-agents-type-consumer": "solwyn-openai-agents-types-",
     "bundle-proofs": "solwyn-consumer-bundle-",
     "browser-proof": "solwyn-consumer-browser-",
     "runtime-matrix": "solwyn-consumer-matrix-native-",
@@ -101,7 +102,7 @@ it.each([
     );
   }
   expect(child.status, child.stderr).toBe(1);
-  expect(evidence.details.probes).toHaveLength(8);
+  expect(evidence.details.probes).toHaveLength(9);
   for (const entry of evidence.details.probes) {
     const root = entry.result?.details.actualRoot;
     expect(entry.command.timedOut).toBe(true);

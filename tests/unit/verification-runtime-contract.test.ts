@@ -16,6 +16,7 @@ const edge = {
   nodeGlobalAbsent: true,
   bufferAbsent: true,
   langchainNodeRequired: true,
+  openaiAgentsNodeRequired: true,
   coreClosed: { checks: 2, confirms: 2, ingested: 2 },
   warnings: [],
 };
@@ -94,6 +95,7 @@ const allSdkEntries = [
   "@solwyn/sdk/testing",
   "@solwyn/sdk/ai-sdk",
   "@solwyn/sdk/langchain",
+  "@solwyn/sdk/openai-agents",
 ];
 const artifactEntries = {
   "provider-free-runtime": allSdkEntries,

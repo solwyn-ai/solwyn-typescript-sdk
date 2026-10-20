@@ -307,7 +307,7 @@ jobs:
           retention-days: 7
 
   framework-canary:
-    name: Latest LangChain / LangGraph canary
+    name: Latest framework canary
     # Provider drift must not suppress the framework check after catalog validation.
     if: "!cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs['provider-surface-inventory'].outputs.catalog == 'success'"
     needs: provider-surface-inventory
@@ -330,10 +330,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Overlay latest framework packages
         run: |
-          pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest
+          pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest @openai/agents@latest
           git diff --exit-code -- pnpm-lock.yaml
       - name: Exercise the offline framework recipe
-        run: pnpm vitest run tests/unit/langchain-handler.test.ts tests/unit/langchain.test.ts tests/unit/langchain-docs.test.ts
+        run: pnpm vitest run tests/unit/langchain-handler.test.ts tests/unit/langchain.test.ts tests/unit/langchain-docs.test.ts tests/unit/openai-agents.test.ts tests/unit/openai-agents-docs.test.ts
 
   required:
     name: Required / CI

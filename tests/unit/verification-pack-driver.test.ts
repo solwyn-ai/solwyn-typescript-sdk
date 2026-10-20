@@ -77,6 +77,10 @@ describe("installed consumer verification gate", () => {
     "empty-package-consumers",
     "empty-native-type-consumer",
     "empty-langchain-type-consumer",
+    "empty-openai-agents-type-consumer",
+    "agents-missing-recipe",
+    "agents-multiple-openai",
+    "agents-wrong-lock",
     "langchain-missing-recipe",
     "langchain-multiple-openai",
     "langchain-wrong-lock",
@@ -121,6 +125,7 @@ describe("installed consumer verification gate", () => {
       "native-type-consumer",
       "ai-type-consumer",
       "langchain-type-consumer",
+      "openai-agents-type-consumer",
       "bundle-proofs",
       "browser-proof",
       "runtime-matrix",
@@ -129,21 +134,23 @@ describe("installed consumer verification gate", () => {
     for (const probe of probes) {
       const target = scenario.startsWith("package-")
         ? "package-consumers"
-        : scenario.startsWith("langchain-")
-          ? "langchain-type-consumer"
-          : scenario.startsWith("native-")
-            ? "native-type-consumer"
-            : scenario.startsWith("runtime-")
-              ? "runtime-matrix"
-              : scenario.startsWith("bundle-")
-                ? "bundle-proofs"
-                : scenario.startsWith("google-")
-                  ? "google-native-compat"
-                  : scenario.startsWith("browser-")
-                    ? "browser-proof"
-                    : scenario.startsWith("empty-") && scenario !== "empty-evidence"
-                      ? scenario.slice(6)
-                      : "ai-type-consumer";
+        : scenario.startsWith("agents-")
+          ? "openai-agents-type-consumer"
+          : scenario.startsWith("langchain-")
+            ? "langchain-type-consumer"
+            : scenario.startsWith("native-")
+              ? "native-type-consumer"
+              : scenario.startsWith("runtime-")
+                ? "runtime-matrix"
+                : scenario.startsWith("bundle-")
+                  ? "bundle-proofs"
+                  : scenario.startsWith("google-")
+                    ? "google-native-compat"
+                    : scenario.startsWith("browser-")
+                      ? "browser-proof"
+                      : scenario.startsWith("empty-") && scenario !== "empty-evidence"
+                        ? scenario.slice(6)
+                        : "ai-type-consumer";
       const selected = probe === target;
       const status = selected && scenario === "skipped" ? "skipped" : "pass";
       const missing = selected && scenario === "missing";
@@ -166,7 +173,7 @@ const readmeAiPackages=resolveReadmeAiPackages(readmeAiContract.packageNames,rea
 const compiler={floor:'5.8.3',current:'6.0.3'};
 const compilerCells=Object.entries(compiler).flatMap(([label,version])=>['esm','cjs'].map(format=>({compiler:{label,version},format,status:'pass',strict:true,skipLibCheck:false,files:format==='esm'?['consumer.mts','responses-consumer.mts']:['consumer.cts','responses-consumer.cts'],command:{status:0},baseline:{status:0},sdk:{status:0},inference:{status:0}})));
 const sdkVersion='7.6.5';
-const allSdkEntries=['@solwyn/sdk','@solwyn/sdk/node','@solwyn/sdk/testing','@solwyn/sdk/ai-sdk','@solwyn/sdk/langchain'];
+const allSdkEntries=['@solwyn/sdk','@solwyn/sdk/node','@solwyn/sdk/testing','@solwyn/sdk/ai-sdk','@solwyn/sdk/langchain','@solwyn/sdk/openai-agents'];
 const artifactIdentity=(format='esm',entries=allSdkEntries,consumer='provider-free')=>{
   const consumerRealpath=path.join(out,'observed',consumer);
   const packageRoot=path.join(consumerRealpath,'node_modules/@solwyn/sdk');
@@ -193,14 +200,17 @@ if(probe==='package-consumers'){
   Object.assign(versions,{sdk:sdkVersion,typescript:'6.0.3',providers:{ai:'7.0.14',aiOpenai:'4.0.65'}});
   fs.writeFileSync(path.join(out,'ai-smoke-package-lock.json'),'locked dependencies');
   const fixtures=['package-identity-remediation.mjs','post-remediation-errors.mjs'];
-  Object.assign(details,{artifactIdentity:{version:sdkVersion,providerFreeResolution:artifactIdentity('esm'),providerFree:['esm','cjs'].map(format=>artifactIdentity(format)),aiPeer:['esm','cjs'].map(format=>artifactIdentity(format,allSdkEntries,'ai-peer')),runValidation:['esm','cjs'].flatMap(format=>fixtures.map(fixture=>({fixture,artifactIdentity:artifactIdentity(format)}))),aiHarness:['esm','cjs'].map(format=>({format,artifactIdentity:artifactIdentity(format)}))},langchainRuntime:["esm","cjs"].map(format=>({format,loaded:true,nodeRequired:true,dispatches:1,checks:1,ingested:1})),inventory:{verified:true,actualCount:106},runtime:['esm','cjs'].map(format=>({format,dispatches:3,checks:3,confirms:3,ingested:3,aiBuffered:true,aiStreaming:true,artifactIdentity:artifactIdentity(format)})),negativeControls:{openaiCannotResolve:true,missingExportRejected:true,reviewedArtifactUnchanged:true},aiDependencyLock:{unchanged:true,exactTree:true,sha256:hash('locked dependencies')},typeScriptLibraries:{positive:['ES2023','DOM','ESNext.Disposable'],missingDisposableRejected:true},readmeAiTypes:{runtimeDependencies:['@solwyn/sdk',...readmeAiContract.packageNames].sort(),developmentDependencies:['@types/json-schema','@types/node','typescript'],installCommand:readmeAiContract.installCommand,packageNames:readmeAiContract.packageNames,packageSpecs:readmeAiPackages.map(({spec})=>spec),installedPackages:Object.fromEntries(readmeAiPackages.map(({name,version})=>[name,version])),sourceSha256:readmeAiContract.sourceSha256,strict:true,skipLibCheck:false,types:['node'],lib:['ES2023','DOM','ESNext.Disposable']}});
-}else if(probe==='langchain-type-consumer'){
-  Object.assign(versions,{typescript:compiler,core:'1.2.18',langchainOpenai:'1.6.2',langgraph:'1.5.1',openai:'7.36.0',typesNode:'22.15.30',zod:'4.4.3'});
-  fs.writeFileSync(path.join(out,'langchain-smoke-package-lock.json'),'locked langchain');
+  Object.assign(details,{artifactIdentity:{version:sdkVersion,providerFreeResolution:artifactIdentity('esm'),providerFree:['esm','cjs'].map(format=>artifactIdentity(format)),aiPeer:['esm','cjs'].map(format=>artifactIdentity(format,allSdkEntries,'ai-peer')),runValidation:['esm','cjs'].flatMap(format=>fixtures.map(fixture=>({fixture,artifactIdentity:artifactIdentity(format)}))),aiHarness:['esm','cjs'].map(format=>({format,artifactIdentity:artifactIdentity(format)}))},langchainRuntime:["esm","cjs"].map(format=>({format,loaded:true,nodeRequired:true,dispatches:1,checks:1,ingested:1})),inventory:{verified:true,actualCount:120},runtime:['esm','cjs'].map(format=>({format,dispatches:3,checks:3,confirms:3,ingested:3,aiBuffered:true,aiStreaming:true,artifactIdentity:artifactIdentity(format)})),negativeControls:{openaiCannotResolve:true,missingExportRejected:true,reviewedArtifactUnchanged:true},aiDependencyLock:{unchanged:true,exactTree:true,sha256:hash('locked dependencies')},typeScriptLibraries:{positive:['ES2023','DOM','ESNext.Disposable'],missingDisposableRejected:true},readmeAiTypes:{runtimeDependencies:['@solwyn/sdk',...readmeAiContract.packageNames].sort(),developmentDependencies:['@types/json-schema','@types/node','typescript'],installCommand:readmeAiContract.installCommand,packageNames:readmeAiContract.packageNames,packageSpecs:readmeAiPackages.map(({spec})=>spec),installedPackages:Object.fromEntries(readmeAiPackages.map(({name,version})=>[name,version])),sourceSha256:readmeAiContract.sourceSha256,strict:true,skipLibCheck:false,types:['node'],lib:['ES2023','DOM','ESNext.Disposable']}});
+  details.openaiAgentsRuntime=details.langchainRuntime;
+  details.openaiAgentsPeerRequired=true;
+}else if(probe==='langchain-type-consumer'||probe==='openai-agents-type-consumer'){
+  const agents=probe==='openai-agents-type-consumer';
+  Object.assign(versions,{agents:'0.20.0',mcp:'2.3.1',typescript:compiler,core:'1.2.18',langchainOpenai:'1.6.2',langgraph:'1.5.1',openai:'7.36.0',typesNode:'22.15.30',zod:'4.4.3'});
+  fs.writeFileSync(path.join(out,agents?'openai-agents-smoke-package-lock.json':'langchain-smoke-package-lock.json'),'locked langchain');
   Object.assign(details,{strict:true,skipLibCheck:false,cells:compilerCells.map(cell=>({...cell,files:[cell.format==='esm'?'recipe.mts':'recipe.cts']})),fixture:{copiesPreserved:true,manifestSha256:'a'.repeat(64),lockSha256:hash('locked langchain')},isolation:{nodePathCleared:true,sdkResolvedInsideConsumer:true,installedPackagesAreReal:true},dependencyTree:{preservedAfterSdkInstall:true,lockedPackageCount:10},singleOpenai:true,recipe:{compiled:true,result:{dispatches:3,checks:3,ingested:3,unexpectedFetch:0,socketAttempts:0}}});
-  if(${JSON.stringify(selected && scenario === "langchain-missing-recipe")})delete details.recipe;
-  if(${JSON.stringify(selected && scenario === "langchain-multiple-openai")})details.singleOpenai=false;
-  if(${JSON.stringify(selected && scenario === "langchain-wrong-lock")})details.fixture.lockSha256='b'.repeat(64);
+  if(${JSON.stringify(selected && ["langchain-missing-recipe", "agents-missing-recipe"].includes(scenario))})delete details.recipe;
+  if(${JSON.stringify(selected && ["langchain-multiple-openai", "agents-multiple-openai"].includes(scenario))})details.singleOpenai=false;
+  if(${JSON.stringify(selected && ["langchain-wrong-lock", "agents-wrong-lock"].includes(scenario))})details.fixture.lockSha256='b'.repeat(64);
 }else if(probe==='native-type-consumer'||probe==='ai-type-consumer'){
   Object.assign(versions,{typescript:compiler,openai:'6.45.0',anthropic:'0.123.0',ai:'7.0.14',typesJsonSchema:'7.0.15',typesNode:'22.15.30',zod:'4.4.3'});
   Object.assign(details,{strict:true,skipLibCheck:false,cells:compilerCells});
@@ -208,10 +218,10 @@ if(probe==='package-consumers'){
 }else if(probe==='bundle-proofs'){
   versions.esbuild='0.27.7';
   fs.writeFileSync(path.join(out,'edge-browser-bundle.js'),'bundle evidence');
-  Object.assign(details,{nodeControls:['esm','cjs'].flatMap(format=>['node-reexport','node-bare-import','node-run-used','core-explicit-close'].flatMap(kind=>[false,true].map(ignoreAnnotations=>({label:format+'-'+kind+'-'+(ignoreAnnotations?'ignore-annotations':'default'),format,ignoreAnnotations,status:0,result:{dispatched:1,registration:kind==='core-explicit-close'?'undefined':'function',checks:1,confirms:1,ingested:1},warnings:[]})))),edgeVm:{ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[]},bundleSha256:hash('bundle evidence'),bundlePath:path.join(out,'edge-browser-bundle.js'),externalImports:[]});
+  Object.assign(details,{nodeControls:['esm','cjs'].flatMap(format=>['node-reexport','node-bare-import','node-run-used','core-explicit-close'].flatMap(kind=>[false,true].map(ignoreAnnotations=>({label:format+'-'+kind+'-'+(ignoreAnnotations?'ignore-annotations':'default'),format,ignoreAnnotations,status:0,result:{dispatched:1,registration:kind==='core-explicit-close'?'undefined':'function',checks:1,confirms:1,ingested:1},warnings:[]})))),edgeVm:{ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,openaiAgentsNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[]},bundleSha256:hash('bundle evidence'),bundlePath:path.join(out,'edge-browser-bundle.js'),externalImports:[]});
 }else if(probe==='browser-proof'){
   versions.browser='Chromium 152.0.0';
-  Object.assign(details,{result:{ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[]},execution:{browser:process.execPath,exit:{code:0,signal:null}},supervisorCleanup:{method:'owned-supervisor-group',attempted:true,completed:null,cleanupTimedOut:false,error:null,detached:false},stderr:{limitBytes:1048576,receivedBytes:0,retainedBytes:0,truncated:false},bundleSha256:hash('bundle evidence')});
+  Object.assign(details,{result:{ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,openaiAgentsNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[]},execution:{browser:process.execPath,exit:{code:0,signal:null}},supervisorCleanup:{method:'owned-supervisor-group',attempted:true,completed:null,cleanupTimedOut:false,error:null,detached:false},stderr:{limitBytes:1048576,receivedBytes:0,retainedBytes:0,truncated:false},bundleSha256:hash('bundle evidence')});
 }else if(probe==='runtime-matrix'){
   Object.assign(versions,{sdk:sdkVersion,anthropic:'0.123.0',aws:{'client-bedrock':'3.1124.0','client-s3':'3.1124.0'},runtimes:[{binary:process.execPath,version:process.version}]});
   details.runtimes=[{binary:process.execPath,version:process.version}];
@@ -348,7 +358,7 @@ if(${selected && scenario === "unresponsive-probe"}){process.on('SIGTERM',()=>{}
       `${child.stdout}\n${child.stderr}\n${JSON.stringify(failedProbe, null, 2)}`,
     ).toBe(shouldPass ? 0 : 1);
     expect(result.status).toBe(shouldPass ? "pass" : "fail");
-    expect(result.details.probes).toHaveLength(8);
+    expect(result.details.probes).toHaveLength(9);
     if (scenario === "unresponsive-probe") {
       expect(Date.now() - started).toBeLessThan(1800);
       const failed = result.details.probes.find(

@@ -1,7 +1,7 @@
 {
   "name": "@solwyn/sdk",
   "version": "0.1.1",
-  "description": "Usage metadata and budget controls for OpenAI, Anthropic, Google, Bedrock, compatible clients, AI SDK, and LangChain; failover for wrapped provider clients.",
+  "description": "Usage metadata and budget controls for OpenAI, Anthropic, Google, Bedrock, compatible clients, AI SDK, LangChain, and OpenAI Agents; failover for wrapped provider clients.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -22,7 +22,8 @@
     "cost-tracking",
     "failover",
     "langchain",
-    "langgraph"
+    "langgraph",
+    "openai-agents"
   ],
   "type": "module",
   "engines": {
@@ -88,6 +89,16 @@
         "default": "./dist/langchain/index.cjs"
       }
     },
+    "./openai-agents": {
+      "import": {
+        "types": "./dist/openai-agents/index.d.ts",
+        "default": "./dist/openai-agents/index.js"
+      },
+      "require": {
+        "types": "./dist/openai-agents/index.d.cts",
+        "default": "./dist/openai-agents/index.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "sideEffects": [
@@ -131,6 +142,7 @@
     "@aws-sdk/client-bedrock-runtime": ">=3.422.0 <4",
     "@google/genai": ">=0.3.1 <3",
     "@langchain/core": ">=1.2.14 <2",
+    "@openai/agents": ">=0.20.0 <1",
     "ai": ">=7.0.14 <8",
     "openai": ">=4.41.0 <8",
     "together-ai": ">=0.16.0 <1"
@@ -146,6 +158,9 @@
       "optional": true
     },
     "@langchain/core": {
+      "optional": true
+    },
+    "@openai/agents": {
       "optional": true
     },
     "ai": {
@@ -167,6 +182,7 @@
     "@langchain/core": "1.2.18",
     "@langchain/langgraph": "1.5.1",
     "@langchain/openai": "1.6.2",
+    "@openai/agents": "0.20.0",
     "@types/json-schema": "7.0.15",
     "@types/node": "^26.1.0",
     "ai": "7.0.14",

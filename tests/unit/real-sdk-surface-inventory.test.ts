@@ -560,11 +560,13 @@ describe("committed provider surface interval evidence", () => {
       "@google/genai": ">=0.3.1 <3",
       ai: ">=7.0.14 <8",
       "@langchain/core": ">=1.2.14 <2",
+      "@openai/agents": ">=0.20.0 <1",
       openai: ">=4.41.0 <8",
       "together-ai": ">=0.16.0 <1",
     });
     expect(packageJson.devDependencies["ai"]).toBe("7.0.14");
     expect(packageJson.devDependencies["@langchain/core"]).toBe("1.2.18");
+    expect(packageJson.devDependencies["@openai/agents"]).toBe("0.20.0");
     expect(packageJson.devDependencies["@langchain/openai"]).toBe("1.6.2");
     expect(packageJson.devDependencies["@langchain/langgraph"]).toBe("1.5.1");
   });

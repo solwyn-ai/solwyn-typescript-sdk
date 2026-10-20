@@ -12,6 +12,7 @@ import {
   runValidationWrapperSource,
 } from "./artifact-identity.mjs";
 import { langchainHarnessArguments } from "./langchain-consumer.mjs";
+import { openaiAgentsHarnessArguments } from "./openai-agents-consumer.mjs";
 import { classifyCommandFailure, runBoundedCommand } from "./process.mjs";
 import {
   extractReadmeAiConsumer,
@@ -58,7 +59,14 @@ export function assertPackageInventory(listing) {
     "package/CHANGELOG.md",
     "package/package.json",
   ];
-  for (const entry of ["index", "node", "ai-sdk/index", "testing/index", "langchain/index"])
+  for (const entry of [
+    "index",
+    "node",
+    "ai-sdk/index",
+    "testing/index",
+    "langchain/index",
+    "openai-agents/index",
+  ])
     for (const extension of ["js", "cjs", "js.map", "cjs.map", "d.ts", "d.cts"])
       expected.push(`package/dist/${entry}.${extension}`);
   for (const provider of [
@@ -71,7 +79,7 @@ export function assertPackageInventory(listing) {
   ])
     for (const extension of ["js", "cjs", "js.map", "cjs.map"])
       expected.push(`package/dist/${provider}-HASH.${extension}`);
-  for (let index = 0; index < 11; index++)
+  for (let index = 0; index < 13; index++)
     for (const extension of ["js", "cjs", "js.map", "cjs.map"])
       expected.push(`package/dist/chunk-HASH.${extension}`);
   for (const declaration of ["proxies", "types"])
@@ -87,7 +95,7 @@ export function assertPackageInventory(listing) {
   assert.deepEqual(
     normalized.sort(),
     expected.sort(),
-    "Package inventory differs from the reviewed 106-file publication shape",
+    "Package inventory differs from the reviewed 120-file publication shape",
   );
   return { expectedCount: expected.length, actualCount: files.length, verified: true };
 }
@@ -154,6 +162,7 @@ const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
 const langchain=await load('@solwyn/sdk/langchain');
+const openaiAgents=await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 process.stdout.write(JSON.stringify({format,...artifactIdentity})+'\\n');
@@ -173,6 +182,7 @@ const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
 const langchain=await load('@solwyn/sdk/langchain');
+const openaiAgents=await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const packageRoot=fs.realpathSync(path.dirname(req.resolve('@solwyn/sdk/package.json')));
@@ -196,6 +206,7 @@ const node = await load('@solwyn/sdk/node');
 const testing = await load('@solwyn/sdk/testing');
 const ai = await load('@solwyn/sdk/ai-sdk');
 const langchain = await load('@solwyn/sdk/langchain');
+const openaiAgents = await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const plane = new testing.FakeControlPlane();
@@ -385,6 +396,7 @@ const node=await import('@solwyn/sdk/node');
 const testing=await import('@solwyn/sdk/testing');
 const ai=await import('@solwyn/sdk/ai-sdk');
 const langchain=await import('@solwyn/sdk/langchain');
+const openaiAgents=await import('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "'esm'")}
 for(const name of ${JSON.stringify(forbidden)})assert.throws(()=>consumerRequire.resolve(name),{code:'MODULE_NOT_FOUND'});
@@ -449,6 +461,25 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
           ).stdout,
         ),
       });
+    fs.copyFileSync(
+      path.join(root, "tests/dist/fixtures/openai-agents-harness.mjs"),
+      path.join(app, "openai-agents-harness.mjs"),
+    );
+    report.details.openaiAgentsRuntime = [];
+    for (const format of ["esm", "cjs"])
+      report.details.openaiAgentsRuntime.push({
+        format,
+        ...JSON.parse(
+          (
+            await run(
+              `openai-agents-${format}`,
+              process.execPath,
+              openaiAgentsHarnessArguments(sdkPath, format),
+              app,
+            )
+          ).stdout,
+        ),
+      });
     for (const ext of ["mts", "cts"]) fs.writeFileSync(path.join(app, `consumer.${ext}`), types);
     const strictTypeScriptConfig = {
       compilerOptions: {
@@ -470,6 +501,35 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
       [repositoryRequire.resolve("typescript/bin/tsc"), "-p", "tsconfig.json"],
       app,
     );
+    for (const extension of ["mts", "cts"]) {
+      fs.writeFileSync(
+        path.join(app, `agents-missing-peer.${extension}`),
+        "import {SolwynAgents} from '@solwyn/sdk/openai-agents'; void SolwynAgents;\n",
+      );
+      fs.writeFileSync(
+        path.join(app, "tsconfig-agents-missing-peer.json"),
+        JSON.stringify({
+          ...strictTypeScriptConfig,
+          files: [`agents-missing-peer.${extension}`],
+        }),
+      );
+      const missingPeer = await run(
+        `agents-missing-peer-${extension}`,
+        process.execPath,
+        [
+          repositoryRequire.resolve("typescript/bin/tsc"),
+          "-p",
+          "tsconfig-agents-missing-peer.json",
+        ],
+        app,
+        true,
+      );
+      assert.match(
+        `${missingPeer.stdout}\n${missingPeer.stderr}`,
+        /TS2307: Cannot find module '@openai\/agents'/,
+      );
+    }
+    report.details.openaiAgentsPeerRequired = true;
     fs.writeFileSync(
       path.join(app, "tsconfig-missing-disposable.json"),
       JSON.stringify({
@@ -796,6 +856,8 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
       inventory: report.details.inventory,
       runtime: report.details.runtime,
       langchainRuntime: report.details.langchainRuntime,
+      openaiAgentsRuntime: report.details.openaiAgentsRuntime,
+      openaiAgentsPeerRequired: report.details.openaiAgentsPeerRequired,
       artifactIdentity: report.details.artifactIdentity,
       negativeControls: report.details.negativeControls,
       aiDependencyLock: {

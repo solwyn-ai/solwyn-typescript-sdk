@@ -20,6 +20,7 @@ const expectedEntries = [
   "@solwyn/sdk/testing",
   "@solwyn/sdk/ai-sdk",
   "@solwyn/sdk/langchain",
+  "@solwyn/sdk/openai-agents",
 ];
 const temporary: string[] = [];
 
@@ -83,6 +84,7 @@ async function identitySource() {
       { specifier: "@solwyn/sdk/testing", binding: "testing" },
       { specifier: "@solwyn/sdk/ai-sdk", binding: "ai" },
       { specifier: "@solwyn/sdk/langchain", binding: "langchain" },
+      { specifier: "@solwyn/sdk/openai-agents", binding: "openaiAgents" },
     ],
     "artifactIdentity",
     "format",
@@ -116,6 +118,7 @@ function createConsumer({
       import: "./langchain.mjs",
       require: "./langchain.cjs",
     },
+    "./openai-agents": { import: "./openai-agents.mjs", require: "./openai-agents.cjs" },
     "./ai-sdk": { import: "./ai-sdk.mjs", require: "./ai-sdk.cjs" },
     "./package.json": "./package.json",
   };
@@ -149,7 +152,7 @@ function createConsumer({
     }
     writeFileSync(path.join(sdk, `${entry}.cjs`), cjsSource);
   }
-  for (const entry of ["testing", "ai-sdk", "langchain"]) {
+  for (const entry of ["testing", "ai-sdk", "langchain", "openai-agents"]) {
     writeFileSync(path.join(sdk, `${entry}.mjs`), "export const loaded=true;");
     writeFileSync(path.join(sdk, `${entry}.cjs`), "exports.loaded=true;");
   }
@@ -172,6 +175,7 @@ const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
 const langchain=await load('@solwyn/sdk/langchain');
+const openaiAgents=await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${source}
 process.stdout.write(JSON.stringify(artifactIdentity));
@@ -197,7 +201,7 @@ it.each([
     manifestRealpath: realpathSync(path.join(sdk, "package.json")),
     entries: expectedEntries,
     entryRealpaths: Object.fromEntries(
-      ["index", "node", "testing", "ai-sdk", "langchain"].map((entry, index) => [
+      ["index", "node", "testing", "ai-sdk", "langchain", "openai-agents"].map((entry, index) => [
         expectedEntries[index],
         realpathSync(path.join(sdk, `${entry}.${format === "esm" ? "mjs" : "cjs"}`)),
       ]),

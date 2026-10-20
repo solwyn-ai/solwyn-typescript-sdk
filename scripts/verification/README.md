@@ -95,6 +95,7 @@ actually ran; one local version does not establish coverage of the full supporte
 | `native-type-consumer` | Genuinely installed OpenAI/Anthropic native typing, strict installed Responses fixtures, explicit compiler floor/current cells. |
 | `ai-type-consumer` | Strict installed AI consumer and upstream baseline diagnostics; explicit compiler floor/current cells. The separate TypeScript 5.7.3 CJS diagnostic must be `upstream-invalid` with a normal nonzero compiler exit and TS1479. It never replaces a required floor/current cell or masks an SDK consumer failure. |
 | `langchain-type-consumer` | Locked `langchain-smoke` fixture; strict complete docs recipe compilation under TypeScript 5.8.3/6.0.3 in ESM/CJS; offline execution with real LangChain/LangGraph; one OpenAI 7.36.0; immutable lock hash and installed tree. |
+| `openai-agents-type-consumer` | Locked Agents 0.20.0 fixture with MCP client 2.3.1 installed explicitly for upstream declarations; strict complete docs recipe compilation under TypeScript 5.8.3/6.0.3 in ESM/CJS, offline real-Runner execution, one OpenAI 7.36.0 and Zod 4.4.3, immutable lock hash and installed tree. |
 | `bundle-proofs` | Sixteen Node bundle controls, browser-target VM controls, edge bundle generation and artifact/bundle hashes. |
 | `browser-proof` | Actual headless browser executes the verified edge bundle; no browser or missing bundle is a failure. |
 | `runtime-matrix` | Every configured Node binary in ESM/CJS: installed-manifest realpath and dynamic `VERSION` identity across the entries each cell loads; package operation; manifest-bound mixed-format identity/run enforcement; native Anthropic promise behavior; foreign AWS Bedrock-control/S3 clients and subclasses rejected without requests; and all 11 error families with denial/stop/middleware enforcement. |
@@ -192,15 +193,15 @@ must remain unchanged. Evidence retains `ai-smoke-package.json`, `ai-smoke-packa
 the lock SHA-256, and all resolved package versions/paths even after consumer cleanup. Dependency
 updates require an explicit reviewed fixture-lock update; ordinary runs never regenerate it.
 
-The native and AI type probes likewise keep their reviewed lockfiles authoritative. After
+The native, AI, and framework type probes likewise keep their reviewed lockfiles authoritative. After
 `npm ci`, they add the supplied SDK with `--no-save --package-lock=true`: lockfile reads stay
 enabled while manifest and lockfile writes stay disabled. Both copies must remain byte-identical
 to the fixtures, and the complete installed dependency tree must remain unchanged except for the
 SDK itself. New transitive registry releases do not refresh the reviewed fixture versions.
 
-Package inventory is a complete reviewed 106-file shape, not just a shipping allowlist: four
-metadata files; five public entries in both runtime, declaration and sourcemap formats; six
-provider chunks in both runtime formats with maps; eleven shared chunks per runtime format with
+Package inventory is a complete reviewed 120-file shape, not just a shipping allowlist: four
+metadata files; six public entries in both runtime, declaration and sourcemap formats; six
+provider chunks in both runtime formats with maps; thirteen shared chunks per runtime format with
 maps; and two shared declarations in both formats. Hashed filename suffixes may change with
 content. LF and CRLF tar listings are normalized before inventory comparison. Missing entries,
 duplicate entries, new unexpected files, and unmatched sourcemaps fail.
@@ -264,6 +265,10 @@ The previous package-consumer export/file checks, optional-peer policy, ESM/CJS 
 strict declarations now live in `package-consumers.mjs`. The former pack smoke's legacy budget
 result shape, materialized lease fields, testing helpers, local health seam and provider-free
 dispatch are retained there. Repository fixtures `package-identity-remediation.mjs`,
-`post-remediation-errors.mjs`, `langchain-harness.mjs`, and `ai-sdk-harness.mjs` run from copies in the installed consumer.
+`post-remediation-errors.mjs`, `langchain-harness.mjs`, `openai-agents-harness.mjs`, and `ai-sdk-harness.mjs` run from copies in the installed consumer.
 The native and AI typing, bundle, real-browser, runtime and Google proofs retain their dedicated
 probe names. All paths to repository fixtures are resolved from script location.
+
+The Agents runtime entry is provider-free. Its declarations import native `@openai/agents` types;
+the provider-free consumer verifies the missing-peer diagnostic in both module formats, and the
+locked Agents consumer checks its full declarations with that peer installed.

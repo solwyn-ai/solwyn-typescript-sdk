@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 const [entry, nodeEntry, testingEntry] = process.argv.slice(2);
 assert.ok(entry && nodeEntry && testingEntry);
 const { SolwynRunScopeHandler } = await import(entry);
-assert.throws(() => new SolwynRunScopeHandler(), { name: "ConfigurationError" });
+assert.throws(() => new SolwynRunScopeHandler(), { name: "ConfigurationError", field: null });
 const { Solwyn } = await import(nodeEntry);
 const { FakeControlPlane } = await import(testingEntry);
 const plane = new FakeControlPlane();

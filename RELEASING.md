@@ -213,8 +213,8 @@ explicitly with the manifest and public documentation:
 - full quality, package, consumer, and AI integration lanes are Node.js `22.23.2` and `24.21.0`;
   if `engines.node` remains `>=20`, test exact final Node.js `20.20.2` in a separately labeled
   provider-free installed core, `./node`, and `./testing` lane and document that the current
-  development toolchain, Vercel AI SDK 7, and `@langchain/openai` require Node.js 22 or newer.
-  The `./ai-sdk` and `./langchain` entries are deliberately excluded from the Node 20 lane
+  development toolchain, Vercel AI SDK 7, `@langchain/openai`, and OpenAI Agents require Node.js 22 or newer.
+  The `./ai-sdk`, `./langchain`, and `./openai-agents` entries are deliberately excluded from the Node 20 lane
   because their integration peers require Node 22. Node.js 20 is end-of-life, so that lane is
   compatibility evidence, not a maintenance promise;
 - strict ESM/CommonJS declaration consumers pass with TypeScript 5.8.3 (the tested floor) and
@@ -223,7 +223,8 @@ explicitly with the manifest and public documentation:
   Anthropic 0.123.0, the runtime matrix with Anthropic 0.123.0, the locked Vercel AI SDK 7.0.14
   types/runtime fixtures, the locked LangChain recipe fixture (core 1.2.18, OpenAI integration
   1.6.2, LangGraph 1.5.1, OpenAI 7.36.0, and `@types/node` 22.15.30) with strict TypeScript
-  5.8.3/6.0.3 ESM/CommonJS compilation and offline execution, and separate Google GenAI
+  5.8.3/6.0.3 ESM/CommonJS compilation and offline execution, the locked OpenAI Agents 0.20.0
+  recipe fixture (OpenAI 7.36.0, Zod 4.4.3, and `@types/node` 22.15.30), and separate Google GenAI
   0.3.1 plus 2.20.0 installations for native lifecycle behavior. These installed probes retain
   their own pins; they do not install the development dependencies or the provider-surface
   inventory's latest cells;
@@ -274,8 +275,8 @@ npm publish --dry-run \
   --ignore-scripts
 ```
 
-The package must include the five public entries (`.`, `./node`, `./ai-sdk`, `./testing`, and
-`./langchain`), declarations, source maps, `README.md`, `CHANGELOG.md`, `LICENSE`, and `package.json`, with no source,
+The package must include the six public entries (`.`, `./node`, `./ai-sdk`, `./testing`,
+`./langchain`, and `./openai-agents`), declarations, source maps, `README.md`, `CHANGELOG.md`, `LICENSE`, and `package.json`, with no source,
 tests, private material, credentials, or unexpected files. Scan the unpacked artifact, including
 source-map `sourcesContent`:
 
@@ -326,7 +327,7 @@ Use these exact CI check names when configuring the branch ruleset:
 Draft pull requests defer the underlying jobs and fail `Required / CI` with an explanation;
 marking a pull request ready for review starts the full run. Ready pull requests and pushes run
 all 11 reviewed floor/latest provider cells. Scheduled CI runs and manual dispatches on `main`
-select all six latest provider cells and run `Latest LangChain / LangGraph canary`, which overlays
+select all six latest provider cells and run `Latest framework canary`, which overlays
 the latest frameworks without changing the lockfile. The framework canary is not a required
 gate, never runs on pull requests or pushes, and still runs after provider checks fail if the
 inventory's catalog validation succeeded. Canary failures fail their jobs and the workflow;

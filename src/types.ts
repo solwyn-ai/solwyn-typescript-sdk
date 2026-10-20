@@ -144,6 +144,10 @@ export const SERVICE_TIER_MAX_LENGTH = 32;
 export const FAILOVER_ERROR_CLASS_MAX_LENGTH = 64;
 /** Max `call_id` length (D1) — a `crypto.randomUUID()` is exactly 36 chars. */
 export const CALL_ID_MAX_LENGTH = 36;
+/** Exact width of a W3C/OpenTelemetry trace id in lowercase hex. */
+export const TRACE_ID_HEX_LENGTH = 32;
+/** Exact width of a W3C/OpenTelemetry span id in lowercase hex. */
+export const SPAN_ID_HEX_LENGTH = 16;
 /** Max `fallback_models` / `fallback_providers` list length. */
 export const FALLBACK_MAX_ITEMS = 8;
 
@@ -154,6 +158,10 @@ export const FALLBACK_MAX_ITEMS = 8;
 export const FAILOVER_ERROR_CLASS_PATTERN = /^[A-Za-z][A-Za-z0-9_.]*$/;
 
 /** Public copy project-ID format: `proj_` + 24 lowercase hex. */
+/** Lowercase-hex W3C trace id; the all-zero invalid id is rejected separately. */
+export const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
+/** Lowercase-hex W3C span id; the all-zero invalid id is rejected separately. */
+export const SPAN_ID_PATTERN = /^[0-9a-f]{16}$/;
 export const PROJECT_ID_PATTERN = /^proj_[a-f0-9]{24}$/;
 /** Project API-key format: `sk_proj_` + 64 lowercase hex. */
 export const PROJECT_KEY_PATTERN = /^sk_proj_[a-f0-9]{64}$/;
@@ -233,6 +241,12 @@ export interface MetadataEvent {
   call_id: string;
   /** Funding lease used by the paired settlement confirmation. */
   lease_id?: string | null;
+  /** Random OpenTelemetry trace id active when the call started; never content. */
+  trace_id?: string | null;
+  /** Random OpenTelemetry span id active when the call started; requires `trace_id`. */
+  span_id?: string | null;
+  /** W3C sampled flag of that span context; requires `trace_id`. */
+  trace_sampled?: boolean | null;
   possibly_succeeded?: boolean | null;
   service_tier?: string | null;
   sdk_instance_id: string;

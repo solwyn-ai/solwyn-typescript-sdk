@@ -50,6 +50,7 @@ describe("env-var population", () => {
     expect(config.acknowledge_untracked).toEqual([]);
     expect(Object.isFrozen(config.acknowledge_untracked)).toBe(true);
     expect(config.report_untracked_surfaces).toBe(true);
+    expect(config.trace_correlation).toBe(true);
     expect(config.budget_check_timeout).toBe(1.0);
     expect(config.control_plane_failure_threshold).toBe(3);
     expect(config.control_plane_recovery_timeout).toBe(30.0);
@@ -88,6 +89,7 @@ describe("env-var population", () => {
       on_unmetered: "SOLWYN_ON_UNMETERED",
       acknowledge_untracked: "SOLWYN_ACKNOWLEDGE_UNTRACKED",
       report_untracked_surfaces: "SOLWYN_REPORT_UNTRACKED_SURFACES",
+      trace_correlation: "SOLWYN_TRACE_CORRELATION",
       velocity_mode: "SOLWYN_VELOCITY_MODE",
       velocity_repeat_count: "SOLWYN_VELOCITY_REPEAT_COUNT",
       velocity_repeat_window_s: "SOLWYN_VELOCITY_REPEAT_WINDOW_S",
@@ -1797,5 +1799,48 @@ describe("numeric configuration safety bounds", () => {
         {},
       ).circuit_breaker_recovery_timeout_jitter,
     ).toBe(1);
+  });
+});
+
+describe("trace-correlation environment setting", () => {
+  it.each([
+    ["true", true],
+    ["1", true],
+    ["yes", true],
+    ["TRUE", true],
+    ["false", false],
+    ["0", false],
+    ["no", false],
+    ["anything-else", false],
+  ])("coerces SOLWYN_TRACE_CORRELATION=%s to %s", (raw, expected) => {
+    const config = resolveConfigFromEnvSnapshot(
+      { api_key: VALID_KEY },
+      { SOLWYN_TRACE_CORRELATION: raw },
+    );
+    expect(config.trace_correlation).toBe(expected);
+  });
+
+  it("lets an explicit constructor value win over the environment in both directions", () => {
+    expect(
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, trace_correlation: true },
+        { SOLWYN_TRACE_CORRELATION: "false" },
+      ).trace_correlation,
+    ).toBe(true);
+    expect(
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, trace_correlation: false },
+        { SOLWYN_TRACE_CORRELATION: "true" },
+      ).trace_correlation,
+    ).toBe(false);
+  });
+
+  it("rejects a non-boolean constructor value", () => {
+    expect(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, trace_correlation: "false" as unknown as boolean },
+        {},
+      ),
+    ).toThrow(ConfigurationError);
   });
 });

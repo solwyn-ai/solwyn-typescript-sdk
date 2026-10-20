@@ -9,12 +9,16 @@ import {
   TAGS_MAX_KEYS as ROOT_TAGS_MAX_KEYS,
 } from "../../src/index";
 import { createTokenDetails } from "../../src/token-details";
-import type {
-  BudgetConfirmRequest,
-  LeaseGrantRequest,
-  LeaseRenewRequest,
-  LeaseSurrenderRequest,
-  MetadataEvent,
+import {
+  type BudgetConfirmRequest,
+  type LeaseGrantRequest,
+  type LeaseRenewRequest,
+  type LeaseSurrenderRequest,
+  type MetadataEvent,
+  SPAN_ID_HEX_LENGTH,
+  SPAN_ID_PATTERN,
+  TRACE_ID_HEX_LENGTH,
+  TRACE_ID_PATTERN,
 } from "../../src/types";
 import * as validation from "../../src/validation";
 import {
@@ -1529,6 +1533,61 @@ describe("testing-plane wire models", () => {
 // ---------------------------------------------------------------------------
 // Fixtures.
 // ---------------------------------------------------------------------------
+
+describe("MetadataEvent trace context", () => {
+  const traceId = "0af7651916cd43dd8448eb211c80319c";
+  const spanId = "b7ad6b7169203331";
+
+  it("omits unset trace fields entirely, so untraced payloads are unchanged", () => {
+    const wire = serializeMetadataEvent(minimalMetadataEvent() as unknown as MetadataEvent);
+    const withNulls = serializeMetadataEvent(
+      minimalMetadataEvent({
+        trace_id: null,
+        span_id: null,
+        trace_sampled: null,
+      }) as unknown as MetadataEvent,
+    );
+    expect(JSON.stringify(withNulls)).toBe(JSON.stringify(wire));
+    for (const field of ["trace_id", "span_id", "trace_sampled"]) {
+      expect(Object.hasOwn(wire, field)).toBe(false);
+    }
+  });
+
+  it("keeps an unsampled flag on the wire and round-trips through the strict schema", () => {
+    const wire = serializeMetadataEvent(
+      minimalMetadataEvent({
+        trace_id: traceId,
+        span_id: spanId,
+        trace_sampled: false,
+      }) as unknown as MetadataEvent,
+    );
+    expect(wire).toMatchObject({ trace_id: traceId, span_id: spanId, trace_sampled: false });
+    const parsed = MetadataEventSchema.parse(JSON.parse(JSON.stringify(wire)));
+    expect(parsed).toMatchObject({ trace_id: traceId, span_id: spanId, trace_sampled: false });
+  });
+
+  it.each([
+    ["all-zero trace id", { trace_id: "0".repeat(32) }, "trace_id must not be all zeros"],
+    [
+      "all-zero span id",
+      { trace_id: traceId, span_id: "0".repeat(16) },
+      "span_id must not be all zeros",
+    ],
+    ["orphan span id", { span_id: spanId }, "span_id requires trace_id"],
+    ["orphan sampled flag", { trace_sampled: false }, "trace_sampled requires trace_id"],
+  ])("rejects an %s", (_label, fields, message) => {
+    const result = MetadataEventSchema.safeParse(minimalMetadataEvent(fields));
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map((issue) => issue.message)).toContain(message);
+  });
+
+  it("pins the W3C identifier widths", () => {
+    expect(TRACE_ID_HEX_LENGTH).toBe(32);
+    expect(SPAN_ID_HEX_LENGTH).toBe(16);
+    expect(TRACE_ID_PATTERN.source).toBe("^[0-9a-f]{32}$");
+    expect(SPAN_ID_PATTERN.source).toBe("^[0-9a-f]{16}$");
+  });
+});
 
 function minimalMetadataEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

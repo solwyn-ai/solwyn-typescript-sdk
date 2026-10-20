@@ -75,6 +75,7 @@ import {
   runObservedAt,
 } from "./run-control";
 import { type TokenDetails, totalTokens } from "./token-details";
+import { withoutTraceContext } from "./trace-context";
 import {
   BUDGET_CHECK_PATH,
   type FetchLike,
@@ -1452,17 +1453,20 @@ export class BudgetEnforcer {
     });
 
     let tracked!: Promise<void>;
-    tracked = Promise.resolve()
-      .then(() => this.performRenewal(operation))
-      .catch(() => {
-        if (operation.closeEpoch === this.closeEpoch) {
-          this.failRenewal(runId, originLeaseId, originGeneration);
-        }
-        this.logger.warn("lease.renew_failed: internal_error");
-      })
-      .finally(() => {
-        this.renewalOperations.delete(tracked);
-      });
+    // Renewal is background control-plane work: keep it out of the admitting call's trace.
+    tracked = withoutTraceContext(() =>
+      Promise.resolve()
+        .then(() => this.performRenewal(operation))
+        .catch(() => {
+          if (operation.closeEpoch === this.closeEpoch) {
+            this.failRenewal(runId, originLeaseId, originGeneration);
+          }
+          this.logger.warn("lease.renew_failed: internal_error");
+        })
+        .finally(() => {
+          this.renewalOperations.delete(tracked);
+        }),
+    );
     this.renewalOperations.add(tracked);
   }
 

@@ -44,6 +44,10 @@ import {
   PROVIDER_REGION_MAX_LENGTH,
   SERVICE_TIER_MAX_LENGTH,
   SERVICE_TIERS,
+  SPAN_ID_HEX_LENGTH,
+  SPAN_ID_PATTERN,
+  TRACE_ID_HEX_LENGTH,
+  TRACE_ID_PATTERN,
   UNTRACKED_CAPABILITY_SCOPES,
   UNTRACKED_CLIENT_MODES,
   UNTRACKED_CLIENT_SHAPES,
@@ -140,6 +144,9 @@ export const MetadataEventSchema = z
     attempt_index: z.number().int().min(0).default(0),
     call_id: z.string().max(CALL_ID_MAX_LENGTH).regex(CANONICAL_UUID_PATTERN),
     lease_id: z.string().max(64).nullable().optional(),
+    trace_id: z.string().max(TRACE_ID_HEX_LENGTH).regex(TRACE_ID_PATTERN).nullable().optional(),
+    span_id: z.string().max(SPAN_ID_HEX_LENGTH).regex(SPAN_ID_PATTERN).nullable().optional(),
+    trace_sampled: z.boolean().nullable().optional(),
     possibly_succeeded: z.boolean().nullable().optional(),
     service_tier: z.string().max(SERVICE_TIER_MAX_LENGTH).nullable().optional(),
     sdk_instance_id: z.string(),
@@ -168,6 +175,31 @@ export const MetadataEventSchema = z
         message: "receipt_pricing_input_tokens requires receipt_aggregate_count",
         path: ["receipt_pricing_input_tokens"],
       });
+    }
+    if (event.trace_id === "0".repeat(TRACE_ID_HEX_LENGTH)) {
+      context.addIssue({
+        code: "custom",
+        message: "trace_id must not be all zeros",
+        path: ["trace_id"],
+      });
+    }
+    if (event.span_id === "0".repeat(SPAN_ID_HEX_LENGTH)) {
+      context.addIssue({
+        code: "custom",
+        message: "span_id must not be all zeros",
+        path: ["span_id"],
+      });
+    }
+    if (event.trace_id === null || event.trace_id === undefined) {
+      for (const field of ["span_id", "trace_sampled"] as const) {
+        if (event[field] !== null && event[field] !== undefined) {
+          context.addIssue({
+            code: "custom",
+            message: `${field} requires trace_id`,
+            path: [field],
+          });
+        }
+      }
     }
   });
 

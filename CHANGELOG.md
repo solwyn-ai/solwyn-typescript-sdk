@@ -37,6 +37,15 @@ corresponding release notes before users upgrade.
   Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.
 
+- **OpenTelemetry trace correlation.** Metadata events from wrapped clients and the AI SDK
+  middleware include the caller's active OpenTelemetry trace ID, span ID, and sampled flag
+  (`trace_id`, `span_id`, `trace_sampled`) when the application already has an active span.
+  The identifiers are captured once at call start and carried by every event of the call,
+  including streaming, failover hops, errors, and denials. They never contain prompts or
+  responses. Solwyn adds no OpenTelemetry dependency, creates no spans, and reads only those
+  three values from the active span. Events without an active span are unchanged. Disable
+  capture with `traceCorrelation: false` or `SOLWYN_TRACE_CORRELATION=false`.
+
 ### Fixed
 
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
@@ -67,6 +76,13 @@ corresponding release notes before users upgrade.
   npm `ERESOLVE` when an application already installs an out-of-range version, even if the
   application does not use the integration. Upgrade the installed core to the supported range
   or retain the previous SDK release. The package still installs without LangChain present.
+
+- **Background work no longer joins the caller's trace.** When your application uses an
+  OpenTelemetry context manager, the reporter's flush loop and close-time delivery, lease
+  renewals and surrenders, and untracked-surface advisories now run without the active span and baggage of the call that
+  started them. Application instrumentation no longer attributes this background traffic to
+  whichever call happened to start it, and that call's span is no longer retained for the
+  client's lifetime. Budget checks and lease grants still run in the caller's context.
 
 - **Public-preview compatibility:** Legacy raw-request and client escapes on native OpenAI,
   Azure OpenAI, Anthropic and Together clients, OpenAI Realtime session/client-secret creation

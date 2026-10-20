@@ -2,6 +2,7 @@ import { ConfigurationError } from "./errors";
 import { bestEffortLogger, type Logger, noopLogger } from "./logging";
 import { handleReadOnlyKeyError } from "./read-only-key";
 import { SURFACE_CLIENT_SHAPES, type SurfaceClientShape, validateSurfacePath } from "./surfaces";
+import { withoutTraceContext } from "./trace-context";
 import {
   type FetchLike,
   isRetryableTransportError,
@@ -446,7 +447,8 @@ export class UntrackedSurfaceReporter {
       finishFlush = resolve;
     });
     this.#activeFlush = active;
-    void this.#drainRequestedFlushes(finishFlush);
+    // Advisory delivery is background work; keep it out of the requesting call's trace.
+    void withoutTraceContext(() => this.#drainRequestedFlushes(finishFlush));
     return active;
   }
 

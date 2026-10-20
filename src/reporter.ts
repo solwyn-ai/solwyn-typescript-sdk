@@ -38,6 +38,7 @@ import {
   ReceiptFoldState,
 } from "./receipt-fold";
 import { runOutsideRun } from "./run-context";
+import { withoutTraceContext } from "./trace-context";
 import {
   BUDGET_CONFIRM_PATH,
   type FetchLike,
@@ -1932,7 +1933,9 @@ export class MetadataReporter {
     this.loopStarted = true;
     this.tickTarget =
       typeof WeakRef === "function" ? { weak: new WeakRef(this) } : { strong: this };
-    runOutsideRun(() => this._armTick(false));
+    // The tick chain re-arms itself for the reporter's lifetime, so it must not inherit the
+    // run scope or the OpenTelemetry span of whichever call happened to start it.
+    runOutsideRun(() => withoutTraceContext(() => this._armTick(false)));
   }
 
   private _warnFlushScheduleFailure(error: unknown): void {
@@ -2178,7 +2181,8 @@ export class MetadataReporter {
         clearTimeout(this.tickTimer);
         this.tickTimer = null;
       }
-      void this._finishClose(deadline).then(release, () => {
+      // Close-time delivery is the reporter's own work, not part of the closing caller's trace.
+      void withoutTraceContext(() => this._finishClose(deadline)).then(release, () => {
         this._sealDelivery();
         release();
       });

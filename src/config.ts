@@ -349,6 +349,7 @@ export const SolwynConfigSchema = z.strictObject({
   on_unmetered: OnUnmeteredPostureSchema.default("warn"),
   acknowledge_untracked: AcknowledgeUntrackedSchema,
   report_untracked_surfaces: z.boolean().default(true),
+  trace_correlation: z.boolean().default(true),
   velocity_mode: z.enum(["off", "warn", "deny"]).default("warn"),
   velocity_repeat_count: numberFromNumberOrStringSchema(
     z.number().finite().int().min(2).max(VELOCITY_HISTORY_LIMIT),
@@ -447,6 +448,7 @@ export interface SolwynConfigOptions {
   on_unmetered?: OnUnmeteredPosture;
   acknowledge_untracked?: readonly string[];
   report_untracked_surfaces?: boolean;
+  trace_correlation?: boolean;
   velocity_mode?: VelocityConfig["velocity_mode"];
   velocity_repeat_count?: number;
   velocity_repeat_window_s?: number;
@@ -494,6 +496,7 @@ export const ENV_FIELD_MAP: Readonly<Record<string, string>> = {
   on_unmetered: "SOLWYN_ON_UNMETERED",
   acknowledge_untracked: "SOLWYN_ACKNOWLEDGE_UNTRACKED",
   report_untracked_surfaces: "SOLWYN_REPORT_UNTRACKED_SURFACES",
+  trace_correlation: "SOLWYN_TRACE_CORRELATION",
   velocity_mode: "SOLWYN_VELOCITY_MODE",
   velocity_repeat_count: "SOLWYN_VELOCITY_REPEAT_COUNT",
   velocity_repeat_window_s: "SOLWYN_VELOCITY_REPEAT_WINDOW_S",
@@ -580,6 +583,7 @@ export function loadConfigFromEnv(
       field === "fail_open" ||
       field === "lease_enabled" ||
       field === "report_untracked_surfaces" ||
+      field === "trace_correlation" ||
       field === "breaker_reporting_enabled"
     ) {
       raw[field] = coerceFailOpen(envValue);

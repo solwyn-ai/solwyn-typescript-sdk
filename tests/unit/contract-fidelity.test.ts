@@ -548,3 +548,64 @@ describe("D7: price_hints keys are intentionally unrestricted (deliberate deviat
     expect(parsed.success).toBe(true);
   });
 });
+
+describe("D8: trace context is strict in the SDK, lenient at ingest (deliberate deviation)", () => {
+  const props = specSchema("IngestMetadataEvent").properties ?? {};
+  const event = {
+    model: "gpt-4o",
+    provider: "openai",
+    input_tokens: 1,
+    output_tokens: 1,
+    latency_ms: 1,
+    status: "success",
+    is_model_fallback: false,
+    call_id: "11111111-1111-1111-1111-111111111111",
+    sdk_instance_id: "sdk-1",
+    timestamp: "2026-10-19T00:00:00Z",
+  };
+  const traceId = "0af7651916cd43dd8448eb211c80319c";
+  const spanId = "b7ad6b7169203331";
+
+  it("the spec accepts bounded plain strings and scalar flags, dropping malformed values", () => {
+    for (const field of ["trace_id", "span_id"]) {
+      expect(findConstraint(props[field], "maxLength")).toBe(64);
+      expect(findConstraint(props[field], "pattern")).toBeUndefined();
+    }
+    expect(
+      (props["trace_sampled"]?.anyOf ?? []).map((sub) => (sub as { type?: string }).type),
+    ).toEqual(["boolean", "string", "integer", "number", "null"]);
+    expect(specSchema("IngestMetadataEvent").required).not.toEqual(
+      expect.arrayContaining(["trace_id", "span_id", "trace_sampled"]),
+    );
+  });
+
+  it("the SDK emits only well-formed W3C ids, a real boolean, and children with a trace id", () => {
+    const parse = (fields: Record<string, unknown>) =>
+      MetadataEventSchema.safeParse({ ...event, ...fields }).success;
+    expect(parse({ trace_id: traceId, span_id: spanId, trace_sampled: false })).toBe(true);
+    expect(parse({ trace_id: traceId })).toBe(true);
+    for (const invalid of [
+      { trace_id: traceId.toUpperCase() },
+      { trace_id: traceId.slice(1) },
+      { trace_id: "0".repeat(32) },
+      { trace_id: "x".repeat(64) },
+      { trace_id: traceId, span_id: "0".repeat(16) },
+      { trace_id: traceId, span_id: `${spanId}0` },
+      { trace_id: traceId, trace_sampled: "true" },
+      { trace_id: traceId, trace_sampled: 1 },
+      { span_id: spanId },
+      { trace_sampled: true },
+    ]) {
+      expect(parse(invalid)).toBe(false);
+    }
+  });
+
+  it("every SDK-valid trace value fits inside the ingest envelope", () => {
+    expect(traceId.length).toBeLessThanOrEqual(
+      findConstraint(props["trace_id"], "maxLength") as number,
+    );
+    expect(spanId.length).toBeLessThanOrEqual(
+      findConstraint(props["span_id"], "maxLength") as number,
+    );
+  });
+});

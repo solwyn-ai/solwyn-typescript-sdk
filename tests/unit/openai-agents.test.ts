@@ -1115,6 +1115,30 @@ describe("OpenAI Agents fail-closed boundaries", () => {
 });
 
 describe("OpenAI Agents refusal identity", () => {
+  it.each([false, true])("unwraps minified tool decisions (streamed=%s)", async (streamed) => {
+    const state = setup();
+    class t extends framework.ToolCallError {}
+    try {
+      for (const decision of [
+        new BudgetExceededError({
+          projectId: null,
+          budgetLimit: 1,
+          currentUsage: 1,
+          estimatedCost: 0.00003,
+          budgetPeriod: "daily",
+          mode: "hard",
+        }),
+        new RunStoppedError({ agentRunId: "synthetic-run", reason: "stop", source: "server" }),
+      ]) {
+        const error = new t("synthetic tool failure", decision);
+        vi.spyOn(state.runner, "run").mockRejectedValue(error);
+        await expect(invoke(state, streamed)).rejects.toBe(decision);
+      }
+    } finally {
+      await state.client.close();
+    }
+  });
+
   it.each([
     "next",
     "return",
@@ -1123,7 +1147,7 @@ describe("OpenAI Agents refusal identity", () => {
     const state = setup();
     const nativeRun = state.runner.run.bind(state.runner);
     const decision = new SolwynError("synthetic decision");
-    let failure: Error = new framework.ToolCallError("synthetic tool failure", decision);
+    let failure: unknown = new framework.ToolCallError("synthetic tool failure", decision);
     vi.spyOn(state.runner, "run").mockImplementation(async (...args) => {
       const result = await nativeRun(...args);
       await result.completed;
@@ -1144,11 +1168,34 @@ describe("OpenAI Agents refusal identity", () => {
       return result;
     });
     try {
-      for (const error of [
-        new framework.ToolCallError("synthetic tool failure", decision),
-        new framework.ToolCallError("synthetic ordinary failure", new Error("synthetic failure")),
-        Object.assign(new Error("synthetic failure"), { error: decision }),
-      ]) {
+      for (const [error, unwrap] of [
+        [new framework.ToolCallError("synthetic tool failure", decision), true],
+        [
+          Object.assign(new framework.ToolCallError("synthetic tool failure", decision), {
+            name: "t",
+          }),
+          true,
+        ],
+        [
+          new framework.ToolCallError("synthetic ordinary failure", new Error("synthetic failure")),
+          false,
+        ],
+        [Object.assign(new Error("synthetic failure"), { error: decision }), false],
+        [{ error: decision, state: undefined }, false],
+        [Object.create(new framework.ToolCallError("synthetic tool failure", decision)), false],
+        [
+          Object.defineProperty(
+            new framework.ToolCallError("synthetic tool failure", decision),
+            "error",
+            {
+              get() {
+                throw new Error("synthetic accessor failure");
+              },
+            },
+          ),
+          false,
+        ],
+      ] as const) {
         failure = error;
         const result = await state.integration.runStreamed(
           state.runner,
@@ -1161,11 +1208,7 @@ describe("OpenAI Agents refusal identity", () => {
           method === "throw"
             ? iterator.throw?.(new Error("synthetic consumer failure"))
             : iterator[method]?.();
-        await expect(operation).rejects.toBe(
-          error instanceof framework.ToolCallError && error.error instanceof SolwynError
-            ? decision
-            : error,
-        );
+        await expect(operation).rejects.toBe(unwrap ? decision : error);
       }
     } finally {
       await state.client.close();

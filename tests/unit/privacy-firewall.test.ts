@@ -159,7 +159,7 @@ const AGENTS_READABLE_PROPERTIES = new Set([
   "getResponse", // Admitted wrapped-model dispatch.
   "getRetryAdvice", // Retry decision capability.
   "getStreamedResponse", // Admitted wrapped-model stream dispatch.
-  "hasOwn", // Only fixed HTTP model dispatch methods on its direct prototype.
+  "hasOwn", // Fixed HTTP model methods and ToolCallError own-field presence only.
   "model", // Structural string/model selection; never model input.
   "modelProvider", // Runner provider identity.
   "name", // Explicit structural agent attribution name.
@@ -618,6 +618,28 @@ function isRetryError(node: ts.Node, checker: ts.TypeChecker): boolean {
   );
 }
 
+/** Check only fixed error-field presence; Agents state values remain unreadable. */
+function isToolErrorShape(node: ts.Node): boolean {
+  const access = node.parent;
+  if (
+    !ts.isPropertyAccessExpression(access) ||
+    access.expression !== node ||
+    access.name.text !== "hasOwn"
+  )
+    return false;
+  const call = access.parent;
+  return (
+    enclosingFunction(node)?.name?.getText() === "unwrapToolDecision" &&
+    ts.isCallExpression(call) &&
+    call.expression === access &&
+    call.arguments.length === 2 &&
+    call.arguments[0]?.getText() === "error" &&
+    !!call.arguments[1] &&
+    ts.isStringLiteralLike(call.arguments[1]) &&
+    ["error", "state"].includes(call.arguments[1].text)
+  );
+}
+
 function isToolDecisionProjection(node: ts.Node, checker: ts.TypeChecker): boolean {
   if (
     !ts.isPropertyAccessExpression(node) ||
@@ -634,7 +656,7 @@ function isToolDecisionProjection(node: ts.Node, checker: ts.TypeChecker): boole
     if (
       ts.isIfStatement(scope) &&
       scope.expression.getText().replace(/\s+/g, "") ===
-        'errorinstanceofError&&error.name==="ToolCallError"&&"error"inerror'
+        'errorinstanceofError&&"error"inerror&&Object.hasOwn(error,"error")&&Object.hasOwn(error,"state")'
     )
       toolErrorGuard = true;
     scope = scope.parent;
@@ -1206,7 +1228,8 @@ function findIntegrationViolations(text: string, path: string): string[] {
         node.parent.expression === node &&
         integrationMemberName(node.parent) === "defineProperty"
       ) &&
-      !isModelTopology(node, checker)
+      !isModelTopology(node, checker) &&
+      !(rel.startsWith("openai-agents/") && isToolErrorShape(node))
     )
       report("references Object outside defineProperty");
     if (ts.isIdentifier(node) && node.text === "fetch") report("references fetch");
@@ -2410,6 +2433,20 @@ describe("privacy firewall — integration source controls", () => {
       "factory(String(error.error)); if (error.error instanceof SolwynError)",
     );
     expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+
+  it("limits ToolCallError reflection to fixed own-field presence checks", () => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    for (const replacement of ['Object.hasOwn(error, "messages")', "error.state"]) {
+      const mutated = shipped.replace('Object.hasOwn(error, "state")', replacement);
+      expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).not.toEqual([]);
+    }
+    expect(
+      findIntegrationViolations(
+        'function unwrapToolDecision(error: unknown) { return Object.hasOwn(error, "state"); }',
+        "src/langchain/index.ts",
+      ),
+    ).not.toEqual([]);
   });
 
   it.each([

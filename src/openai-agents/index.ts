@@ -45,12 +45,18 @@ function violation(message: string): SolwynError {
 
 /** Agents wraps thrown tool/guardrail errors in .error rather than .cause. */
 function unwrapToolDecision(error: unknown): unknown {
-  if (error instanceof Error && error.name === "ToolCallError" && "error" in error) {
-    try {
+  try {
+    // Agents' own error/state fields survive class-name minification; state stays opaque.
+    if (
+      error instanceof Error &&
+      "error" in error &&
+      Object.hasOwn(error, "error") &&
+      Object.hasOwn(error, "state")
+    ) {
       if (error.error instanceof SolwynError) return error.error;
-    } catch {
-      // A foreign error's accessor must not replace the original failure.
     }
+  } catch {
+    // A foreign error's accessor must not replace the original failure.
   }
   return error;
 }

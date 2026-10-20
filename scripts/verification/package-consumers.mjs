@@ -249,7 +249,9 @@ const types = `
 import {Solwyn,budgetCheckResult,type FetchLike,type BudgetCheckResult,RunStoppedError,SolwynError,VERSION} from '@solwyn/sdk';
 import {run,currentRun,createRun,currentRunContext,VERSION as nodeVersion} from '@solwyn/sdk/node';
 import {FakeControlPlane,denialOnlyOpenAIClient,assertCheckContract,assertConfirmContract,assertLeaseContract,assertReceiptIngestContract,assertRunControlContract,type ScenarioWindow,type ContractOptions} from '@solwyn/sdk/testing';
+import {SolwynRunScopeHandler} from '@solwyn/sdk/langchain';
 const plane=new FakeControlPlane();
+const handler=new SolwynRunScopeHandler();
 const seam:FetchLike=plane.fetch;
 const client=new Solwyn({chat:{completions:{create(_params:{model:string}){return {usage:{prompt_tokens:1,completion_tokens:1}};}}}},{fetch:seam,apiKey:plane.apiKey});
 const usage:Promise<{usage:{prompt_tokens:number;completion_tokens:number}}>=client.chat.completions.create({model:'gpt-review'});
@@ -264,7 +266,7 @@ const leaseClaimToken:number|null=budget.leaseClaimToken;
 const failure:SolwynError=new RunStoppedError({agentRunId:'run_review',reason:'review',source:'server'});
 const packageVersion:string=VERSION;
 const nodePackageVersion:string=nodeVersion;
-void [usage,identity,handle,scope,options,budget,legacy,leaseId,leaseClaimToken,failure,currentRunContext,denialOnlyOpenAIClient,assertCheckContract,assertConfirmContract,assertLeaseContract,assertReceiptIngestContract,assertRunControlContract,packageVersion,nodePackageVersion];
+void [usage,identity,handle,handler,scope,options,budget,legacy,leaseId,leaseClaimToken,failure,currentRunContext,denialOnlyOpenAIClient,assertCheckContract,assertConfirmContract,assertLeaseContract,assertReceiptIngestContract,assertRunControlContract,packageVersion,nodePackageVersion];
 `;
 
 export async function runPackageConsumers({ tarball, out }) {

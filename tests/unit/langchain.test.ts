@@ -140,6 +140,25 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     expect(plane.checks).toHaveLength(1);
     expect(plane.ingested).toHaveLength(1);
   });
+  it("purges an early-ended model stream when its graph root completes", async () => {
+    const { model, handler, transport } = await setup();
+    const upstream = new AbortController();
+    const State = graph.Annotation.Root({ done: graph.Annotation<boolean>() });
+    const workflow = new graph.StateGraph(State)
+      .addNode("answer", async () => {
+        for await (const _ of await model.stream("Synthetic stream")) break;
+        return { done: true };
+      })
+      .addEdge(graph.START, "answer")
+      .addEdge("answer", graph.END)
+      .compile();
+    await expect(
+      workflow.invoke({}, { callbacks: [handler], signal: upstream.signal }),
+    ).resolves.toEqual({ done: true });
+    expect(transport.requests).toHaveLength(1);
+    for (const key of ["runs", "models", "roots"])
+      expect((Reflect.get(handler, key) as Map<unknown, unknown>).size, key).toBe(0);
+  });
   it.each([
     "invoke",
     "values",
@@ -309,22 +328,13 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
     expect(plane.ingested[0]?.parent_agent_run_id).toBeTruthy();
   });
   it.each([
-    "reasoning",
-    "explicit",
-    "parse",
-    "events",
-    "unparented",
-    "override",
-  ] as const)("fails closed on %s", async (path) => {
+    ["parse", "LangChain client member is not admitted"],
+    ["events", "LangChain chat-model stream events are not admitted"],
+    ["unparented", "LangChain run requires a mapped parent chain"],
+    ["override", "LangChain call has no bound Solwyn signal key; path is not admitted"],
+  ] as const)("fails closed on %s", async (path, message) => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { chain, model, handler, plane, transport } = await setup(
-      {},
-      path === "reasoning"
-        ? { reasoning: { summary: "auto" } }
-        : path === "explicit"
-          ? { useResponsesApi: true }
-          : {},
-    );
+    const { chain, model, handler, plane, transport } = await setup();
     const started = performance.now();
     let operation: Promise<unknown>;
     if (path === "parse")
@@ -345,12 +355,74 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
           ? { options: { signal: new AbortController().signal } }
           : {}) as Parameters<typeof chain.invoke>[1],
       );
-    await expect(operation).rejects.toBeInstanceOf(SolwynError);
+    await expect(operation).rejects.toMatchObject({ constructor: SolwynError, message });
     expect(performance.now() - started).toBeLessThan(1000);
     expect(transport.requests).toHaveLength(0);
     expect(plane.checks).toHaveLength(0);
   });
-  it("raises a post-hoc error for a plain unbound model", async () => {
+  it.each([
+    ["explicit", false],
+    ["explicit", true],
+    ["reasoning", false],
+    ["reasoning", true],
+    ["hosted tool", false],
+  ] as const)("preserves the Responses refusal for %s (stream=%s)", async (selection, stream) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { model, handler, plane, transport, client } = await setup(
+      {},
+      selection === "explicit"
+        ? { useResponsesApi: true }
+        : selection === "reasoning"
+          ? { reasoning: { summary: "auto" } }
+          : {},
+    );
+    const selected =
+      selection === "hosted tool" ? model.bindTools([{ type: "web_search_preview" }]) : model;
+    const chain = prompts.ChatPromptTemplate.fromTemplate("Synthetic")
+      .pipe(selected)
+      .withConfig({ callbacks: [handler] });
+    const operation = stream
+      ? (async () => {
+          for await (const _ of await chain.stream({})) {
+            /* drain */
+          }
+        })()
+      : chain.invoke({});
+    await expect(operation).rejects.toMatchObject({
+      constructor: SolwynError,
+      message: "LangChain Responses API is not admitted",
+    });
+    await client.close();
+    expect(transport.requests).toHaveLength(0);
+    expect(plane.checks).toHaveLength(0);
+    expect(plane.ingested).toHaveLength(0);
+  });
+  it("preserves the chat-model events refusal through the real callback error path", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { chain, plane, transport } = await setup();
+    const { BaseCallbackHandler } = await import("@langchain/core/callbacks/base");
+    class EventHandler extends BaseCallbackHandler {
+      name = "synthetic_events";
+      lc_prefer_chat_model_stream_events = true;
+    }
+    await expect(
+      chain.invoke(
+        { question: "fixture" },
+        {
+          callbacks: [new EventHandler()],
+        },
+      ),
+    ).rejects.toMatchObject({
+      constructor: SolwynError,
+      message: "LangChain chat-model stream events are not admitted",
+    });
+    expect(transport.requests).toHaveLength(0);
+    expect(plane.checks).toHaveLength(0);
+  });
+  it.each([
+    false,
+    true,
+  ])("raises a post-hoc error for a successful unbound model (stream=%s)", async (stream) => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { handler, transport } = await setup();
     const plain = new LC.ChatOpenAI({
@@ -359,11 +431,17 @@ describe("real LangChain/LangGraph with the wrapped provider boundary", () => {
       maxRetries: 0,
       configuration: { fetch: transport.fetch },
     });
-    await expect(
-      prompts.ChatPromptTemplate.fromTemplate("Synthetic")
-        .pipe(plain)
-        .invoke({}, { callbacks: [handler] }),
-    ).rejects.toThrow(/not metered/);
+    const chain = prompts.ChatPromptTemplate.fromTemplate("Synthetic")
+      .pipe(plain)
+      .withConfig({ callbacks: [handler] });
+    const operation = stream
+      ? (async () => {
+          for await (const _ of await chain.stream({})) {
+            /* drain */
+          }
+        })()
+      : chain.invoke({});
+    await expect(operation).rejects.toThrow(/not metered/);
     expect(transport.requests).toHaveLength(1);
   });
   it.each([false, true])("vetoes default retries on budget denial (tagged=%s)", async (tagged) => {

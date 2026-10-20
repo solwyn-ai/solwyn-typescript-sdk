@@ -196,15 +196,40 @@ describe("LangChain structural run handler", () => {
     handler.handleLLMError(undefined, "m2");
     handler.handleChainEnd(undefined, "root");
   });
-  it.each([
-    "handleLLMEnd",
-    "handleLLMError",
-  ] as const)("%s cleans up and rejects an unbound model", (method) => {
+  it("handleLLMEnd cleans up and rejects a successful unbound model", () => {
     const handler = new SolwynRunScopeHandler();
     start(handler);
     handler.handleChatModelStart(undefined, undefined, "m", "root");
-    expect(() => handler[method](undefined, "m")).toThrow(/not metered/);
+    expect(() => handler.handleLLMEnd(undefined, "m")).toThrow(/not metered/);
     handler.handleChainError(undefined, "root");
+    expect(counts(handler)).toEqual([0, 0, 0]);
+  });
+  it("handleLLMError cleans up an unbound model without masking its failure", () => {
+    const handler = new SolwynRunScopeHandler();
+    start(handler);
+    handler.handleChatModelStart(undefined, undefined, "m", "root");
+    expect(() => handler.handleLLMError(new Error("synthetic refusal"), "m")).not.toThrow();
+    handler.handleChainError(undefined, "root");
+    expect(counts(handler)).toEqual([0, 0, 0]);
+  });
+  it.each([
+    "handleChainEnd",
+    "handleChainError",
+  ] as const)("%s purges abandoned model bindings only for its root", (method) => {
+    const handler = new SolwynRunScopeHandler();
+    start(handler);
+    start(handler, "other-root");
+    const upstream = new AbortController();
+    const remove = vi.spyOn(upstream.signal, "removeEventListener");
+    const options = bind(handler, "abandoned", "root", upstream.signal);
+    const other = bind(handler, "other-model", "other-root");
+    handler[method](undefined, "root");
+    expect(counts(handler)).toEqual([1, 1, 1]);
+    expect(remove).toHaveBeenCalledExactlyOnceWith("abort", expect.any(Function));
+    expect(() => leaf(handler).chat.completions.create({}, options)).toThrow(/not admitted/);
+    expect(other.signal).toBeDefined();
+    handler.handleLLMEnd(undefined, "other-model");
+    handler.handleChainEnd(undefined, "other-root");
     expect(counts(handler)).toEqual([0, 0, 0]);
   });
   it("finishes deferred scopes after an activation without masking its rejection", async () => {

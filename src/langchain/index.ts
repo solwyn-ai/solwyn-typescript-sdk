@@ -186,7 +186,9 @@ export class SolwynRunScopeHandler {
     this.startModel(runId, parentRunId);
   }
   handleLLMEnd(_opaqueOutput: unknown, runId: string): void {
-    this.endModel(runId);
+    const model = this.endModel(runId);
+    if (model !== undefined && !model.bound)
+      refusal("LangChain model call bypassed the Solwyn leaf; it was not metered");
   }
   handleLLMError(_opaqueError: unknown, runId: string): void {
     this.endModel(runId);
@@ -348,7 +350,7 @@ export class SolwynRunScopeHandler {
     this.materialize(parent.scope);
     this.models.set(runId, { ...parent, bound: false, bindings: new Map() });
   }
-  private endModel(runId: string): void {
+  private endModel(runId: string): ModelRun | undefined {
     const model = this.models.get(runId);
     if (model === undefined) return;
     this.models.delete(runId);
@@ -357,7 +359,7 @@ export class SolwynRunScopeHandler {
       this.keys.delete(signal);
     }
     this.finishClosedRoot(model.rootRunId);
-    if (!model.bound) refusal("LangChain model call bypassed the Solwyn leaf; it was not metered");
+    return model;
   }
   private end(runId: string): void {
     const run = this.runs.get(runId);
@@ -369,6 +371,9 @@ export class SolwynRunScopeHandler {
       root.closed = true;
       for (const childRunId of this.runs.keys()) {
         if (this.runs.get(childRunId)?.rootRunId === runId) this.runs.delete(childRunId);
+      }
+      for (const modelRunId of this.models.keys()) {
+        if (this.models.get(modelRunId)?.rootRunId === runId) this.endModel(modelRunId);
       }
       this.finishClosedRoot(runId);
     }

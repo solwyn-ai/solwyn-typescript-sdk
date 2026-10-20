@@ -617,11 +617,17 @@ describe("CI workflow contract", () => {
     expect(canary["timeout-minutes"]).toBe(20);
     const overlay = namedStep(canary, "Overlay latest framework packages");
     expect(overlay.run).toContain(
-      "pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest",
+      "pnpm add --no-lockfile -D @langchain/core@latest @langchain/openai@latest @langchain/langgraph@latest @openai/agents@latest",
     );
     expect(overlay.run).toContain("git diff --exit-code -- pnpm-lock.yaml");
     expect(namedStep(canary, "Exercise the offline framework recipe").run).toContain(
       "tests/unit/langchain-docs.test.ts",
+    );
+    expect(namedStep(canary, "Exercise the offline framework recipe").run).toContain(
+      "tests/unit/openai-agents.test.ts",
+    );
+    expect(namedStep(canary, "Exercise the offline framework recipe").run).toContain(
+      "tests/unit/openai-agents-docs.test.ts",
     );
     expect(semanticJob(model, "required").needs).not.toContain("framework-canary");
     expect(await readFile(ciPath, "utf8")).toContain('cron: "0 6 * * 1"');

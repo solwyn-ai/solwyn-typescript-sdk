@@ -11,6 +11,14 @@ corresponding release notes before users upgrade.
 
 ### Added
 
+- **OpenAI Agents JS attribution.** The new `@solwyn/sdk/openai-agents` entry adds content-free
+  workflow and stable per-agent scopes for the Node.js 22+ Chat Completions and Responses HTTP
+  recipe. Function-tool turns, handoffs and hand-backs reuse the correct agent identity; the
+  wrapped client alone owns enforcement and settlement. Nested agent-as-tool calls, unexpected
+  models, missing hierarchy, and concurrent attempts fail closed with typed errors. Streaming
+  completion and iteration preserve latched decisions and release state after completion or
+  cancellation. Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.
+
 - **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
   a content-free run-scope handler and a guarded Chat Completions leaf for the documented
   Node.js 22+ OpenAI recipe. Stable graph-node scopes preserve lease reuse, velocity history,
@@ -43,6 +51,12 @@ corresponding release notes before users upgrade.
   helpers report a zero-token error event with no confirmation.
 
 ### Changed
+
+- **Public-preview compatibility:** The new optional `@openai/agents >=0.20.0 <1` peer can cause
+  npm `ERESOLVE` when an application already installs an out-of-range framework version, even
+  when it does not use the integration. Upgrade that dependency or retain the previous SDK
+  release. Runtime imports and the provider-free core still work without Agents installed;
+  the Agents entry's native declarations require the framework package.
 
 - **Public-preview compatibility:** The new optional `@langchain/core >=1.2.14 <2` peer can cause
   npm `ERESOLVE` when an application already installs an out-of-range version, even if the

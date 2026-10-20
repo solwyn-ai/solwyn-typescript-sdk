@@ -8,6 +8,7 @@ export const allInstalledEntries = [
   { specifier: "@solwyn/sdk/testing", binding: "testing" },
   { specifier: "@solwyn/sdk/ai-sdk", binding: "ai" },
   { specifier: "@solwyn/sdk/langchain", binding: "langchain" },
+  { specifier: "@solwyn/sdk/openai-agents", binding: "openaiAgents" },
 ];
 
 export const allInstalledSpecifiers = allInstalledEntries.map(({ specifier }) => specifier);
@@ -21,7 +22,10 @@ export function installedArtifactIdentitySource(entries, outputBinding, formatEx
   assert.match(outputBinding, /^[A-Za-z_$][A-Za-z0-9_$]*$/);
   assert.match(formatExpression, /^(?:format|['"](?:esm|cjs)['"])$/);
   for (const entry of entries) {
-    assert.match(entry.specifier, /^@solwyn\/sdk(?:\/(?:node|testing|ai-sdk|langchain))?$/);
+    assert.match(
+      entry.specifier,
+      /^@solwyn\/sdk(?:\/(?:node|testing|ai-sdk|langchain|openai-agents))?$/,
+    );
     assert.match(entry.binding, /^[A-Za-z_$][A-Za-z0-9_$]*$/);
   }
   const loadedEntries = entries
@@ -77,6 +81,7 @@ const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
 const langchain=await load('@solwyn/sdk/langchain');
+const openaiAgents=await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 assert.equal(fs.realpathSync(sdkRoot),fs.realpathSync(path.dirname(req.resolve('@solwyn/sdk/package.json'))),'Run validation must use the installed package identified by its consumer manifest');

@@ -155,7 +155,7 @@ globalThis.WebSocket = class extends EventTarget {
     let result = {};
     if (method === 'Runtime.evaluate') {
       const value = params.expression === 'Boolean(globalThis.reviewDone)' ? true
-        : params.expression === 'globalThis.reviewDone' ? { ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[] }
+        : params.expression === 'globalThis.reviewDone' ? { ok:true,providerCalls:2,checks:4,confirms:4,transmittedEvents:4,uniqueCalls:4,ingested:4,legacyDedupCollisions:0,unexpectedFetch:0,ambientRunAbsent:true,nodeGlobalAbsent:true,bufferAbsent:true,langchainNodeRequired:true,openaiAgentsNodeRequired:true,coreClosed:{checks:2,confirms:2,ingested:2},warnings:[] }
         : '<html></html>';
       result = { result: { value } };
       if(scenario==='descendant' && params.expression==='globalThis.reviewDone') result.exceptionDetails={text:'Synthetic internal proof failure'};

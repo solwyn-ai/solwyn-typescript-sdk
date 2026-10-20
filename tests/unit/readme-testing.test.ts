@@ -224,6 +224,7 @@ describe("README release compatibility guide", () => {
       ["@google/genai", ">=0.3.1 <3"],
       ["ai", ">=7.0.14 <8"],
       ["@langchain/core", ">=1.2.14 <2"],
+      ["@openai/agents", ">=0.20.0 <1"],
       ["openai", ">=4.41.0 <8"],
       ["together-ai", ">=0.16.0 <1"],
     ]) {

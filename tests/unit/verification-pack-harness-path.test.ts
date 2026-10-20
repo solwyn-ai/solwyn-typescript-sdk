@@ -69,3 +69,23 @@ it.each([
     expect(entry.endsWith(format === "esm" ? ".js" : ".cjs")).toBe(true);
   }
 });
+
+it.each([
+  "esm",
+  "cjs",
+])("encodes each %s OpenAI Agents harness entry beneath URL-sensitive paths", async (format) => {
+  const helper = await import(
+    new URL("../../scripts/verification/openai-agents-consumer.mjs", import.meta.url).href
+  );
+  const sdk = path.resolve(path.parse(process.cwd()).root, "installed sdk #100%", "sdk");
+  const args = helper.openaiAgentsHarnessArguments(sdk, format) as string[];
+  expect(args[0]).toBe("openai-agents-harness.mjs");
+  expect(args.slice(1)).toHaveLength(3);
+  for (const entry of args.slice(1)) {
+    expect(entry).toMatch(/^file:/);
+    expect(entry).toContain("%23");
+    expect(entry).toContain("%25");
+    expect(fileURLToPath(entry).startsWith(sdk + path.sep)).toBe(true);
+    expect(entry.endsWith(format === "esm" ? ".js" : ".cjs")).toBe(true);
+  }
+});

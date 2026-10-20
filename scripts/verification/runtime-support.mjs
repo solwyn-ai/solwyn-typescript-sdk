@@ -178,6 +178,7 @@ export function assertEdgeResult(result) {
     nodeGlobalAbsent: true,
     bufferAbsent: true,
     langchainNodeRequired: true,
+    openaiAgentsNodeRequired: true,
     coreClosed: { checks: 2, confirms: 2, ingested: 2 },
     warnings: [],
   });

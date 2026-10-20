@@ -11,3 +11,4 @@ tests/unit/.langchain-recipe-*/
 .env
 .env.*
 .worktrees
+tests/unit/.openai-agents-docs-*/

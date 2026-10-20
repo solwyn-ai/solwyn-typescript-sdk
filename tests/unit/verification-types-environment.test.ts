@@ -23,7 +23,7 @@ type FixtureLock = {
   packages: Record<string, LockedPackage>;
 };
 
-function successfulTypeChecks(kind: "native" | "ai" | "langchain") {
+function successfulTypeChecks(kind: "native" | "ai" | "langchain" | "openai-agents") {
   const successfulCommand = () => ({ status: 0, stdout: "", stderr: "" });
   const compilerCells = [
     ["floor", "5.8.3", "esm"],
@@ -115,6 +115,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s allocates beneath a parent-owned verification root", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-parent-"));
   const parentRoot = await mkdtemp(join(directory, "owned-"));
@@ -140,6 +141,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s removes its failed consumer but preserves output evidence", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-cleanup-"));
   try {
@@ -158,6 +160,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s reports and honors SMOKE_KEEP=1 after failure", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-keep-"));
   let consumerRoot = "";
@@ -180,6 +183,17 @@ it.each([
   }
 });
 const fixtureGraphs = [
+  {
+    name: "openai-agents-smoke",
+    dependencies: {
+      "@openai/agents": "0.20.0",
+      "@types/node": "22.15.30",
+      openai: "7.36.0",
+      zod: "4.4.3",
+      "typescript-current": "npm:typescript@6.0.3",
+      "typescript-floor": "npm:typescript@5.8.3",
+    },
+  },
   {
     name: "langchain-smoke",
     dependencies: {
@@ -221,6 +235,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s rejects an output directory inside the repository", async (probe) => {
   const failure = await execute(
     process.execPath,
@@ -241,6 +256,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s finalizes a schema-v1 failure report and removes its registered root", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-schema-fail-"));
   try {
@@ -352,6 +368,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s removes mixed-case NODE_PATH keys before spawning npm", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-env-"));
   try {
@@ -394,6 +411,11 @@ it.each([
   ["native-type-consumer", "native-types", "Locked native consumer npm ci failed"],
   ["ai-type-consumer", "ai-types", "Locked AI consumer npm ci failed"],
   ["langchain-type-consumer", "langchain-smoke", "Locked LangChain consumer npm ci failed"],
+  [
+    "openai-agents-type-consumer",
+    "openai-agents-smoke",
+    "Locked OpenAI Agents consumer npm ci failed",
+  ],
 ])("%s accepts an equivalent CRLF fixture checkout", async (probe, fixture, expectedFailure) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-crlf-"));
   try {
@@ -407,6 +429,7 @@ it.each([
       "support.mjs",
       "process.mjs",
       "langchain-consumer.mjs",
+      "openai-agents-consumer.mjs",
     ])
       await writeFile(
         join(verification, name),
@@ -593,6 +616,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s persists a bounded npm timeout while inherited pipes remain open", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-timeout-"));
   try {
@@ -647,6 +671,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s rejects a zero-exit npm root whose inherited pipes do not close", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-root-exit-"));
   try {
@@ -718,6 +743,7 @@ it.each([
   "native-type-consumer",
   "ai-type-consumer",
   "langchain-type-consumer",
+  "openai-agents-type-consumer",
 ])("%s rejects dependency-tree drift during the no-save tarball install", async (probe) => {
   const directory = await mkdtemp(join(tmpdir(), "solwyn-verification-types-tree-"));
   try {

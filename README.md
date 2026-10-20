@@ -446,13 +446,17 @@ the recipe page.
 | Framework | Integration | Runtime |
 |---|---|---|
 | LangChain.js / LangGraph.js | `@solwyn/sdk/langchain` plus the documented OpenAI recipe | Node.js 22+ for attribution |
+| OpenAI Agents JS | [`@solwyn/sdk/openai-agents` recipe](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/integrations/openai-agents.md) for Chat Completions and Responses HTTP | Node.js 22+ for attribution |
 | CrewAI | Not available: no official TypeScript SDK | — |
 
 CrewAI is Python-only; its official JavaScript route calls a REST API for hosted crews, so there
 is no in-process provider client to wrap. See the [framework support matrix](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/integrations/README.md)
 for tested versions, dependency posture, hierarchy, and exclusions. Tags remain explicit,
 non-sensitive attribution; tagged calls use per-call checks instead of token leases.
-LangSmith tracing can export content to LangSmith, outside Solwyn's privacy boundary.
+OpenAI Agents adds a workflow parent and stable agent children across tool turns and hand-backs.
+Use `SolwynAgents.run` or `runStreamed` with its controlled HTTP model provider; nested agents-as-tools
+and websocket models are refused. LangSmith and Agents tracing can export content independently
+of Solwyn; keep framework tracing disabled when content must stay local.
 
 ## Media surfaces
 

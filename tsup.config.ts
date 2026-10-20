@@ -15,6 +15,7 @@ export default defineConfig({
     "testing/index": "src/testing/index.ts",
     // Content-free and edge-safe to load; Node attribution is installed via the Node entry.
     "langchain/index": "src/langchain/index.ts",
+    "openai-agents/index": "src/openai-agents/index.ts",
   },
   format: ["esm", "cjs"],
   dts: true,

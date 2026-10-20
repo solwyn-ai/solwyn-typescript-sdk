@@ -14,6 +14,7 @@ Optional provider peers are bounded to the reviewed major-version intervals:
 | `@google/genai` | `>=0.3.1 <3` | 0.3.1 and 2.30.0 surface cells; installed lifecycle checks at 0.3.1 and 2.20.0 |
 | `together-ai` | `>=0.16.0 <1` | 0.16.0 and 0.58.0 surface cells |
 | `ai` | `>=7.0.14 <8` | Vercel AI SDK integration checks at 7.0.14 |
+| `@openai/agents` | `>=0.20.0 <1` | OpenAI Agents HTTP recipe checked at 0.20.0 with OpenAI 7.36.0 |
 | `@langchain/core` | `>=1.2.14 <2` | LangChain recipe checks at core 1.2.18, OpenAI integration 1.6.2, LangGraph 1.5.1 |
 
 `@google/generative-ai` has one reviewed surface cell at 0.24.1 and is not an optional peer; do

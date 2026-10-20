@@ -54,5 +54,5 @@ try {
 }
 if (result?.status === "pass" && !process.exitCode)
   process.stdout.write(
-    `[pack-smoke] PASS ${result.artifact.sha256} — five entries, strict ESM/CJS declarations, AI and LangChain dispatch/settlement, identity, and isolation controls\n`,
+    `[pack-smoke] PASS ${result.artifact.sha256} — six entries, strict ESM/CJS declarations, AI, LangChain, and Agents dispatch/settlement, identity, and isolation controls\n`,
   );

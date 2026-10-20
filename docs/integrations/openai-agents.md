@@ -12,6 +12,12 @@ Use Node.js 22 or newer. This recipe is tested with `@openai/agents@0.20.0` and 
 Install `@solwyn/sdk`, `openai`, and **`@openai/agents`**. Installing only `@openai/agents-core`
 and `@openai/agents-openai` does not supply the public types imported by this entry.
 
+## Support matrix
+
+| Framework | Enforcement | Attribution | Hierarchy | Admitted and tested calls | Install and dependency posture | Churn posture |
+|---|---|---|---|---|---|---|
+| OpenAI Agents JS | Wrapped OpenAI Chat Completions and Responses HTTP generation. | Content-free detached workflow and agent handles. | Stable child per agent object; siblings on handoff; reuse on hand-back. | `run`/`runStreamed`, function tools, handoffs/hand-backs, concurrency, retries, denials, stops, abort and iterator return. | Node 22+; install `@openai/agents >=0.20.0 <1` and `openai`. Native declarations require the umbrella framework package. | Locked 0.20.0; weekly/manual latest-framework canary; unexpected shapes refuse dispatch. |
+
 ## Complete example
 
 Provide the actual `OpenAIProvider` class and a Solwyn-wrapped OpenAI client. The integration
@@ -83,7 +89,9 @@ resuming a `RunState` is refused. `runStreamed` selects streaming internally and
 native `StreamedRunResult`, with completion and async iteration observing Solwyn's violation latch.
 Consume it with `for await (const event of result) { ... }` and await `result.completed`. Always
 consume or cancel a streamed result. Returning its iterator cancels it, including before the first
-pull. Abandoned background runs retain attribution until they settle. If using native alternate
+pull. Abandoned background runs retain attribution and any token lease until they settle;
+`client.close()` releases outstanding leases. A provider that ignores cancellation can delay
+completion and handle cleanup until its in-flight operation settles. If using native alternate
 views such as `toTextStream()` or `toStream()`, also await `completed` to observe a swallowed
 tool-level attribution violation.
 
@@ -193,8 +201,11 @@ Node seam with a `ConfigurationError`.
 
 Agents is a fast-moving 0.x dependency. The tested version is **0.20.0**; runtime shape checks
 refuse unexpected models and hierarchy. Validate the admitted paths again when upgrading.
-CI uses the committed lockfile with that exact version. A latest-version canary will be added
-during packaging; it is not active yet.
+CI uses the committed lockfile with that exact version. A separate, non-required weekly/manual
+canary installs the latest LangChain, LangGraph, and `@openai/agents` and runs the offline recipes.
+The locked installed consumer strictly compiles the recipe in ESM/CJS with TypeScript 5.8.3 and
+6.0.3, and executes it against fake transports. The entry loads without the framework at runtime;
+its declarations use native Agents types, so importing them requires installing `@openai/agents`.
 For strict declaration checking with this Agents version, use `@types/node` 22.15.30 or 24:
 `@types/node` 26 exposes upstream TS2416 errors in Agents' lifecycle and Realtime declarations.
 Include DOM types when checking the umbrella package, which also exports Realtime declarations.

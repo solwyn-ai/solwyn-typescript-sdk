@@ -15,7 +15,7 @@ Dispatches must target `main`. Dispatching another branch or tag fails catalog v
 `Provider surface inventory` and fails `Required / CI`.
 
 Scheduled and main dispatch runs also run the separate, non-required
-`Latest LangChain / LangGraph canary` after catalog validation. It still runs if provider interval
+`Latest framework canary` after catalog validation. It still runs if provider interval
 checks fail. Both canary jobs surface failures through their own results; `Required / CI` is skipped
 for schedules and main dispatches with successful catalog validation.
 

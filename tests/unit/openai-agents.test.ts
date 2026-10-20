@@ -25,6 +25,7 @@ import { createAgentsTransport } from "../helpers/openai-agents-transport";
 let framework: typeof Agents;
 let OpenAIClient: typeof OpenAI;
 let env: ReturnType<typeof installIntegrationEnv>;
+const instances: SolwynAgents[] = [];
 
 beforeAll(async () => {
   env = installIntegrationEnv();
@@ -35,6 +36,8 @@ beforeAll(async () => {
 });
 afterAll(() => env.restore());
 afterEach(() => {
+  for (const instance of instances.splice(0))
+    expect((instance as unknown as { invocations: Map<string, unknown> }).invocations.size).toBe(0);
   expect(env.fetchAttempts).toEqual([]);
   expect(env.socketAttempts()).toBe(0);
 });
@@ -56,6 +59,7 @@ function setup(
   });
   const client = plane.wrap(raw, { provider: "openai", onUnmetered: "raise", ...settings.wrap });
   const integration = new SolwynAgents({ client, OpenAIProvider: framework.OpenAIProvider, api });
+  instances.push(integration);
   const runner = new framework.Runner({
     modelProvider: integration.modelProvider,
     tracingDisabled: true,
@@ -160,6 +164,32 @@ describe("OpenAI Agents HTTP attribution", () => {
       expect(transport.requests).toEqual([]);
     } finally {
       await client.close();
+    }
+  });
+
+  it("refuses a saved model after workflow closure and does not accumulate hooks", async () => {
+    const state = setup();
+    const model = await state.integration.modelProvider.getModel();
+    const on = vi.spyOn(state.runner, "on");
+    try {
+      await Promise.all([invoke(state, false), invoke(state, true)]);
+      for (const event of [
+        "agent_start",
+        "agent_end",
+        "agent_handoff",
+        "agent_tool_start",
+        "agent_tool_end",
+      ] as const)
+        expect(on.mock.calls.filter(([name]) => name === event)).toHaveLength(1);
+      await expect(model.getResponse({} as Agents.ModelRequest)).rejects.toThrow(
+        "openai-agents: model used outside a SolwynAgents workflow",
+      );
+      expect(() => model.getStreamedResponse({} as Agents.ModelRequest)).toThrow(
+        "openai-agents: model used outside a SolwynAgents workflow",
+      );
+      expect(state.transport.requests).toHaveLength(2);
+    } finally {
+      await state.client.close();
     }
   });
 
@@ -340,6 +370,54 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
     expect(
       (state.integration as unknown as { invocations: Map<string, unknown> }).invocations.size,
     ).toBe(0);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("preserves an exact-run stop across hand-back (streamed=%s)", async (streamed) => {
+    const base = createAgentsTransport([
+      { kind: "tool", name: "transfer_to_Specialist" },
+      { kind: "tool", name: "transfer_to_Worker" },
+      { kind: "text" },
+    ]);
+    let leafId: string | undefined;
+    const state = setup("chat_completions", {
+      transport: {
+        requests: base.requests,
+        fetch: async (...args) => {
+          leafId ??= getCurrentRun()?.agentRunId;
+          return base.fetch(...args);
+        },
+      },
+    });
+    const specialist = new framework.Agent({
+      name: "Specialist",
+      model: "gpt-4.1-mini",
+      handoffs: [state.agent],
+    });
+    state.agent.handoffs = [specialist];
+    state.runner.on("agent_handoff", () => {
+      if (leafId === undefined) throw new Error("missing agent run");
+      state.plane.stopRun(leafId);
+    });
+    try {
+      const error = await invoke(state, streamed).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(leafId).toBe(state.plane.checks[0]?.agent_run_id);
+      expect(error).toBeInstanceOf(RunStoppedError);
+    } finally {
+      await state.client.close();
+      if (leafId !== undefined) clearRunTermination(leafId);
+    }
+    expect(base.requests).toHaveLength(2);
+    expect(state.plane.leaseGrants).toHaveLength(0);
+    expect(state.plane.ingested.filter((event) => event.status === "success")).toHaveLength(2);
+    expect(
+      state.plane.ingested.find((event) => event.status === "budget_denied")?.agent_run_id,
+    ).toBe(leafId);
   });
 
   it("keeps distinct same-named agent objects in separate runs", async () => {
@@ -665,7 +743,10 @@ describe("OpenAI Agents fail-closed boundaries", () => {
     }
   });
 
-  it("refuses a model call before an agent starts", async () => {
+  it.each([
+    false,
+    true,
+  ])("refuses a model call before an agent starts (streamed=%s)", async (streamed) => {
     const state = setup();
     const model = await state.integration.modelProvider.getModel();
     state.agent.inputGuardrails = [
@@ -679,7 +760,7 @@ describe("OpenAI Agents fail-closed boundaries", () => {
       },
     ];
     try {
-      await expect(invoke(state, false)).rejects.toThrow(/no active agent/);
+      await expect(invoke(state, streamed)).rejects.toThrow(/no active agent/);
     } finally {
       await state.client.close();
     }
@@ -760,7 +841,9 @@ describe("OpenAI Agents fail-closed boundaries", () => {
       if (stopFirst) state.agent.toolUseBehavior = "stop_on_first_tool";
       try {
         if (!streamed) {
-          await expect(invoke(state, false)).rejects.toBeInstanceOf(SolwynError);
+          await expect(invoke(state, false)).rejects.toThrow(
+            "openai-agents: model call inside a tool (nested agent run) is not admitted",
+          );
         } else {
           const result = await state.integration.runStreamed(
             state.runner,
@@ -774,8 +857,12 @@ describe("OpenAI Agents fail-closed boundaries", () => {
                 /* drain */
               }
             })(),
-          ).rejects.toBeInstanceOf(SolwynError);
-          await expect(result.completed).rejects.toBeInstanceOf(SolwynError);
+          ).rejects.toThrow(
+            "openai-agents: model call inside a tool (nested agent run) is not admitted",
+          );
+          await expect(result.completed).rejects.toThrow(
+            "openai-agents: model call inside a tool (nested agent run) is not admitted",
+          );
         }
       } finally {
         await state.client.close();
@@ -794,42 +881,119 @@ describe("OpenAI Agents fail-closed boundaries", () => {
     "\ud800",
     "a".repeat(250),
   ])("rejects an invalid agent name (%j)", async (name) => {
-    const state = setup();
-    state.agent.name = name;
-    try {
-      await expect(invoke(state, false)).rejects.toBeInstanceOf(SolwynError);
-    } finally {
-      await state.client.close();
+    for (const streamed of [false, true]) {
+      const state = setup();
+      state.agent.name = name;
+      try {
+        await expect(invoke(state, streamed)).rejects.toBeInstanceOf(SolwynError);
+      } finally {
+        await state.client.close();
+      }
+      expect(state.transport.requests).toHaveLength(0);
     }
-    expect(state.transport.requests).toHaveLength(0);
   });
 
-  it("refuses overlapping agent_start hooks", async () => {
+  it.each([
+    false,
+    true,
+  ])("refuses overlapping agent_start hooks (streamed=%s)", async (streamed) => {
     const state = setup();
     state.integration.attach(state.runner);
     state.runner.on("agent_start", (context, agent) =>
       state.runner.emit("agent_start", context, agent),
     );
     try {
-      await expect(invoke(state, false)).rejects.toThrow(/overlapping agent_start/);
+      await expect(invoke(state, streamed)).rejects.toThrow(/overlapping agent_start/);
     } finally {
       await state.client.close();
     }
     expect(state.transport.requests).toHaveLength(0);
   });
 
-  it("rejects RunState resume before invoking the framework", async () => {
+  it.each([
+    false,
+    true,
+  ])("rejects RunState resume before invoking the framework (streamed=%s)", async (streamed) => {
     const state = setup();
     const run = vi.spyOn(state.runner, "run");
     try {
       await expect(
-        state.integration.run(state.runner, state.agent, {} as unknown as string, {
-          workflow: "workflow",
-        }),
+        state.integration[streamed ? "runStreamed" : "run"](
+          state.runner,
+          state.agent,
+          {} as unknown as string,
+          {
+            workflow: "workflow",
+          },
+        ),
       ).rejects.toThrow(/RunState/);
       expect(run).not.toHaveBeenCalled();
     } finally {
       await state.client.close();
+    }
+  });
+});
+
+describe("OpenAI Agents refusal identity", () => {
+  it.each([
+    false,
+    true,
+  ])("preserves exact pre-dispatch refusal messages (streamed=%s)", async (streamed) => {
+    for (const kind of ["websocket", "unknown", "agent-model"] as const) {
+      const state = setup("responses");
+      const delegate =
+        kind === "websocket"
+          ? new framework.OpenAIResponsesWSModel(state.raw, "gpt-4.1-mini")
+          : {
+              getResponse: async () => {
+                throw new Error("must not dispatch");
+              },
+              getStreamedResponse: () => {
+                throw new Error("must not dispatch");
+              },
+            };
+      class RefusedProvider extends framework.OpenAIProvider {
+        override async getModel() {
+          return delegate;
+        }
+      }
+      const integration = new SolwynAgents({
+        client: state.client,
+        OpenAIProvider: RefusedProvider,
+        api: "responses",
+      });
+      instances.push(integration);
+      const runner = new framework.Runner({
+        modelProvider: integration.modelProvider,
+        tracingDisabled: true,
+      });
+      if (kind === "agent-model") state.agent.model = delegate;
+      const message =
+        kind === "agent-model"
+          ? "openai-agents: Agent.model must be a string; Model instances bypass attribution"
+          : "openai-agents: only the OpenAIProvider Chat Completions and Responses HTTP models are admitted";
+      try {
+        if (!streamed) {
+          await expect(
+            integration.run(runner, state.agent, "Synthetic input.", { workflow: "refusal" }),
+          ).rejects.toThrow(message);
+        } else {
+          const result = await integration.runStreamed(runner, state.agent, "Synthetic input.", {
+            workflow: "refusal",
+          });
+          await expect(
+            (async () => {
+              for await (const _event of result) {
+              }
+            })(),
+          ).rejects.toThrow(message);
+          await expect(result.completed).rejects.toThrow(message);
+        }
+      } finally {
+        await state.client.close();
+      }
+      expect(state.transport.requests).toHaveLength(0);
+      expect(state.plane.checks).toHaveLength(0);
     }
   });
 });
@@ -916,6 +1080,62 @@ describe("OpenAI Agents stream and handle lifecycle", () => {
     } finally {
       tracker.restore();
       await state.client.close();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("releases invocation state after abort (streamed=%s)", async (streamed) => {
+    for (const api of ["chat_completions", "responses"] as const) {
+      const tracker = trackRuns();
+      const controller = new AbortController();
+      let started!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const base = createFakeOpenAITransport();
+      const state = setup(api, {
+        transport: {
+          requests: base.requests,
+          fetch: async (_request, options) => {
+            started();
+            const signal = options?.signal;
+            await new Promise<void>((_resolve, reject) => {
+              const abort = () => reject(new DOMException("Synthetic abort.", "AbortError"));
+              if (signal?.aborted) abort();
+              else signal?.addEventListener("abort", abort, { once: true });
+            });
+            throw new Error("aborted fetch must not dispatch");
+          },
+        },
+      });
+      try {
+        const options = { workflow: "cancel", runOptions: { signal: controller.signal } };
+        const pending = streamed
+          ? state.integration
+              .runStreamed(state.runner, state.agent, "Synthetic input.", options)
+              .then(async (result) => {
+                await expect(
+                  (async () => {
+                    for await (const _event of result) {
+                    }
+                  })(),
+                ).rejects.toBeInstanceOf(Error);
+                await expect(result.completed).rejects.toBeInstanceOf(Error);
+              })
+          : expect(
+              state.integration.run(state.runner, state.agent, "Synthetic input.", options),
+            ).rejects.toBeInstanceOf(Error);
+        await entered;
+        controller.abort();
+        await pending;
+        for (const handle of tracker.handles)
+          expect(() => handle.activate(() => undefined)).toThrow(/finished/);
+      } finally {
+        tracker.restore();
+        await state.client.close();
+      }
     }
   });
 

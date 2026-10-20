@@ -29,7 +29,12 @@ interface RecordEntry {
 }
 
 function executeIntervals(
-  options: { readonly fail?: string; readonly hang?: string; readonly input?: string } = {},
+  options: {
+    readonly fail?: string;
+    readonly hang?: string;
+    readonly hangGrandchild?: boolean;
+    readonly input?: string;
+  } = {},
 ) {
   const scratch = mkdtempSync(join(tmpdir(), "provider intervals "));
   const root = join(scratch, "repo");
@@ -47,6 +52,7 @@ function executeIntervals(
     writeFileSync(
       pnpm,
       String.raw`#!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const manifest = JSON.parse(readFileSync("package.json", "utf8"));
@@ -54,6 +60,11 @@ appendFileSync(process.env.TRACE_FILE, JSON.stringify({ cwd: process.cwd(), args
   family: process.env.SOLWYN_SURFACE_CANARY_FAMILY, overlay: manifest.overlay }) + "\n");
 if (process.env.HANG_COMMAND === args[0] && !existsSync(process.env.HANG_MARKER)) {
   writeFileSync(process.env.HANG_MARKER, "started");
+  if (process.env.HANG_GRANDCHILD === "true") {
+    const grandchild = spawn(process.execPath, ["-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); setTimeout(() => process.exit(96), 10000);'], { stdio: "ignore" });
+    writeFileSync(process.env.GRANDCHILD_PID, String(grandchild.pid));
+    grandchild.unref();
+  }
   process.on("SIGTERM", () => {});
   // Bound the fixture even if the runner regresses and stops killing hung children.
   setTimeout(() => process.exit(95), 2_000);
@@ -94,6 +105,8 @@ if (args[0] === "install") {
           FAIL_STAGE: options.fail ?? "",
           HANG_COMMAND: options.hang ?? "",
           HANG_MARKER: join(scratch, "hung"),
+          HANG_GRANDCHILD: String(options.hangGrandchild ?? false),
+          GRANDCHILD_PID: join(scratch, "grandchild-pid"),
           SURFACE_STAGE_TIMEOUT_MS: "1000",
           SOLWYN_SURFACE_CANARY_FAMILY: "inherited-family",
         },
@@ -107,6 +120,9 @@ if (args[0] === "install") {
       : [];
     return {
       ...result,
+      grandchildPid: existsSync(join(scratch, "grandchild-pid"))
+        ? Number(readFileSync(join(scratch, "grandchild-pid"), "utf8"))
+        : undefined,
       records,
       cleaned: records.every((record) => !existsSync(record.cwd)),
       manifest: readFileSync(join(root, "package.json"), "utf8"),
@@ -179,6 +195,42 @@ describe("consolidated provider surface runner", () => {
     expect(result.reports[1]).toEqual(["@anthropic-ai/sdk@0.135.0"]);
     expect(result.reports[2]).toEqual(["openai@4.41.0"]);
     expect(result.cleaned).toBe(true);
+  });
+
+  it("kills a hung stage's grandchild and continues to later intervals", async () => {
+    const result = executeIntervals({ hang: "tsx", hangGrandchild: true });
+    const pid = result.grandchildPid;
+    expect(pid, result.stderr).toBeTypeOf("number");
+    if (pid === undefined) throw new Error("hung fixture did not spawn its grandchild");
+    try {
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain("anthropic / floor: capture failed (SIGKILL)");
+      await expect
+        .poll(
+          () => {
+            try {
+              process.kill(pid, 0);
+              return false;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+              throw error;
+            }
+          },
+          { timeout: 500, interval: 20 },
+        )
+        .toBe(true);
+      expect(result.records.filter(({ args }) => args[0] === "vitest")).toHaveLength(3);
+      expect(result.reports[1]).toEqual(["@anthropic-ai/sdk@0.135.0"]);
+      expect(result.reports[2]).toEqual(["openai@4.41.0"]);
+      expect(result.cleaned).toBe(true);
+    } finally {
+      // Regressions must not leave the deliberately hung fixture running.
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        expect((error as NodeJS.ErrnoException).code).toBe("ESRCH");
+      }
+    }
   });
 
   it.each([

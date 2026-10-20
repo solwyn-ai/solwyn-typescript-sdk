@@ -276,6 +276,8 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      catalog: ${{ steps.catalog.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -306,7 +308,7 @@ jobs:
 
   required:
     name: Required / CI
-    if: always() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-inventory'].outputs.catalog == 'success')
     needs:
       - quality
       - package-artifact
@@ -326,6 +328,10 @@ jobs:
         run: |
           if [ "$DRAFT_PR" = true ]; then
             echo "Draft PR: CI deferred until ready for review"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "workflow_dispatch on a non-main ref runs canaries only and cannot satisfy Required / CI"
             exit 1
           fi
           for result in "$QUALITY" "$PACKAGE_ARTIFACT" "$ARTIFACT_CONSUMERS" "$LEGACY_INSTALLED_CORE" "$PROVIDER_SURFACE_INVENTORY"; do

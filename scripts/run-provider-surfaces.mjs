@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -54,16 +54,35 @@ for (const cell of include) {
       mkdirSync(dirname(target), { recursive: true });
       copyFileSync(join(repositoryRoot, file), target);
     }
-    function run(stage, args) {
-      const result = spawnSync("pnpm", args, {
-        cwd: workspace,
-        env: {
-          ...process.env,
-          SOLWYN_SURFACE_CANARY_FAMILY: stage === "canary" ? cell.family : undefined,
-        },
-        stdio: "inherit",
-        timeout: stageTimeoutMs,
-        killSignal: "SIGKILL",
+    async function run(stage, args) {
+      const result = await new Promise((resolve, reject) => {
+        const child = spawn("pnpm", args, {
+          cwd: workspace,
+          env: {
+            ...process.env,
+            SOLWYN_SURFACE_CANARY_FAMILY: stage === "canary" ? cell.family : undefined,
+          },
+          stdio: "inherit",
+          // Own the stage's process group, including tsx/vitest/Node descendants.
+          detached: true,
+        });
+        const timer = setTimeout(() => {
+          if (child.pid === undefined) return;
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch (error) {
+            // The group may have exited just before the timeout fired.
+            if (error.code !== "ESRCH") reject(error);
+          }
+        }, stageTimeoutMs);
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          resolve({ error });
+        });
+        child.once("close", (status, signal) => {
+          clearTimeout(timer);
+          resolve({ status, signal });
+        });
       });
       if (result.status === 0) return true;
       console.error(
@@ -74,13 +93,13 @@ for (const cell of include) {
     }
 
     if (
-      run("install", ["install", "--frozen-lockfile"]) &&
-      run("overlay", ["add", "--no-lockfile", "-D", ...cell.packages])
+      (await run("install", ["install", "--frozen-lockfile"])) &&
+      (await run("overlay", ["add", "--no-lockfile", "-D", ...cell.packages]))
     ) {
       if (!readFileSync(join(workspace, "pnpm-lock.yaml")).equals(lockfile)) {
         failures.push("lockfile");
       } else {
-        run("capture", [
+        await run("capture", [
           "tsx",
           "scripts/capture-surface-inventory.ts",
           "--check",
@@ -99,7 +118,7 @@ for (const cell of include) {
       }
     }
     // Match the former always() canary step even when installation or capture failed.
-    run("canary", ["vitest", "run", "tests/unit/surface-canary.test.ts"]);
+    await run("canary", ["vitest", "run", "tests/unit/surface-canary.test.ts"]);
   } catch (error) {
     failures.push(`setup: ${error.message}`);
   } finally {

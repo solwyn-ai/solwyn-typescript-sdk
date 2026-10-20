@@ -33,6 +33,7 @@ interface WorkflowJob {
   readonly needs?: string | readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly if?: string;
+  readonly outputs?: Readonly<Record<string, string>>;
   readonly permissions?: Readonly<Record<string, string>>;
   readonly steps?: readonly WorkflowStep[];
   readonly "timeout-minutes"?: number;
@@ -75,6 +76,7 @@ function jobConditionMatches(
   eventName: string,
   ref: string,
   draft = false,
+  catalogOutcome = "success",
 ): boolean {
   return (
     runInNewContext(workflowJob.if ?? "true", {
@@ -84,6 +86,7 @@ function jobConditionMatches(
         ref: ref.toLowerCase(),
         event: { pull_request: { draft } },
       },
+      needs: { "provider-surface-inventory": { outputs: { catalog: catalogOutcome } } },
       always: () => true,
     }) === true
   );
@@ -349,16 +352,78 @@ describe("CI workflow contract", () => {
   });
 
   it.each([
-    ["schedule", "refs/heads/main"],
-    ["workflow_dispatch", "refs/heads/main"],
-    ["workflow_dispatch", "refs/heads/feature"],
-  ])("runs only the consolidated catalog and provider canaries for %s on %s", async (eventName, ref) => {
+    ["schedule", "refs/heads/main", ["provider-surface-inventory"]],
+    ["workflow_dispatch", "refs/heads/main", ["provider-surface-inventory"]],
+    ["workflow_dispatch", "refs/heads/feature", ["provider-surface-inventory", "required"]],
+  ])("runs the consolidated canaries and any required failure gate for %s on %s", async (eventName, ref, expectedJobs) => {
     const { model } = await parseWorkflow(ciPath);
     expect(
       Object.entries(model.jobs)
         .filter(([, value]) => jobConditionMatches(value, eventName, ref))
         .map(([id]) => id),
-    ).toEqual(["provider-surface-inventory"]);
+    ).toEqual(expectedJobs);
+  });
+
+  it.each([
+    ["schedule", "refs/heads/main", "success", false, false],
+    ["schedule", "refs/heads/main", "failure", false, false],
+    ["workflow_dispatch", "refs/heads/main", "success", false, false],
+    ["workflow_dispatch", "refs/heads/main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/main", "cancelled", true, false],
+    ["workflow_dispatch", "refs/heads/main", "skipped", true, false],
+    ["workflow_dispatch", "refs/heads/main", "", true, false],
+    ["workflow_dispatch", "refs/heads/Main", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/feature", "failure", true, false],
+    ["workflow_dispatch", "refs/heads/feature", "success", true, false],
+    ["workflow_dispatch", "refs/heads/main-canary", "success", true, false],
+    ["workflow_dispatch", "refs/tags/main", "success", true, false],
+    ["pull_request", "refs/pull/11/merge", "success", true, true],
+    ["push", "refs/heads/main", "success", true, true],
+    ["push", "refs/heads/main", "failure", true, true],
+  ] as const)("allows only validated main dispatches to skip Required / CI: %s on %s (catalog %s)", async (eventName, ref, catalogOutcome, requiredRuns, fullCiRuns) => {
+    const { model } = await parseWorkflow(ciPath);
+
+    expect(
+      jobConditionMatches(semanticJob(model, "required"), eventName, ref, false, catalogOutcome),
+    ).toBe(requiredRuns);
+    for (const id of [
+      "quality",
+      "package-artifact",
+      "artifact-consumers",
+      "legacy-installed-core",
+    ]) {
+      expect(jobConditionMatches(semanticJob(model, id), eventName, ref), id).toBe(fullCiRuns);
+    }
+  });
+
+  it.each([
+    "refs/heads/Main",
+    "refs/heads/feature",
+    "refs/heads/main-canary",
+    "refs/tags/main",
+  ])("fails Required / CI when a non-main dispatch skips full CI even if catalog and provider canaries pass: %s", async (ref) => {
+    const { model } = await parseWorkflow(ciPath);
+    const required = semanticJob(model, "required");
+    const gate = namedStep(required, "Require every launch gate");
+    const catalogOutcome = ref === "refs/heads/Main" ? "failure" : "success";
+
+    expect(jobConditionMatches(required, "workflow_dispatch", ref, false, catalogOutcome)).toBe(
+      true,
+    );
+    const result = runBash(gate.run ?? "", {
+      GITHUB_EVENT_NAME: "workflow_dispatch",
+      GITHUB_REF: ref,
+      DRAFT_PR: "false",
+      QUALITY: "skipped",
+      PACKAGE_ARTIFACT: "skipped",
+      ARTIFACT_CONSUMERS: "skipped",
+      LEGACY_INSTALLED_CORE: "skipped",
+      PROVIDER_SURFACE_INVENTORY: "success",
+    });
+    expect(result.status).toBe(1);
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      "workflow_dispatch on a non-main ref runs canaries only and cannot satisfy Required / CI",
+    );
   });
 
   it("cancels only superseded runs of the same pull request", async () => {
@@ -474,6 +539,7 @@ describe("CI workflow contract", () => {
       "provider-surface-inventory",
     ]);
     expect(inventory["timeout-minutes"]).toBe(15);
+    expect(inventory.outputs).toEqual({ catalog: `\${{ steps.catalog.outcome }}` });
     expect(source).toContain("node scripts/provider-surface-matrix.mjs");
     expect(namedStep(inventory, "Run every selected provider interval").env).toEqual({
       SURFACE_INTERVALS: `\${{ steps.catalog.outputs.include }}`,
@@ -526,12 +592,14 @@ describe("CI workflow contract", () => {
     const gate = namedStep(required, "Require every launch gate");
 
     expect(required.if).toBe(
-      "always() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
+      "always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-inventory'].outputs.catalog == 'success')",
     );
     expect(required.needs).toEqual(expectedNeeds);
     expect(gate.env).toEqual(expectedEnvironment);
     expect(
       runBash(gate.run ?? "", {
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_REF: "refs/heads/main",
         ...Object.fromEntries(
           expectedNeeds.map((key) => [key.replaceAll("-", "_").toUpperCase(), "success"]),
         ),
@@ -544,6 +612,8 @@ describe("CI workflow contract", () => {
           Object.keys(expectedEnvironment).map((name) => [name, "success"]),
         );
         env["DRAFT_PR"] = "false";
+        env["GITHUB_EVENT_NAME"] = "push";
+        env["GITHUB_REF"] = "refs/heads/main";
         env[key] = state;
         expect(runBash(gate.run ?? "", env).status, `${key}=${state} must fail`).not.toBe(0);
       }

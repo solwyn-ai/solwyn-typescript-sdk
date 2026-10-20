@@ -467,8 +467,8 @@ export class SolwynAgents {
     return state;
   }
 
-  #validateInput(runInput: unknown): void {
-    if (typeof runInput !== "string" && !Array.isArray(runInput)) {
+  #validateInput(opaqueRunInput: unknown): void {
+    if (typeof opaqueRunInput !== "string" && !Array.isArray(opaqueRunInput)) {
       throw violation("RunState resume and non-input objects are not admitted");
     }
   }

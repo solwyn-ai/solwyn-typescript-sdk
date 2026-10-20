@@ -130,6 +130,55 @@ const INTEGRATION_READABLE_PROPERTIES = new Set([
   "warn", // Logger method; direct calls with literal/run-id messages only.
 ]);
 
+// Each additional property is required by the shipped Agents module. The necessity test
+// removes them individually; none grants access to opaque requests or callback content.
+const AGENTS_READABLE_PROPERTIES = new Set([
+  "OpenAIProvider", // Explicitly supplied provider constructor; no framework value import.
+  "client", // Explicit wrapped-client constructor option.
+  "api", // Explicit HTTP dialect option.
+  "agentRunId", // Current detached-run identity.
+  "parentAgentRunId", // Current detached-run parent identity.
+  "asyncIterator", // Well-known iteration capability; never a yielded content field.
+  "beginAttempt", // Internal invocation concurrency admission.
+  "bind", // Preserve native iterator receivers.
+  "cause", // Bounded branded error traversal; never inspect error messages.
+  "check", // Internal invocation lifecycle/violation check.
+  "clear", // Structural collection cleanup.
+  "close", // Internal invocation cleanup.
+  "completed", // Native background-work completion capability.
+  "config", // Runner structural configuration.
+  "done", // Iterator terminal flag; never inspect its value.
+  "end", // Internal agent lifecycle transition.
+  "error", // Only the retry-advice error projection is readable.
+  "fail", // Internal typed violation latch.
+  "failure", // Forward latched or original errors unchanged.
+  "finally", // Promise cleanup registration.
+  "finish", // Internal attempt release.
+  "getModel", // Controlled provider model selection.
+  "getPrototypeOf", // Only topology of the controlled provider model is inspected.
+  "getResponse", // Admitted wrapped-model dispatch.
+  "getRetryAdvice", // Retry decision capability.
+  "getStreamedResponse", // Admitted wrapped-model stream dispatch.
+  "hasOwn", // Only fixed HTTP model dispatch methods on its direct prototype.
+  "model", // Structural string/model selection; never model input.
+  "modelProvider", // Runner provider identity.
+  "name", // Explicit structural agent attribution name.
+  "next", // Iterator pull capability.
+  "on", // Structural Runner hook registration.
+  "prototype", // Object.prototype identity in the model topology check only.
+  "return", // Iterator cancellation capability.
+  "run", // Native Runner dispatch; never an attribution sink for opaque input.
+  "runOptions", // Native invocation options forwarded opaquely.
+  "start", // Internal agent lifecycle transition.
+  "supportsPromptModelSelection", // Native model capability flag.
+  "throw", // Iterator error forwarding.
+  "toolEnd", // Internal tool identity lifecycle transition.
+  "toolStart", // Internal tool identity lifecycle transition.
+  "values", // Structural handle collection traversal.
+  "workflow", // Explicit workflow attribution name.
+]);
+for (const property of AGENTS_READABLE_PROPERTIES) INTEGRATION_READABLE_PROPERTIES.add(property);
+
 const INTEGRATION_CORE_IMPORTS = new Set([
   "run-context",
   "errors",
@@ -203,6 +252,12 @@ function integrationMemberName(node: ts.Expression): string | undefined {
   if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression)) {
     return node.argumentExpression.text;
   }
+  if (
+    ts.isElementAccessExpression(node) &&
+    ts.isPropertyAccessExpression(node.argumentExpression) &&
+    node.argumentExpression.getText() === "Symbol.asyncIterator"
+  )
+    return "asyncIterator";
   return undefined;
 }
 
@@ -218,6 +273,164 @@ const OPAQUE_ATTRIBUTION_SINKS = new Set([
   "withTags",
 ]);
 
+function enclosingFunction(node: ts.Node): ts.FunctionLikeDeclaration | undefined {
+  let owner = node.parent;
+  while (owner) {
+    if (ts.isFunctionLike(owner) && "body" in owner) return owner as ts.FunctionLikeDeclaration;
+    owner = owner.parent;
+  }
+  return undefined;
+}
+
+function localDeclaration(node: ts.Node, checker: ts.TypeChecker): ts.Declaration | undefined {
+  return checker.getSymbolAtLocation(node)?.valueDeclaration;
+}
+
+function importedType(
+  type: ts.TypeNode | undefined,
+  name: string,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!type || !ts.isTypeReferenceNode(type) || !ts.isIdentifier(type.typeName)) return false;
+  const declaration = checker.getSymbolAtLocation(type.typeName)?.declarations?.[0];
+  return !!(
+    declaration &&
+    ts.isImportSpecifier(declaration) &&
+    (declaration.propertyName ?? declaration.name).text === name &&
+    ts.isImportDeclaration(declaration.parent.parent.parent) &&
+    declaration.parent.parent.parent.moduleSpecifier.getText() === '"@openai/agents"'
+  );
+}
+
+/** Only a symbol guarded by requireSolwynClient can supply the provider leaf. */
+function isWrappedClient(node: ts.Expression, checker: ts.TypeChecker): boolean {
+  const declaration = localDeclaration(node, checker);
+  if (!declaration || !ts.isVariableDeclaration(declaration) || !declaration.initializer)
+    return false;
+  let initializer = declaration.initializer;
+  while (ts.isAsExpression(initializer) || ts.isParenthesizedExpression(initializer))
+    initializer = initializer.expression;
+  if (!ts.isIdentifier(initializer)) return false;
+  const symbol = checker.getSymbolAtLocation(initializer);
+  const owner = enclosingFunction(declaration);
+  if (!symbol || !owner?.body) return false;
+  let guarded = false;
+  const visit = (child: ts.Node): void => {
+    if (
+      ts.isCallExpression(child) &&
+      ts.isIdentifier(child.expression) &&
+      child.expression.text === "requireSolwynClient" &&
+      child.pos < declaration.pos &&
+      child.arguments[0] &&
+      checker.getSymbolAtLocation(child.arguments[0]) === symbol
+    ) {
+      const imported = checker.getSymbolAtLocation(child.expression)?.declarations?.[0];
+      guarded = !!(
+        imported &&
+        ts.isImportSpecifier(imported) &&
+        ts.isImportDeclaration(imported.parent.parent.parent) &&
+        /integration-support["']$/.test(imported.parent.parent.parent.moduleSpecifier.getText())
+      );
+    }
+    if (!ts.isFunctionLike(child)) ts.forEachChild(child, visit);
+  };
+  ts.forEachChild(owner.body, visit);
+  return guarded;
+}
+
+function isProviderForward(call: ts.CallExpression, checker: ts.TypeChecker): boolean {
+  const callee = call.expression;
+  if (!ts.isPropertyAccessExpression(callee)) return false;
+  const receiver = callee.expression;
+  if (
+    callee.name.text === "create" &&
+    ts.isPropertyAccessExpression(receiver) &&
+    receiver.name.text === "completions" &&
+    ts.isPropertyAccessExpression(receiver.expression) &&
+    receiver.expression.name.text === "chat"
+  )
+    return isWrappedClient(receiver.expression.expression, checker);
+  if (["getResponse", "getStreamedResponse", "getRetryAdvice"].includes(callee.name.text)) {
+    const declaration = localDeclaration(
+      ts.isPropertyAccessExpression(receiver) ? receiver.name : receiver,
+      checker,
+    );
+    return !!(
+      declaration &&
+      ts.isPropertyDeclaration(declaration) &&
+      importedType(declaration.type, "Model", checker)
+    );
+  }
+  if (callee.name.text === "run") {
+    const declaration = localDeclaration(receiver, checker);
+    return !!(
+      declaration &&
+      ts.isParameter(declaration) &&
+      importedType(declaration.type, "Runner", checker)
+    );
+  }
+  return false;
+}
+
+/** Reflection is limited to provider-model topology, never callback/request objects. */
+function isModelTopology(node: ts.Node, checker: ts.TypeChecker): boolean {
+  const derived = (expression: ts.Expression, seen = new Set<ts.Node>()): boolean => {
+    if (seen.has(expression)) return false;
+    seen.add(expression);
+    if (ts.isAwaitExpression(expression) || ts.isParenthesizedExpression(expression))
+      return derived(expression.expression, seen);
+    if (ts.isIdentifier(expression)) {
+      const declaration = localDeclaration(expression, checker);
+      return !!(
+        declaration &&
+        ts.isVariableDeclaration(declaration) &&
+        declaration.initializer &&
+        derived(declaration.initializer, seen)
+      );
+    }
+    if (!ts.isCallExpression(expression) || !ts.isPropertyAccessExpression(expression.expression))
+      return false;
+    const callee = expression.expression;
+    if (callee.getText() === "Object.getPrototypeOf")
+      return !!expression.arguments[0] && derived(expression.arguments[0], seen);
+    if (callee.name.text !== "getModel") return false;
+    const provider = localDeclaration(callee.expression, checker);
+    return !!(
+      provider &&
+      ts.isVariableDeclaration(provider) &&
+      provider.initializer &&
+      ts.isNewExpression(provider.initializer) &&
+      integrationMemberName(provider.initializer.expression) === "OpenAIProvider"
+    );
+  };
+  const access = node.parent;
+  if (!ts.isPropertyAccessExpression(access) || access.expression !== node) return false;
+  if (access.name.text === "prototype") {
+    const comparison = access.parent;
+    return (
+      ts.isBinaryExpression(comparison) && comparison.right === access && derived(comparison.left)
+    );
+  }
+  const call = access.parent;
+  return (
+    ["getPrototypeOf", "hasOwn"].includes(access.name.text) &&
+    ts.isCallExpression(call) &&
+    call.expression === access &&
+    !!call.arguments[0] &&
+    derived(call.arguments[0])
+  );
+}
+
+function isRetryError(node: ts.Node): boolean {
+  return (
+    ts.isPropertyAccessExpression(node) &&
+    node.name.text === "error" &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "args" &&
+    enclosingFunction(node)?.name?.getText() === "getRetryAdvice"
+  );
+}
+
 function isOpaqueForward(node: ts.Identifier, checker: ts.TypeChecker): boolean {
   const declaration = node.parent;
   if (
@@ -225,10 +438,16 @@ function isOpaqueForward(node: ts.Identifier, checker: ts.TypeChecker): boolean 
     declaration.name === node
   )
     return true;
-  return isOpaqueExpressionForward(node, checker);
+  const origin = localDeclaration(node, checker);
+  return isOpaqueExpressionForward(node, checker, origin ? enclosingFunction(origin) : undefined);
 }
 
-function isOpaqueExpressionForward(value: ts.Expression, checker: ts.TypeChecker): boolean {
+function isOpaqueExpressionForward(
+  value: ts.Expression,
+  checker: ts.TypeChecker,
+  origin?: ts.FunctionLikeDeclaration,
+  visiting = new Set<ts.Node>(),
+): boolean {
   let expression = value;
   while (
     ts.isParenthesizedExpression(expression.parent) ||
@@ -239,15 +458,17 @@ function isOpaqueExpressionForward(value: ts.Expression, checker: ts.TypeChecker
   )
     expression = expression.parent;
   const parent = expression.parent;
+  // Fresh input shape validation does not read any array item or content field.
+  if (ts.isTypeOfExpression(parent)) return true;
+  if (ts.isCallExpression(parent) && parent.expression.getText() === "Array.isArray") return true;
   if (ts.isCallExpression(parent) && parent.arguments.some((arg) => arg === expression)) {
     const callee = parent.expression;
     const name = integrationMemberName(callee) ?? (ts.isIdentifier(callee) ? callee.text : "");
-    // Never declassify callback data as attribution, even through an opaque-named helper.
+    if (isProviderForward(parent, checker)) return true;
     if (LOGGER_METHODS.has(name) || OPAQUE_ATTRIBUTION_SINKS.has(name)) return false;
-    if (callee.getText().replace(/\s+/g, "") === "wrapped.chat.completions.create") return true;
     const target = checker.getResolvedSignature(parent)?.declaration;
     if (
-      target === undefined ||
+      !target ||
       target.getSourceFile() !== expression.getSourceFile() ||
       !(
         ts.isFunctionDeclaration(target) ||
@@ -259,24 +480,62 @@ function isOpaqueExpressionForward(value: ts.Expression, checker: ts.TypeChecker
     )
       return false;
     const parameter = target.parameters[parent.arguments.indexOf(expression)];
-    // Resolve the actual local implementation, including shadowing and this.method calls.
-    // Its parameter must remain opaque, and its result must remain opaque at the caller.
     return !!(
       parameter &&
       !parameter.dotDotDotToken &&
       ts.isIdentifier(parameter.name) &&
       /^_?opaque/.test(parameter.name.text) &&
-      isOpaqueExpressionForward(parent, checker)
+      isOpaqueExpressionForward(parent, checker, origin, visiting)
     );
   }
   if (ts.isSpreadAssignment(parent))
-    return isOpaqueExpressionForward(parent.parent as ts.ObjectLiteralExpression, checker);
-  return (
-    (ts.isReturnStatement(parent) && parent.expression === expression) ||
-    (ts.isArrowFunction(parent) && parent.body === expression) ||
-    // Discarding a local forwarding helper's result cannot expose it.
-    (ts.isExpressionStatement(parent) && ts.isCallExpression(expression))
-  );
+    return isOpaqueExpressionForward(
+      parent.parent as ts.ObjectLiteralExpression,
+      checker,
+      origin,
+      visiting,
+    );
+  if (ts.isExpressionStatement(parent) && ts.isCallExpression(expression)) return true;
+  if (
+    !(
+      (ts.isReturnStatement(parent) && parent.expression === expression) ||
+      (ts.isArrowFunction(parent) && parent.body === expression)
+    )
+  )
+    return false;
+  const owner = enclosingFunction(expression);
+  if (!owner) return false;
+  // Direct callback/API returns are opaque. Captured returns must have verified callers.
+  if (owner === origin) return true;
+  if (visiting.has(owner)) return false;
+  const next = new Set(visiting).add(owner);
+  if (
+    (ts.isArrowFunction(owner) || ts.isFunctionExpression(owner)) &&
+    ts.isCallExpression(owner.parent) &&
+    owner.parent.expression === owner
+  )
+    return isOpaqueExpressionForward(owner.parent, checker, origin, next);
+  const binding =
+    owner.name ?? (ts.isVariableDeclaration(owner.parent) ? owner.parent.name : undefined);
+  if (!binding) return false;
+  const symbol = checker.getSymbolAtLocation(binding);
+  if (!symbol) return false;
+  let safe = true;
+  let used = false;
+  const visit = (node: ts.Node): void => {
+    if (node !== binding && ts.isIdentifier(node) && checker.getSymbolAtLocation(node) === symbol) {
+      used = true;
+      if (
+        !ts.isCallExpression(node.parent) ||
+        node.parent.expression !== node ||
+        !isOpaqueExpressionForward(node.parent, checker, origin, next)
+      )
+        safe = false;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(value.getSourceFile());
+  return used && safe;
 }
 
 /** Reusable source-string rule; directory discovery is independent and tolerates absent integrations. */
@@ -346,7 +605,9 @@ function findIntegrationViolations(text: string, path: string): string[] {
       | ts.GetAccessorDeclaration
       | ts.SetAccessorDeclaration,
   ): void => {
-    if (!/^(?:handle[A-Z]|on[A-Z_])/.test(name)) return;
+    const modelCallback =
+      rel.startsWith("openai-agents/") && ["getResponse", "getStreamedResponse"].includes(name);
+    if (!modelCallback && !/^(?:handle[A-Z]|on[A-Z_])/.test(name)) return;
     const structural = rel.startsWith("langchain/")
       ? LANGCHAIN_CALLBACK_PARAMETERS[name]
       : undefined;
@@ -418,6 +679,34 @@ function findIntegrationViolations(text: string, path: string): string[] {
       const name = propertyNameText(node.name);
       if (name !== undefined) callbackParameters(name, node.initializer);
     }
+    if (
+      ts.isCallExpression(node) &&
+      integrationMemberName(node.expression) === "on" &&
+      node.arguments[0] &&
+      ts.isStringLiteralLike(node.arguments[0]) &&
+      node.arguments[1] &&
+      (ts.isArrowFunction(node.arguments[1]) || ts.isFunctionExpression(node.arguments[1]))
+    ) {
+      const event = node.arguments[0].text;
+      const slots: Record<string, Record<number, string>> = {
+        agent_start: { 1: "agent" },
+        agent_end: { 1: "agent" },
+        agent_handoff: { 1: "fromAgent", 2: "toAgent" },
+        agent_tool_start: { 1: "agent", 2: "tool" },
+        agent_tool_end: { 1: "agent", 2: "tool" },
+      };
+      const callback = node.arguments[1];
+      for (const [index, parameter] of callback.parameters.entries()) {
+        if (!ts.isIdentifier(parameter.name))
+          report("Agents hook parameter must not be destructured");
+        else if (
+          !/^_?opaque/.test(parameter.name.text) &&
+          slots[event]?.[index] !== parameter.name.text &&
+          containsIdentifier(callback.body, parameter.name.text)
+        )
+          report(`Agents hook parameter '${parameter.name.text}' must be opaque or unreferenced`);
+      }
+    }
     let specifier = importSpecifier(node);
     if (
       ts.isImportTypeNode(node) &&
@@ -458,7 +747,8 @@ function findIntegrationViolations(text: string, path: string): string[] {
       if (
         name !== undefined &&
         LOGGER_METHODS.has(name) &&
-        !(ts.isCallExpression(node.parent) && node.parent.expression === node)
+        !(ts.isCallExpression(node.parent) && node.parent.expression === node) &&
+        !isRetryError(node)
       ) {
         report("logger methods must be called directly, never aliased");
       }
@@ -482,6 +772,23 @@ function findIntegrationViolations(text: string, path: string): string[] {
     if (ts.isIdentifier(node) && /^_?opaque/.test(node.text) && !isOpaqueForward(node, checker)) {
       report(`uses opaque identifier '${node.text}' outside direct forwarding`);
     }
+    if (
+      ts.isIdentifier(node) &&
+      node.text === "args" &&
+      enclosingFunction(node)?.name?.getText() === "getRetryAdvice" &&
+      !(ts.isParameter(node.parent) && node.parent.name === node) &&
+      !(
+        ts.isPropertyAccessExpression(node.parent) &&
+        node.parent.expression === node &&
+        isRetryError(node.parent)
+      ) &&
+      !(
+        ts.isCallExpression(node.parent) &&
+        isProviderForward(node.parent, checker) &&
+        integrationMemberName(node.parent.expression) === "getRetryAdvice"
+      )
+    )
+      report("retry advice may only inspect args.error or forward args to the delegate");
     if (ts.isIdentifier(node) && node.text === "Reflect") report("references Reflect");
     if (
       ts.isIdentifier(node) &&
@@ -490,7 +797,8 @@ function findIntegrationViolations(text: string, path: string): string[] {
         (ts.isPropertyAccessExpression(node.parent) || ts.isElementAccessExpression(node.parent)) &&
         node.parent.expression === node &&
         integrationMemberName(node.parent) === "defineProperty"
-      )
+      ) &&
+      !isModelTopology(node, checker)
     )
       report("references Object outside defineProperty");
     if (ts.isIdentifier(node) && node.text === "fetch") report("references fetch");
@@ -1494,6 +1802,52 @@ describe("privacy firewall — integration source controls", () => {
     ).not.toEqual([]);
   });
 
+  const escapeMutations = [
+    ["arrow closure", "const leak = () => OPAQUE; this.factory(String(leak()));"],
+    ["function closure", "function leak() { return OPAQUE; } this.factory(String(leak()));"],
+    ["IIFE", "this.factory(String((() => OPAQUE)()));"],
+    ["thunk", "this.relay(() => OPAQUE);"],
+    ["interpolated closure", `const leak = () => OPAQUE; refusal(\`\${leak()}\`);`],
+    [
+      "shadowed provider",
+      "const wrapped = { chat: { completions: { create: (v) => this.factory(String(v)) } } }; wrapped.chat.completions.create(OPAQUE);",
+    ],
+  ];
+  it.each([...AGENTS_READABLE_PROPERTIES])("requires the reviewed Agents property %s", (name) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    INTEGRATION_READABLE_PROPERTIES.delete(name);
+    try {
+      expect(findIntegrationViolations(shipped, "src/openai-agents/index.ts")).toContain(
+        `src/openai-agents/index.ts: integration reads unapproved property '${name}'`,
+      );
+    } finally {
+      INTEGRATION_READABLE_PROPERTIES.add(name);
+    }
+  });
+  it.each(escapeMutations)("rejects a LangChain opaque escape via %s", (_label, mutation) => {
+    const shipped = readFileSync(join(SRC_ROOT, "langchain/index.ts"), "utf8");
+    const marker = "this.startEdge(runId, parentRunId);";
+    expect(shipped).toContain(marker);
+    const mutated = shipped.replace(marker, mutation.replaceAll("OPAQUE", "_opaqueInput"));
+    expect(findIntegrationViolations(mutated, "src/langchain/index.ts")).toEqual(
+      expect.arrayContaining([expect.stringContaining("opaque")]),
+    );
+  });
+  it.each(escapeMutations)("rejects an Agents opaque escape via %s", (_label, mutation) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const marker = "async getResponse(opaqueRequest: ModelRequest) {";
+    expect(shipped).toContain(marker);
+    const mutated = shipped.replace(
+      marker,
+      `${marker}\n${mutation.replaceAll("OPAQUE", "opaqueRequest")}`,
+    );
+    const baseline = findIntegrationViolations(shipped, "src/openai-agents/index.ts");
+    const added = findIntegrationViolations(mutated, "src/openai-agents/index.ts");
+    expect(added.filter((line) => line.includes("opaque")).length).toBeGreaterThan(
+      baseline.filter((line) => line.includes("opaque")).length,
+    );
+  });
+
   it.each([
     "src/langchain/nested/leaf.ts",
     "src/openai-agents/index.ts",
@@ -1613,6 +1967,17 @@ describe("privacy firewall — integration source controls", () => {
     );
   });
 
+  it.each([
+    "class Model { getResponse(input) { return input.name; } }",
+    "class Model { getStreamedResponse(input) { return input.signal; } }",
+    'runner.on("agent_start", (context, agent, turnInput) => consume(turnInput.name));',
+    'runner.on("agent_tool_end", (context, agent, tool, result) => consume(result.name));',
+    "class Model { getRetryAdvice(args) { return args.signal; } }",
+    "class Model { getResponse(opaqueRequest) { return Object.getPrototypeOf(opaqueRequest); } }",
+  ])("rejects renamed Agents content and request inspection: %s", (source) => {
+    expect(findIntegrationViolations(source, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+
   it("permits unused callback parameters and positional structural arguments", () => {
     const source = `
       class Handler {
@@ -1713,7 +2078,9 @@ describe("privacy firewall — integration source controls", () => {
     "function forward(opaqueRequest, opaqueOptions) { return wrapped.chat.completions.create(opaqueRequest, opaqueOptions); }",
     "const forward = (opaqueRequest, opaqueOptions) => wrapped.chat.completions.create(opaqueRequest, opaqueOptions);",
   ])("permits opaque forwarding through a local helper: %s", (helper) => {
-    const source = `${helper}\nfunction f(opaqueRequest, opaqueOptions) { return forward(opaqueRequest, { ...opaqueOptions }); }`;
+    const source = `import { requireSolwynClient } from "../integration-support";
+      function leaf(client) { requireSolwynClient(client, "test"); const wrapped = client;
+      ${helper}\nfunction f(opaqueRequest, opaqueOptions) { return forward(opaqueRequest, { ...opaqueOptions }); } }`;
     expect(findIntegrationViolations(source, path)).toEqual([]);
   });
 
@@ -1787,13 +2154,15 @@ describe("privacy firewall — integration source controls", () => {
     const source = `
       import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
       import { requireDetachedRunFactory } from "../integration-support";
+      import { requireSolwynClient } from "../integration-support";
+      function leaf(client) { requireSolwynClient(client, "test"); const wrapped = client;
       function forward(opaqueRequest, opaqueOptions) {
         return wrapped.chat.completions.create(opaqueRequest, opaqueOptions);
       }
       class Handler {
         #scopes = new Map();
         localCount = 0;
-        f(opaqueRequest, options, manager) {
+        f(opaqueRequest, opaqueOptions, options, manager) {
           const { runId, handlers } = manager;
           const signal = options["signal"];
           this.localCount++;
@@ -1805,7 +2174,7 @@ describe("privacy firewall — integration source controls", () => {
         logger;
         passthrough(_opaqueResult) { return _opaqueResult; }
         arrow = (opaqueResult) => opaqueResult;
-      }
+      } }
     `;
     expect(findIntegrationViolations(source, path)).toEqual([]);
   });

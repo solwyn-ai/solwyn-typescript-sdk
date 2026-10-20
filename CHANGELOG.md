@@ -17,7 +17,11 @@ corresponding release notes before users upgrade.
   wrapped client alone owns enforcement and settlement. Nested agent-as-tool calls, unexpected
   models, missing hierarchy, and concurrent attempts fail closed with typed errors. Streaming
   completion and iteration preserve latched decisions and release state after completion or
-  cancellation. Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.
+  cancellation. Tool-code and tool-input-guardrail denials and stops surface the exact original
+  Solwyn error from `run`, streamed iteration, and `completed`, including in minified bundles.
+  Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
+  still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
+  Locked ESM/CJS recipe consumers and the latest-framework canary cover the entry.
 
 - **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
   a content-free run-scope handler and a guarded Chat Completions leaf for the documented
@@ -34,11 +38,6 @@ corresponding release notes before users upgrade.
   paths; framework modules have no runtime framework imports and remain privacy-firewalled.
 
 ### Fixed
-
-- **OpenAI Agents tool decisions.** Tool-code and tool-input-guardrail denials and stops now
-  surface the exact original Solwyn error from `run`, streamed iteration, and `completed`.
-  Tool-end events emitted before a tool starts preserve guardrail errors; a mismatched agent
-  still fails closed. Invalid `OpenAIProvider` options raise a typed `ConfigurationError`.
 
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
   it agrees with the initial usage split, including streams that start without cache writes.

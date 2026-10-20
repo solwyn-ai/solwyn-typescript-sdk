@@ -163,7 +163,10 @@ children; tools and retrievers add no Solwyn runs. Scopes finish when the root e
 active work until its activation settles. Root completion also releases any remaining model
 bindings and their abort listeners. Missing root terminal callbacks can retain handler state;
 consume streams through completion or use an invocation-local handler for the excluded
-cancellation paths above. Model cancellation releases its bindings even without callbacks, but
+cancellation paths above. On Node.js 22, a reused handler on the excluded abort-and-drain
+path also keeps the run's token lease reserved until `client.close()`, reducing budget headroom
+for other work. This is the budget cost behind the invocation-local-handler advice.
+Model cancellation releases its bindings even without callbacks, but
 cannot finish the root: sibling model calls may still be active. Scope finishing always waits
 for pending activations to settle.
 

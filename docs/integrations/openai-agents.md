@@ -137,8 +137,9 @@ Keep `maxRetries: 0` on the underlying OpenAI client and configure retries on th
 Runner retry crosses the wrapped client as a separate attempt. A retryable provider error without
 usable usage produces an error event without a settlement confirmation; the successful retry
 settles normally. Eligible untagged retries reuse the agent's lease, while tagged attempts each
-receive per-call admission. Solwyn budget and stop errors veto even a permissive Runner retry
-policy.
+receive per-call admission. Solwyn budget and stop errors veto even a permissive plain-boolean
+Runner retry policy. An explicit unsafe-replay approval can override the framework's veto;
+those retries still cross the wrapped client's budget gate.
 
 ## Refused and unsupported paths
 

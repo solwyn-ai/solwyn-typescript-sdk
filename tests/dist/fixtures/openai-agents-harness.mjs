@@ -56,10 +56,10 @@ const runner = {
   on(event, callback) {
     hooks.set(event, callback);
   },
-  async run(agent, request) {
+  async run(agent, _input) {
     hooks.get("agent_start")(undefined, agent);
     const model = await this.config.modelProvider.getModel();
-    const result = await model.getResponse(request);
+    const result = await model.getResponse({ model: agent.model });
     hooks.get("agent_end")(undefined, agent);
     return result;
   },

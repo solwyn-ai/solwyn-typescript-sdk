@@ -177,7 +177,6 @@ const AGENTS_READABLE_PROPERTIES = new Set([
   "values", // Structural handle collection traversal.
   "workflow", // Explicit workflow attribution name.
 ]);
-for (const property of AGENTS_READABLE_PROPERTIES) INTEGRATION_READABLE_PROPERTIES.add(property);
 
 const INTEGRATION_CORE_IMPORTS = new Set([
   "run-context",
@@ -560,6 +559,7 @@ function findIntegrationViolations(text: string, path: string): string[] {
   const readable = (name: string, node: ts.Node, own = false): void => {
     if (
       !INTEGRATION_READABLE_PROPERTIES.has(name) &&
+      !(rel.startsWith("openai-agents/") && AGENTS_READABLE_PROPERTIES.has(name)) &&
       !(own && isOwnIntegrationMember(node, name))
     ) {
       report(`reads unapproved property '${name}'`);
@@ -679,6 +679,16 @@ function findIntegrationViolations(text: string, path: string): string[] {
       const name = propertyNameText(node.name);
       if (name !== undefined) callbackParameters(name, node.initializer);
     }
+    if (
+      rel.startsWith("openai-agents/") &&
+      ts.isCallExpression(node) &&
+      integrationMemberName(node.expression) === "on" &&
+      (!node.arguments[0] ||
+        !ts.isStringLiteralLike(node.arguments[0]) ||
+        !node.arguments[1] ||
+        !(ts.isArrowFunction(node.arguments[1]) || ts.isFunctionExpression(node.arguments[1])))
+    )
+      report("Agents hooks require a literal event and inline callback");
     if (
       ts.isCallExpression(node) &&
       integrationMemberName(node.expression) === "on" &&
@@ -1802,6 +1812,24 @@ describe("privacy firewall — integration source controls", () => {
     ).not.toEqual([]);
   });
 
+  it.each([
+    'const event = "agent_end"; runner.on(event, (_context, agent, output) => this.#factory(String(output)));',
+    'const leak = (_context: unknown, _agent: unknown, output: unknown) => this.#factory(String(output)); runner.on("agent_end", leak);',
+  ])("rejects indirect Agents hook registration: %s", (mutation) => {
+    const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
+    const marker = "if (this.#attached.has(runner)) return;";
+    expect(shipped).toContain(marker);
+    const mutated = shipped.replace(marker, `${mutation}\n${marker}`);
+    expect(findIntegrationViolations(mutated, "src/openai-agents/index.ts")).not.toEqual([]);
+  });
+  it.each([
+    ...AGENTS_READABLE_PROPERTIES,
+  ])("keeps Agents property %s unavailable to LangChain", (name) => {
+    expect(
+      findIntegrationViolations(`const value = options.${name};`, "src/langchain/index.ts"),
+    ).toContain(`src/langchain/index.ts: integration reads unapproved property '${name}'`);
+  });
+
   const escapeMutations = [
     ["arrow closure", "const leak = () => OPAQUE; this.factory(String(leak()));"],
     ["function closure", "function leak() { return OPAQUE; } this.factory(String(leak()));"],
@@ -1815,13 +1843,13 @@ describe("privacy firewall — integration source controls", () => {
   ];
   it.each([...AGENTS_READABLE_PROPERTIES])("requires the reviewed Agents property %s", (name) => {
     const shipped = readFileSync(join(SRC_ROOT, "openai-agents/index.ts"), "utf8");
-    INTEGRATION_READABLE_PROPERTIES.delete(name);
+    AGENTS_READABLE_PROPERTIES.delete(name);
     try {
       expect(findIntegrationViolations(shipped, "src/openai-agents/index.ts")).toContain(
         `src/openai-agents/index.ts: integration reads unapproved property '${name}'`,
       );
     } finally {
-      INTEGRATION_READABLE_PROPERTIES.add(name);
+      AGENTS_READABLE_PROPERTIES.add(name);
     }
   });
   it.each(escapeMutations)("rejects a LangChain opaque escape via %s", (_label, mutation) => {

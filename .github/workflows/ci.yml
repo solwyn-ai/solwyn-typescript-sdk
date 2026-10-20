@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"
@@ -11,10 +12,16 @@ on:
 permissions:
   contents: read
 
+# Only PR updates share a group. Unique run IDs prevent queued main, schedule,
+# or dispatch runs from replacing each other, even with cancellation disabled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   quality:
     name: Quality / Node ${{ matrix.node-major }}
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -67,7 +74,7 @@ jobs:
 
   package-artifact:
     name: Package artifact
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: quality
     runs-on: ubuntu-24.04
     env:
@@ -115,7 +122,7 @@ jobs:
 
   artifact-consumers:
     name: Consumers / Node ${{ matrix.node-major }}
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: package-artifact
     runs-on: ubuntu-24.04
     strategy:
@@ -187,7 +194,7 @@ jobs:
 
   legacy-installed-core:
     name: Legacy runtime / Node 20.20.2
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: package-artifact
     runs-on: ubuntu-24.04
     env:
@@ -264,30 +271,10 @@ jobs:
           })().catch((error) => { process.stderr.write(`${error.stack ?? error}\n`); process.exitCode = 1; });
           NODE
 
-  provider-surface-matrix:
-    name: Provider surface catalog
-    runs-on: ubuntu-24.04
-    outputs:
-      include: ${{ steps.catalog.outputs.include }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.23.2"
-          package-manager-cache: false
-      - id: catalog
-        run: node scripts/provider-surface-matrix.mjs
-
   provider-surface-inventory:
-    name: Provider surface / ${{ matrix.family }} / ${{ matrix.interval }}
-    needs: provider-surface-matrix
+    name: Provider surface inventory
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.provider-surface-matrix.outputs.include) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -302,36 +289,28 @@ jobs:
           node-version: "22.23.2"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - name: Overlay the cell's pinned provider packages
-        run: |
-          pnpm add --no-lockfile -D ${{ join(matrix.packages, ' ') }}
-          git diff --exit-code -- pnpm-lock.yaml
-      - name: Capture --check
-        run: pnpm tsx scripts/capture-surface-inventory.ts --check --family ${{ matrix.family }} --interval ${{ matrix.interval }}
-      - name: Canary
-        if: always()
+      - id: catalog
+        run: node scripts/provider-surface-matrix.mjs
+      - name: Run every selected provider interval
         env:
-          SOLWYN_SURFACE_CANARY_FAMILY: ${{ matrix.family }}
-        run: pnpm vitest run tests/unit/surface-canary.test.ts
+          SURFACE_INTERVALS: ${{ steps.catalog.outputs.include }}
+        run: node scripts/run-provider-surfaces.mjs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: provider-surface-${{ matrix.family }}-${{ matrix.interval }}
+          name: provider-surface-inventory
           path: build/provider-surface-inventory
           if-no-files-found: error
           retention-days: 7
 
   required:
     name: Required / CI
-    # Only skip a main dispatch after the catalog validates the exact ref.
-    if: always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-matrix'].result == 'success')
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     needs:
       - quality
       - package-artifact
       - artifact-consumers
       - legacy-installed-core
-      - provider-surface-matrix
       - provider-surface-inventory
     runs-on: ubuntu-24.04
     steps:
@@ -341,9 +320,8 @@ jobs:
           PACKAGE_ARTIFACT: ${{ needs.package-artifact.result }}
           ARTIFACT_CONSUMERS: ${{ needs.artifact-consumers.result }}
           LEGACY_INSTALLED_CORE: ${{ needs.legacy-installed-core.result }}
-          PROVIDER_SURFACE_MATRIX: ${{ needs.provider-surface-matrix.result }}
           PROVIDER_SURFACE_INVENTORY: ${{ needs.provider-surface-inventory.result }}
         run: |
-          for result in "$QUALITY" "$PACKAGE_ARTIFACT" "$ARTIFACT_CONSUMERS" "$LEGACY_INSTALLED_CORE" "$PROVIDER_SURFACE_MATRIX" "$PROVIDER_SURFACE_INVENTORY"; do
+          for result in "$QUALITY" "$PACKAGE_ARTIFACT" "$ARTIFACT_CONSUMERS" "$LEGACY_INSTALLED_CORE" "$PROVIDER_SURFACE_INVENTORY"; do
             test "$result" = success
           done

@@ -19,7 +19,6 @@ import { parseDocument } from "yaml";
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const ciPath = join(repositoryRoot, ".github", "workflows", "ci.yml");
 const publishPath = join(repositoryRoot, ".github", "workflows", "publish.yml");
-const surfaceCatalogPath = join(repositoryRoot, "tests", "provider-surface-intervals.json");
 
 interface WorkflowStep {
   readonly name?: string;
@@ -39,7 +38,10 @@ interface WorkflowJob {
 }
 
 interface WorkflowModel {
-  readonly concurrency?: { readonly group?: string; readonly "cancel-in-progress"?: boolean };
+  readonly concurrency?: {
+    readonly group?: string;
+    readonly "cancel-in-progress"?: boolean | string;
+  };
   readonly on: Readonly<Record<string, unknown>>;
   readonly jobs: Readonly<Record<string, WorkflowJob>>;
   readonly permissions?: Readonly<Record<string, string>>;
@@ -71,13 +73,16 @@ function jobConditionMatches(
   workflowJob: WorkflowJob,
   eventName: string,
   ref: string,
-  matrixResult = "success",
+  draft = false,
 ): boolean {
   return (
     runInNewContext(workflowJob.if ?? "true", {
       // Actions compares strings case-insensitively against these lowercase literals.
-      github: { event_name: eventName.toLowerCase(), ref: ref.toLowerCase() },
-      needs: { "provider-surface-matrix": { result: matrixResult } },
+      github: {
+        event_name: eventName.toLowerCase(),
+        ref: ref.toLowerCase(),
+        event: { pull_request: { draft } },
+      },
       always: () => true,
     }) === true
   );
@@ -306,69 +311,68 @@ describe("workflow YAML semantics", () => {
 });
 
 describe("CI workflow contract", () => {
-  it("accepts manual dispatches and keeps both provider canary jobs ungated", async () => {
+  it("starts a full run when a draft becomes ready for review", async () => {
     const { model } = await parseWorkflow(ciPath);
 
+    expect(model.on["pull_request"]).toEqual({
+      types: ["opened", "synchronize", "reopened", "ready_for_review"],
+    });
     expect(model.on).toHaveProperty("workflow_dispatch", null);
-    expect(semanticJob(model, "provider-surface-matrix").if).toBeUndefined();
-    expect(semanticJob(model, "provider-surface-inventory").if).toBeUndefined();
   });
 
   it.each([
-    "quality",
-    "package-artifact",
-    "artifact-consumers",
-    "legacy-installed-core",
-  ])("skips %s for scheduled and manually dispatched canaries", async (id) => {
+    ["pull_request", "refs/pull/11/merge", false, true],
+    ["pull_request", "refs/pull/11/merge", true, false],
+    ["push", "refs/heads/main", false, true],
+    ["schedule", "refs/heads/main", false, true],
+    ["workflow_dispatch", "refs/heads/main", false, true],
+  ] as const)("runs every gate for %s (draft=%s)", async (eventName, ref, draft, runs) => {
     const { model } = await parseWorkflow(ciPath);
 
-    expect(semanticJob(model, id).if).toBe(
-      "github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'",
-    );
-  });
-
-  it.each([
-    ["schedule", "refs/heads/main", "success", false, false],
-    ["workflow_dispatch", "refs/heads/main", "success", false, false],
-    ["workflow_dispatch", "refs/heads/main", "failure", true, false],
-    ["workflow_dispatch", "refs/heads/Main", "failure", true, false],
-    ["workflow_dispatch", "refs/heads/feature", "failure", true, false],
-    ["workflow_dispatch", "refs/heads/main-canary", "failure", true, false],
-    ["workflow_dispatch", "refs/tags/main", "failure", true, false],
-    ["pull_request", "refs/pull/11/merge", "success", true, true],
-    ["push", "refs/heads/main", "success", true, true],
-  ] as const)("allows only validated main dispatches to skip Required / CI: %s on %s (catalog %s)", async (eventName, ref, matrixResult, requiredRuns, fullCiRuns) => {
-    const { model } = await parseWorkflow(ciPath);
-
-    expect(jobConditionMatches(semanticJob(model, "required"), eventName, ref, matrixResult)).toBe(
-      requiredRuns,
-    );
-    for (const id of [
-      "quality",
-      "package-artifact",
-      "artifact-consumers",
-      "legacy-installed-core",
-    ]) {
-      expect(jobConditionMatches(semanticJob(model, id), eventName, ref), id).toBe(fullCiRuns);
+    for (const [id, value] of Object.entries(model.jobs)) {
+      expect(jobConditionMatches(value, eventName, ref, draft), id).toBe(runs);
     }
   });
 
-  it("fails Required / CI when a non-main dispatch skips full CI even if both canary jobs pass", async () => {
+  it("cancels only superseded runs of the same pull request", async () => {
     const { model } = await parseWorkflow(ciPath);
-    const required = semanticJob(model, "required");
-    const gate = namedStep(required, "Require every launch gate");
-
-    expect(jobConditionMatches(required, "workflow_dispatch", "refs/heads/feature")).toBe(true);
-    expect(
-      runBash(gate.run ?? "", {
-        QUALITY: "skipped",
-        PACKAGE_ARTIFACT: "skipped",
-        ARTIFACT_CONSUMERS: "skipped",
-        LEGACY_INSTALLED_CORE: "skipped",
-        PROVIDER_SURFACE_MATRIX: "success",
-        PROVIDER_SURFACE_INVENTORY: "success",
-      }).status,
-    ).toBe(1);
+    const concurrency = model.concurrency;
+    expect(concurrency).toBeDefined();
+    function settings(eventName: string, number: number | undefined, runId: number) {
+      const context = {
+        github: {
+          workflow: "CI",
+          event_name: eventName,
+          event: { pull_request: { number } },
+          run_id: runId,
+        },
+      };
+      const group = concurrency?.group?.replace(/\$\{\{(.*?)\}\}/g, (_match, expression) =>
+        String(runInNewContext(expression, context)),
+      );
+      const cancel = concurrency?.["cancel-in-progress"];
+      return {
+        group,
+        cancel:
+          typeof cancel === "string"
+            ? runInNewContext(cancel.replace(/^\$\{\{|\}\}$/g, ""), context)
+            : cancel,
+      };
+    }
+    const first = settings("pull_request", 11, 100);
+    expect(first.cancel).toBe(true);
+    expect(first.group).toBe(settings("pull_request", 11, 101).group);
+    expect(first.group).not.toBe(settings("pull_request", 12, 102).group);
+    const groups = new Set([first.group]);
+    for (const eventName of ["push", "schedule", "workflow_dispatch"]) {
+      const a = settings(eventName, undefined, 100);
+      const b = settings(eventName, undefined, 101);
+      expect(a.cancel).toBe(false);
+      expect(b.cancel).toBe(false);
+      groups.add(a.group);
+      groups.add(b.group);
+    }
+    expect(groups.size).toBe(7);
   });
 
   it("runs every full source gate on exact Node 22 and 24 releases", async () => {
@@ -434,21 +438,21 @@ describe("CI workflow contract", () => {
     );
   });
 
-  it("preserves all provider cells and the scheduled latest canary", async () => {
-    const [workflow, catalogText] = await Promise.all([
-      readFile(ciPath, "utf8"),
-      readFile(surfaceCatalogPath, "utf8"),
-    ]);
-    const catalog = JSON.parse(catalogText) as { include: readonly unknown[] };
-    const inventory = job(workflow, "provider-surface-inventory");
+  it("runs the unchanged interval selector inside one provider job", async () => {
+    const { model, source } = await parseWorkflow(ciPath);
+    const inventory = semanticJob(model, "provider-surface-inventory");
 
-    expect(catalog.include).toHaveLength(11);
-    expect(workflow).toContain('cron: "0 6 * * 1"');
-    expect(workflow).toContain("node scripts/provider-surface-matrix.mjs");
-    expect(inventory).toContain("fromJSON(needs.provider-surface-matrix.outputs.include)");
-    expect(inventory).toContain("pnpm add --no-lockfile -D");
-    expect(inventory).toContain("git diff --exit-code -- pnpm-lock.yaml");
-    expect(inventory).toContain("pnpm vitest run tests/unit/surface-canary.test.ts");
+    expect(model.on["schedule"]).toEqual([{ cron: "0 6 * * 1" }]);
+    expect(Object.keys(model.jobs).filter((id) => id.startsWith("provider-surface"))).toEqual([
+      "provider-surface-inventory",
+    ]);
+    expect(source).toContain("node scripts/provider-surface-matrix.mjs");
+    expect(namedStep(inventory, "Run every selected provider interval").env).toEqual({
+      SURFACE_INTERVALS: `\${{ steps.catalog.outputs.include }}`,
+    });
+    expect(namedStep(inventory, "Run every selected provider interval").run).toBe(
+      "node scripts/run-provider-surfaces.mjs",
+    );
   });
 
   it("runs a pinned actionlint binary as part of the required quality result", async () => {
@@ -472,15 +476,15 @@ describe("CI workflow contract", () => {
     );
   });
 
-  it("fans the stable required result into exactly six jobs and fails every non-success state", async () => {
+  it("fans the stable required result into every gate and fails every non-success state", async () => {
     const { model } = await parseWorkflow(ciPath);
     const required = semanticJob(model, "required");
+    expect(required.name).toBe("Required / CI");
     const expectedNeeds = [
       "quality",
       "package-artifact",
       "artifact-consumers",
       "legacy-installed-core",
-      "provider-surface-matrix",
       "provider-surface-inventory",
     ];
     const expectedEnvironment = {
@@ -488,13 +492,12 @@ describe("CI workflow contract", () => {
       PACKAGE_ARTIFACT: `\${{ needs.package-artifact.result }}`,
       ARTIFACT_CONSUMERS: `\${{ needs.artifact-consumers.result }}`,
       LEGACY_INSTALLED_CORE: `\${{ needs.legacy-installed-core.result }}`,
-      PROVIDER_SURFACE_MATRIX: `\${{ needs.provider-surface-matrix.result }}`,
       PROVIDER_SURFACE_INVENTORY: `\${{ needs.provider-surface-inventory.result }}`,
     };
     const gate = namedStep(required, "Require every launch gate");
 
     expect(required.if).toBe(
-      "always() && github.event_name != 'schedule' && !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs['provider-surface-matrix'].result == 'success')",
+      "always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)",
     );
     expect(required.needs).toEqual(expectedNeeds);
     expect(gate.env).toEqual(expectedEnvironment);

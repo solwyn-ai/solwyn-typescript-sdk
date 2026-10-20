@@ -1,6 +1,6 @@
 # Provider surface canary and drift runbook
 
-Use this runbook when a `provider-surface-inventory` cell, the scheduled Monday run, or a manually
+Use this runbook when the `Provider surface inventory` job, the scheduled Monday run, or a manually
 dispatched run fails. An unclassified provider surface is not an immediate runtime failure: it resolves
 to `unknown` and follows the configured `onUnmetered` policy, which defaults to `"warn"`.
 The failing canary prevents unnoticed provider-SDK drift from reaching a release.
@@ -11,12 +11,18 @@ To run the same six `@latest` provider canaries as the schedule on demand, dispa
 gh workflow run CI --ref main
 ```
 
-Dispatches must target `main`. Dispatching another branch or tag fails `Provider surface catalog`
-and `Required / CI`.
+Dispatches must target `main`. Dispatching another branch or tag fails catalog validation in
+`Provider surface inventory` and fails `Required / CI`.
+
+Scheduled and main dispatch runs also run the separate, non-required
+`Latest LangChain / LangGraph canary` after catalog validation. It still runs if provider interval
+checks fail. Both canary jobs surface failures through their own results; `Required / CI` is skipped
+for schedules and main dispatches with successful catalog validation.
 
 ## 1. Identify
 
-Open the failing cell and download its `provider-surface-<family>-<interval>` artifact.
+Open the failing interval's log group in `Provider surface inventory` and download the
+`provider-surface-inventory` artifact. Each interval's reports are under `<family>-<interval>/`.
 Actionable lines, in order of information:
 
 - `fingerprint drift: <shape>@<interval> (…counts…)` — structure changed.

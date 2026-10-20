@@ -213,16 +213,20 @@ explicitly with the manifest and public documentation:
 - full quality, package, consumer, and AI integration lanes are Node.js `22.23.2` and `24.21.0`;
   if `engines.node` remains `>=20`, test exact final Node.js `20.20.2` in a separately labeled
   provider-free installed core, `./node`, and `./testing` lane and document that the current
-  development toolchain and Vercel AI SDK 7 require Node.js 22 or newer. The `./ai-sdk` entry is
-  deliberately excluded from Node 20 because its peer requires Node 22. Node.js 20 is end-of-life,
-  so that lane is compatibility evidence, not a maintenance promise;
+  development toolchain, Vercel AI SDK 7, and `@langchain/openai` require Node.js 22 or newer.
+  The `./ai-sdk` and `./langchain` entries are deliberately excluded from the Node 20 lane
+  because their integration peers require Node 22. Node.js 20 is end-of-life, so that lane is
+  compatibility evidence, not a maintenance promise;
 - strict ESM/CommonJS declaration consumers pass with TypeScript 5.8.3 (the tested floor) and
   6.0.3 (the tested current compiler), with `skipLibCheck: false`;
 - deeper installed checks exercise the locked native-type fixture with OpenAI 6.45.0 and
   Anthropic 0.123.0, the runtime matrix with Anthropic 0.123.0, the locked Vercel AI SDK 7.0.14
-  types/runtime fixtures, and separate Google GenAI 0.3.1 plus 2.20.0 installations for native
-  lifecycle behavior. These installed probes retain their own pins; they do not install the
-  development dependencies or the provider-surface matrix's latest cells;
+  types/runtime fixtures, the locked LangChain recipe fixture (core 1.2.18, OpenAI integration
+  1.6.2, LangGraph 1.5.1, OpenAI 7.36.0, and `@types/node` 22.15.30) with strict TypeScript
+  5.8.3/6.0.3 ESM/CommonJS compilation and offline execution, and separate Google GenAI
+  0.3.1 plus 2.20.0 installations for native lifecycle behavior. These installed probes retain
+  their own pins; they do not install the development dependencies or the provider-surface
+  inventory's latest cells;
 - provider-surface floor/latest boundary cells separately check OpenAI 4.41.0 and 7.36.0,
   Anthropic 0.30.0 and 0.135.0, Bedrock Runtime 3.422.0 and 3.1124.0, Google GenAI 0.3.1 and
   2.30.0, Together AI 0.16.0 and 0.58.0, plus Google Generative AI 0.24.1 as its reviewed cell.
@@ -230,11 +234,11 @@ explicitly with the manifest and public documentation:
 Do not describe two boundary cells as continuous support evidence or full runtime/type coverage
 for intervening versions. The quality jobs run the unit suite against the development pins in
 `package.json` and `pnpm-lock.yaml`: OpenAI 7.36.0, Anthropic 0.135.0, Google GenAI 2.30.0,
-and Together AI 0.58.0 for the refreshed providers. Each provider-surface job overlays only the
-package specified for its cell in `tests/provider-surface-intervals.json` and runs capture plus
-the surface canary. The consumer jobs test the same tarball using the independent fixture/probe
-pins described above. When a
-version changes, reconcile the relevant fixtures, lockfiles, CI matrix, manifest peer range,
+and Together AI 0.58.0 for the refreshed providers. The single provider-surface inventory job
+checks every selected interval in a fresh temporary install, overlays only the packages specified
+for that cell in `tests/provider-surface-intervals.json`, and runs capture plus the surface canary.
+The consumer jobs test the same tarball using the independent fixture/probe pins described above.
+When a version changes, reconcile the relevant fixtures, lockfiles, CI matrix, manifest peer range,
 README, and release notes together, identifying the evidence each check actually supplies.
 
 Create one candidate tarball in a clean release checkout and a dedicated directory outside that
@@ -270,8 +274,8 @@ npm publish --dry-run \
   --ignore-scripts
 ```
 
-The package must include the four public entries (`.`, `./node`, `./ai-sdk`, and `./testing`),
-declarations, source maps, `README.md`, `CHANGELOG.md`, `LICENSE`, and `package.json`, with no source,
+The package must include the five public entries (`.`, `./node`, `./ai-sdk`, `./testing`, and
+`./langchain`), declarations, source maps, `README.md`, `CHANGELOG.md`, `LICENSE`, and `package.json`, with no source,
 tests, private material, credentials, or unexpected files. Scan the unpacked artifact, including
 source-map `sourcesContent`:
 
@@ -316,13 +320,20 @@ Use these exact CI check names when configuring the branch ruleset:
 - `Package artifact`;
 - `Consumers / Node 22` and `Consumers / Node 24`;
 - `Legacy runtime / Node 20.20.2`;
-- `Provider surface catalog` and every `Provider surface / <family> / <interval>` matrix cell.
+- `Provider surface inventory`.
 
 `Required / CI` must be required on `main`; do not require only a subset of its underlying jobs.
-Scheduled CI runs and manual dispatches on `main` select all six latest provider cells, while
-pull requests and pushes run all 11 reviewed floor/latest cells. Manual CI dispatches must target
-`main` (`gh workflow run CI --ref main`). Dispatching another branch or tag fails
-`Provider surface catalog` and `Required / CI`.
+Draft pull requests defer the underlying jobs and fail `Required / CI` with an explanation;
+marking a pull request ready for review starts the full run. Ready pull requests and pushes run
+all 11 reviewed floor/latest provider cells. Scheduled CI runs and manual dispatches on `main`
+select all six latest provider cells and run `Latest LangChain / LangGraph canary`, which overlays
+the latest frameworks without changing the lockfile. The framework canary is not a required
+gate, never runs on pull requests or pushes, and still runs after provider checks fail if the
+inventory's catalog validation succeeded. Canary failures fail their jobs and the workflow;
+`Required / CI` is skipped on schedules and on main dispatches with successful catalog validation.
+Manual CI dispatches must target `main` (`gh workflow run CI --ref main`). Dispatching another
+branch or tag fails catalog validation in `Provider surface inventory` and fails `Required / CI`,
+while skipping the framework canary.
 
 ## Publish
 

@@ -9,6 +9,22 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+### Added
+
+- **LangChain.js and LangGraph.js attribution.** The new `@solwyn/sdk/langchain` entry supplies
+  a content-free run-scope handler and a guarded Chat Completions leaf for the documented
+  Node.js 22+ OpenAI recipe. Stable graph-node scopes preserve lease reuse, velocity history,
+  and exact-run stops across iterations. Responses and non-streaming JSON-schema parsing are
+  refused; streaming structured output is outside the tested recipe. Failed model callbacks
+  preserve the original error, while successful unbound calls raise a bypass diagnostic. Root
+  completion releases remaining model bindings and abort listeners. Cancellation releases the
+  aborted model's bindings and listeners immediately, without ending sibling work. Early stream
+  termination and Node.js 22 abort-and-drain can omit upstream root callbacks; these paths
+  require an invocation-local handler rather than a reused handler. Scope names replace Unicode
+  format and separator characters, and invalid `namePrefix` values are rejected eagerly.
+  Locked offline recipe checks and a weekly/manual latest-framework canary cover the admitted
+  paths; framework modules have no runtime framework imports and remain privacy-firewalled.
+
 ### Fixed
 
 - Attribute additional Anthropic streaming cache writes using the served request's TTL when
@@ -27,6 +43,11 @@ corresponding release notes before users upgrade.
   helpers report a zero-token error event with no confirmation.
 
 ### Changed
+
+- **Public-preview compatibility:** The new optional `@langchain/core >=1.2.14 <2` peer can cause
+  npm `ERESOLVE` when an application already installs an out-of-range version, even if the
+  application does not use the integration. Upgrade the installed core to the supported range
+  or retain the previous SDK release. The package still installs without LangChain present.
 
 - **Public-preview compatibility:** Legacy raw-request and client escapes on native OpenAI,
   Azure OpenAI, Anthropic and Together clients, OpenAI Realtime session/client-secret creation

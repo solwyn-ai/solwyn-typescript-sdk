@@ -11,7 +11,7 @@ explicitly supply. Prompt and response content is not sent to Solwyn or logged b
 - **Add controls as you need them.** Attribute usage to runs and customers, set up fallback providers, and stop runaway agent runs.
 
 [Quick start](#quick-start) · [Budget enforcement](#budget-enforcement) ·
-[Providers](#providers) · [Vercel AI SDK](#vercel-ai-sdk) ·
+[Providers](#providers) · [Vercel AI SDK](#vercel-ai-sdk) · [Framework integrations](#framework-integrations) ·
 [Configuration](#configuration) · [Data transparency](#data-transparency)
 
 > **Public preview (`0.1.1`).** Install from npm's default `latest` tag. APIs may change before
@@ -29,11 +29,11 @@ The manifest retains **Node.js 20 or later** only for end-of-life (EOL) legacy i
 support in the provider-free core, or a compatible [server-side edge runtime](#edge-runtimes).
 Node.js 22 and 24 are the full development and release lanes. The current development toolchain,
 provider integrations, and Vercel AI SDK 7 middleware require their own supported Node versions;
-in particular, AI SDK 7 requires Node.js 22 or newer. Declarations are consumer-tested with
-TypeScript 5.8.3 and 6.0.3 under `strict: true`, `skipLibCheck: false`, and a lib set that includes
-`ESNext.Disposable` (for `Symbol.asyncDispose`) alongside the runtime libraries your application
-uses. Supports ESM and CommonJS. Keep your existing provider package; Solwyn bundles no provider
-clients.
+in particular, AI SDK 7 and the LangChain/OpenAI recipe require Node.js 22 or newer. Declarations
+are consumer-tested with TypeScript 5.8.3 and 6.0.3 under `strict: true`, `skipLibCheck: false`,
+and a lib set that includes `ESNext.Disposable` (for `Symbol.asyncDispose`) alongside the runtime
+libraries your application uses. Supports ESM and CommonJS. Keep your existing provider package;
+Solwyn bundles no provider clients.
 
 ## Quick start
 
@@ -182,6 +182,7 @@ for preflight deadlines, reporter delivery, and lease eligibility and renewal.
 | I want to… | Start here |
 |------------|------------|
 | Use another provider | [Provider examples](#providers) or [Vercel AI SDK middleware](#vercel-ai-sdk) |
+| Use LangChain or LangGraph | [Framework integrations](#framework-integrations) |
 | Block over-budget requests | [Budget enforcement](#budget-enforcement) |
 | Group usage by workflow or customer | [Agent runs and attribution tags](#tagging-calls-with-agent-runs) |
 | Recover from provider failures | [Failover](#failover) |
@@ -429,6 +430,29 @@ settle stream usage observed so far, including the part pulled at the cancellati
 estimated usage retains the reservation floor.
 
 > **Gateway attribution.** When a model id is resolved through the Vercel AI Gateway (a bare string model like `generateText({ model: "anthropic/claude-sonnet-4.5" })`), the AI SDK stamps `provider: "gateway"`. Solwyn derives the true vendor from the `vendor/model` prefix of the model id, so per-vendor budgets and metadata are attributed correctly instead of collapsing onto `openai_compatible`.
+
+## Framework integrations
+
+Use the [LangChain.js / LangGraph.js recipe](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/integrations/langchain.md)
+with `@solwyn/sdk/langchain` on Node.js 22+. `SolwynRunScopeHandler` adds content-free chain and
+stable graph-node attribution; the Solwyn-wrapped OpenAI client supplies enforcement and
+settlement. The exact recipe admits Chat Completions chain `invoke`/`stream`, compiled graph
+values/updates/messages streaming, parallel nodes, loops, and function-tool binding. Responses
+and non-streaming JSON-schema parsing fail closed; streaming structured output is outside the
+tested recipe. Early stream termination and Node.js 22 abort-and-drain require an
+invocation-local handler because upstream can omit root callbacks. Other paths are listed on
+the recipe page.
+
+| Framework | Integration | Runtime |
+|---|---|---|
+| LangChain.js / LangGraph.js | `@solwyn/sdk/langchain` plus the documented OpenAI recipe | Node.js 22+ for attribution |
+| CrewAI | Not available: no official TypeScript SDK | — |
+
+CrewAI is Python-only; its official JavaScript route calls a REST API for hosted crews, so there
+is no in-process provider client to wrap. See the [framework support matrix](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/integrations/README.md)
+for tested versions, dependency posture, hierarchy, and exclusions. Tags remain explicit,
+non-sensitive attribution; tagged calls use per-call checks instead of token leases.
+LangSmith tracing can export content to LangSmith, outside Solwyn's privacy boundary.
 
 ## Media surfaces
 

@@ -162,7 +162,7 @@ export function assertTypeConsumerChecks(report, kind) {
       );
       assert.ok(cell, `Missing ${label} ${format} compiler cell`);
       assert.equal(cell.status, "pass");
-      if (kind === "native") assert.ok(commandSucceeded(cell.command));
+      if (kind === "native" || kind === "langchain") assert.ok(commandSucceeded(cell.command));
       else {
         assert.ok(commandSucceeded(cell.baseline));
         assert.ok(commandSucceeded(cell.sdk));

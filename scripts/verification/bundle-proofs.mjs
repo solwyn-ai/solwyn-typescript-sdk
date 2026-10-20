@@ -133,10 +133,14 @@ process.once('exit',()=>process.stdout.write(JSON.stringify({dispatched,registra
     JSON.stringify({ esbuild: esbuild.version, results }, null, 2),
   );
 
-  const edgeSource = `import {Solwyn,noopLogger,getCurrentRun} from '@solwyn/sdk';
+  const edgeSource = `import {Solwyn,noopLogger,getCurrentRun,ConfigurationError} from '@solwyn/sdk';
 import {createSolwynMiddleware} from '@solwyn/sdk/ai-sdk';
 import {FakeControlPlane} from '@solwyn/sdk/testing';
+import {SolwynRunScopeHandler} from '@solwyn/sdk/langchain';
 globalThis.reviewDone=(async()=>{
+  let langchainNodeRequired=false;
+  try{new SolwynRunScopeHandler();}catch(failure){if(!(failure instanceof ConfigurationError))throw failure;langchainNodeRequired=true;}
+  if(!langchainNodeRequired)throw new Error('LangChain attribution must require the Node entry');
   let unexpectedFetch=0;
   globalThis.fetch=()=>{unexpectedFetch++;throw new Error('Unexpected external fetch');};
   const plane=new FakeControlPlane();
@@ -160,7 +164,7 @@ globalThis.reviewDone=(async()=>{
   await middleware.close();
   const uniqueCalls=new Set(delivered.map(event=>event.call_id)).size;
   const uniqueLegacyKeys=new Set(delivered.map(event=>event.timestamp+'|'+event.sdk_instance_id)).size;
-  const result={providerCalls,checks:plane.checks.length,confirms:plane.confirms.length,transmittedEvents:delivered.length,uniqueCalls,ingested:plane.ingested.length,legacyDedupCollisions:delivered.length-uniqueLegacyKeys,unexpectedFetch,ambientRunAbsent:getCurrentRun()===undefined,nodeGlobalAbsent:typeof process==='undefined',bufferAbsent:typeof Buffer==='undefined',coreClosed,warnings};
+  const result={langchainNodeRequired,providerCalls,checks:plane.checks.length,confirms:plane.confirms.length,transmittedEvents:delivered.length,uniqueCalls,ingested:plane.ingested.length,legacyDedupCollisions:delivered.length-uniqueLegacyKeys,unexpectedFetch,ambientRunAbsent:getCurrentRun()===undefined,nodeGlobalAbsent:typeof process==='undefined',bufferAbsent:typeof Buffer==='undefined',coreClosed,warnings};
   if(result.providerCalls!==2||result.checks!==4||result.confirms!==4||result.transmittedEvents!==4||uniqueCalls!==4||result.ingested!==4||uniqueLegacyKeys!==4||result.legacyDedupCollisions!==0||unexpectedFetch!==0||!result.ambientRunAbsent||!result.nodeGlobalAbsent||!result.bufferAbsent)throw new Error('Edge verification failed: '+JSON.stringify(result));
   globalThis.reviewResult={ok:true,...result};
   if(typeof document!=='undefined')document.body.textContent=JSON.stringify(globalThis.reviewResult);

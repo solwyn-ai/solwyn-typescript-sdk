@@ -19,6 +19,7 @@ const expectedEntries = [
   "@solwyn/sdk/node",
   "@solwyn/sdk/testing",
   "@solwyn/sdk/ai-sdk",
+  "@solwyn/sdk/langchain",
 ];
 const temporary: string[] = [];
 
@@ -81,6 +82,7 @@ async function identitySource() {
       { specifier: "@solwyn/sdk/node", binding: "node", version: true },
       { specifier: "@solwyn/sdk/testing", binding: "testing" },
       { specifier: "@solwyn/sdk/ai-sdk", binding: "ai" },
+      { specifier: "@solwyn/sdk/langchain", binding: "langchain" },
     ],
     "artifactIdentity",
     "format",
@@ -110,6 +112,10 @@ function createConsumer({
     ".": { import: esmCoreOutside ? "./esm/index.mjs" : "./index.mjs", require: "./index.cjs" },
     "./node": { import: "./node.mjs", require: "./node.cjs" },
     "./testing": { import: "./testing.mjs", require: "./testing.cjs" },
+    "./langchain": {
+      import: "./langchain.mjs",
+      require: "./langchain.cjs",
+    },
     "./ai-sdk": { import: "./ai-sdk.mjs", require: "./ai-sdk.cjs" },
     "./package.json": "./package.json",
   };
@@ -143,7 +149,7 @@ function createConsumer({
     }
     writeFileSync(path.join(sdk, `${entry}.cjs`), cjsSource);
   }
-  for (const entry of ["testing", "ai-sdk"]) {
+  for (const entry of ["testing", "ai-sdk", "langchain"]) {
     writeFileSync(path.join(sdk, `${entry}.mjs`), "export const loaded=true;");
     writeFileSync(path.join(sdk, `${entry}.cjs`), "exports.loaded=true;");
   }
@@ -165,6 +171,7 @@ const sdk=await load('@solwyn/sdk');
 const node=await load('@solwyn/sdk/node');
 const testing=await load('@solwyn/sdk/testing');
 const ai=await load('@solwyn/sdk/ai-sdk');
+const langchain=await load('@solwyn/sdk/langchain');
 let artifactIdentity;
 ${source}
 process.stdout.write(JSON.stringify(artifactIdentity));
@@ -190,7 +197,7 @@ it.each([
     manifestRealpath: realpathSync(path.join(sdk, "package.json")),
     entries: expectedEntries,
     entryRealpaths: Object.fromEntries(
-      ["index", "node", "testing", "ai-sdk"].map((entry, index) => [
+      ["index", "node", "testing", "ai-sdk", "langchain"].map((entry, index) => [
         expectedEntries[index],
         realpathSync(path.join(sdk, `${entry}.${format === "esm" ? "mjs" : "cjs"}`)),
       ]),

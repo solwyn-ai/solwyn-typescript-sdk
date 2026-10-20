@@ -74,7 +74,8 @@ it.each(["js", "cjs"])("rejects Node builtins hidden in a shared %s chunk", asyn
   try {
     await mkdir(join(root, "ai-sdk"));
     await mkdir(join(root, "testing"));
-    for (const entry of ["index", "ai-sdk/index", "testing/index"]) {
+    await mkdir(join(root, "langchain"));
+    for (const entry of ["index", "ai-sdk/index", "testing/index", "langchain/index"]) {
       await writeFile(join(root, `${entry}.${extension}`), "");
     }
     await writeFile(

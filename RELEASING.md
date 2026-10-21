@@ -295,7 +295,18 @@ because its convenience mode builds and packs a different tarball.
 
 ## Tag and approve
 
-Create an annotated tag only after the release commit and local gates are approved:
+Create an annotated tag only after the release commit and local gates are approved, and only after
+a successful `push`-event `CI` run exists for that exact commit on `main`:
+
+```bash
+gh run list --workflow CI --branch main --event push --commit "$(git rev-parse HEAD)" \
+  --json conclusion --jq '.[].conclusion'
+```
+
+GitHub occasionally drops push events, leaving a merged commit with no `CI` run. A re-run or
+manual `CI` dispatch does not satisfy the publish gate, and the release-tag ruleset prevents
+moving a pushed tag. If the run is missing, merge a new commit to `main`, confirm its push run
+succeeds, and tag that commit instead.
 
 ```bash
 git tag -a vX.Y.Z -m "vX.Y.Z"

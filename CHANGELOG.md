@@ -9,6 +9,17 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-21
+
+Public-preview minor release adding content-free attribution for LangChain.js / LangGraph.js and
+OpenAI Agents JS, plus OpenTelemetry trace correlation on metadata events. New optional peers can
+cause npm `ERESOLVE` in applications that already pin out-of-range framework versions, and
+coverage fingerprints for several providers change; review **Changed** before upgrading.
+
+Your LLM calls go directly to your provider. Solwyn receives usage and operational metadata,
+plus tags you explicitly supply. Prompt and response content is not sent to Solwyn or logged by
+the SDK. The new framework entries and trace correlation read no prompt or response content.
+
 ### Added
 
 - **OpenAI Agents JS attribution.** The new `@solwyn/sdk/openai-agents` entry adds content-free
@@ -53,23 +64,6 @@ corresponding release notes before users upgrade.
   three values from the active span. Events without an active span are unchanged. Disable
   capture with `traceCorrelation: false` or `SOLWYN_TRACE_CORRELATION=false`.
 
-### Fixed
-
-- Attribute additional Anthropic streaming cache writes using the served request's TTL when
-  it agrees with the initial usage split, including streams that start without cache writes.
-  Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
-  and conservative handling of unknown TTLs or decreasing totals are preserved.
-
-- **Settlement after per-call streaming errors.** Ordinary mid-stream provider errors on streams
-  using per-call budget checks now settle provider-reported usage observed before the error and
-  include those tokens in the error event. Cloud spend can increase for such calls, including
-  failed Google streaming continuation hops. Lease-funded streams, the default for untagged
-  run-scoped text calls, still report zero usage on mid-stream provider errors and release the
-  local claim. Buffered Google continuation keeps its documented limitation: earlier-hop usage
-  is unavailable if a later hop fails. Set `config.automaticContinuation: false` for
-  application-controlled admission and settlement between hops. Deferred `responses.stream`
-  helpers report a zero-token error event with no confirmation.
-
 ### Changed
 
 - **Public-preview compatibility:** The new optional `@openai/agents >=0.20.0 <1` peer can cause
@@ -102,6 +96,23 @@ corresponding release notes before users upgrade.
   `acknowledgeUntracked` tokens remain valid. Review and refresh pinned
   `coverage(client).expect(...)` fingerprints for OpenAI, Azure, Anthropic, Together, Google
   GenAI and Bedrock when upgrading, even with unchanged provider SDK versions.
+
+### Fixed
+
+- Attribute additional Anthropic streaming cache writes using the served request's TTL when
+  it agrees with the initial usage split, including streams that start without cache writes.
+  Mixed-TTL requests now mark inferred cache-write growth estimated. Explicit per-TTL usage
+  and conservative handling of unknown TTLs or decreasing totals are preserved.
+
+- **Settlement after per-call streaming errors.** Ordinary mid-stream provider errors on streams
+  using per-call budget checks now settle provider-reported usage observed before the error and
+  include those tokens in the error event. Cloud spend can increase for such calls, including
+  failed Google streaming continuation hops. Lease-funded streams, the default for untagged
+  run-scoped text calls, still report zero usage on mid-stream provider errors and release the
+  local claim. Buffered Google continuation keeps its documented limitation: earlier-hop usage
+  is unavailable if a later hop fails. Set `config.automaticContinuation: false` for
+  application-controlled admission and settlement between hops. Deferred `responses.stream`
+  helpers report a zero-token error event with no confirmation.
 
 ## [0.1.1] — 2026-10-17
 
@@ -662,7 +673,8 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0-rc.1...v0.1.0
 [0.1.0-rc.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/releases/tag/v0.1.0-rc.1

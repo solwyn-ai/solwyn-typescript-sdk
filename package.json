@@ -1,6 +1,6 @@
 {
   "name": "@solwyn/sdk",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Usage metadata and budget controls for OpenAI, Anthropic, Google, Bedrock, compatible clients, AI SDK, LangChain, and OpenAI Agents; failover for wrapped provider clients.",
   "license": "Apache-2.0",
   "repository": {

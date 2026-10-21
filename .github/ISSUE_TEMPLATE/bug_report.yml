@@ -27,7 +27,7 @@ body:
     attributes:
       label: SDK version
       description: Provide the exact installed `@solwyn/sdk` version, not a range or dist-tag.
-      placeholder: 0.1.1
+      placeholder: 0.2.0
     validations:
       required: true
 

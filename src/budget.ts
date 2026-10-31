@@ -59,6 +59,7 @@ import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
 import { positiveOutputBound } from "./output-bound";
 import { handleReadOnlyKeyError, isReadOnlyKeyError } from "./read-only-key";
+import { ORDINARY_TOKEN_COUNT_MAX } from "./receipt-fold";
 import {
   RELEASE_DROP_REASONS,
   type ReleaseAttempt,
@@ -830,6 +831,14 @@ export class BudgetEnforcer {
     if (options.modality !== undefined) {
       request.modality = options.modality;
     }
+    // Text calls price their output at the same structural bound the lease path reserves. A cap
+    // above the wire maximum is sent as that maximum, as the denial receipt does.
+    if (options.modality === undefined || options.modality === "text") {
+      request.estimated_output_bound = Math.min(
+        this.outputBoundFor(options),
+        ORDINARY_TOKEN_COUNT_MAX,
+      );
+    }
     if (options.estimatedMedia !== null && options.estimatedMedia !== undefined) {
       request.estimated_media = options.estimatedMedia;
     }
@@ -1087,9 +1096,7 @@ export class BudgetEnforcer {
       tagged: tags !== null && tags !== undefined,
       requestedCallId: checkOptions.callId,
       estimatedInputTokens: checkOptions.estimatedInputTokens,
-      estimatedOutputBound:
-        positiveOutputBound(checkOptions.estimatedOutputBound) ??
-        this.leaseLedger.outputBoundDefault,
+      estimatedOutputBound: this.outputBoundFor(checkOptions),
       model: checkOptions.model,
       provider: checkOptions.provider,
       fallbackProviders,
@@ -2498,14 +2505,24 @@ export class BudgetEnforcer {
     this.lastHardDenyResponse = response;
   }
 
-  /** Server-priced chain identity. Estimates, timeout, and run id are deliberately excluded. */
+  /** The positive output bound a check reserves, or the configured default. */
+  private outputBoundFor(options: CheckBudgetOptions): number {
+    return positiveOutputBound(options.estimatedOutputBound) ?? this.leaseLedger.outputBoundDefault;
+  }
+
+  /**
+   * Server-priced chain identity plus the text output bound, so an allow for a small bound never
+   * admits a larger one. Input estimates, timeout, and run id are deliberately excluded.
+   */
   private allowCacheKey(options: CheckBudgetOptions): string {
+    const modality = options.modality ?? "text";
     return JSON.stringify([
       options.provider,
       options.model,
       options.fallbackProviders ?? [],
       options.fallbackModels ?? [],
-      options.modality ?? "text",
+      modality,
+      modality === "text" ? this.outputBoundFor(options) : null,
     ]);
   }
 

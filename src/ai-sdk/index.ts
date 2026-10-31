@@ -19,7 +19,7 @@
  * machinery — {@link BudgetEnforcer} (pre-flight check + confirm builder), {@link MetadataReporter}
  * (usage telemetry), config resolution, and the privacy length estimators — behind the
  * documented AI SDK middleware interface (`LanguageModelV2Middleware`, exported by the `ai`
- * package as the version-relaxed `LanguageModelMiddleware`): `wrapGenerate` /
+ * package as the version-relaxed `LanguageModelMiddleware`): `transformParams`, `wrapGenerate` /
  * `wrapStream`.
  *
  * EDGE-SAFE: web-standard APIs only (`crypto.randomUUID`, `performance.now`, web
@@ -37,7 +37,7 @@ import { safeErrorClassName } from "../error-class";
 import { ConfigurationError, RunStoppedError, SolwynError } from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
-import { resolveAiSdkOutputBound } from "../output-bound";
+import { applyAiSdkOutputBound, resolveAiSdkOutputBound } from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
@@ -1414,6 +1414,9 @@ export function createSolwynMiddleware(
 
   return {
     middleware: {
+      // The reserved output bound must be true: an uncapped call is sent with the default cap.
+      transformParams: async ({ params }) =>
+        applyAiSdkOutputBound(params, config.lease_output_bound_default),
       wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
       wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
     },

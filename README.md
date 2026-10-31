@@ -14,7 +14,7 @@ explicitly supply. Prompt and response content is not sent to Solwyn or logged b
 [Providers](#providers) · [Vercel AI SDK](#vercel-ai-sdk) · [Framework integrations](#framework-integrations) ·
 [Configuration](#configuration) · [Data transparency](#data-transparency)
 
-> **Public preview (`0.2.0`).** Install from npm's default `latest` tag. APIs may change before
+> **Public preview (`0.3.0`).** Install from npm's default `latest` tag. APIs may change before
 > 1.0; breaking changes are announced in the [changelog](CHANGELOG.md) and release notes before
 > users upgrade.
 

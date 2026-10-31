@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { resolveAiSdkOutputBound, resolveEffectiveOutputBound } from "../../src/output-bound";
+import {
+  applyAiSdkOutputBound,
+  applyOutputBound,
+  resolveAiSdkOutputBound,
+  resolveEffectiveOutputBound,
+} from "../../src/output-bound";
 
 const DEFAULT_BOUND = 4096;
 
@@ -291,5 +296,60 @@ describe("AI SDK output bound", () => {
     [Number.MAX_SAFE_INTEGER + 1, 777],
   ])("maps maxOutputTokens=%j to %i", (maxOutputTokens, expected) => {
     expect(resolveAiSdkOutputBound({ maxOutputTokens }, 777)).toBe(expected);
+  });
+});
+
+describe("applyOutputBound", () => {
+  const openai = { dialect: "openai", provider: "openai", bound: 4096 } as const;
+
+  it("returns a request with a positive cap untouched, by identity", () => {
+    const request = Object.freeze({ model: "gpt-4o", max_tokens: 10 });
+    expect(applyOutputBound(request, { ...openai, model: "gpt-4o" })).toBe(request);
+    const google = Object.freeze({ config: Object.freeze({ maxOutputTokens: 5 }) });
+    expect(applyOutputBound(google, { ...openai, dialect: "google", model: "gemini" })).toBe(
+      google,
+    );
+  });
+
+  it("replaces malformed OpenAI caps with the model's key without mutating the caller", () => {
+    const request = Object.freeze({ max_tokens: "100", max_completion_tokens: null });
+    expect(applyOutputBound(request, { ...openai, model: "gpt-5-mini" })).toEqual({
+      max_completion_tokens: 4096,
+    });
+    expect(applyOutputBound(request, { ...openai, provider: "groq", model: "gpt-5-mini" })).toEqual(
+      { max_tokens: 4096 },
+    );
+    expect(request).toEqual({ max_tokens: "100", max_completion_tokens: null });
+  });
+
+  it("uses max_output_tokens on Responses and ignores chat keys there", () => {
+    expect(
+      applyOutputBound({ max_tokens: 7 }, { ...openai, model: "gpt-4o", responses: true }),
+    ).toEqual({ max_tokens: 7, max_output_tokens: 4096 });
+  });
+
+  it("merges into Google config and Bedrock inferenceConfig, leaving malformed containers", () => {
+    expect(
+      applyOutputBound(
+        { config: { temperature: 1 } },
+        { ...openai, dialect: "google", model: "g" },
+      ),
+    ).toEqual({ config: { temperature: 1, maxOutputTokens: 4096 } });
+    expect(applyOutputBound({}, { ...openai, dialect: "bedrock", model: "b" })).toEqual({
+      inferenceConfig: { maxTokens: 4096 },
+    });
+    const malformed = { inferenceConfig: [1] };
+    expect(applyOutputBound(malformed, { ...openai, dialect: "bedrock", model: "b" })).toBe(
+      malformed,
+    );
+  });
+
+  it("caps AI SDK params only when maxOutputTokens is not positive", () => {
+    const capped = { prompt: [], maxOutputTokens: 9 };
+    expect(applyAiSdkOutputBound(capped, 4096)).toBe(capped);
+    expect(applyAiSdkOutputBound({ prompt: [], maxOutputTokens: 0 }, 4096)).toEqual({
+      prompt: [],
+      maxOutputTokens: 4096,
+    });
   });
 });

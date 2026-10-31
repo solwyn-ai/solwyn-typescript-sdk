@@ -57,5 +57,14 @@ If a grant is refused with 409, or a renewal comes back ineligible, the run uses
 for at most 150 seconds; after an ineligible renewal the SDK releases its lease and acquires a
 new one as soon as the release is confirmed. An ineligible initial grant keeps the run on
 per-call checks.
-Set `leaseOutputBoundDefault` (default `4096`) to change the fallback reservation when a request
-does not expose a usable structural output cap.
+
+**Output bound.** Every text call reserves estimated input plus an output bound, on both the
+lease and the per-call path. The per-call check sends it as `estimated_output_bound`, and Solwyn
+Cloud prices that many output tokens at the model's output rate. A positive cap you set is the
+bound: `max_tokens`, `max_completion_tokens`, Responses `max_output_tokens`, Anthropic
+`max_tokens`, Google `config.maxOutputTokens`, Bedrock `inferenceConfig.maxTokens`, or AI SDK
+`maxOutputTokens`, including caps from `defaultParams`. With failover, the bound is the largest
+cap any configured hop can use. A request with no positive cap is sent to the provider with
+`leaseOutputBoundDefault` (default `4096`) as its cap, so the call cannot produce more output than
+it reserved. Raise `leaseOutputBoundDefault`, or set a cap per call, when a model needs longer
+output. Reasoning models count reasoning tokens against the cap.

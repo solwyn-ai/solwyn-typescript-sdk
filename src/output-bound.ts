@@ -201,3 +201,71 @@ export function resolveAiSdkOutputBound(params: unknown, defaultBound: number): 
     return defaultBound;
   }
 }
+
+function withPositiveCap(
+  request: Record<string, unknown>,
+  key: string,
+  bound: number,
+): Record<string, unknown> {
+  if (positiveOutputBound(request[key]) !== null) return request;
+  return { ...request, [key]: bound };
+}
+
+function withNestedPositiveCap(
+  request: Record<string, unknown>,
+  outerKey: string,
+  innerKey: string,
+  bound: number,
+): Record<string, unknown> {
+  const outer = request[outerKey];
+  if (outer !== undefined && outer !== null && (!isObject(outer) || Array.isArray(outer))) {
+    return request;
+  }
+  const inner = isObject(outer) ? (outer as Record<string, unknown>) : {};
+  if (positiveOutputBound(inner[innerKey]) !== null) return request;
+  return { ...request, [outerKey]: { ...inner, [innerKey]: bound } };
+}
+
+export interface ApplyOutputBoundOptions {
+  readonly dialect: Dialect;
+  readonly provider: string;
+  readonly model: string;
+  readonly bound: number;
+  readonly responses?: boolean;
+}
+
+/**
+ * Make the reserved output bound true on one final provider request. A request that already
+ * carries a positive output cap is returned untouched. Otherwise the dialect's cap key is set to
+ * `bound`, replacing an absent, null, non-positive or non-integer value. A malformed Google
+ * `config` or Bedrock `inferenceConfig` container is left for the provider SDK to reject.
+ */
+export function applyOutputBound(
+  request: Record<string, unknown>,
+  options: ApplyOutputBoundOptions,
+): Record<string, unknown> {
+  const { dialect, provider, model, bound } = options;
+  if (options.responses === true) return withPositiveCap(request, "max_output_tokens", bound);
+  if (dialect === "openai") {
+    const cap = Object.hasOwn(request, "max_completion_tokens")
+      ? request["max_completion_tokens"]
+      : request["max_tokens"];
+    if (positiveOutputBound(cap) !== null) return request;
+    const capped = { ...request };
+    delete capped["max_tokens"];
+    delete capped["max_completion_tokens"];
+    capped[usesOpenaiCompletionTokens(provider, model) ? "max_completion_tokens" : "max_tokens"] =
+      bound;
+    return capped;
+  }
+  if (dialect === "anthropic") return withPositiveCap(request, "max_tokens", bound);
+  if (dialect === "google")
+    return withNestedPositiveCap(request, "config", "maxOutputTokens", bound);
+  return withNestedPositiveCap(request, "inferenceConfig", "maxTokens", bound);
+}
+
+/** The AI SDK call option equivalent of {@link applyOutputBound}. */
+export function applyAiSdkOutputBound<T extends object>(params: T, bound: number): T {
+  if (positiveOutputBound(Reflect.get(params, "maxOutputTokens")) !== null) return params;
+  return { ...params, maxOutputTokens: bound };
+}

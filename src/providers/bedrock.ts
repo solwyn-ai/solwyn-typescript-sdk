@@ -88,6 +88,22 @@ function commandConstructor(value: unknown): CommandConstructor | null {
 }
 
 /**
+ * Bedrock's case of `applyOutputBound` (`output-bound.ts`), kept local so this lazily loaded
+ * adapter chunk imports nothing new. Returns `input` itself when it already carries a positive
+ * `inferenceConfig.maxTokens` or a malformed `inferenceConfig`.
+ */
+function withOutputCap(input: Record<string, unknown>, bound: number): Record<string, unknown> {
+  const config = input["inferenceConfig"];
+  if (config !== undefined && config !== null && (!isObject(config) || Array.isArray(config))) {
+    return input;
+  }
+  const inner = isObject(config) ? config : {};
+  const cap = inner["maxTokens"];
+  if (typeof cap === "number" && Number.isSafeInteger(cap) && cap > 0) return input;
+  return { ...input, inferenceConfig: { ...inner, maxTokens: bound } };
+}
+
+/**
  * Resolve the command instance to dispatch for one hop, including model overrides.
  *
  * The customer's ORIGINAL command travels through the pipeline under
@@ -95,6 +111,9 @@ function commandConstructor(value: unknown): CommandConstructor | null {
  * PRIMARY. The pipeline's merged `kwargs["model"]` is the model this hop must actually serve
  * (`hop.model` — the primary's own model on the primary hop, a fallback entry's model on a
  * bedrock→bedrock failover hop). `entryDefaults` is the served entry's `default_params`.
+ *
+ * `outputBound` makes the reserved output bound true: when the merged input carries no positive
+ * `inferenceConfig.maxTokens`, the rebuilt sibling carries `outputBound` there.
  *
  * When no model/cap mutation, reserved tags, or non-empty entry defaults are in play, the
  * customer's original command is returned by identity (passed to `send` untouched, preserving
@@ -111,6 +130,7 @@ function resolveConverseCommand(
   command: Record<string, unknown>,
   kwargs: Record<string, unknown>,
   entryDefaults: Record<string, unknown> | undefined,
+  outputBound: number | undefined,
 ): unknown {
   const input = getProp(command, "input");
   const originalInput = isObject(input) ? input : {};
@@ -128,10 +148,15 @@ function resolveConverseCommand(
     getProp(getProp(sanitizedInput, "inferenceConfig"), "maxTokens"),
   );
 
-  if (!modelOverridden && !hasDefaults && !hasReservedTags && !capChanged) {
+  const mergedInput: Record<string, unknown> = { ...defaults, ...sanitizedInput };
+  const cappedInput =
+    outputBound === undefined ? mergedInput : withOutputCap(mergedInput, outputBound);
+  const capInjected = cappedInput !== mergedInput;
+
+  if (!modelOverridden && !hasDefaults && !hasReservedTags && !capChanged && !capInjected) {
     return command;
   }
-  const rebuiltInput: Record<string, unknown> = { ...defaults, ...sanitizedInput };
+  const rebuiltInput: Record<string, unknown> = { ...cappedInput };
   rebuiltInput["modelId"] = typeof servedModel === "string" ? servedModel : originalModelId;
   delete rebuiltInput["stream"];
   delete rebuiltInput["solwyn_tags"];
@@ -503,7 +528,12 @@ export class BedrockAdapter implements ProviderAdapter {
       });
     }
     const fn = send as DispatchMethod;
-    const dispatchCommand = resolveConverseCommand(command, kwargs, options.entryDefaultParams);
+    const dispatchCommand = resolveConverseCommand(
+      command,
+      kwargs,
+      options.entryDefaultParams,
+      options.outputBound,
+    );
     return (...passthroughArgs) => {
       const requestOptions = mergeProviderRequestOptions(passthroughArgs, {
         requestTimeout: providerTimeoutMilliseconds(options.timeout),

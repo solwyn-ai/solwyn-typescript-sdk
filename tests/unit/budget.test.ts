@@ -443,6 +443,7 @@ describe("buildCheckRequest", () => {
     });
     expect(req).toEqual({
       estimated_input_tokens: 42,
+      estimated_output_bound: 4096,
       model: "gpt-4o",
       provider: "openai",
       fallback_providers: [],
@@ -454,6 +455,7 @@ describe("buildCheckRequest", () => {
     // No cross-shape leakage (e.g. project_id / reservation_id).
     expect(Object.keys(req).sort()).toEqual([
       "estimated_input_tokens",
+      "estimated_output_bound",
       "failover_directive_version",
       "fallback_models",
       "fallback_providers",

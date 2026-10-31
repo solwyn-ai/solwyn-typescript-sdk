@@ -499,6 +499,7 @@ describe("SolwynCore — native primary request bags", () => {
       model: "primary-model",
       messages: caller.messages,
       unrelated: "caller",
+      max_tokens: 4096,
     });
     expect(primaryKwargs).not.toHaveProperty("solwyn_tags");
     expect(fallback.chat.completions.create).toHaveBeenCalledOnce();
@@ -513,6 +514,7 @@ describe("SolwynCore — native primary request bags", () => {
       model: "fallback-model",
       messages: caller.messages,
       unrelated: "caller",
+      max_tokens: 4096,
     });
     await solwyn.close();
   });
@@ -568,6 +570,7 @@ describe("SolwynCore — native primary request bags", () => {
       model: "primary-model",
       messages: caller.messages,
       caller_unrelated: "caller",
+      max_tokens: 4096,
     });
     expect(primaryKwargs).not.toHaveProperty("solwyn_tags");
     expect(fallback.chat.completions.create).toHaveBeenCalledOnce();
@@ -577,6 +580,7 @@ describe("SolwynCore — native primary request bags", () => {
       model: "fallback-model",
       messages: caller.messages,
       caller_unrelated: "caller",
+      max_tokens: 4096,
     });
     expect(fallbackKwargs).not.toHaveProperty("solwyn_tags");
     expect(defaults).toEqual(defaultsBefore);
@@ -897,7 +901,7 @@ describe("SolwynCore — text-call tags", () => {
     expect(ingested[0]).toMatchObject({ tags: { customer: "acme", environment: "test" } });
     expect(ingested[0]).not.toHaveProperty("agent_run_id");
     expect(create).toHaveBeenCalledWith(
-      { model: "gpt-4o", messages: [], temperature: 0.2 },
+      { model: "gpt-4o", messages: [], temperature: 0.2, max_tokens: 4096 },
       { timeout: 600_000, maxRetries: 0 },
     );
     expect(caller).toEqual({ model: "gpt-4o", messages: [], solwyn_tags: { customer: "acme" } });

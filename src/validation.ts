@@ -214,6 +214,7 @@ export const BudgetCheckRequestObjectSchema = z.strictObject({
   model: z.string().max(MODEL_NAME_MAX_LENGTH),
   provider: ProviderNameSchema,
   modality: ModalitySchema.default("text"),
+  estimated_output_bound: z.number().int().min(0).max(100_000_000).nullable().optional(),
   fallback_providers: z.array(ProviderNameSchema).default(() => []),
   fallback_models: z
     .array(z.string().max(MODEL_NAME_MAX_LENGTH))

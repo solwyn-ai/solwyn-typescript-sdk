@@ -169,6 +169,12 @@ export interface PrepareCallOptions {
    * `defaultParams` is configured (the primary entry's own `default_params` is always `{}`).
    */
   entryDefaultParams?: Record<string, unknown>;
+  /**
+   * Output cap applied when the final request carries no positive one, so the reserved output
+   * bound holds. ONLY the Bedrock adapter consumes it, on its rebuilt command input; the
+   * dispatcher has already applied it to every other adapter's merged kwargs.
+   */
+  outputBound?: number;
 }
 
 /** A bound provider-SDK method (never invoked inside an adapter). */

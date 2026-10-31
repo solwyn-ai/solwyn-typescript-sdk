@@ -2416,6 +2416,7 @@ describe("proxies — Bedrock send(command) interception (AWS SDK v3)", () => {
     const command = new ConverseCommand({
       modelId: "anthropic.claude-3-5-sonnet-20241022-v2:0",
       messages: [],
+      inferenceConfig: { maxTokens: 256 },
     });
     const send = vi.fn((_command: unknown) => rawResponse);
     const client = bedrockClient(send);
@@ -2662,6 +2663,7 @@ describe("proxies — Bedrock send(command) interception (AWS SDK v3)", () => {
     const command = new ConverseStreamCommand({
       modelId: "meta.llama3-1-70b-instruct-v1:0",
       messages: [],
+      inferenceConfig: { maxTokens: 256 },
     });
     // v3 ConverseStream output exposes its events as an async-iterable `.stream` property.
     const send = vi.fn((_command: unknown) => ({ stream: eventStream() }));
@@ -2913,6 +2915,7 @@ describe("proxies — Bedrock send(command) interception (AWS SDK v3)", () => {
     const command = new ConverseCommand({
       modelId: "anthropic.claude-3-5-sonnet-20241022-v2:0",
       messages: [],
+      inferenceConfig: { maxTokens: 256 },
       stream: true,
     });
     const result = await (solwyn as unknown as { send(c: unknown): Promise<unknown> }).send(

@@ -78,7 +78,11 @@ import {
   safeExtractServiceTier,
 } from "./fail-soft";
 import { consoleLogger, type Logger } from "./logging";
-import { normalizeOpenaiOutputCap, resolveEffectiveOutputBound } from "./output-bound";
+import {
+  applyOutputBound,
+  normalizeOpenaiOutputCap,
+  resolveEffectiveOutputBound,
+} from "./output-bound";
 import {
   estimateContentLength,
   estimateResponsesContentLength,
@@ -3935,6 +3939,18 @@ export class SolwynCore {
         };
       }
     }
+    // The reserved output bound must be true: a final hop request with no positive output cap
+    // gets the configured default as its cap. Bedrock applies this to its rebuilt command input.
+    const outputBound = this.#config.lease_output_bound_default;
+    if (runtime.adapter.dialect !== "bedrock") {
+      merged = applyOutputBound(merged, {
+        dialect: runtime.adapter.dialect,
+        provider: runtime.adapter.name,
+        model: typeof merged["model"] === "string" ? merged["model"] : "",
+        bound: outputBound,
+        responses: surface === "responses",
+      });
+    }
     const dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
       surface,
       isStreaming,
@@ -3955,6 +3971,7 @@ export class SolwynCore {
       // command input still WINS over both). Every other adapter ignores this field (their `merged`
       // bag already carries the fill-absent result).
       entryDefaultParams,
+      outputBound,
       responsesLeaf,
     });
     return dispatch(...passthroughArgs);

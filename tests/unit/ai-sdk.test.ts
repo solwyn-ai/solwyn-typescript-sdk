@@ -965,7 +965,13 @@ describe("ai-sdk middleware — generateText happy path", () => {
   it.each([
     ["alibaba.chat", "qwen3.5-plus", {}, "reasoning_without_budget"],
     ["xai.chat", "grok-4", {}, "reasoning_without_budget"],
-    ["openai.chat", "gpt-4o", { openai: { maxCompletionTokens: 9000 } }, "client_body_override"],
+    ["openai.chat", "gpt-4o", { openai: { maxCompletionTokens: 9000 } }, "unsupported_override"],
+    [
+      "anthropic.messages",
+      "claude-sonnet-4-5",
+      { anthropic: { thinking: { type: "enabled", budgetTokens: 1024 } } },
+      "unsupported_override",
+    ],
   ] as const)("refuses %s under hard_deny when the bound cannot hold (%s)", async (providerId, modelId, providerOptions, reason) => {
     const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
     const solwyn = createSolwynMiddleware({
@@ -995,6 +1001,94 @@ describe("ai-sdk middleware — generateText happy path", () => {
     expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
     expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
     expect(doGenerate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["anthropic.messages", "claude-sonnet-4-5", { reasoning: "high" }, "reasoning_without_budget"],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      { reasoning: "low" },
+      "reasoning_without_budget",
+    ],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      {
+        maxOutputTokens: 100,
+        providerOptions: { bedrock: { inferenceConfig: { maxTokens: 9000 } } },
+      },
+      "unsupported_override",
+    ],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      {
+        maxOutputTokens: 100,
+        providerOptions: { bedrock: { additionalModelRequestFields: { max_tokens: 9000 } } },
+      },
+      "unsupported_override",
+    ],
+    ["openai.chat", "gpt-4o", { maxOutputTokens: 200_000_001 }, "bound_exceeded"],
+  ] as const)("refuses %s under hard_deny before the model is called (%j)", async (providerId, modelId, options, reason) => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const doGenerate = vi.fn(
+      async (): Promise<V3GenerateResult> => ({
+        content: [{ type: "text", text: "hi" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: usage(4, 2),
+        warnings: [],
+      }),
+    );
+    const model = new MockLanguageModelV3({ provider: providerId, modelId, doGenerate });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    const error = await generateText({
+      model: wrapped,
+      prompt: "one",
+      ...(options as object),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    await solwyn.close();
+    expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
+    expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
+    expect(doGenerate).not.toHaveBeenCalled();
+    if (reason === "bound_exceeded") {
+      expect(captured.checks[0]?.["estimated_output_bound"]).toBe(100_000_000);
+    }
+  });
+
+  it("allows an OpenAI reasoning effort, which stays inside the cap", async () => {
+    const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const seen: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "o4-mini",
+      doGenerate: async (options): Promise<V3GenerateResult> => {
+        seen.push(options.maxOutputTokens);
+        return {
+          content: [{ type: "text", text: "hi" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: usage(4, 2),
+          warnings: [],
+        };
+      },
+    });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    await generateText({ model: wrapped, prompt: "one", reasoning: "high" } as never);
+    await solwyn.close();
+    expect(seen).toEqual([4096]);
   });
 
   it("treats an empty reservation id as event-only", async () => {

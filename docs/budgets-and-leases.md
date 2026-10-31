@@ -83,9 +83,27 @@ produce more output than the bound, the call fails before it reaches the provide
 | `malformed_cap_container` | Google `config` or Bedrock `inferenceConfig` or `additionalModelRequestFields` is not an object |
 | `malformed_candidate_count` | `n` or `candidateCount` is not a positive integer |
 | `reasoning_without_budget` | Qwen with thinking not turned off (`enable_thinking: false`) and no positive `thinking_budget`; an xAI reasoning model (xAI caps leave reasoning out and take no budget); Qwen or an xAI reasoning model through the AI SDK |
-| `client_body_override` | a Google client's `httpOptions.extraBody` sets `generationConfig`; Bedrock `additionalModelRequestFields` sets a token limit or count; AI SDK `providerOptions` set a token limit or count |
+| `unsupported_override` | a body extension carries a key Solwyn cannot account for (see below) |
 | `azure_api_version` | an uncapped Azure OpenAI call on an api-version older than 2024-09-01 |
 | `bound_exceeded` | the final request can still produce more than the bound, for example a cap above 100,000,000 |
+
+On a hard_deny project, body-extension channels may carry only keys Solwyn counts in the bound;
+any other key, including `model`, refuses the call with `unsupported_override`:
+
+- OpenAI chat: create params outside the typed set the `openai` SDK defines (JavaScript sends
+  unknown params as body keys). Qwen may add `enable_thinking` and `thinking_budget`.
+- OpenAI Responses and Anthropic messages: create params outside their typed sets.
+- OpenAI and Anthropic clients: a client-level `fetchOptions.body`, which replaces the serialized
+  body. A per-request `fetchOptions.body` is rejected on every project.
+- Google: a client-level `httpOptions.extraBody` with any key. A per-request `extraBody` is
+  rejected on every project.
+- Bedrock `additionalModelRequestFields`: any key except `thinking`.
+- AI SDK `providerOptions`: any key, at any depth.
+
+In the AI SDK middleware, a call-level `reasoning` effort other than `none` refuses with
+`reasoning_without_budget` except on OpenAI and Azure OpenAI, because other adapters can add a
+thinking budget on top of `maxOutputTokens`. The cap the model receives must also fit the bound
+the check reserved, or the call refuses with `bound_exceeded`.
 
 Azure OpenAI gets `max_completion_tokens`, which api-versions from 2024-09-01 accept for every
 chat deployment. A deployment name never selects the parameter, and an explicit

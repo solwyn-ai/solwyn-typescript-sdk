@@ -337,18 +337,123 @@ export function applyOutputBound(
   return withNestedPositiveCap(request, "inferenceConfig", "maxTokens", bound);
 }
 
-/** Model-native Bedrock body keys that can raise the output limit or the candidate count. */
-const BEDROCK_OVERRIDE_KEYS = [
+// Under hard_deny admission a body-extension channel may carry only keys the SDK accounts for in the
+// bound. JavaScript provider SDKs send unknown create params as top-level body keys, so for the
+// OpenAI and Anthropic dialects the extension is every key outside the typed create params
+// (openai 7.36 and @anthropic-ai/sdk 0.135).
+const OPENAI_CHAT_PARAMS = new Set([
+  "audio",
+  "frequency_penalty",
+  "function_call",
+  "functions",
+  "logit_bias",
+  "logprobs",
+  "max_completion_tokens",
   "max_tokens",
-  "maxTokens",
-  "max_gen_len",
-  "max_new_tokens",
-  "max_output_tokens",
-  "maxOutputTokens",
+  "messages",
+  "metadata",
+  "modalities",
+  "model",
+  "moderation",
   "n",
-  "candidateCount",
-  "num_return_sequences",
-] as const;
+  "parallel_tool_calls",
+  "prediction",
+  "presence_penalty",
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "prompt_cache_retention",
+  "reasoning_effort",
+  "response_format",
+  "safety_identifier",
+  "seed",
+  "service_tier",
+  "stop",
+  "store",
+  "stream",
+  "stream_options",
+  "temperature",
+  "tool_choice",
+  "tools",
+  "top_logprobs",
+  "top_p",
+  "user",
+  "verbosity",
+  "web_search_options",
+]);
+const OPENAI_RESPONSES_PARAMS = new Set([
+  "access_programs",
+  "background",
+  "context_management",
+  "conversation",
+  "include",
+  "input",
+  "instructions",
+  "max_output_tokens",
+  "metadata",
+  "model",
+  "moderation",
+  "parallel_tool_calls",
+  "previous_response_id",
+  "prompt",
+  "prompt_cache_key",
+  "prompt_cache_options",
+  "prompt_cache_retention",
+  "reasoning",
+  "safety_identifier",
+  "service_tier",
+  "store",
+  "stream",
+  "stream_options",
+  "temperature",
+  "text",
+  "tool_choice",
+  "tools",
+  "top_logprobs",
+  "top_p",
+  "truncation",
+  "user",
+]);
+const ANTHROPIC_PARAMS = new Set([
+  "cache_control",
+  "container",
+  "diagnostics",
+  "inference_geo",
+  "max_tokens",
+  "messages",
+  "metadata",
+  "model",
+  "output_config",
+  "service_tier",
+  "speed",
+  "stop_sequences",
+  "stream",
+  "system",
+  "temperature",
+  "thinking",
+  "tool_choice",
+  "tools",
+  "top_k",
+  "top_p",
+  "user_profile_id",
+  "workspace_id",
+]);
+/** Qwen's reasoning switches are body extensions the bound folds in. */
+const QWEN_EXTENSION_KEYS = new Set(["enable_thinking", "thinking_budget"]);
+/** Bedrock `additionalModelRequestFields` keys: Anthropic `thinking`, bounded by maxTokens. */
+const BEDROCK_EXTENSION_KEYS = new Set(["thinking"]);
+
+function onlyKnownKeys(
+  request: Record<string, unknown>,
+  known: ReadonlySet<string>,
+  extensions: ReadonlySet<string>,
+  provider: string,
+): void {
+  for (const key of Object.keys(request)) {
+    if (!known.has(key) && !extensions.has(key)) refuse(provider, "unsupported_override");
+  }
+}
+
+const NO_KEYS: ReadonlySet<string> = new Set();
 
 /** Azure api-versions from this date accept `max_completion_tokens` for every chat deployment. */
 const AZURE_COMPLETION_TOKENS_SINCE = "2024-09-01";
@@ -409,7 +514,19 @@ export function enforceOutputBound(
   hop: HopOutputEnforcement,
 ): Record<string, unknown> {
   const { dialect, provider } = hop;
-  if (hop.clientBodyOverride === true) refuse(provider, "client_body_override");
+  if (hop.clientBodyOverride === true) refuse(provider, "unsupported_override");
+  if (hop.responses === true) {
+    onlyKnownKeys(request, OPENAI_RESPONSES_PARAMS, NO_KEYS, provider);
+  } else if (dialect === "openai") {
+    onlyKnownKeys(
+      request,
+      OPENAI_CHAT_PARAMS,
+      provider === "qwen" ? QWEN_EXTENSION_KEYS : NO_KEYS,
+      provider,
+    );
+  } else if (dialect === "anthropic") {
+    onlyKnownKeys(request, ANTHROPIC_PARAMS, NO_KEYS, provider);
+  }
   if (dialect === "google") {
     const config = presentValue(request, "config");
     if (config !== undefined && config !== null && !isPlainContainer(config)) {
@@ -424,9 +541,7 @@ export function enforceOutputBound(
     const extra = presentValue(request, "additionalModelRequestFields");
     if (extra !== undefined && extra !== null) {
       if (!isPlainContainer(extra)) refuse(provider, "malformed_cap_container");
-      if (BEDROCK_OVERRIDE_KEYS.some((key) => Object.hasOwn(extra, key))) {
-        refuse(provider, "client_body_override");
-      }
+      onlyKnownKeys(extra, NO_KEYS, BEDROCK_EXTENSION_KEYS, provider);
     }
   }
   const before = request;
@@ -479,21 +594,10 @@ export function enforceOutputBound(
   return capped;
 }
 
-/** AI SDK provider-option keys that can raise the output limit or the candidate count. */
-const AI_SDK_OVERRIDE_KEYS = [
-  "maxTokens",
-  "maxCompletionTokens",
-  "maxOutputTokens",
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  "n",
-  "candidateCount",
-] as const;
-
 /**
- * Whether AI SDK `providerOptions` can change the output limit or candidate count after Solwyn
- * sets `maxOutputTokens`. An unreadable options object counts as an override.
+ * Whether AI SDK `providerOptions` carry any key. Provider options are a body-extension channel
+ * the middleware cannot account for, so under hard_deny their allowlist is empty. An unreadable
+ * options object counts as an override.
  */
 export function aiSdkBodyOverride(params: unknown): boolean {
   try {
@@ -502,10 +606,21 @@ export function aiSdkBodyOverride(params: unknown): boolean {
     if (!isObject(options)) return true;
     for (const scope of Object.values(options)) {
       if (!isObject(scope)) continue;
-      if (AI_SDK_OVERRIDE_KEYS.some((key) => Object.hasOwn(scope, key))) return true;
+      if (Object.keys(scope).length > 0) return true;
     }
     return false;
   } catch {
     return true;
   }
+}
+
+/**
+ * Whether an AI SDK call-level `reasoning` effort can raise the wire cap above `maxOutputTokens`.
+ * Only the OpenAI and Azure adapters keep reasoning inside the cap; other adapters may add a
+ * thinking budget on top of it, so any effort other than `none` cannot be bounded there.
+ */
+export function aiSdkReasoningRaisesCap(params: unknown, provider: string): boolean {
+  const reasoning = isObject(params) ? Reflect.get(params, "reasoning") : undefined;
+  if (reasoning === undefined || reasoning === null || reasoning === "none") return false;
+  return provider !== "openai" && provider !== "azure_openai";
 }

@@ -426,14 +426,39 @@ function azureApiVersion(client: unknown): unknown {
   return readPath(client, ["_options", "defaultQuery", "api-version"], Number.NaN);
 }
 
-/** Whether a Google client's own `httpOptions.extraBody` can rewrite `generationConfig`. */
+/**
+ * Whether a Google client carries its own `httpOptions.extraBody`, a body-extension channel that is
+ * deep-merged into every request after serialization. Its allowlist is empty, so any key counts.
+ */
 function googleClientBodyOverride(client: unknown): boolean {
   for (const owner of [client, readPath(client, ["models"], undefined)]) {
     const extra = readPath(owner, ["apiClient", "clientOptions", "httpOptions", "extraBody"], true);
     if (extra === true) return true;
-    if (isRecord(extra) && Object.hasOwn(extra, "generationConfig")) return true;
+    if (
+      extra !== undefined &&
+      extra !== null &&
+      (!isRecord(extra) || Object.keys(extra).length > 0)
+    ) {
+      return true;
+    }
   }
   return false;
+}
+
+/**
+ * Whether a client's own `fetchOptions` carry a request `body`. JavaScript callers can set one at
+ * runtime on the OpenAI and Anthropic SDKs, and it replaces the serialized body after Solwyn
+ * reads it. Per-request `fetchOptions.body` is rejected on every project.
+ */
+function clientFetchBodyOverride(client: unknown): boolean {
+  const options = readPath(client, ["fetchOptions"], true);
+  if (options === true) return true;
+  if (!isRecord(options)) return false;
+  try {
+    return Object.hasOwn(options, "body") && Reflect.get(options, "body") !== undefined;
+  } catch {
+    return true;
+  }
 }
 
 function wireTokenQuantity(value: number): number {
@@ -3456,7 +3481,10 @@ export class SolwynCore {
       defaultCap: ctx.outputCap,
       reserved: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
       azureApiVersion: provider === "azure_openai" ? azureApiVersion(runtime.sdkClient) : undefined,
-      clientBodyOverride: dialect === "google" && googleClientBodyOverride(runtime.sdkClient),
+      clientBodyOverride:
+        dialect === "google"
+          ? googleClientBodyOverride(runtime.sdkClient)
+          : clientFetchBodyOverride(runtime.sdkClient),
     };
     if (dialect !== "bedrock") return enforceOutputBound(hopKwargs, hop);
     const snapshot = Reflect.get(hopKwargs, BEDROCK_NATIVE_INPUT_SNAPSHOT);

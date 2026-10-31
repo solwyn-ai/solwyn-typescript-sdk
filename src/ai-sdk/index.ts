@@ -37,6 +37,7 @@ import { safeErrorClassName } from "../error-class";
 import {
   ConfigurationError,
   OutputBoundUnenforceableError,
+  type OutputBoundUnenforceableReason,
   RunStoppedError,
   SolwynError,
 } from "../errors";
@@ -44,11 +45,13 @@ import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
 import {
   aiSdkBodyOverride,
+  aiSdkReasoningRaisesCap,
   positiveOutputBound,
   reasoningOutsideCap,
   resolveAiSdkOutputBound,
 } from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
+import { ORDINARY_TOKEN_COUNT_MAX } from "../receipt-fold";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
 import {
@@ -929,6 +932,7 @@ export function createSolwynMiddleware(
   interface WrappedCallParams {
     readonly prompt: unknown;
     readonly maxOutputTokens?: unknown;
+    readonly reasoning?: unknown;
     readonly abortSignal?: AbortSignal;
   }
 
@@ -1009,12 +1013,7 @@ export function createSolwynMiddleware(
     // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its
     // cap, and a provider-option override that could raise it refuses the call before dispatch.
     if (decision.hardDenyAdmitted) {
-      const reason = reasoningOutsideCap(provider, modelId)
-        ? "reasoning_without_budget"
-        : aiSdkBodyOverride(params)
-          ? "client_body_override"
-          : null;
-      if (reason !== null) {
+      const refuse = (reason: OutputBoundUnenforceableReason): never => {
         if (decision.leaseClaimToken !== null) {
           try {
             budget.releaseReservation(callId, decision.leaseClaimToken);
@@ -1023,9 +1022,18 @@ export function createSolwynMiddleware(
           }
         }
         throw new OutputBoundUnenforceableError({ provider, reason });
+      };
+      if (reasoningOutsideCap(provider, modelId) || aiSdkReasoningRaisesCap(params, provider)) {
+        refuse("reasoning_without_budget");
       }
+      if (aiSdkBodyOverride(params)) refuse("unsupported_override");
       if (positiveOutputBound(params.maxOutputTokens) === null) {
         Reflect.set(params, "maxOutputTokens", config.lease_output_bound_default);
+      }
+      // Final guard: the cap the model receives must fit the clamped reservation.
+      const cap = positiveOutputBound(params.maxOutputTokens);
+      if (cap === null || cap > Math.min(estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX)) {
+        refuse("bound_exceeded");
       }
     }
 

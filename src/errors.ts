@@ -417,7 +417,7 @@ export const OUTPUT_BOUND_UNENFORCEABLE_REASONS = [
   "malformed_cap_container",
   "malformed_candidate_count",
   "reasoning_without_budget",
-  "client_body_override",
+  "unsupported_override",
   "azure_api_version",
   "bound_exceeded",
 ] as const;
@@ -430,8 +430,8 @@ const OUTPUT_BOUND_HINTS: Readonly<Record<OutputBoundUnenforceableReason, string
     "Set the candidate count (n or candidateCount) to a positive integer, or leave it unset.",
   reasoning_without_budget:
     "Reasoning is enabled with no reasoning budget, and this provider's output cap does not include reasoning. Set a positive thinking budget, turn reasoning off, or use a non-reasoning model.",
-  client_body_override:
-    "Move output limits out of body overrides, provider options, or additionalModelRequestFields and into the request's own cap parameters.",
+  unsupported_override:
+    "Remove keys Solwyn cannot account for from request body extensions (body overrides, provider options, extraBody, or additionalModelRequestFields), and set output limits with the request's own cap parameters.",
   azure_api_version:
     "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI api-version that supports max_completion_tokens.",
   bound_exceeded:

@@ -5,6 +5,7 @@
  * mock transports and assert on the request body each SDK would send. Fully offline.
  */
 
+import Anthropic from "@anthropic-ai/sdk";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { GoogleGenAI } from "@google/genai";
 import OpenAI, { AzureOpenAI } from "openai";
@@ -291,21 +292,155 @@ describe("Google: containers and client overrides", () => {
       solwyn.models.generateContent({ model: "gemini-2.5-flash", contents: "synthetic" }),
     );
     await solwyn.close();
-    expect(error.reason).toBe("client_body_override");
+    expect(error.reason).toBe("unsupported_override");
     expect(bodies).toHaveLength(0);
   });
 
-  it("caps on the wire when a client extraBody leaves generationConfig alone", async () => {
+  it.each([
+    { generationConfig: { maxOutputTokens: 9000, candidateCount: 3 } },
+    { generation_config: { max_output_tokens: 9000 } },
+    { GenerationConfig: { maxOutputTokens: 9000 } },
+    { labels: { team: "synthetic" } },
+  ])("refuses any client-level extraBody key under hard_deny: %j", async (extraBody) => {
     const bodies = googleFetch();
     const { fetch } = plane();
+    const native = new GoogleGenAI({ apiKey: "test-key", httpOptions: { extraBody } });
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      solwyn.models.generateContent({ model: "gemini-2.5-flash", contents: "synthetic" }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("sends a client extraBody unchanged on an alert-only project", async () => {
+    const bodies = googleFetch();
+    const { fetch } = plane("alert_only");
     const native = new GoogleGenAI({
       apiKey: "test-key",
-      httpOptions: { extraBody: { labels: { team: "synthetic" } } },
+      httpOptions: { extraBody: { generationConfig: { candidateCount: 3 } } },
     });
     const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
     await solwyn.models.generateContent({ model: "gemini-2.5-flash", contents: "synthetic" });
     await solwyn.close();
-    expect(bodies[0]?.["generationConfig"]).toEqual({ maxOutputTokens: 4096 });
+    expect(bodies[0]?.["generationConfig"]).toEqual({ candidateCount: 3 });
+  });
+});
+
+describe("body extensions under hard_deny carry only allowlisted keys", () => {
+  it.each([
+    [
+      "model override",
+      "https://api.x.ai/v1",
+      "grok-4-fast-non-reasoning",
+      { model_override: "grok-4" },
+    ],
+    [
+      "template kwargs",
+      "https://api.together.xyz/v1",
+      "Qwen/Qwen3-32B",
+      { chat_template_kwargs: { enable_thinking: true } },
+    ],
+    [
+      "provider reasoning",
+      "https://openrouter.ai/api/v1",
+      "openai/gpt-4o",
+      { reasoning: { max_tokens: 9000 } },
+    ],
+  ])("refuses an untyped OpenAI chat body key (%s)", async (_label, baseURL, model, extension) => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const { fetch } = plane();
+    const solwyn = new Solwyn(new OpenAI({ apiKey: "sk-test", baseURL, fetch: transport }), {
+      apiKey: API_KEY,
+      fetch,
+    });
+    const error = await refusal(chat(solwyn, { model, messages: MESSAGES, ...extension }));
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("keeps typed OpenAI params and sends an untyped key unchanged on alert-only", async () => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const hard = plane();
+    const typed = new Solwyn(new OpenAI({ apiKey: "sk-test", fetch: transport }), {
+      apiKey: API_KEY,
+      fetch: hard.fetch,
+    });
+    await chat(typed, {
+      model: "gpt-4o",
+      messages: MESSAGES,
+      temperature: 0.1,
+      seed: 1,
+      user: "u",
+    });
+    await typed.close();
+    const alert = plane("alert_only");
+    const untyped = new Solwyn(new OpenAI({ apiKey: "sk-test", fetch: transport }), {
+      apiKey: API_KEY,
+      fetch: alert.fetch,
+    });
+    await chat(untyped, { model: "gpt-4o", messages: MESSAGES, custom_extension: true });
+    await untyped.close();
+    expect(bodies[0]).toMatchObject({ temperature: 0.1, seed: 1, max_tokens: 4096 });
+    expect(bodies[1]).toMatchObject({ custom_extension: true });
+    expect(bodies[1]).not.toHaveProperty("max_tokens");
+  });
+
+  it("refuses an untyped Anthropic messages body key", async () => {
+    const bodies: Body[] = [];
+    const client = new Anthropic({
+      apiKey: "sk-ant-test",
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        bodies.push(JSON.parse(String(init?.body)) as Body);
+        return Response.json({
+          id: "msg_1",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-5",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+          usage: { input_tokens: 1, output_tokens: 1 },
+        });
+      },
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const messages = (solwyn as unknown as { messages: { create(b: Body): Promise<unknown> } })
+      .messages;
+    await messages.create({ model: "claude-sonnet-4-5", max_tokens: 100, messages: MESSAGES });
+    const error = await refusal(
+      messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 100,
+        messages: MESSAGES,
+        max_tokens_override: 9000,
+      }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toMatchObject({ max_tokens: 100 });
+  });
+
+  it("refuses an untyped Responses body key", async () => {
+    const bodies: Body[] = [];
+    const client = new OpenAI({
+      apiKey: "sk-test",
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        bodies.push(JSON.parse(String(init?.body)) as Body);
+        return Response.json({});
+      },
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      solwyn.responses.create({ model: "gpt-4o", input: "synthetic", n: 2 } as never),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
   });
 });
 
@@ -368,6 +503,26 @@ describe("Bedrock: containers and model-native overrides", () => {
     expect(bodies).toHaveLength(0);
   });
 
+  it.each([
+    [{ top_k: 5 }],
+    [{ anthropic_beta: ["output-128k-2025-02-19"] }],
+    [{ Thinking: { type: "enabled", budget_tokens: 1024 } }],
+  ])("refuses additionalModelRequestFields outside the allowlist: %j", async (extra) => {
+    const { client, bodies } = bedrock();
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      send(solwyn, {
+        modelId: MODEL,
+        messages: CONVERSE_MESSAGES,
+        additionalModelRequestFields: extra,
+      }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
+  });
+
   it("refuses an additionalModelRequestFields token limit", async () => {
     const { client, bodies } = bedrock();
     const { fetch } = plane();
@@ -381,7 +536,7 @@ describe("Bedrock: containers and model-native overrides", () => {
       }),
     );
     await solwyn.close();
-    expect(error.reason).toBe("client_body_override");
+    expect(error.reason).toBe("unsupported_override");
     expect(bodies).toHaveLength(0);
   });
 
@@ -564,5 +719,64 @@ describe("Azure: layered cap aliases", () => {
     expect(checks[0]?.["estimated_output_bound"]).toBe(300);
     expect(transport.bodies[0]).toMatchObject({ max_tokens: 300 });
     expect(transport.bodies[0]).not.toHaveProperty("max_completion_tokens");
+  });
+});
+
+describe("client-level fetchOptions.body replaces the serialized body", () => {
+  const override = JSON.stringify({ model: "gpt-4o", messages: MESSAGES, max_tokens: 9000 });
+
+  it("refuses an OpenAI client with fetchOptions.body under hard_deny", async () => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const client = new OpenAI({
+      apiKey: "sk-test",
+      fetch: transport,
+      fetchOptions: { body: override } as never,
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      chat(solwyn, { model: "gpt-4o", messages: MESSAGES, max_tokens: 100 }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("refuses an Anthropic client with fetchOptions.body under hard_deny", async () => {
+    const bodies: unknown[] = [];
+    const client = new Anthropic({
+      apiKey: "sk-ant-test",
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        bodies.push(init?.body);
+        return Response.json({});
+      },
+      fetchOptions: { body: override } as never,
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      (solwyn as unknown as { messages: { create(b: Body): Promise<unknown> } }).messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 100,
+        messages: MESSAGES,
+      }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("unsupported_override");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("leaves an alert-only client with fetchOptions.body unchanged", async () => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const client = new OpenAI({
+      apiKey: "sk-test",
+      fetch: transport,
+      fetchOptions: { body: override } as never,
+    });
+    const { fetch } = plane("alert_only");
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    await chat(solwyn, { model: "gpt-4o", messages: MESSAGES, max_tokens: 100 });
+    await solwyn.close();
+    expect(bodies[0]).toMatchObject({ max_tokens: 9000 });
   });
 });

@@ -88,6 +88,8 @@ export const COMPAT_PROFILES: readonly CompatProfile[] = Object.freeze([
   new CompatProfile({
     name: "xai",
     hosts: ["api.x.ai"],
+    // Regional endpoints, e.g. eu-west-1.api.x.ai and us.api.x.ai.
+    hostSuffixes: [".api.x.ai"],
     modelPrefixes: ["grok-"],
     supportsIncludeUsage: false,
   }),
@@ -115,6 +117,9 @@ export const COMPAT_PROFILES: readonly CompatProfile[] = Object.freeze([
   new CompatProfile({
     name: "qwen",
     hosts: ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com"],
+    // Shared regional and plan hosts (cn-hongkong.dashscope..., coding.dashscope...) and Model
+    // Studio workspace, trial, and token-plan hosts (<workspace>.<region>.maas.aliyuncs.com).
+    hostSuffixes: [".dashscope.aliyuncs.com", ".maas.aliyuncs.com"],
     modelPrefixes: ["qwen", "qwq-", "qvq-"],
     supportsIncludeUsage: true,
   }),

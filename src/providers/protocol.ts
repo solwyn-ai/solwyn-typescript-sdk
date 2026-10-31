@@ -17,6 +17,7 @@
 import { ConfigurationError } from "../errors";
 import type { RequestedAnthropicCacheTtl } from "../privacy";
 import type { TokenDetails } from "../token-details";
+import type { FetchLike } from "../transport";
 import type { MediaUsage, Modality, ProviderName } from "../types";
 
 /**
@@ -169,6 +170,25 @@ export interface PrepareCallOptions {
    * `defaultParams` is configured (the primary entry's own `default_params` is always `{}`).
    */
   entryDefaultParams?: Record<string, unknown>;
+  /**
+   * Output cap applied when the final request carries no positive one, so the reserved output
+   * bound holds under hard_deny admission; absent otherwise. ONLY the Bedrock adapter consumes it,
+   * on its rebuilt command input; the dispatcher has already applied it to every other adapter's
+   * merged kwargs.
+   */
+  outputBound?: number;
+  /**
+   * Hard_deny admission: the call may make at most one successful generation request. ONLY the
+   * Google adapter consumes it, through a per-request fetch guard; no other adapter's metered
+   * dispatch loops internally. `defaultFetch` is the runtime fetch the guard wraps when neither
+   * the request nor the client supplies one; every outgoing request must name `model` and fit
+   * `reserved` output tokens.
+   */
+  singleGeneration?: {
+    readonly defaultFetch: FetchLike;
+    readonly reserved: number;
+    readonly model: string;
+  };
 }
 
 /** A bound provider-SDK method (never invoked inside an adapter). */

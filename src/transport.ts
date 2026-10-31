@@ -61,6 +61,9 @@ export function retryBackoffDelay(
 export const MAX_RATE_LIMIT_ATTEMPTS = 20;
 
 /** Validate the caller-owned transport seam before any component can start work. */
+/** The runtime's global `fetch`, read at call time. The SDK's only executable global fetch read. */
+export const globalFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
+
 export function requireFetchLike(fetch: unknown): asserts fetch is FetchLike | undefined {
   if (fetch !== undefined && typeof fetch !== "function") {
     throw new ConfigurationError("fetch must be a function", { field: "fetch" });
@@ -343,7 +346,7 @@ export class Transport {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.apiKey = apiKey;
     const injected = options.fetch;
-    this.fetchImpl = injected ?? ((input, init) => globalThis.fetch(input, init));
+    this.fetchImpl = injected ?? globalFetch;
     this.maxRetries = Math.max(0, options.maxRetries ?? 0);
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 100;
   }

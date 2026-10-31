@@ -55,6 +55,8 @@ const makers = {
     new api.UntranslatableRequestError({ source: "openai", target: "google", feature: "schema" }),
   UntranslatableModelError: (api) =>
     new api.UntranslatableModelError({ model: "model", provider: "google" }),
+  OutputBoundUnenforceableError: (api) =>
+    new api.OutputBoundUnenforceableError({ provider: "qwen", reason: "reasoning_without_budget" }),
 };
 assert.deepEqual(
   Object.keys(entries[0])

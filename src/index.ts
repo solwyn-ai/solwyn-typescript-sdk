@@ -7,7 +7,7 @@
  * here — importing this entry must never pull in `node:*`.
  */
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 // Budget enforcement surface (pre-flight check + sans-I/O settlement builder).
 export {
@@ -55,6 +55,10 @@ export {
   BudgetExceededError,
   ConfigurationError,
   CoverageMismatchError,
+  OUTPUT_BOUND_UNENFORCEABLE_REASONS,
+  OutputBoundUnenforceableError,
+  type OutputBoundUnenforceableErrorOptions,
+  type OutputBoundUnenforceableReason,
   ProviderUnavailableError,
   RunStoppedError,
   type RunStoppedErrorOptions,

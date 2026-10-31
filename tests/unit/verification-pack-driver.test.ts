@@ -191,7 +191,7 @@ const runtimeResult=(name,format)=>{
   if(name==='mixed-format-enforcement-identity')return {firstFormat:format,denied:6,dispatches:0,checks:6,ingested:6,sharedBrands:true};
   if(name==='native-anthropic-promise')return {format,dispatches:1,confirms:1,ingested:1,ordinaryPromise:true};
   if(name==='native-foreign-aws')return {results:['bedrock-control','bedrock-control-subclass','s3','s3-subclass'].map(family=>({format,family,rejected:true})),requests:0,network:'none; constructors and synchronous detection only'};
-  if(name==='post-remediation-errors')return {families:11,denied:8,stopped:8,middlewareDenied:2};
+  if(name==='post-remediation-errors')return {families:12,denied:8,stopped:8,middlewareDenied:2};
   throw new Error('Unknown runtime cell '+name);
 };
 const versions={node:process.version};

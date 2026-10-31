@@ -99,10 +99,10 @@ Auto-detected providers (by base-URL host):
 
 | Provider | Detected from |
 |----------|---------------|
-| xAI (Grok) | `api.x.ai` |
+| xAI (Grok) | `api.x.ai`, `*.api.x.ai` |
 | DeepSeek | `api.deepseek.com` |
 | Mistral | `api.mistral.ai` |
-| Qwen (DashScope) | `dashscope*.aliyuncs.com` |
+| Qwen (DashScope) | `dashscope.aliyuncs.com`, `dashscope-intl.aliyuncs.com`, `dashscope-us.aliyuncs.com`, `*.dashscope.aliyuncs.com`, `*.maas.aliyuncs.com` |
 | Z.ai | `api.z.ai` (`include_usage` is injected for streaming calls) |
 | Groq | `api.groq.com` |
 | Together AI (first-class) | Native `together-ai` client or `api.together.xyz` / `api.together.ai` |

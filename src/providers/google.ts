@@ -28,7 +28,13 @@
  * allowlist and must stay that way.
  */
 
-import { ConfigurationError, markCallerAbort, UnsupportedSurfaceError } from "../errors";
+import {
+  ConfigurationError,
+  markCallerAbort,
+  OutputBoundUnenforceableError,
+  type OutputBoundUnenforceableReason,
+  UnsupportedSurfaceError,
+} from "../errors";
 import type { TokenDetails } from "../token-details";
 import { buildReportedTokenDetails, isUsageCount } from "../token-details";
 import { detectGoogleClient } from "./detection";
@@ -204,6 +210,102 @@ function withGoogleHttpBound(
   httpOptions["retryOptions"] = retryOptions;
   config["httpOptions"] = httpOptions;
 
+  return { ...kwargs, config };
+}
+
+type FetchFunction = (input: unknown, init?: unknown) => Promise<{ ok?: unknown }>;
+
+/** The model a generateContent URL names (`.../models/{model}:generateContent`), if any. */
+function urlModel(input: unknown): string | null {
+  const url = typeof input === "string" ? input : String(getProp(input, "url") ?? input);
+  const match = /\/(?:models|tunedModels)\/([^/:?]+):/.exec(url);
+  return match?.[1] ?? null;
+}
+
+function modelLeaf(model: string): string {
+  return model.slice(model.lastIndexOf("/") + 1);
+}
+
+/**
+ * Check one outgoing generation request against the admission before it is sent: it must name
+ * the admitted model, and its `generationConfig` must carry a positive cap whose total across
+ * candidates fits the reserved output tokens. Returns the refusal reason, or null.
+ */
+function unboundedRequest(
+  input: unknown,
+  init: unknown,
+  guard: { readonly reserved: number; readonly model: string },
+): OutputBoundUnenforceableReason | null {
+  const model = urlModel(input);
+  if (model === null || modelLeaf(model) !== modelLeaf(guard.model)) return "unsupported_override";
+  let body: unknown;
+  try {
+    const raw = getProp(init, "body");
+    body = typeof raw === "string" ? JSON.parse(raw) : undefined;
+  } catch {
+    return "bound_exceeded";
+  }
+  const config = getProp(body, "generationConfig");
+  const cap = getProp(config, "maxOutputTokens");
+  const count = getProp(config, "candidateCount");
+  const candidates = count === undefined || count === null ? 1 : count;
+  if (
+    typeof cap !== "number" ||
+    !Number.isSafeInteger(cap) ||
+    cap <= 0 ||
+    typeof candidates !== "number" ||
+    !Number.isSafeInteger(candidates) ||
+    candidates <= 0 ||
+    cap * candidates > guard.reserved
+  ) {
+    return "bound_exceeded";
+  }
+  return null;
+}
+
+/**
+ * Under hard_deny admission, let one call make at most one successful generation request, and
+ * check every request before it is sent. The per-request `httpOptions.fetch` wraps the fetch the
+ * SDK would use (the request's own, then the client's, then `defaultFetch`). The generation slot
+ * is claimed synchronously, before any I/O, so an overlapping send refuses; a non-2xx response or a
+ * network error frees it for a retry, and a 2xx keeps it. This backstops SDK-internal generation
+ * loops the request settings do not already turn off.
+ */
+function withSingleGenerationFetch(
+  kwargs: Record<string, unknown>,
+  client: unknown,
+  guard: NonNullable<PrepareCallOptions["singleGeneration"]>,
+): Record<string, unknown> {
+  const config = mappingFromConfig(kwargs["config"]);
+  const httpOptions = mappingFromConfig(config["httpOptions"]);
+  const own = httpOptions["fetch"];
+  const clientFetch =
+    ownDataPath(client, ["apiClient", "clientOptions", "httpOptions", "fetch"]) ??
+    ownDataPath(client, ["models", "apiClient", "clientOptions", "httpOptions", "fetch"]);
+  const base =
+    typeof own === "function" ? own : typeof clientFetch === "function" ? clientFetch : undefined;
+  let state: "idle" | "in_flight" | "succeeded" = "idle";
+  httpOptions["fetch"] = async (input: unknown, init?: unknown) => {
+    if (state !== "idle") {
+      throw new OutputBoundUnenforceableError({
+        provider: "google",
+        reason: "multi_generation_loop",
+      });
+    }
+    const reason = unboundedRequest(input, init, guard);
+    if (reason !== null) throw new OutputBoundUnenforceableError({ provider: "google", reason });
+    state = "in_flight";
+    let succeeded = false;
+    try {
+      const send = (base ?? guard.defaultFetch) as FetchFunction;
+      const response = await send(input, init);
+      succeeded = response.ok === true;
+      return response;
+    } finally {
+      state = succeeded ? "succeeded" : "idle";
+    }
+  };
+  config["httpOptions"] = httpOptions;
   return { ...kwargs, config };
 }
 
@@ -436,7 +538,11 @@ export class GoogleAdapter implements ProviderAdapter {
     kwargs: Record<string, unknown>,
     options: PrepareCallOptions,
   ): PreparedDispatch {
-    const shaped = withGoogleHttpBound(kwargs, options.timeout);
+    const bounded = withGoogleHttpBound(kwargs, options.timeout);
+    const shaped =
+      options.singleGeneration === undefined
+        ? bounded
+        : withSingleGenerationFetch(bounded, client, options.singleGeneration);
     // `stream` is not a valid Google kwarg — remove it from the shaped COPY (input is
     // untouched: `shaped` is a fresh object).
     delete shaped["stream"];

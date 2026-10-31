@@ -20,7 +20,7 @@
  * usage shape at runtime. The middleware reads both shapes defensively; tests use V3.
  */
 
-import { generateText, streamText, wrapLanguageModel } from "ai";
+import { generateText, jsonSchema, stepCountIs, streamText, tool, wrapLanguageModel } from "ai";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -30,7 +30,11 @@ import {
   usageToTokenDetails,
 } from "../../src/ai-sdk/index";
 import { BudgetEnforcer, budgetCheckResult } from "../../src/budget";
-import { BudgetExceededError, RunStoppedError } from "../../src/errors";
+import {
+  BudgetExceededError,
+  OutputBoundUnenforceableError,
+  RunStoppedError,
+} from "../../src/errors";
 import { currentRun, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import { clearRunTermination, markTerminated, resetRunControlForTest } from "../../src/run-control";
@@ -922,6 +926,216 @@ describe("ai-sdk middleware — generateText happy path", () => {
     expect(captured.confirms).toHaveLength(1);
     expect(captured.events.filter((e) => e.status === "success")).toHaveLength(2);
     expect(captured.events.every((e) => e.provider === "anthropic")).toBe(true);
+  });
+
+  it.each([
+    ["alert_only", [undefined, 300]],
+    ["hard_deny", [2048, 300]],
+  ] as const)("sends the output bound on the check and caps an uncapped call only under hard_deny (%s)", async (mode, expected) => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      leaseOutputBoundDefault: 2048,
+    });
+    const seen: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "gpt-4o-mini",
+      doGenerate: async (options): Promise<V3GenerateResult> => {
+        seen.push(options.maxOutputTokens);
+        return {
+          content: [{ type: "text", text: "hi" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: usage(4, 2),
+          warnings: [],
+        };
+      },
+    });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    await generateText({ model: wrapped, prompt: "one" });
+    await generateText({ model: wrapped, prompt: "two", maxOutputTokens: 300 });
+    await solwyn.close();
+
+    expect(seen).toEqual(expected);
+    expect(captured.checks.map((check) => check["estimated_output_bound"])).toEqual([2048, 300]);
+  });
+
+  it.each([
+    ["alibaba.chat", "qwen3.5-plus", {}, "reasoning_without_budget"],
+    ["xai.chat", "grok-4", {}, "reasoning_without_budget"],
+    ["synthetic-gateway.chat", "Qwen/Qwen3-32B", {}, "reasoning_without_budget"],
+    ["openai.chat", "gpt-4o", { openai: { maxCompletionTokens: 9000 } }, "unsupported_override"],
+    [
+      "anthropic.messages",
+      "claude-sonnet-4-5",
+      { anthropic: { thinking: { type: "enabled", budgetTokens: 1024 } } },
+      "unsupported_override",
+    ],
+  ] as const)("refuses %s under hard_deny when the bound cannot hold (%s)", async (providerId, modelId, providerOptions, reason) => {
+    const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const doGenerate = vi.fn(
+      async (): Promise<V3GenerateResult> => ({
+        content: [{ type: "text", text: "hi" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: usage(4, 2),
+        warnings: [],
+      }),
+    );
+    const model = new MockLanguageModelV3({ provider: providerId, modelId, doGenerate });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    const error = await generateText({
+      model: wrapped,
+      prompt: "one",
+      providerOptions: providerOptions as never,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    await solwyn.close();
+    expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
+    expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
+    expect(doGenerate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["anthropic.messages", "claude-sonnet-4-5", { reasoning: "high" }, "reasoning_without_budget"],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      { reasoning: "low" },
+      "reasoning_without_budget",
+    ],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      {
+        maxOutputTokens: 100,
+        providerOptions: { bedrock: { inferenceConfig: { maxTokens: 9000 } } },
+      },
+      "unsupported_override",
+    ],
+    [
+      "amazon-bedrock",
+      "anthropic.claude-sonnet-4-5",
+      {
+        maxOutputTokens: 100,
+        providerOptions: { bedrock: { additionalModelRequestFields: { max_tokens: 9000 } } },
+      },
+      "unsupported_override",
+    ],
+    ["openai.chat", "gpt-4o", { maxOutputTokens: 200_000_001 }, "bound_exceeded"],
+  ] as const)("refuses %s under hard_deny before the model is called (%j)", async (providerId, modelId, options, reason) => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const doGenerate = vi.fn(
+      async (): Promise<V3GenerateResult> => ({
+        content: [{ type: "text", text: "hi" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: usage(4, 2),
+        warnings: [],
+      }),
+    );
+    const model = new MockLanguageModelV3({ provider: providerId, modelId, doGenerate });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    const error = await generateText({
+      model: wrapped,
+      prompt: "one",
+      ...(options as object),
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    await solwyn.close();
+    expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
+    expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
+    expect(doGenerate).not.toHaveBeenCalled();
+    if (reason === "bound_exceeded") {
+      expect(captured.checks[0]?.["estimated_output_bound"]).toBe(100_000_000);
+    }
+  });
+
+  it("allows an OpenAI reasoning effort, which stays inside the cap", async () => {
+    const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const seen: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "o4-mini",
+      doGenerate: async (options): Promise<V3GenerateResult> => {
+        seen.push(options.maxOutputTokens);
+        return {
+          content: [{ type: "text", text: "hi" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: usage(4, 2),
+          warnings: [],
+        };
+      },
+    });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    await generateText({ model: wrapped, prompt: "one", reasoning: "high" } as never);
+    await solwyn.close();
+    expect(seen).toEqual([4096]);
+  });
+
+  it("checks and caps every step of a multi-step generateText run separately", async () => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      budgetCheckCacheTtl: 0,
+    });
+    const seen: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "gpt-4o",
+      doGenerate: async (options): Promise<V3GenerateResult> => {
+        seen.push(options.maxOutputTokens);
+        return seen.length === 1
+          ? {
+              content: [
+                { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: "{}" },
+              ],
+              finishReason: { unified: "tool-calls", raw: "tool_calls" },
+              usage: usage(4, 2),
+              warnings: [],
+            }
+          : {
+              content: [{ type: "text", text: "done" }],
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: usage(4, 2),
+              warnings: [],
+            };
+      },
+    });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    await generateText({
+      model: wrapped,
+      prompt: "one",
+      maxOutputTokens: 300,
+      tools: {
+        lookup: tool({ inputSchema: jsonSchema({ type: "object" }), execute: async () => "ok" }),
+      },
+      stopWhen: stepCountIs(2),
+    });
+    await solwyn.close();
+    expect(seen).toEqual([300, 300]);
+    expect(captured.checks.map((check) => check["estimated_output_bound"])).toEqual([300, 300]);
   });
 
   it("treats an empty reservation id as event-only", async () => {

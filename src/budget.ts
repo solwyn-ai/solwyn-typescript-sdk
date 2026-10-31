@@ -59,6 +59,7 @@ import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
 import { positiveOutputBound } from "./output-bound";
 import { handleReadOnlyKeyError, isReadOnlyKeyError } from "./read-only-key";
+import { ORDINARY_TOKEN_COUNT_MAX } from "./receipt-fold";
 import {
   RELEASE_DROP_REASONS,
   type ReleaseAttempt,
@@ -264,17 +265,24 @@ export interface BudgetCheckResult {
   denySource?: DenySource | null;
   /** Stable machine-readable denial reason; optional for pre-R2 consumer literals. */
   denyReason?: string | null;
+  /**
+   * Whether hard_deny authority admitted this call: a live or cached hard_deny allow, or a
+   * lease-funded admission under a hard_deny lease posture. Wrapped clients then send an
+   * uncapped request with the output bound as its cap. Never set on SDK-local outage results.
+   */
+  hardDenyAdmitted?: boolean;
 }
 
 /** Internal decision shape after lease authority has been normalized at a trust boundary. */
 type MaterializedBudgetCheckResult = Omit<
   BudgetCheckResult,
-  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason"
+  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason" | "hardDenyAdmitted"
 > & {
   leaseId: string | null;
   leaseClaimToken: number | null;
   denySource: DenySource | null;
   denyReason: string | null;
+  hardDenyAdmitted: boolean;
 };
 
 /** Required fields plus optional overrides for {@link budgetCheckResult}. */
@@ -332,6 +340,7 @@ export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudg
     deniedByPeriod: init.deniedByPeriod ?? null,
     denySource: init.denySource ?? null,
     denyReason: init.denyReason ?? null,
+    hardDenyAdmitted: init.hardDenyAdmitted ?? false,
   };
 }
 
@@ -830,6 +839,14 @@ export class BudgetEnforcer {
     if (options.modality !== undefined) {
       request.modality = options.modality;
     }
+    // Text calls price their output at the same structural bound the lease path reserves. A cap
+    // above the wire maximum is sent as that maximum, as the denial receipt does.
+    if (options.modality === undefined || options.modality === "text") {
+      request.estimated_output_bound = Math.min(
+        this.outputBoundFor(options),
+        ORDINARY_TOKEN_COUNT_MAX,
+      );
+    }
     if (options.estimatedMedia !== null && options.estimatedMedia !== undefined) {
       request.estimated_media = options.estimatedMedia;
     }
@@ -1087,9 +1104,7 @@ export class BudgetEnforcer {
       tagged: tags !== null && tags !== undefined,
       requestedCallId: checkOptions.callId,
       estimatedInputTokens: checkOptions.estimatedInputTokens,
-      estimatedOutputBound:
-        positiveOutputBound(checkOptions.estimatedOutputBound) ??
-        this.leaseLedger.outputBoundDefault,
+      estimatedOutputBound: this.outputBoundFor(checkOptions),
       model: checkOptions.model,
       provider: checkOptions.provider,
       fallbackProviders,
@@ -1158,6 +1173,7 @@ export class BudgetEnforcer {
             currentUsage: cached.current_usage,
             priceHints: cached.price_hints ?? null,
             failoverTuningAllowed: null,
+            hardDenyAdmitted: cached.mode === "hard_deny",
           }),
           leaseClaimToken,
         );
@@ -1364,6 +1380,8 @@ export class BudgetEnforcer {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
+      // Captured with the reservation, so a renewal landing before this result cannot change it.
+      hardDenyAdmitted: admission.leaseId !== null && admission.postureMode === "hard_deny",
     });
   }
 
@@ -1662,7 +1680,8 @@ export class BudgetEnforcer {
       | "deniedByPeriod"
       | "denySource"
       | "denyReason"
-    >,
+    > &
+      Partial<Pick<MaterializedBudgetCheckResult, "hardDenyAdmitted">>,
   ): MaterializedBudgetCheckResult {
     return budgetCheckResult({
       ...fields,
@@ -2099,6 +2118,7 @@ export class BudgetEnforcer {
         currentUsage: response.current_usage,
         priceHints: response.price_hints ?? null,
         failoverTuningAllowed: response.failover_directive?.failover_tuning_allowed ?? null,
+        hardDenyAdmitted: response.mode === "hard_deny",
       });
     }
     if (response.mode === "hard_deny") {
@@ -2498,14 +2518,24 @@ export class BudgetEnforcer {
     this.lastHardDenyResponse = response;
   }
 
-  /** Server-priced chain identity. Estimates, timeout, and run id are deliberately excluded. */
+  /** The positive output bound a check reserves, or the configured default. */
+  private outputBoundFor(options: CheckBudgetOptions): number {
+    return positiveOutputBound(options.estimatedOutputBound) ?? this.leaseLedger.outputBoundDefault;
+  }
+
+  /**
+   * Server-priced chain identity plus the text output bound, so an allow for a small bound never
+   * admits a larger one. Input estimates, timeout, and run id are deliberately excluded.
+   */
   private allowCacheKey(options: CheckBudgetOptions): string {
+    const modality = options.modality ?? "text";
     return JSON.stringify([
       options.provider,
       options.model,
       options.fallbackProviders ?? [],
       options.fallbackModels ?? [],
-      options.modality ?? "text",
+      modality,
+      modality === "text" ? this.outputBoundFor(options) : null,
     ]);
   }
 

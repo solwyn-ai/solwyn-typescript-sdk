@@ -88,6 +88,8 @@ export interface LeaseAdmission {
   readonly warning: string | null;
   readonly renewalDue: boolean;
   readonly mode: BudgetMode | null;
+  /** The lease posture mode at the moment this admission reserved, for a funded admission. */
+  readonly postureMode: BudgetMode | null;
   readonly reason: string | null;
   readonly claimToken: number | null;
   readonly admitted: boolean;
@@ -919,6 +921,7 @@ export class LeaseLedger {
       return this.#admission(LeaseDecision.AdmitLocal, {
         leaseId: state.leaseId,
         reservedTokens: reserve,
+        postureMode: state.postureMode,
         renewalDue: this.renewalDue(state, now),
       });
     }
@@ -934,6 +937,7 @@ export class LeaseLedger {
       return this.#admission(LeaseDecision.AdmitOutageMetered, {
         leaseId: state.leaseId,
         reservedTokens: reserve,
+        postureMode: state.postureMode,
         warning:
           "Solwyn unreachable; lease grant exhausted — drawing down this holder's headroom share",
         reason: "share_drawdown",
@@ -952,6 +956,7 @@ export class LeaseLedger {
       leaseId: state.leaseId,
       reservedTokens: reserve,
       mode: state.postureMode,
+      postureMode: state.postureMode,
       warning:
         "Budget lease exhausted and Solwyn unreachable; alert_only mode continues past the share",
       reason: "lease_share_exhausted",
@@ -983,6 +988,7 @@ export class LeaseLedger {
       return this.#admission(LeaseDecision.AdmitOutageMetered, {
         leaseId: state.leaseId,
         reservedTokens: reserve,
+        postureMode: state.postureMode,
         warning:
           "Budget lease expired and Solwyn unreachable; metering locally against the last known headroom share",
         reason: "expired_local_enforce",
@@ -1002,6 +1008,7 @@ export class LeaseLedger {
       leaseId: state.leaseId,
       reservedTokens: reserve,
       mode: state.postureMode,
+      postureMode: state.postureMode,
       warning:
         "Budget lease expired, Solwyn unreachable and the last known headroom share is exhausted; alert_only mode continues",
       reason: "local_enforce_bound_exceeded",
@@ -1018,6 +1025,7 @@ export class LeaseLedger {
       warning: null,
       renewalDue: false,
       mode: null,
+      postureMode: null,
       reason: null,
       claimToken: null,
       ...fields,

@@ -19,7 +19,7 @@
  * machinery — {@link BudgetEnforcer} (pre-flight check + confirm builder), {@link MetadataReporter}
  * (usage telemetry), config resolution, and the privacy length estimators — behind the
  * documented AI SDK middleware interface (`LanguageModelV2Middleware`, exported by the `ai`
- * package as the version-relaxed `LanguageModelMiddleware`): `wrapGenerate` /
+ * package as the version-relaxed `LanguageModelMiddleware`): `transformParams`, `wrapGenerate` /
  * `wrapStream`.
  *
  * EDGE-SAFE: web-standard APIs only (`crypto.randomUUID`, `performance.now`, web
@@ -34,11 +34,24 @@ import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } fr
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
-import { ConfigurationError, RunStoppedError, SolwynError } from "../errors";
+import {
+  ConfigurationError,
+  OutputBoundUnenforceableError,
+  type OutputBoundUnenforceableReason,
+  RunStoppedError,
+  SolwynError,
+} from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
-import { resolveAiSdkOutputBound } from "../output-bound";
+import {
+  aiSdkBodyOverride,
+  aiSdkReasoningRaisesCap,
+  positiveOutputBound,
+  reasoningOutsideCap,
+  resolveAiSdkOutputBound,
+} from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
+import { ORDINARY_TOKEN_COUNT_MAX } from "../receipt-fold";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
 import {
@@ -919,6 +932,7 @@ export function createSolwynMiddleware(
   interface WrappedCallParams {
     readonly prompt: unknown;
     readonly maxOutputTokens?: unknown;
+    readonly reasoning?: unknown;
     readonly abortSignal?: AbortSignal;
   }
 
@@ -995,6 +1009,32 @@ export function createSolwynMiddleware(
         // The typed denial remains authoritative if telemetry construction/enqueue is unavailable.
       }
       throw budget.buildDenialError(decision, estimatedInputTokens, run?.agentRunId);
+    }
+    // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its
+    // cap, and a provider-option override that could raise it refuses the call before dispatch.
+    if (decision.hardDenyAdmitted) {
+      const refuse = (reason: OutputBoundUnenforceableReason): never => {
+        if (decision.leaseClaimToken !== null) {
+          try {
+            budget.releaseReservation(callId, decision.leaseClaimToken);
+          } catch {
+            // Local capability cleanup is best effort; the refusal is authoritative.
+          }
+        }
+        throw new OutputBoundUnenforceableError({ provider, reason });
+      };
+      if (reasoningOutsideCap(provider, modelId) || aiSdkReasoningRaisesCap(params, provider)) {
+        refuse("reasoning_without_budget");
+      }
+      if (aiSdkBodyOverride(params)) refuse("unsupported_override");
+      if (positiveOutputBound(params.maxOutputTokens) === null) {
+        Reflect.set(params, "maxOutputTokens", config.lease_output_bound_default);
+      }
+      // Final guard: the cap the model receives must fit the clamped reservation.
+      const cap = positiveOutputBound(params.maxOutputTokens);
+      if (cap === null || cap > Math.min(estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX)) {
+        refuse("bound_exceeded");
+      }
     }
 
     return {
@@ -1414,6 +1454,9 @@ export function createSolwynMiddleware(
 
   return {
     middleware: {
+      // A Solwyn-owned copy of the call options. The AI SDK hands this same object to wrapGenerate
+      // and the model, so preflight caps it in place without touching a caller-owned record.
+      transformParams: async ({ params }) => ({ ...params }),
       wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
       wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
     },

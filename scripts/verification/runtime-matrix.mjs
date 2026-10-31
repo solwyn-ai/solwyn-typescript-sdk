@@ -276,7 +276,7 @@ process.stdout.write(JSON.stringify({results,requests,network:'none; constructor
           result: parsed,
         });
         if (name === "post-remediation-errors") {
-          assert.deepEqual(parsed, { families: 11, denied: 8, stopped: 8, middlewareDenied: 2 });
+          assert.deepEqual(parsed, { families: 12, denied: 8, stopped: 8, middlewareDenied: 2 });
         } else if (name === "native-foreign-aws") {
           assert.equal(parsed.requests, 0);
           assert.deepEqual(parsed.results, [

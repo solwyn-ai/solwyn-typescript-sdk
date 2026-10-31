@@ -272,6 +272,7 @@ export interface BudgetCheckRequest {
   model: string;
   provider: ProviderName;
   modality?: Modality;
+  estimated_output_bound?: number | null;
   fallback_providers?: ProviderName[];
   fallback_models?: string[];
   agent_run_id?: string | null;

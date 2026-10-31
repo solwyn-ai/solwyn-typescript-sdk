@@ -345,6 +345,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
+      hardDenyAdmitted: false,
     });
     expect(seen).toEqual([
       {
@@ -572,6 +573,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
       deniedByPeriod: null,
       denySource,
       denyReason,
+      hardDenyAdmitted: false,
     });
   });
 

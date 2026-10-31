@@ -900,6 +900,14 @@
             ],
             "description": "Estimated non-text billing quantities for the pending call (image/video/audio/TTS). None for text-only calls; each quantity inside is None when unobservable pre-flight. The media analog of estimated_input_tokens — the server prices the reservation off it."
           },
+          "estimated_output_bound": {
+            "anyOf": [
+              { "type": "integer", "maximum": 100000000, "minimum": 0.0 },
+              { "type": "null" }
+            ],
+            "title": "Estimated Output Bound",
+            "description": "Maximum number of output tokens the pending call can produce. When present, the server reserves input cost plus this bound at the model's output rate. When omitted, the reservation keeps the legacy estimate, which prices output as equal to input."
+          },
           "fallback_providers": {
             "items": {
               "$ref": "#/components/schemas/ProviderName"

@@ -1149,7 +1149,7 @@ describe("BudgetEnforcer run-directive transaction", () => {
       deniedByPeriod: "run_stopped",
       denySource: "sticky_replay",
       denyReason: "velocity:repeat_size",
-      capsOutput: false,
+      hardDenyAdmitted: false,
     });
     expect(log.warn).toContainEqual({
       message: "Cloud API unreachable; preserving retained run stop",
@@ -1369,7 +1369,7 @@ describe("BudgetEnforcer lease directive fences", () => {
       deniedByPeriod: "run_stopped",
       denySource: "server",
       denyReason: "grant_manual_stop",
-      capsOutput: false,
+      hardDenyAdmitted: false,
     });
     expect(internal(budget).runHardDenyResponses.get("run-a")?.observedAt).toBe(71);
     expect(runObservedAt("run-a")).toBe(71);

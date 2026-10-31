@@ -1001,7 +1001,7 @@ export function createSolwynMiddleware(
     }
     // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its cap.
     if (
-      decision.capsOutput &&
+      decision.hardDenyAdmitted &&
       ownedParams.has(params) &&
       positiveOutputBound(params.maxOutputTokens) === null
     ) {

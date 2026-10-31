@@ -206,7 +206,7 @@ describe("BudgetCheckResult", () => {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
-      capsOutput: false,
+      hardDenyAdmitted: false,
     });
   });
 

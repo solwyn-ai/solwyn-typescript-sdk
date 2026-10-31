@@ -2373,7 +2373,9 @@ export class SolwynCore {
       estimatedInputTokens,
       estimatedOutputBound,
       outputCap:
-        budget.allowed && budget.capsOutput ? this.#config.lease_output_bound_default : undefined,
+        budget.allowed && budget.hardDenyAdmitted
+          ? this.#config.lease_output_bound_default
+          : undefined,
       velocityFlags: velocity.flags,
       priceHints: budget.priceHints,
       funding: Object.freeze({

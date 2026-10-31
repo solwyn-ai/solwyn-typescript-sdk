@@ -270,19 +270,19 @@ export interface BudgetCheckResult {
    * lease-funded admission under a hard_deny lease posture. Wrapped clients then send an
    * uncapped request with the output bound as its cap. Never set on SDK-local outage results.
    */
-  capsOutput?: boolean;
+  hardDenyAdmitted?: boolean;
 }
 
 /** Internal decision shape after lease authority has been normalized at a trust boundary. */
 type MaterializedBudgetCheckResult = Omit<
   BudgetCheckResult,
-  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason" | "capsOutput"
+  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason" | "hardDenyAdmitted"
 > & {
   leaseId: string | null;
   leaseClaimToken: number | null;
   denySource: DenySource | null;
   denyReason: string | null;
-  capsOutput: boolean;
+  hardDenyAdmitted: boolean;
 };
 
 /** Required fields plus optional overrides for {@link budgetCheckResult}. */
@@ -340,7 +340,7 @@ export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudg
     deniedByPeriod: init.deniedByPeriod ?? null,
     denySource: init.denySource ?? null,
     denyReason: init.denyReason ?? null,
-    capsOutput: init.capsOutput ?? false,
+    hardDenyAdmitted: init.hardDenyAdmitted ?? false,
   };
 }
 
@@ -1173,7 +1173,7 @@ export class BudgetEnforcer {
             currentUsage: cached.current_usage,
             priceHints: cached.price_hints ?? null,
             failoverTuningAllowed: null,
-            capsOutput: cached.mode === "hard_deny",
+            hardDenyAdmitted: cached.mode === "hard_deny",
           }),
           leaseClaimToken,
         );
@@ -1380,7 +1380,7 @@ export class BudgetEnforcer {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
-      capsOutput:
+      hardDenyAdmitted:
         admission.leaseId !== null && this.leaseLedger.postureModeFor(runId) === "hard_deny",
     });
   }
@@ -1681,7 +1681,7 @@ export class BudgetEnforcer {
       | "denySource"
       | "denyReason"
     > &
-      Partial<Pick<MaterializedBudgetCheckResult, "capsOutput">>,
+      Partial<Pick<MaterializedBudgetCheckResult, "hardDenyAdmitted">>,
   ): MaterializedBudgetCheckResult {
     return budgetCheckResult({
       ...fields,
@@ -2118,7 +2118,7 @@ export class BudgetEnforcer {
         currentUsage: response.current_usage,
         priceHints: response.price_hints ?? null,
         failoverTuningAllowed: response.failover_directive?.failover_tuning_allowed ?? null,
-        capsOutput: response.mode === "hard_deny",
+        hardDenyAdmitted: response.mode === "hard_deny",
       });
     }
     if (response.mode === "hard_deny") {

@@ -49,8 +49,8 @@ the SDK.
   decisions never add a cap.
 - **Allow cache.** A cached allow is reused only for a check with the same output bound, so an
   allow for a small bound never admits a larger one.
-- **`BudgetCheckResult.capsOutput`.** Results report whether hard_deny authority admitted the
-  call.
+- **`BudgetCheckResult.hardDenyAdmitted`.** Results report whether hard_deny authority admitted
+  the call.
 
 ### Known limitations
 

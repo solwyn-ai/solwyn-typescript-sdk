@@ -100,7 +100,7 @@ describe("provider usage observed before a stream error", () => {
     "http",
     "network",
   ] as const)("settles Google continuation usage when the next hop has a %s error", async (failure) => {
-    const plane = new FakeControlPlane();
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     const fixture = googleContinuationFailure(failure);
     const breakerFailure = vi.spyOn(CircuitBreaker.prototype, "recordFailure");
     const latencySample = vi.spyOn(LatencyTracker.prototype, "recordLatency");
@@ -145,7 +145,7 @@ describe("provider usage observed before a stream error", () => {
   });
 
   it("settles observed usage for a tagged run-scoped stream through a per-call check", async () => {
-    const plane = new FakeControlPlane();
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     const fixture = googleContinuationFailure("http");
     const tags = { test_case: "stream_error" };
     const client = plane.wrap(fixture.raw, {
@@ -217,7 +217,12 @@ describe("provider usage observed before a stream error", () => {
   });
 
   it("keeps Google lease-funded errors at zero usage and releases the claim", async () => {
-    const plane = new FakeControlPlane({ grantedTokens: 20, finalGrant: true });
+    const plane = new FakeControlPlane({
+      grantedTokens: 20,
+      finalGrant: true,
+      mode: "alert_only",
+      postureMode: "alert_only",
+    });
     const fixture = googleContinuationFailure("http");
     const client = plane.wrap(fixture.raw, {
       reportUntrackedSurfaces: false,
@@ -458,7 +463,7 @@ describe("provider usage observed before a stream error", () => {
   });
 
   it("cannot settle earlier buffered Google continuation usage when a later hop fails", async () => {
-    const plane = new FakeControlPlane();
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     const fixture = googleContinuationFailure("http", false);
     const client = plane.wrap(fixture.raw, {
       leaseEnabled: false,

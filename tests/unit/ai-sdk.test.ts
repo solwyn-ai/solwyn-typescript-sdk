@@ -20,7 +20,7 @@
  * usage shape at runtime. The middleware reads both shapes defensively; tests use V3.
  */
 
-import { generateText, streamText, wrapLanguageModel } from "ai";
+import { generateText, jsonSchema, stepCountIs, streamText, tool, wrapLanguageModel } from "ai";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -1089,6 +1089,52 @@ describe("ai-sdk middleware — generateText happy path", () => {
     await generateText({ model: wrapped, prompt: "one", reasoning: "high" } as never);
     await solwyn.close();
     expect(seen).toEqual([4096]);
+  });
+
+  it("checks and caps every step of a multi-step generateText run separately", async () => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+      budgetCheckCacheTtl: 0,
+    });
+    const seen: unknown[] = [];
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "gpt-4o",
+      doGenerate: async (options): Promise<V3GenerateResult> => {
+        seen.push(options.maxOutputTokens);
+        return seen.length === 1
+          ? {
+              content: [
+                { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: "{}" },
+              ],
+              finishReason: { unified: "tool-calls", raw: "tool_calls" },
+              usage: usage(4, 2),
+              warnings: [],
+            }
+          : {
+              content: [{ type: "text", text: "done" }],
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: usage(4, 2),
+              warnings: [],
+            };
+      },
+    });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    await generateText({
+      model: wrapped,
+      prompt: "one",
+      maxOutputTokens: 300,
+      tools: {
+        lookup: tool({ inputSchema: jsonSchema({ type: "object" }), execute: async () => "ok" }),
+      },
+      stopWhen: stepCountIs(2),
+    });
+    await solwyn.close();
+    expect(seen).toEqual([300, 300]);
+    expect(captured.checks.map((check) => check["estimated_output_bound"])).toEqual([300, 300]);
   });
 
   it("treats an empty reservation id as event-only", async () => {

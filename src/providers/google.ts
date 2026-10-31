@@ -28,9 +28,15 @@
  * allowlist and must stay that way.
  */
 
-import { ConfigurationError, markCallerAbort, UnsupportedSurfaceError } from "../errors";
+import {
+  ConfigurationError,
+  markCallerAbort,
+  OutputBoundUnenforceableError,
+  UnsupportedSurfaceError,
+} from "../errors";
 import type { TokenDetails } from "../token-details";
 import { buildReportedTokenDetails, isUsageCount } from "../token-details";
+import type { FetchLike } from "../transport";
 import { detectGoogleClient } from "./detection";
 import type {
   CreateStreamAccumulatorOptions,
@@ -204,6 +210,45 @@ function withGoogleHttpBound(
   httpOptions["retryOptions"] = retryOptions;
   config["httpOptions"] = httpOptions;
 
+  return { ...kwargs, config };
+}
+
+type FetchFunction = (input: unknown, init?: unknown) => Promise<{ ok?: unknown }>;
+
+/**
+ * Under hard_deny admission, let one call make at most one successful generation request. The
+ * per-request `httpOptions.fetch` wraps the fetch the SDK would use (the request's own, then the
+ * client's, then the global). After a 2xx, any further request in the same call is refused before
+ * it is sent; a request after a non-2xx response or a network error may still go out. This
+ * backstops SDK-internal generation loops the request settings do not already turn off.
+ */
+function withSingleGenerationFetch(
+  kwargs: Record<string, unknown>,
+  client: unknown,
+  defaultFetch: FetchLike,
+): Record<string, unknown> {
+  const config = mappingFromConfig(kwargs["config"]);
+  const httpOptions = mappingFromConfig(config["httpOptions"]);
+  const own = httpOptions["fetch"];
+  const clientFetch =
+    ownDataPath(client, ["apiClient", "clientOptions", "httpOptions", "fetch"]) ??
+    ownDataPath(client, ["models", "apiClient", "clientOptions", "httpOptions", "fetch"]);
+  const base =
+    typeof own === "function" ? own : typeof clientFetch === "function" ? clientFetch : undefined;
+  let succeeded = false;
+  httpOptions["fetch"] = async (input: unknown, init?: unknown) => {
+    if (succeeded) {
+      throw new OutputBoundUnenforceableError({
+        provider: "google",
+        reason: "multi_generation_loop",
+      });
+    }
+    const send = (base ?? defaultFetch) as FetchFunction;
+    const response = await send(input, init);
+    if (response.ok === true) succeeded = true;
+    return response;
+  };
+  config["httpOptions"] = httpOptions;
   return { ...kwargs, config };
 }
 
@@ -436,7 +481,11 @@ export class GoogleAdapter implements ProviderAdapter {
     kwargs: Record<string, unknown>,
     options: PrepareCallOptions,
   ): PreparedDispatch {
-    const shaped = withGoogleHttpBound(kwargs, options.timeout);
+    const bounded = withGoogleHttpBound(kwargs, options.timeout);
+    const shaped =
+      options.singleGeneration === undefined
+        ? bounded
+        : withSingleGenerationFetch(bounded, client, options.singleGeneration.defaultFetch);
     // `stream` is not a valid Google kwarg — remove it from the shaped COPY (input is
     // untouched: `shaped` is a fresh object).
     delete shaped["stream"];

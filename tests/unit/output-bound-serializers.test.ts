@@ -7,11 +7,12 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, mcpToTool } from "@google/genai";
 import OpenAI, { AzureOpenAI } from "openai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OutputBoundUnenforceableError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
+import { GoogleAdapter } from "../../src/providers/google";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetMode } from "../../src/types";
 
@@ -778,5 +779,349 @@ describe("client-level fetchOptions.body replaces the serialized body", () => {
     await chat(solwyn, { model: "gpt-4o", messages: MESSAGES, max_tokens: 100 });
     await solwyn.close();
     expect(bodies[0]).toMatchObject({ max_tokens: 9000 });
+  });
+});
+
+describe("Google: one model generation per hard_deny call", () => {
+  function continuationFetch(streaming: boolean) {
+    const bodies: Body[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, init?: { body?: unknown }) => {
+      bodies.push(JSON.parse(String(init?.body)) as Body);
+      const first = bodies.length === 1;
+      const body = {
+        candidates: [
+          {
+            index: 0,
+            content: {
+              role: "model",
+              parts: [{ text: first ? "synthetic start" : "synthetic end" }],
+            },
+            finishReason: first ? "CONTINUATION" : "STOP",
+            ...(first ? { continuationToken: "c3ludGhldGlj" } : {}),
+          },
+        ],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 100, totalTokenCount: 110 },
+        modelVersion: "gemini-2.5-flash",
+      };
+      return streaming
+        ? new Response(`data: ${JSON.stringify(body)}\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          })
+        : Response.json(body);
+    });
+    return bodies;
+  }
+
+  async function generate(solwyn: unknown, streaming: boolean, config: Body): Promise<unknown> {
+    const { models } = solwyn as GoogleGenAI;
+    const params = { model: "gemini-2.5-flash", contents: "synthetic", config };
+    if (!streaming) return models.generateContent(params);
+    const chunks: unknown[] = [];
+    for await (const chunk of await models.generateContentStream(params)) chunks.push(chunk);
+    return chunks.at(-1);
+  }
+
+  for (const streaming of [false, true]) {
+    const label = streaming ? "streaming" : "buffered";
+
+    it(`turns off default automatic continuation (${label})`, async () => {
+      const bodies = continuationFetch(streaming);
+      const { fetch, checks } = plane();
+      const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+        apiKey: API_KEY,
+        fetch,
+        leaseEnabled: false,
+      });
+      await generate(solwyn, streaming, { maxOutputTokens: 100 });
+      await solwyn.close();
+      expect(checks[0]?.["estimated_output_bound"]).toBe(100);
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]?.["generationConfig"]).toEqual({ maxOutputTokens: 100 });
+    });
+
+    it(`refuses explicit automatic continuation (${label})`, async () => {
+      const bodies = continuationFetch(streaming);
+      const { fetch } = plane();
+      const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+        apiKey: API_KEY,
+        fetch,
+        leaseEnabled: false,
+      });
+      const error = await refusal(
+        generate(solwyn, streaming, { maxOutputTokens: 100, automaticContinuation: true }),
+      );
+      await solwyn.close();
+      expect(error.reason).toBe("multi_generation_loop");
+      expect(bodies).toHaveLength(0);
+    });
+
+    it(`leaves continuation on for alert-only projects (${label})`, async () => {
+      const bodies = continuationFetch(streaming);
+      const { fetch } = plane("alert_only");
+      const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+        apiKey: API_KEY,
+        fetch,
+        leaseEnabled: false,
+      });
+      await generate(solwyn, streaming, { maxOutputTokens: 100 });
+      await solwyn.close();
+      expect(bodies).toHaveLength(2);
+    });
+  }
+
+  function afcFetch() {
+    const bodies: Body[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, init?: { body?: unknown }) => {
+      bodies.push(JSON.parse(String(init?.body)) as Body);
+      const first = bodies.length === 1;
+      return Response.json({
+        candidates: [
+          {
+            index: 0,
+            content: {
+              role: "model",
+              parts: first
+                ? [{ functionCall: { name: "synthetic_lookup", args: { id: "synthetic" } } }]
+                : [{ text: "synthetic answer" }],
+            },
+            finishReason: "STOP",
+          },
+        ],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 80, totalTokenCount: 90 },
+        modelVersion: "gemini-2.5-flash",
+      });
+    });
+    return bodies;
+  }
+
+  function mcpTool(calls: unknown[]) {
+    return mcpToTool({
+      async listTools() {
+        return {
+          tools: [
+            {
+              name: "synthetic_lookup",
+              description: "Synthetic fixture tool",
+              inputSchema: { type: "object", properties: { id: { type: "string" } } },
+            },
+          ],
+        };
+      },
+      async callTool(params: unknown) {
+        calls.push(params);
+        return { content: [{ type: "text", text: "synthetic result" }] };
+      },
+    } as never);
+  }
+
+  it("turns off default automatic function calling for an MCP tool", async () => {
+    const bodies = afcFetch();
+    const calls: unknown[] = [];
+    const { fetch } = plane();
+    const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+      apiKey: API_KEY,
+      fetch,
+      leaseEnabled: false,
+    });
+    await solwyn.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: "synthetic",
+      config: { maxOutputTokens: 100, tools: [mcpTool(calls)] },
+    });
+    await solwyn.close();
+    expect(bodies).toHaveLength(1);
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([
+    [{ maximumRemoteCalls: 2 }],
+    [{ disable: false, maximumRemoteCalls: 2 }],
+    [{}],
+  ])("refuses an enabled automatic function calling config %j", async (automaticFunctionCalling) => {
+    const bodies = afcFetch();
+    const calls: unknown[] = [];
+    const { fetch } = plane();
+    const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+      apiKey: API_KEY,
+      fetch,
+      leaseEnabled: false,
+    });
+    const error = await refusal(
+      solwyn.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: "synthetic",
+        config: { maxOutputTokens: 100, tools: [mcpTool(calls)], automaticFunctionCalling },
+      }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("multi_generation_loop");
+    expect(bodies).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("accepts automatic function calling the caller disabled", async () => {
+    const bodies = afcFetch();
+    const calls: unknown[] = [];
+    const { fetch } = plane();
+    const solwyn = new Solwyn(new GoogleGenAI({ apiKey: "test-key" }), {
+      apiKey: API_KEY,
+      fetch,
+      leaseEnabled: false,
+    });
+    await solwyn.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: "synthetic",
+      config: {
+        maxOutputTokens: 100,
+        tools: [mcpTool(calls)],
+        automaticFunctionCalling: { disable: true },
+      },
+    });
+    await solwyn.close();
+    expect(bodies).toHaveLength(1);
+  });
+});
+
+describe("Google: at most one successful generation request per hard_deny call", () => {
+  const options = {
+    surface: "models" as const,
+    isStreaming: false,
+    crossProvider: false,
+    timeout: 600,
+    maxRetries: 0,
+  };
+
+  function continuationFetch() {
+    const bodies: Body[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, init?: { body?: unknown }) => {
+      bodies.push(JSON.parse(String(init?.body)) as Body);
+      const first = bodies.length === 1;
+      return Response.json({
+        candidates: [
+          {
+            index: 0,
+            content: { role: "model", parts: [{ text: "synthetic" }] },
+            finishReason: first ? "CONTINUATION" : "STOP",
+            ...(first ? { continuationToken: "c3ludGhldGlj" } : {}),
+          },
+        ],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 100, totalTokenCount: 110 },
+      });
+    });
+    return bodies;
+  }
+
+  // The adapter is driven directly with continuation left on, standing in for an SDK-internal
+  // loop the request settings do not turn off.
+  const kwargs = {
+    model: "gemini-2.5-flash",
+    contents: "synthetic",
+    config: { maxOutputTokens: 100, automaticContinuation: true },
+  };
+
+  it("refuses a second request after a successful generation", async () => {
+    const bodies = continuationFetch();
+    const native = new GoogleGenAI({ apiKey: "test-key" });
+    const dispatch = new GoogleAdapter().prepareCall(native, kwargs, {
+      ...options,
+      singleGeneration: {
+        defaultFetch: (input: string, init?: unknown) =>
+          globalThis.fetch(input, init as RequestInit),
+      },
+    });
+    const error = await refusal(Promise.resolve().then(() => dispatch()));
+    expect(error.reason).toBe("multi_generation_loop");
+    expect(bodies).toHaveLength(1);
+  });
+
+  it("wraps the client's own fetch rather than the global one", async () => {
+    const globalBodies = continuationFetch();
+    const clientBodies: unknown[] = [];
+    const native = new GoogleGenAI({
+      apiKey: "test-key",
+      httpOptions: {
+        fetch: async (input: unknown, init?: RequestInit) => {
+          clientBodies.push(init?.body);
+          return globalThis.fetch(input as string, init);
+        },
+      } as never,
+    });
+    const dispatch = new GoogleAdapter().prepareCall(native, kwargs, {
+      ...options,
+      singleGeneration: {
+        defaultFetch: (input: string, init?: unknown) =>
+          globalThis.fetch(input, init as RequestInit),
+      },
+    });
+    await refusal(Promise.resolve().then(() => dispatch()));
+    expect(clientBodies).toHaveLength(1);
+    expect(globalBodies).toHaveLength(1);
+  });
+
+  it("leaves the SDK loop alone without hard_deny admission", async () => {
+    const bodies = continuationFetch();
+    const native = new GoogleGenAI({ apiKey: "test-key" });
+    await new GoogleAdapter().prepareCall(native, kwargs, options)();
+    expect(bodies).toHaveLength(2);
+  });
+});
+
+describe("Anthropic fallbacks and Qwen workspace hosts", () => {
+  it("refuses Anthropic fallbacks, which send a second generation", async () => {
+    const bodies: unknown[] = [];
+    const client = new Anthropic({
+      apiKey: "sk-ant-test",
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        bodies.push(init?.body);
+        return Response.json({});
+      },
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      (solwyn as unknown as { messages: { create(b: Body): Promise<unknown> } }).messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 100,
+        messages: MESSAGES,
+        fallbacks: [{ model: "claude-opus-4-1", max_tokens: 9000 }],
+      }),
+    );
+    await solwyn.close();
+    expect(error.reason).toBe("multi_generation_loop");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("detects a regional xAI host and refuses its reasoning model", async () => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const client = new OpenAI({
+      apiKey: "sk-test",
+      baseURL: "https://eu-west-1.api.x.ai/v1",
+      fetch: transport,
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      chat(solwyn, { model: "grok-4", messages: MESSAGES, max_completion_tokens: 100 }),
+    );
+    await solwyn.close();
+    expect(error).toMatchObject({ provider: "xai", reason: "reasoning_without_budget" });
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("detects a Model Studio workspace host as Qwen and enforces its reasoning rule", async () => {
+    const { bodies, fetch: transport } = openaiTransport();
+    const client = new OpenAI({
+      apiKey: "sk-test",
+      baseURL: "https://synthetic-workspace.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+      fetch: transport,
+    });
+    const { fetch } = plane();
+    const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      chat(solwyn, { model: "qwen3.8-max", messages: MESSAGES, max_tokens: 100 }),
+    );
+    await solwyn.close();
+    expect(error).toMatchObject({ provider: "qwen", reason: "reasoning_without_budget" });
+    expect(bodies).toHaveLength(0);
   });
 });

@@ -504,6 +504,35 @@ function candidateCount(provider: string, value: unknown): number {
 }
 
 /**
+ * The Google SDK can generate more than once inside one call: automatic continuation resends a
+ * request that stopped at its cap, and automatic function calling runs callable tools and asks
+ * again. Each loop multiplies output past a single generation's bound, so both are turned off
+ * when unset, and an enabled loop refuses. Both settings are SDK-local and never serialized.
+ */
+function singleGeneration(
+  config: Record<string, unknown>,
+  provider: string,
+): Record<string, unknown> {
+  const continuation = presentValue(config, "automaticContinuation");
+  if (continuation !== undefined && continuation !== false) {
+    refuse(provider, "multi_generation_loop");
+  }
+  const calling = presentValue(config, "automaticFunctionCalling");
+  if (calling !== undefined) {
+    const disabled =
+      isPlainContainer(calling) &&
+      (calling["disable"] === true ||
+        (typeof calling["maximumRemoteCalls"] === "number" && calling["maximumRemoteCalls"] <= 0));
+    if (!disabled) refuse(provider, "multi_generation_loop");
+  }
+  return {
+    ...config,
+    automaticContinuation: false,
+    ...(calling === undefined ? { automaticFunctionCalling: { disable: true } } : {}),
+  };
+}
+
+/**
  * Hold one final hop request to the call's reserved output bound under hard_deny admission.
  * Returns the request to send, with the default cap injected when it has none, or throws
  * {@link OutputBoundUnenforceableError} when its possible output cannot be proven within the
@@ -515,6 +544,10 @@ export function enforceOutputBound(
 ): Record<string, unknown> {
   const { dialect, provider } = hop;
   if (hop.clientBodyOverride === true) refuse(provider, "unsupported_override");
+  // Anthropic `fallbacks` sends another generation, at its own cap, after the first.
+  if (dialect === "anthropic" && presentValue(request, "fallbacks") !== undefined) {
+    refuse(provider, "multi_generation_loop");
+  }
   if (hop.responses === true) {
     onlyKnownKeys(request, OPENAI_RESPONSES_PARAMS, NO_KEYS, provider);
   } else if (dialect === "openai") {
@@ -545,7 +578,7 @@ export function enforceOutputBound(
     }
   }
   const before = request;
-  const capped = applyOutputBound(request, {
+  let capped = applyOutputBound(request, {
     dialect,
     provider,
     model: hop.model,
@@ -583,7 +616,8 @@ export function enforceOutputBound(
   } else if (dialect === "anthropic") {
     cap = capped["max_tokens"];
   } else if (dialect === "google") {
-    const config = capped["config"] as Record<string, unknown>;
+    const config = singleGeneration(capped["config"] as Record<string, unknown>, provider);
+    capped = { ...capped, config };
     cap = config["maxOutputTokens"];
     count = candidateCount(provider, presentValue(config, "candidateCount"));
   } else {

@@ -420,6 +420,7 @@ export const OUTPUT_BOUND_UNENFORCEABLE_REASONS = [
   "unsupported_override",
   "azure_api_version",
   "bound_exceeded",
+  "multi_generation_loop",
 ] as const;
 export type OutputBoundUnenforceableReason = (typeof OUTPUT_BOUND_UNENFORCEABLE_REASONS)[number];
 
@@ -436,6 +437,8 @@ const OUTPUT_BOUND_HINTS: Readonly<Record<OutputBoundUnenforceableReason, string
     "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI api-version that supports max_completion_tokens.",
   bound_exceeded:
     "Set the output cap and candidate count on the call itself so the request fits the output bound Solwyn priced.",
+  multi_generation_loop:
+    "This call lets the provider SDK generate more than once (automatic continuation or automatic function calling). Turn those off for this call, or run the loop yourself so Solwyn checks each generation.",
 };
 
 /** Options for {@link OutputBoundUnenforceableError}. */

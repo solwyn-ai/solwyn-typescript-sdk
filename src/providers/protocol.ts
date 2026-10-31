@@ -17,6 +17,7 @@
 import { ConfigurationError } from "../errors";
 import type { RequestedAnthropicCacheTtl } from "../privacy";
 import type { TokenDetails } from "../token-details";
+import type { FetchLike } from "../transport";
 import type { MediaUsage, Modality, ProviderName } from "../types";
 
 /**
@@ -176,6 +177,13 @@ export interface PrepareCallOptions {
    * merged kwargs.
    */
   outputBound?: number;
+  /**
+   * Hard_deny admission: the call may make at most one successful generation request. ONLY the
+   * Google adapter consumes it, through a per-request fetch guard; no other adapter's metered
+   * dispatch loops internally. `defaultFetch` is the runtime fetch the guard wraps when neither
+   * the request nor the client supplies one.
+   */
+  singleGeneration?: { readonly defaultFetch: FetchLike };
 }
 
 /** A bound provider-SDK method (never invoked inside an adapter). */

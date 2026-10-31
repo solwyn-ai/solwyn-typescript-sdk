@@ -640,3 +640,64 @@ describe("BudgetEnforcer output bound", () => {
     await enforcer.close();
   });
 });
+
+describe("the single-generation guard on an SDK-internal loop", () => {
+  it("stops after one paid generation and records a possibly-succeeded error", async () => {
+    const sent: unknown[] = [];
+    const events: Request[] = [];
+    // A Google-shaped client that loops through the per-request fetch, as an SDK-internal
+    // continuation the request settings did not turn off would.
+    const generateContent = vi.fn(async (params: Request) => {
+      const fetch = ((params["config"] as Request)["httpOptions"] as Request)["fetch"] as (
+        url: string,
+        init: unknown,
+      ) => Promise<Response>;
+      for (let round = 0; round < 2; round++) {
+        await fetch("https://generativelanguage.example/v1beta", { body: "{}" });
+      }
+      return { usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
+    });
+    vi.stubGlobal("fetch", async (url: unknown) => {
+      sent.push(url);
+      return Response.json({});
+    });
+    const planeFetch: FetchLike = async (url, init) => {
+      if (url.includes("/api/v1/budgets/check")) {
+        return Response.json({
+          allowed: true,
+          remaining_budget: 950,
+          reservation_id: "res-guard",
+          mode: "hard_deny",
+          budget_limit: 1000,
+          current_usage: 50,
+          denied_by_period: null,
+          project_id: PROJECT_ID,
+          price_hints: null,
+        });
+      }
+      if (url.includes("/api/v1/metadata/ingest") && typeof init?.body === "string") {
+        events.push(...(JSON.parse(init.body) as Request[]));
+      }
+      return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+    };
+    const solwyn = new Solwyn(
+      { models: { generateContent, generateContentStream: vi.fn() } },
+      { apiKey: API_KEY, fetch: planeFetch, leaseEnabled: false },
+    );
+    const error = await (
+      solwyn as unknown as { models: { generateContent(p: Request): Promise<unknown> } }
+    ).models
+      .generateContent({ model: "gemini-2.5-flash", contents: "synthetic" })
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+    await solwyn.close();
+    vi.unstubAllGlobals();
+
+    expect(error).toMatchObject({ reason: "multi_generation_loop" });
+    expect(sent).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ status: "error", possibly_succeeded: true });
+  });
+});

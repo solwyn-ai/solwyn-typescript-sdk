@@ -64,6 +64,7 @@ import { safeErrorClassName } from "./error-class";
 import {
   ConfigurationError,
   isCallerAbort,
+  OutputBoundUnenforceableError,
   ProviderUnavailableError,
   RunStoppedError,
   SolwynError,
@@ -194,7 +195,7 @@ import {
   type TraceSnapshot,
   withoutTraceContext,
 } from "./trace-context";
-import { type FetchLike, requireFetchLike } from "./transport";
+import { type FetchLike, globalFetch, requireFetchLike } from "./transport";
 import type {
   BudgetMode,
   DenySource,
@@ -2954,6 +2955,24 @@ export class SolwynCore {
             );
             throw error;
           }
+          if (
+            error instanceof OutputBoundUnenforceableError &&
+            error.reason === "multi_generation_loop"
+          ) {
+            // The single-generation guard fired after the provider already served one paid
+            // generation: keep the reservation at its floor, report a possibly-succeeded error,
+            // and stop the chain with no breaker verdict and no failover.
+            breaker.releaseProbe(admission);
+            this.#budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+            const guardRegion = safeExtractRegion(
+              () => runtime.adapter.extractRegion(runtime.sdkClient),
+              this.#logger,
+            );
+            this.#reporter.report(
+              this.#buildErrorEvent(ctx, hop, error, nowMs() - hopStarted, true, guardRegion),
+            );
+            throw error;
+          }
           lastError = error;
           anyAttemptFailed = true;
           const latencyMs = nowMs() - hopStarted;
@@ -4097,6 +4116,7 @@ export class SolwynCore {
       // bag already carries the fill-absent result).
       entryDefaultParams,
       outputBound,
+      ...(outputBound === undefined ? {} : { singleGeneration: { defaultFetch: globalFetch } }),
       responsesLeaf,
     });
     return dispatch(...passthroughArgs);

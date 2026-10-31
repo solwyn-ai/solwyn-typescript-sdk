@@ -332,7 +332,7 @@ it.each([
   false,
   true,
 ])("settles cumulative Google continuation usage once (stream=%s)", async (streaming) => {
-  const plane = new FakeControlPlane();
+  const plane = new FakeControlPlane({ mode: "alert_only" });
   let requests = 0;
   const providerFetch: typeof fetch = async () => {
     const first = requests++ === 0;

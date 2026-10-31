@@ -37,7 +37,8 @@ the SDK.
   than its bound, and that the SDK cannot cap, fails before it reaches the provider with
   `code: "output_bound_unenforceable"`, a `reason` (`malformed_cap_container`,
   `malformed_candidate_count`, `reasoning_without_budget`, `unsupported_override`,
-  `azure_api_version`, or `bound_exceeded`), and a `hint` saying what to change. Lease
+  `azure_api_version`, `bound_exceeded`, or `multi_generation_loop`), and a `hint` saying what to
+  change. Lease
   reservations are released.
 - **`BudgetCheckResult.hardDenyAdmitted`.** Results report whether hard_deny authority admitted
   the call.
@@ -67,7 +68,11 @@ the SDK.
   - an AI SDK call sets a `reasoning` effort other than `none` on a provider other than OpenAI
     or Azure OpenAI, whose adapters can add a thinking budget on top of `maxOutputTokens`;
   - an uncapped Azure call uses an api-version older than 2024-09-01;
-  - the final request can still exceed its bound.
+  - the final request can still exceed its bound;
+  - the provider SDK would generate more than once (`multi_generation_loop`): Google
+    `automaticContinuation` or an enabled `automaticFunctionCalling` config, or Anthropic
+    `fallbacks`. Unset Google loops are turned off for the call, and a Google call that already
+    received one successful generation response cannot send another.
 
   Nothing changes on alert-only projects, and SDK-local outage decisions never add a cap.
 - **Azure OpenAI caps keep their key.** A deployment name no longer selects the cap parameter, and
@@ -75,6 +80,8 @@ the SDK.
   call set different cap keys, the call's key wins.
 - **Allow cache.** A cached allow is reused only for a check with the same output bound, so an
   allow for a small bound never admits a larger one.
+- **Provider detection.** Model Studio workspace hosts (`*.maas.aliyuncs.com`) are detected as
+  Qwen, and xAI regional hosts (`*.api.x.ai`) as xAI, so their reasoning rules apply.
 
 ### Known limitations
 

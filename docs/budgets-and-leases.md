@@ -86,6 +86,7 @@ produce more output than the bound, the call fails before it reaches the provide
 | `unsupported_override` | a body extension carries a key Solwyn cannot account for (see below) |
 | `azure_api_version` | an uncapped Azure OpenAI call on an api-version older than 2024-09-01 |
 | `bound_exceeded` | the final request can still produce more than the bound, for example a cap above 100,000,000 |
+| `multi_generation_loop` | the provider SDK would generate more than once in the call: Google `automaticContinuation` or an enabled `automaticFunctionCalling` config, Anthropic `fallbacks` |
 
 On a hard_deny project, body-extension channels may carry only keys Solwyn counts in the bound;
 any other key, including `model`, refuses the call with `unsupported_override`:
@@ -104,6 +105,14 @@ In the AI SDK middleware, a call-level `reasoning` effort other than `none` refu
 `reasoning_without_budget` except on OpenAI and Azure OpenAI, because other adapters can add a
 thinking budget on top of `maxOutputTokens`. The cap the model receives must also fit the bound
 the check reserved, or the call refuses with `bound_exceeded`.
+
+A hard_deny call makes one model generation. For Google, Solwyn sets
+`automaticContinuation: false` and `automaticFunctionCalling: { disable: true }` when you leave
+them unset; both are SDK-local settings. As a backstop, a Google call that already received one
+successful generation response cannot send another: the next request fails before it is sent,
+the reservation is kept, and the call reports a possibly-succeeded error. AI SDK multi-step runs
+(`stopWhen`) check and cap every step separately. Tool runners (`runTools`, `toolRunner`) and
+Google `chats` are untracked surfaces with no budget check; `onUnmetered: "raise"` refuses them.
 
 Azure OpenAI gets `max_completion_tokens`, which api-versions from 2024-09-01 accept for every
 chat deployment. A deployment name never selects the parameter, and an explicit

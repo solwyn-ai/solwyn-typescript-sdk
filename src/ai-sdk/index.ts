@@ -34,10 +34,20 @@ import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } fr
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
-import { ConfigurationError, RunStoppedError, SolwynError } from "../errors";
+import {
+  ConfigurationError,
+  OutputBoundUnenforceableError,
+  RunStoppedError,
+  SolwynError,
+} from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
-import { positiveOutputBound, resolveAiSdkOutputBound } from "../output-bound";
+import {
+  aiSdkBodyOverride,
+  positiveOutputBound,
+  reasoningOutsideCap,
+  resolveAiSdkOutputBound,
+} from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
@@ -921,9 +931,6 @@ export function createSolwynMiddleware(
     readonly maxOutputTokens?: unknown;
     readonly abortSignal?: AbortSignal;
   }
-  // Call options copied by `transformParams`. The AI SDK hands this same object to the model, so
-  // preflight may cap it in place without touching a caller-owned record.
-  const ownedParams = new WeakSet<object>();
 
   /**
    * Resolve attribution, size the pre-flight estimate, and run the budget check. On a deny:
@@ -999,13 +1006,27 @@ export function createSolwynMiddleware(
       }
       throw budget.buildDenialError(decision, estimatedInputTokens, run?.agentRunId);
     }
-    // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its cap.
-    if (
-      decision.hardDenyAdmitted &&
-      ownedParams.has(params) &&
-      positiveOutputBound(params.maxOutputTokens) === null
-    ) {
-      Reflect.set(params, "maxOutputTokens", config.lease_output_bound_default);
+    // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its
+    // cap, and a provider-option override that could raise it refuses the call before dispatch.
+    if (decision.hardDenyAdmitted) {
+      const reason = reasoningOutsideCap(provider, modelId)
+        ? "reasoning_without_budget"
+        : aiSdkBodyOverride(params)
+          ? "client_body_override"
+          : null;
+      if (reason !== null) {
+        if (decision.leaseClaimToken !== null) {
+          try {
+            budget.releaseReservation(callId, decision.leaseClaimToken);
+          } catch {
+            // Local capability cleanup is best effort; the refusal is authoritative.
+          }
+        }
+        throw new OutputBoundUnenforceableError({ provider, reason });
+      }
+      if (positiveOutputBound(params.maxOutputTokens) === null) {
+        Reflect.set(params, "maxOutputTokens", config.lease_output_bound_default);
+      }
     }
 
     return {
@@ -1425,12 +1446,9 @@ export function createSolwynMiddleware(
 
   return {
     middleware: {
-      // A Solwyn-owned copy that preflight may cap under hard_deny admission.
-      transformParams: async ({ params }) => {
-        const owned = { ...params };
-        ownedParams.add(owned);
-        return owned;
-      },
+      // A Solwyn-owned copy of the call options. The AI SDK hands this same object to wrapGenerate
+      // and the model, so preflight caps it in place without touching a caller-owned record.
+      transformParams: async ({ params }) => ({ ...params }),
       wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
       wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
     },

@@ -14,7 +14,7 @@ it.each(["esm", "cjs"])("shares every error family with %s loaded first", async 
   const { stdout } = await execute(process.execPath, [harness, process.cwd(), first], {
     timeout: 30_000,
   });
-  expect(JSON.parse(stdout)).toEqual({ families: 11, denied: 8, stopped: 8, middlewareDenied: 2 });
+  expect(JSON.parse(stdout)).toEqual({ families: 12, denied: 8, stopped: 8, middlewareDenied: 2 });
 });
 
 it("compiles strict native Responses helpers in ESM and CJS", async () => {

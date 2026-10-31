@@ -504,11 +504,11 @@ describe("estimated_output_bound on the per-call check, per dialect", () => {
     });
   }
 
-  it("sends a cap above the wire maximum as the maximum", async () => {
+  it("sends a cap above the wire maximum as the maximum (alert_only sends the call as built)", async () => {
     const create = vi.fn((_kwargs: Request) => ({
       usage: { prompt_tokens: 1, completion_tokens: 1 },
     }));
-    const { fetchMock, checks } = allowPlane();
+    const { fetchMock, checks } = allowPlane("alert_only");
     const solwyn = new Solwyn(
       { chat: { completions: { create } } },
       { apiKey: API_KEY, fetch: fetchMock },

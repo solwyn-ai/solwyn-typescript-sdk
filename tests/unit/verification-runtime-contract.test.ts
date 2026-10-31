@@ -176,7 +176,7 @@ const runtime = {
         },
         {
           name: "post-remediation-errors",
-          result: { families: 11, denied: 8, stopped: 8, middlewareDenied: 2 },
+          result: { families: 12, denied: 8, stopped: 8, middlewareDenied: 2 },
         },
       ].map((cell) => ({
         binary,

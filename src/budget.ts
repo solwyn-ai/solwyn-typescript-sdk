@@ -1380,8 +1380,8 @@ export class BudgetEnforcer {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
-      hardDenyAdmitted:
-        admission.leaseId !== null && this.leaseLedger.postureModeFor(runId) === "hard_deny",
+      // Captured with the reservation, so a renewal landing before this result cannot change it.
+      hardDenyAdmitted: admission.leaseId !== null && admission.postureMode === "hard_deny",
     });
   }
 

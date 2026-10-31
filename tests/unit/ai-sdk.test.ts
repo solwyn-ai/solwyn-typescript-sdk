@@ -30,7 +30,11 @@ import {
   usageToTokenDetails,
 } from "../../src/ai-sdk/index";
 import { BudgetEnforcer, budgetCheckResult } from "../../src/budget";
-import { BudgetExceededError, RunStoppedError } from "../../src/errors";
+import {
+  BudgetExceededError,
+  OutputBoundUnenforceableError,
+  RunStoppedError,
+} from "../../src/errors";
 import { currentRun, run } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import { clearRunTermination, markTerminated, resetRunControlForTest } from "../../src/run-control";
@@ -956,6 +960,41 @@ describe("ai-sdk middleware — generateText happy path", () => {
 
     expect(seen).toEqual(expected);
     expect(captured.checks.map((check) => check["estimated_output_bound"])).toEqual([2048, 300]);
+  });
+
+  it.each([
+    ["alibaba.chat", "qwen3.5-plus", {}, "reasoning_without_budget"],
+    ["xai.chat", "grok-4", {}, "reasoning_without_budget"],
+    ["openai.chat", "gpt-4o", { openai: { maxCompletionTokens: 9000 } }, "client_body_override"],
+  ] as const)("refuses %s under hard_deny when the bound cannot hold (%s)", async (providerId, modelId, providerOptions, reason) => {
+    const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const solwyn = createSolwynMiddleware({
+      apiKey: API_KEY,
+      fetch: fetchMock,
+      logger: NOOP_LOGGER,
+    });
+    const doGenerate = vi.fn(
+      async (): Promise<V3GenerateResult> => ({
+        content: [{ type: "text", text: "hi" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: usage(4, 2),
+        warnings: [],
+      }),
+    );
+    const model = new MockLanguageModelV3({ provider: providerId, modelId, doGenerate });
+    const wrapped = wrapLanguageModel({ model, middleware: solwyn.middleware });
+    const error = await generateText({
+      model: wrapped,
+      prompt: "one",
+      providerOptions: providerOptions as never,
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught,
+    );
+    await solwyn.close();
+    expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
+    expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
+    expect(doGenerate).not.toHaveBeenCalled();
   });
 
   it("treats an empty reservation id as event-only", async () => {

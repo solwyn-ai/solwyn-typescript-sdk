@@ -253,7 +253,7 @@ export function assertRuntimeChecks(checks, sdkVersion = checks.artifactIdentity
             network: "none; constructors and synchronous detection only",
           },
         ],
-        ["post-remediation-errors", { families: 11, denied: 8, stopped: 8, middlewareDenied: 2 }],
+        ["post-remediation-errors", { families: 12, denied: 8, stopped: 8, middlewareDenied: 2 }],
       ])
         expected.push({ binary, version, name, format, status: 0, result });
     }

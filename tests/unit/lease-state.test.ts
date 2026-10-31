@@ -65,6 +65,26 @@ function admit(value: LeaseLedger, options: Partial<Parameters<LeaseLedger["admi
   });
 }
 
+describe("LeaseLedger posture capture", () => {
+  it("stamps the posture on the admission, so a later renewal cannot change a funded call's authority", () => {
+    const value = installed(grant({ posture: { mode: "hard_deny", on_unreachable: "fail_open" } }));
+    const admission = admit(value);
+    expect(admission).toMatchObject({
+      decision: LeaseDecision.AdmitLocal,
+      postureMode: "hard_deny",
+    });
+    expect(
+      value.applyGrantResponse(
+        RUN,
+        grant({ generation: 2, posture: { mode: "alert_only", on_unreachable: "fail_open" } }),
+        { now: 1_002, declaredModels: ["gpt-5"] },
+      ),
+    ).toBe("applied");
+    expect(admission.postureMode).toBe("hard_deny");
+    expect(admit(value, { callId: "call-2", now: 1_003 }).postureMode).toBe("alert_only");
+  });
+});
+
 describe("LeaseLedger admission ladder", () => {
   it("gates before claiming, then claims before ineligibility and declared-model gates", () => {
     const disabled = installed();

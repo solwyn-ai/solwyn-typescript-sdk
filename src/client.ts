@@ -79,8 +79,9 @@ import {
 } from "./fail-soft";
 import { consoleLogger, type Logger } from "./logging";
 import {
-  applyOutputBound,
+  enforceOutputBound,
   normalizeOpenaiOutputCap,
+  resolveAzureCapAliases,
   resolveEffectiveOutputBound,
 } from "./output-bound";
 import {
@@ -91,7 +92,13 @@ import {
 } from "./privacy";
 import { validatePinnedClientFamily } from "./providers/detection";
 import { resolveProviderIdentity } from "./providers/index";
-import type { Dialect, DispatchSurface, MediaSurfaceSpec } from "./providers/protocol";
+import {
+  BEDROCK_NATIVE_COMMAND,
+  BEDROCK_NATIVE_INPUT_SNAPSHOT,
+  type Dialect,
+  type DispatchSurface,
+  type MediaSurfaceSpec,
+} from "./providers/protocol";
 // Namespace import (NOT destructured) so the native-happy-path zero-translation guarantee stays
 // spy-able: `translation.md` pins `TestZeroTranslationOnNativePath` (a `vi.spyOn` on the module's
 // named exports asserting the native path never calls `toCanonical`/`normalizeResponse`), and the
@@ -385,6 +392,50 @@ function withoutSolwynTags(layer: Record<string, unknown>): Record<string, unkno
 }
 
 /** Clamp a reported token quantity without changing enforcement or settlement math. */
+/** Azure keeps each layer's cap key; the merged request keeps the highest layer's. */
+function azureCapAliases(
+  provider: string,
+  merged: Record<string, unknown>,
+  layers: readonly Record<string, unknown>[],
+): Record<string, unknown> {
+  return provider === "azure_openai" ? resolveAzureCapAliases(merged, layers) : merged;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Read one property path without trusting accessors; an unreadable step reads as `fallback`. */
+function readPath(value: unknown, keys: readonly string[], fallback: unknown): unknown {
+  let current = value;
+  try {
+    for (const key of keys) {
+      if (!isRecord(current)) return undefined;
+      current = Reflect.get(current, key);
+    }
+  } catch {
+    return fallback;
+  }
+  return current;
+}
+
+/** The api-version an Azure OpenAI client sends, from `AzureOpenAI` or a default query. */
+function azureApiVersion(client: unknown): unknown {
+  const version = readPath(client, ["apiVersion"], Number.NaN);
+  if (version !== undefined) return version;
+  return readPath(client, ["_options", "defaultQuery", "api-version"], Number.NaN);
+}
+
+/** Whether a Google client's own `httpOptions.extraBody` can rewrite `generationConfig`. */
+function googleClientBodyOverride(client: unknown): boolean {
+  for (const owner of [client, readPath(client, ["models"], undefined)]) {
+    const extra = readPath(owner, ["apiClient", "clientOptions", "httpOptions", "extraBody"], true);
+    if (extra === true) return true;
+    if (isRecord(extra) && Object.hasOwn(extra, "generationConfig")) return true;
+  }
+  return false;
+}
+
 function wireTokenQuantity(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(Math.max(Math.trunc(value), 0), ORDINARY_TOKEN_COUNT_MAX);
@@ -2821,7 +2872,7 @@ export class SolwynCore {
       // health verdict) and PROPAGATE — never swallow it into a failover/retry.
       let hopKwargs: Record<string, unknown>;
       try {
-        hopKwargs = this.#prepareHopKwargs(runtime, hop, ctx);
+        hopKwargs = this.#enforceHopOutput(runtime, ctx, this.#prepareHopKwargs(runtime, hop, ctx));
       } catch (prepError) {
         breaker.releaseProbe(admission);
         throw prepError;
@@ -3281,12 +3332,16 @@ export class SolwynCore {
       }
       const normalize = (layer: Record<string, unknown>) =>
         servedDialect === "openai" ? normalizeOpenaiOutputCap(targetName, hop.model, layer) : layer;
-      return {
-        ...normalize(globalDefaults),
-        ...normalize(entryDefaults),
-        ...normalize(ctx.callerKwargs),
-        model: hop.model,
-      };
+      return azureCapAliases(
+        targetName,
+        {
+          ...normalize(globalDefaults),
+          ...normalize(entryDefaults),
+          ...normalize(ctx.callerKwargs),
+          model: hop.model,
+        },
+        [ctx.callerKwargs, entryDefaults, globalDefaults],
+      );
     }
 
     // CROSS-PROVIDER hop. Defensive structural guard (#16): the target entry MUST carry a
@@ -3301,11 +3356,15 @@ export class SolwynCore {
       // model swap. The legacy-key rewrite (`max_completion_tokens` → `max_tokens` for
       // non-OpenAI targets) is applied PER SOURCE LAYER BEFORE the precedence merge — never on
       // the merged dict, or an entry-default cap could silently beat a per-call one (#14).
-      const normalized: Record<string, unknown> = {
-        ...normalizeOpenaiOutputCap(targetName, hop.model, globalDefaults),
-        ...normalizeOpenaiOutputCap(targetName, hop.model, entryDefaults),
-        ...normalizeOpenaiOutputCap(targetName, hop.model, ctx.callerKwargs),
-      };
+      const normalized: Record<string, unknown> = azureCapAliases(
+        targetName,
+        {
+          ...normalizeOpenaiOutputCap(targetName, hop.model, globalDefaults),
+          ...normalizeOpenaiOutputCap(targetName, hop.model, entryDefaults),
+          ...normalizeOpenaiOutputCap(targetName, hop.model, ctx.callerKwargs),
+        },
+        [ctx.callerKwargs, entryDefaults, globalDefaults],
+      );
       // Endpoint-scoped transport params authored for the ORIGINAL target must not reach a
       // different vendor: strip them, then re-author from the TARGET entry's own defaults (#15).
       const passthrough: Record<string, unknown> = { ...normalized };
@@ -3358,10 +3417,14 @@ export class SolwynCore {
     >;
     const targetKwargs =
       servedDialect === "openai"
-        ? {
-            ...normalizeOpenaiOutputCap(targetName, hop.model, entryDefaults),
-            ...normalizeOpenaiOutputCap(targetName, hop.model, callKwargs),
-          }
+        ? azureCapAliases(
+            targetName,
+            {
+              ...normalizeOpenaiOutputCap(targetName, hop.model, entryDefaults),
+              ...normalizeOpenaiOutputCap(targetName, hop.model, callKwargs),
+            },
+            [callKwargs, entryDefaults],
+          )
         : { ...entryDefaults, ...callKwargs };
     if (servedDialect !== "openai") delete targetKwargs["max_completion_tokens"];
     if (servedDialect !== "openai" && servedDialect !== "anthropic")
@@ -3369,6 +3432,45 @@ export class SolwynCore {
     return servedDialect === "google"
       ? restoreGoogleTargetTransport(targetKwargs, entryDefaults)
       : targetKwargs;
+  }
+
+  /**
+   * Under hard_deny admission, hold the final hop request to the reserved output bound: inject the
+   * default cap where the request has none, or throw `OutputBoundUnenforceableError` before any
+   * provider I/O. Bedrock's wire command is rebuilt in its adapter, so this validates the same
+   * `{ ...defaults, ...commandInput }` merge there and leaves the injection to the adapter.
+   */
+  #enforceHopOutput(
+    runtime: ProviderRuntime,
+    ctx: DispatchContext,
+    hopKwargs: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (ctx.outputCap === undefined) return hopKwargs;
+    const dialect = runtime.adapter.dialect;
+    const provider = runtime.adapter.name;
+    const hop = {
+      dialect,
+      provider,
+      model: typeof hopKwargs["model"] === "string" ? hopKwargs["model"] : "",
+      responses: ctx.surface === "responses",
+      defaultCap: ctx.outputCap,
+      reserved: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+      azureApiVersion: provider === "azure_openai" ? azureApiVersion(runtime.sdkClient) : undefined,
+      clientBodyOverride: dialect === "google" && googleClientBodyOverride(runtime.sdkClient),
+    };
+    if (dialect !== "bedrock") return enforceOutputBound(hopKwargs, hop);
+    const snapshot = Reflect.get(hopKwargs, BEDROCK_NATIVE_INPUT_SNAPSHOT);
+    const command = Reflect.get(hopKwargs, BEDROCK_NATIVE_COMMAND);
+    const commandInput = isRecord(command) ? Reflect.get(command, "input") : undefined;
+    enforceOutputBound(
+      {
+        ...ctx.requestDefaults.global,
+        ...ctx.requestDefaults.entries.get(runtime),
+        ...(isRecord(snapshot) ? snapshot : isRecord(commandInput) ? commandInput : {}),
+      },
+      hop,
+    );
+    return hopKwargs;
   }
 
   /**
@@ -3945,17 +4047,6 @@ export class SolwynCore {
           },
         };
       }
-    }
-    // Under hard_deny admission the reserved output bound must be true: a final hop request with
-    // no positive output cap gets the bound as its cap. Bedrock applies it to its rebuilt input.
-    if (outputBound !== undefined && runtime.adapter.dialect !== "bedrock") {
-      merged = applyOutputBound(merged, {
-        dialect: runtime.adapter.dialect,
-        provider: runtime.adapter.name,
-        model: typeof merged["model"] === "string" ? merged["model"] : "",
-        bound: outputBound,
-        responses: surface === "responses",
-      });
     }
     const dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
       surface,

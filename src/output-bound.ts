@@ -1,3 +1,4 @@
+import { OutputBoundUnenforceableError, type OutputBoundUnenforceableReason } from "./errors";
 import type { Dialect } from "./providers/protocol";
 
 export interface OutputBoundHop {
@@ -25,7 +26,11 @@ interface CapSlot {
 interface ProjectedCaps {
   maxTokens?: CapSlot;
   maxCompletionTokens?: CapSlot;
+  candidates?: CapSlot;
+  enableThinking?: CapSlot;
+  thinkingBudget?: CapSlot;
   googleConfigMaxOutputTokens?: CapSlot;
+  googleConfigCandidateCount?: CapSlot;
   bedrockMaxTokens?: CapSlot;
 }
 
@@ -63,7 +68,11 @@ function usesOpenaiCompletionTokens(provider: string, model: string): boolean {
   );
 }
 
-/** Normalize one layer before merging, so caller cap aliases override default aliases. */
+/**
+ * Normalize one layer before merging, so caller cap aliases override default aliases. An Azure
+ * `model` is a deployment name, so Azure keeps the caller's own key and never trades
+ * `max_completion_tokens` for the weaker `max_tokens`.
+ */
 export function normalizeOpenaiOutputCap(
   provider: string,
   model: string,
@@ -76,9 +85,50 @@ export function normalizeOpenaiOutputCap(
   const normalized = { ...params };
   delete normalized["max_tokens"];
   delete normalized["max_completion_tokens"];
-  normalized[usesOpenaiCompletionTokens(provider, model) ? "max_completion_tokens" : "max_tokens"] =
-    cap.value;
+  const completionKey =
+    provider === "azure_openai"
+      ? modern !== undefined
+      : usesOpenaiCompletionTokens(provider, model);
+  normalized[completionKey ? "max_completion_tokens" : "max_tokens"] = cap.value;
   return normalized;
+}
+
+/**
+ * Azure keeps each layer's own cap key, so merged layers can carry both. Keep the key the
+ * highest-precedence layer set (`layers` runs from highest to lowest) and drop the other.
+ */
+export function resolveAzureCapAliases(
+  merged: Record<string, unknown>,
+  layers: readonly Record<string, unknown>[],
+): Record<string, unknown> {
+  if (!Object.hasOwn(merged, "max_tokens") || !Object.hasOwn(merged, "max_completion_tokens")) {
+    return merged;
+  }
+  const owner = layers.find(
+    (layer) => Object.hasOwn(layer, "max_completion_tokens") || Object.hasOwn(layer, "max_tokens"),
+  );
+  const resolved = { ...merged };
+  delete resolved[
+    owner !== undefined && !Object.hasOwn(owner, "max_completion_tokens")
+      ? "max_completion_tokens"
+      : "max_tokens"
+  ];
+  return resolved;
+}
+
+// Two providers' OpenAI-compatible output caps leave reasoning out. Qwen thinks by default on many
+// models and takes a `thinking_budget`, which the hop bound adds. xAI has no reasoning budget, so
+// only its non-reasoning models can be bounded.
+function xaiNonReasoning(model: string): boolean {
+  return model.includes("non-reasoning");
+}
+
+/**
+ * Whether a provider's reasoning cannot be bounded from request fields the SDK reads; used where
+ * the request shape is opaque (the AI SDK middleware).
+ */
+export function reasoningOutsideCap(provider: string, model: string): boolean {
+  return provider === "qwen" || (provider === "xai" && !xaiNonReasoning(model));
 }
 
 function projectCaps(
@@ -99,17 +149,24 @@ function projectCaps(
     return {
       maxTokens: ownSlot(normalized, "max_tokens"),
       maxCompletionTokens: ownSlot(normalized, "max_completion_tokens"),
+      candidates: ownSlot(value, "n"),
+      enableThinking: ownSlot(value, "enable_thinking"),
+      thinkingBudget: ownSlot(value, "thinking_budget"),
     };
   }
   if (dialect === "anthropic") {
     return { maxTokens: ownSlot(value, "max_tokens") };
   }
   if (dialect === "google") {
+    // A layer's `config` replaces lower layers' config whole, so absent keys read as unset.
+    if (ownSlot(value, "config") === undefined) return {};
     return {
-      googleConfigMaxOutputTokens:
-        ownSlot(value, "config") === undefined
-          ? undefined
-          : (nestedSlot(value, "config", "maxOutputTokens") ?? { value: undefined }),
+      googleConfigMaxOutputTokens: nestedSlot(value, "config", "maxOutputTokens") ?? {
+        value: undefined,
+      },
+      googleConfigCandidateCount: nestedSlot(value, "config", "candidateCount") ?? {
+        value: undefined,
+      },
     };
   }
   return {
@@ -121,15 +178,14 @@ function projectCaps(
 }
 
 function overlayCaps(target: ProjectedCaps, source: ProjectedCaps): void {
-  if (source.maxTokens !== undefined) target.maxTokens = source.maxTokens;
-  if (source.maxCompletionTokens !== undefined) {
+  // A layer that sets either OpenAI cap key replaces both, so a lower layer's alias cannot win.
+  if (source.maxTokens !== undefined || source.maxCompletionTokens !== undefined) {
+    target.maxTokens = source.maxTokens;
     target.maxCompletionTokens = source.maxCompletionTokens;
   }
-  if (source.googleConfigMaxOutputTokens !== undefined) {
-    target.googleConfigMaxOutputTokens = source.googleConfigMaxOutputTokens;
-  }
-  if (source.bedrockMaxTokens !== undefined) {
-    target.bedrockMaxTokens = source.bedrockMaxTokens;
+  for (const key of Object.keys(source) as (keyof ProjectedCaps)[]) {
+    const slot = source[key];
+    if (slot !== undefined) target[key] = slot;
   }
 }
 
@@ -154,6 +210,20 @@ function resolvedProjectedCap(caps: ProjectedCaps, dialect: Dialect): number | n
   return positiveCap(caps.bedrockMaxTokens);
 }
 
+/** Candidates the request asks for; an absent or malformed count reads as one. */
+function projectedCandidates(caps: ProjectedCaps, dialect: Dialect): number {
+  if (dialect === "openai") return positiveCap(caps.candidates) ?? 1;
+  if (dialect === "google") return positiveCap(caps.googleConfigCandidateCount) ?? 1;
+  return 1;
+}
+
+/** Qwen reasoning tokens a candidate may spend outside its output cap. */
+function projectedReasoning(caps: ProjectedCaps, dialect: Dialect, provider: string): number {
+  if (dialect !== "openai" || provider !== "qwen") return 0;
+  if (caps.enableThinking?.value === false) return 0;
+  return positiveCap(caps.thinkingBudget) ?? 0;
+}
+
 function resolveHop(options: EffectiveOutputBoundOptions, hop: OutputBoundHop): number {
   const crossDialect = hop.dialect !== options.sourceDialect;
   const dialect = crossDialect ? options.sourceDialect : hop.dialect;
@@ -163,7 +233,8 @@ function resolveHop(options: EffectiveOutputBoundOptions, hop: OutputBoundHop): 
   overlayCaps(caps, projectCaps(options.globalDefaults, dialect, provider, model));
   overlayCaps(caps, projectCaps(hop.defaultParams, dialect, provider, model));
   overlayCaps(caps, projectCaps(options.callParams, dialect, provider, model));
-  return resolvedProjectedCap(caps, dialect) ?? options.defaultBound;
+  const cap = resolvedProjectedCap(caps, dialect) ?? options.defaultBound;
+  return (cap + projectedReasoning(caps, dialect, provider)) * projectedCandidates(caps, dialect);
 }
 
 export function resolveEffectiveOutputBound(options: EffectiveOutputBoundOptions): number {
@@ -254,12 +325,187 @@ export function applyOutputBound(
     const capped = { ...request };
     delete capped["max_tokens"];
     delete capped["max_completion_tokens"];
-    capped[usesOpenaiCompletionTokens(provider, model) ? "max_completion_tokens" : "max_tokens"] =
-      bound;
+    // An Azure `model` is a deployment name, so it cannot identify a model family.
+    const completionKey =
+      provider === "azure_openai" || usesOpenaiCompletionTokens(provider, model);
+    capped[completionKey ? "max_completion_tokens" : "max_tokens"] = bound;
     return capped;
   }
   if (dialect === "anthropic") return withPositiveCap(request, "max_tokens", bound);
   if (dialect === "google")
     return withNestedPositiveCap(request, "config", "maxOutputTokens", bound);
   return withNestedPositiveCap(request, "inferenceConfig", "maxTokens", bound);
+}
+
+/** Model-native Bedrock body keys that can raise the output limit or the candidate count. */
+const BEDROCK_OVERRIDE_KEYS = [
+  "max_tokens",
+  "maxTokens",
+  "max_gen_len",
+  "max_new_tokens",
+  "max_output_tokens",
+  "maxOutputTokens",
+  "n",
+  "candidateCount",
+  "num_return_sequences",
+] as const;
+
+/** Azure api-versions from this date accept `max_completion_tokens` for every chat deployment. */
+const AZURE_COMPLETION_TOKENS_SINCE = "2024-09-01";
+
+/**
+ * Whether an Azure client accepts an injected `max_completion_tokens`. The v1 API carries no
+ * dated version; an older or unparseable dated version is not trusted.
+ */
+export function azureAcceptsCompletionTokens(apiVersion: unknown): boolean {
+  if (apiVersion === undefined || apiVersion === null) return true;
+  if (typeof apiVersion !== "string") return false;
+  if (apiVersion === "v1" || apiVersion === "preview" || apiVersion === "latest") return true;
+  const date = /^(\d{4}-\d{2}-\d{2})(?:-preview)?$/.exec(apiVersion)?.[1];
+  return date !== undefined && date >= AZURE_COMPLETION_TOKENS_SINCE;
+}
+
+export interface HopOutputEnforcement {
+  readonly dialect: Dialect;
+  readonly provider: string;
+  readonly model: string;
+  readonly responses?: boolean;
+  /** Cap injected when the request has no positive one. */
+  readonly defaultCap: number;
+  /** Output tokens the budget check reserved for the whole call. */
+  readonly reserved: number;
+  /** The wrapped Azure client's api-version, when the provider is Azure OpenAI. */
+  readonly azureApiVersion?: unknown;
+  /** A client-level body override can rewrite the output limit after serialization. */
+  readonly clientBodyOverride?: boolean;
+}
+
+function refuse(provider: string, reason: OutputBoundUnenforceableReason): never {
+  throw new OutputBoundUnenforceableError({ provider, reason });
+}
+
+function presentValue(request: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(request, key) ? request[key] : undefined;
+}
+
+function isPlainContainer(value: unknown): value is Record<string, unknown> {
+  return isObject(value) && !Array.isArray(value);
+}
+
+/** A present count must be a positive integer; null and absent mean one. */
+function candidateCount(provider: string, value: unknown): number {
+  if (value === undefined || value === null) return 1;
+  return positiveOutputBound(value) ?? refuse(provider, "malformed_candidate_count");
+}
+
+/**
+ * Hold one final hop request to the call's reserved output bound under hard_deny admission.
+ * Returns the request to send, with the default cap injected when it has none, or throws
+ * {@link OutputBoundUnenforceableError} when its possible output cannot be proven within the
+ * reservation: (cap + reasoning outside the cap) x candidates.
+ */
+export function enforceOutputBound(
+  request: Record<string, unknown>,
+  hop: HopOutputEnforcement,
+): Record<string, unknown> {
+  const { dialect, provider } = hop;
+  if (hop.clientBodyOverride === true) refuse(provider, "client_body_override");
+  if (dialect === "google") {
+    const config = presentValue(request, "config");
+    if (config !== undefined && config !== null && !isPlainContainer(config)) {
+      refuse(provider, "malformed_cap_container");
+    }
+  }
+  if (dialect === "bedrock") {
+    const config = presentValue(request, "inferenceConfig");
+    if (config !== undefined && config !== null && !isPlainContainer(config)) {
+      refuse(provider, "malformed_cap_container");
+    }
+    const extra = presentValue(request, "additionalModelRequestFields");
+    if (extra !== undefined && extra !== null) {
+      if (!isPlainContainer(extra)) refuse(provider, "malformed_cap_container");
+      if (BEDROCK_OVERRIDE_KEYS.some((key) => Object.hasOwn(extra, key))) {
+        refuse(provider, "client_body_override");
+      }
+    }
+  }
+  const before = request;
+  const capped = applyOutputBound(request, {
+    dialect,
+    provider,
+    model: hop.model,
+    bound: hop.defaultCap,
+    responses: hop.responses === true,
+  });
+  if (
+    capped !== before &&
+    provider === "azure_openai" &&
+    hop.responses !== true &&
+    !azureAcceptsCompletionTokens(hop.azureApiVersion)
+  ) {
+    refuse(provider, "azure_api_version");
+  }
+
+  let cap: unknown;
+  let count = 1;
+  let reasoning = 0;
+  if (hop.responses === true) {
+    cap = capped["max_output_tokens"];
+  } else if (dialect === "openai") {
+    cap = Object.hasOwn(capped, "max_completion_tokens")
+      ? capped["max_completion_tokens"]
+      : capped["max_tokens"];
+    count = candidateCount(provider, presentValue(capped, "n"));
+    if (provider === "qwen" && presentValue(capped, "enable_thinking") !== false) {
+      // Qwen thinks by default on many models, and its caps leave reasoning out.
+      reasoning =
+        positiveOutputBound(presentValue(capped, "thinking_budget")) ??
+        refuse(provider, "reasoning_without_budget");
+    }
+    if (provider === "xai" && !xaiNonReasoning(hop.model)) {
+      refuse(provider, "reasoning_without_budget");
+    }
+  } else if (dialect === "anthropic") {
+    cap = capped["max_tokens"];
+  } else if (dialect === "google") {
+    const config = capped["config"] as Record<string, unknown>;
+    cap = config["maxOutputTokens"];
+    count = candidateCount(provider, presentValue(config, "candidateCount"));
+  } else {
+    cap = (capped["inferenceConfig"] as Record<string, unknown>)["maxTokens"];
+  }
+  const perCandidate = positiveOutputBound(cap) ?? refuse(provider, "bound_exceeded");
+  if ((perCandidate + reasoning) * count > hop.reserved) refuse(provider, "bound_exceeded");
+  return capped;
+}
+
+/** AI SDK provider-option keys that can raise the output limit or the candidate count. */
+const AI_SDK_OVERRIDE_KEYS = [
+  "maxTokens",
+  "maxCompletionTokens",
+  "maxOutputTokens",
+  "max_tokens",
+  "max_completion_tokens",
+  "max_output_tokens",
+  "n",
+  "candidateCount",
+] as const;
+
+/**
+ * Whether AI SDK `providerOptions` can change the output limit or candidate count after Solwyn
+ * sets `maxOutputTokens`. An unreadable options object counts as an override.
+ */
+export function aiSdkBodyOverride(params: unknown): boolean {
+  try {
+    const options = isObject(params) ? Reflect.get(params, "providerOptions") : undefined;
+    if (options === undefined || options === null) return false;
+    if (!isObject(options)) return true;
+    for (const scope of Object.values(options)) {
+      if (!isObject(scope)) continue;
+      if (AI_SDK_OVERRIDE_KEYS.some((key) => Object.hasOwn(scope, key))) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }

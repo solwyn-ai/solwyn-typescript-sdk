@@ -336,7 +336,7 @@ async function validateChecks(probe, report, out) {
             ]);
           } else if (name === "post-remediation-errors") {
             assert.deepEqual(cell.result, {
-              families: 11,
+              families: 12,
               denied: 8,
               stopped: 8,
               middlewareDenied: 2,

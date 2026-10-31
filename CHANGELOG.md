@@ -28,34 +28,56 @@ the SDK.
   Google, Bedrock Converse, and the AI SDK middleware) sends `estimated_output_bound`, the most
   output tokens the call can produce. Solwyn Cloud reserves input cost plus that bound at the
   model's output rate, so `hard_deny` refuses a call before dispatch when its bound does not fit
-  the remaining budget, and alert-only reservations get more accurate. The value is the one the
-  run lease already reserves: a positive caller or `defaultParams` cap as is, the largest cap
-  across failover hops, or `leaseOutputBoundDefault` (default `4096`) when there is no cap. A cap
-  above 100,000,000 is sent as 100,000,000. Media checks do not send it.
+  the remaining budget, and alert-only reservations get more accurate. The bound is the
+  per-candidate cap (a positive caller or `defaultParams` cap, or `leaseOutputBoundDefault`,
+  default `4096`) times the candidate count (OpenAI `n`, Google `candidateCount`), plus Qwen's
+  `thinking_budget` per candidate, and the largest across failover hops. A bound above
+  100,000,000 is sent as 100,000,000. Media checks do not send it.
+- **`OutputBoundUnenforceableError`.** On hard_deny projects a call that could produce more output
+  than its bound, and that the SDK cannot cap, fails before it reaches the provider with
+  `code: "output_bound_unenforceable"`, a `reason` (`malformed_cap_container`,
+  `malformed_candidate_count`, `reasoning_without_budget`, `client_body_override`,
+  `azure_api_version`, or `bound_exceeded`), and a `hint` saying what to change. Lease
+  reservations are released.
+- **`BudgetCheckResult.hardDenyAdmitted`.** Results report whether hard_deny authority admitted
+  the call.
 
 ### Changed
 
 - **Uncapped calls on hard_deny projects get an output cap.** An unbounded call cannot honestly
   be held to a hard cap, so when a hard_deny check allows a text call, or the call draws on a
   lease with a hard_deny posture, a request with no positive output cap is sent with
-  `leaseOutputBoundDefault` (default `4096`, configurable) as its cap. Set your own cap to choose
-  a different limit. The cap goes in the dialect's own field: `max_tokens`, or
-  `max_completion_tokens` for OpenAI and Azure o-series and GPT-5 models, Responses
-  `max_output_tokens`, Anthropic `max_tokens`, Google `config.maxOutputTokens`, Bedrock
-  `inferenceConfig.maxTokens`, and AI SDK `maxOutputTokens`. A zero, negative, non-integer, or
-  null cap is replaced. A positive cap is never changed. An uncapped Bedrock command is sent as a
-  rebuilt sibling command instead of the original instance. Reasoning models count reasoning
-  tokens against the cap. Nothing changes on alert-only projects, and SDK-local outage
-  decisions never add a cap.
+  `leaseOutputBoundDefault` (default `4096`, configurable) as its per-candidate cap. Set your own
+  cap to choose a different limit. The cap goes in the dialect's own field: `max_tokens`, or
+  `max_completion_tokens` for OpenAI o-series and GPT-5 models and for every Azure OpenAI
+  deployment, Responses `max_output_tokens`, Anthropic `max_tokens`, Google
+  `config.maxOutputTokens`, Bedrock `inferenceConfig.maxTokens`, and AI SDK `maxOutputTokens`. A
+  zero, negative, non-integer, or null cap is replaced. A positive cap is never changed. An
+  uncapped Bedrock command is sent as a rebuilt sibling command instead of the original instance.
+  OpenAI, Azure OpenAI, Anthropic, Gemini, and Bedrock count reasoning inside the cap.
+- **Refusals on hard_deny projects.** A call fails with `OutputBoundUnenforceableError` when:
+  - Qwen thinking is not turned off and has no positive `thinking_budget`;
+  - the model is an xAI reasoning model, whose caps leave reasoning out and take no budget;
+  - the candidate count or the Google or Bedrock settings container is malformed;
+  - a Google client `httpOptions.extraBody` sets `generationConfig`;
+  - Bedrock `additionalModelRequestFields` or AI SDK `providerOptions` set a token limit or count;
+  - an uncapped Azure call uses an api-version older than 2024-09-01;
+  - the final request can still exceed its bound.
+
+  Nothing changes on alert-only projects, and SDK-local outage decisions never add a cap.
+- **Azure OpenAI caps keep their key.** A deployment name no longer selects the cap parameter, and
+  an explicit `max_completion_tokens` is never rewritten to `max_tokens`. When defaults and the
+  call set different cap keys, the call's key wins.
 - **Allow cache.** A cached allow is reused only for a check with the same output bound, so an
   allow for a small bound never admits a larger one.
-- **`BudgetCheckResult.hardDenyAdmitted`.** Results report whether hard_deny authority admitted
-  the call.
 
 ### Known limitations
 
 - A scoped hard_deny rule on an alert-only project is not visible in the check's `mode`, so
   uncapped calls under that rule are not capped and one call can still overshoot it.
+- A Qwen model that thinks even with `enable_thinking: false` is bounded without its reasoning.
+- DeepSeek, Groq, Mistral, Z.ai, Perplexity, and Fireworks are treated as counting reasoning
+  inside the cap; their docs do not say so explicitly.
 
 ## [0.2.0] — 2026-10-21
 

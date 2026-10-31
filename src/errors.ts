@@ -412,6 +412,60 @@ export class UntranslatableModelError extends SolwynError {
   }
 }
 
+/** Closed set of reasons the SDK cannot hold a hard_deny call to its reserved output bound. */
+export const OUTPUT_BOUND_UNENFORCEABLE_REASONS = [
+  "malformed_cap_container",
+  "malformed_candidate_count",
+  "reasoning_without_budget",
+  "client_body_override",
+  "azure_api_version",
+  "bound_exceeded",
+] as const;
+export type OutputBoundUnenforceableReason = (typeof OUTPUT_BOUND_UNENFORCEABLE_REASONS)[number];
+
+const OUTPUT_BOUND_HINTS: Readonly<Record<OutputBoundUnenforceableReason, string>> = {
+  malformed_cap_container:
+    "Pass the request's output settings (Google config, Bedrock inferenceConfig, or a request body extension) as an object so Solwyn can read the output cap.",
+  malformed_candidate_count:
+    "Set the candidate count (n or candidateCount) to a positive integer, or leave it unset.",
+  reasoning_without_budget:
+    "Reasoning is enabled with no reasoning budget, and this provider's output cap does not include reasoning. Set a positive thinking budget, turn reasoning off, or use a non-reasoning model.",
+  client_body_override:
+    "Move output limits out of body overrides, provider options, or additionalModelRequestFields and into the request's own cap parameters.",
+  azure_api_version:
+    "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI api-version that supports max_completion_tokens.",
+  bound_exceeded:
+    "Set the output cap and candidate count on the call itself so the request fits the output bound Solwyn priced.",
+};
+
+/** Options for {@link OutputBoundUnenforceableError}. */
+export interface OutputBoundUnenforceableErrorOptions {
+  provider: string;
+  reason: OutputBoundUnenforceableReason;
+}
+
+/**
+ * Raised before provider dispatch when a call admitted under hard_deny could produce more output
+ * than its reserved bound and the SDK cannot cap it. The reservation is released. Fields are
+ * structural labels only.
+ */
+export class OutputBoundUnenforceableError extends SolwynError {
+  readonly code = "output_bound_unenforceable";
+  readonly provider: string;
+  readonly reason: OutputBoundUnenforceableReason;
+  readonly hint: string;
+
+  constructor(options: OutputBoundUnenforceableErrorOptions) {
+    const hint = OUTPUT_BOUND_HINTS[options.reason];
+    super(`${hint} (output_bound_unenforceable: ${options.reason})`);
+    this.name = "OutputBoundUnenforceableError";
+    brandError(this, "OutputBoundUnenforceableError");
+    this.provider = options.provider;
+    this.reason = options.reason;
+    this.hint = hint;
+  }
+}
+
 // Only these exact SDK constructors opt into the process-wide family checks.
 for (const [errorConstructor, family] of [
   [SolwynError, "SolwynError"],
@@ -424,6 +478,7 @@ for (const [errorConstructor, family] of [
   [CoverageMismatchError, "CoverageMismatchError"],
   [UntranslatableRequestError, "UntranslatableRequestError"],
   [UntranslatableModelError, "UntranslatableModelError"],
+  [OutputBoundUnenforceableError, "OutputBoundUnenforceableError"],
 ] as const) {
   errorFamilies.set(errorConstructor, family);
 }

@@ -924,8 +924,11 @@ describe("ai-sdk middleware — generateText happy path", () => {
     expect(captured.events.every((e) => e.provider === "anthropic")).toBe(true);
   });
 
-  it("sends the output bound on the check and caps an uncapped call at the default", async () => {
-    const { fetchMock, captured } = makeFetch(() => allow());
+  it.each([
+    ["alert_only", [undefined, 300]],
+    ["hard_deny", [2048, 300]],
+  ] as const)("sends the output bound on the check and caps an uncapped call only under hard_deny (%s)", async (mode, expected) => {
+    const { fetchMock, captured } = makeFetch(() => allow({ mode }));
     const solwyn = createSolwynMiddleware({
       apiKey: API_KEY,
       fetch: fetchMock,
@@ -951,7 +954,7 @@ describe("ai-sdk middleware — generateText happy path", () => {
     await generateText({ model: wrapped, prompt: "two", maxOutputTokens: 300 });
     await solwyn.close();
 
-    expect(seen).toEqual([2048, 300]);
+    expect(seen).toEqual(expected);
     expect(captured.checks.map((check) => check["estimated_output_bound"])).toEqual([2048, 300]);
   });
 

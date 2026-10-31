@@ -265,17 +265,24 @@ export interface BudgetCheckResult {
   denySource?: DenySource | null;
   /** Stable machine-readable denial reason; optional for pre-R2 consumer literals. */
   denyReason?: string | null;
+  /**
+   * Whether hard_deny authority admitted this call: a live or cached hard_deny allow, or a
+   * lease-funded admission under a hard_deny lease posture. Wrapped clients then send an
+   * uncapped request with the output bound as its cap. Never set on SDK-local outage results.
+   */
+  capsOutput?: boolean;
 }
 
 /** Internal decision shape after lease authority has been normalized at a trust boundary. */
 type MaterializedBudgetCheckResult = Omit<
   BudgetCheckResult,
-  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason"
+  "leaseId" | "leaseClaimToken" | "denySource" | "denyReason" | "capsOutput"
 > & {
   leaseId: string | null;
   leaseClaimToken: number | null;
   denySource: DenySource | null;
   denyReason: string | null;
+  capsOutput: boolean;
 };
 
 /** Required fields plus optional overrides for {@link budgetCheckResult}. */
@@ -333,6 +340,7 @@ export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudg
     deniedByPeriod: init.deniedByPeriod ?? null,
     denySource: init.denySource ?? null,
     denyReason: init.denyReason ?? null,
+    capsOutput: init.capsOutput ?? false,
   };
 }
 
@@ -1165,6 +1173,7 @@ export class BudgetEnforcer {
             currentUsage: cached.current_usage,
             priceHints: cached.price_hints ?? null,
             failoverTuningAllowed: null,
+            capsOutput: cached.mode === "hard_deny",
           }),
           leaseClaimToken,
         );
@@ -1371,6 +1380,8 @@ export class BudgetEnforcer {
       deniedByPeriod: null,
       denySource: null,
       denyReason: null,
+      capsOutput:
+        admission.leaseId !== null && this.leaseLedger.postureModeFor(runId) === "hard_deny",
     });
   }
 
@@ -1669,7 +1680,8 @@ export class BudgetEnforcer {
       | "deniedByPeriod"
       | "denySource"
       | "denyReason"
-    >,
+    > &
+      Partial<Pick<MaterializedBudgetCheckResult, "capsOutput">>,
   ): MaterializedBudgetCheckResult {
     return budgetCheckResult({
       ...fields,
@@ -2106,6 +2118,7 @@ export class BudgetEnforcer {
         currentUsage: response.current_usage,
         priceHints: response.price_hints ?? null,
         failoverTuningAllowed: response.failover_directive?.failover_tuning_allowed ?? null,
+        capsOutput: response.mode === "hard_deny",
       });
     }
     if (response.mode === "hard_deny") {

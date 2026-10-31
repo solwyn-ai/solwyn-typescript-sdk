@@ -64,7 +64,15 @@ Cloud prices that many output tokens at the model's output rate. A positive cap 
 bound: `max_tokens`, `max_completion_tokens`, Responses `max_output_tokens`, Anthropic
 `max_tokens`, Google `config.maxOutputTokens`, Bedrock `inferenceConfig.maxTokens`, or AI SDK
 `maxOutputTokens`, including caps from `defaultParams`. With failover, the bound is the largest
-cap any configured hop can use. A request with no positive cap is sent to the provider with
-`leaseOutputBoundDefault` (default `4096`) as its cap, so the call cannot produce more output than
-it reserved. Raise `leaseOutputBoundDefault`, or set a cap per call, when a model needs longer
-output. Reasoning models count reasoning tokens against the cap.
+cap any configured hop can use. With no cap, the bound is `leaseOutputBoundDefault` (default
+`4096`).
+
+On a hard_deny project, an uncapped call is capped at `leaseOutputBoundDefault`, because a call
+with no output limit cannot honestly be held to a hard budget cap. This applies when a hard_deny
+check allows the call, or when it draws on a lease with a hard_deny posture. Set your own cap
+to choose a different limit, or raise `leaseOutputBoundDefault`. Reasoning models count reasoning
+tokens against the cap. Nothing changes on alert-only projects, and an SDK-local outage
+decision never adds a cap: those calls reach the provider exactly as you built them.
+
+Known limitation: a scoped hard_deny rule on an alert-only project does not show in the check's
+`mode`. Uncapped calls under that rule are not capped, so one call can still overshoot it.

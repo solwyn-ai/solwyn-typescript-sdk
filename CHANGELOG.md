@@ -15,8 +15,8 @@ Public-preview minor release that makes `hard_deny` bound a call's output. Befor
 per-call budget check priced output as equal to input, so one call with a large output cap could
 spend far past the remaining budget before later calls were refused. This release needs a Solwyn
 Cloud API that accepts `estimated_output_bound` on the budget check. An older API rejects every
-per-call check, and the SDK then applies its outage posture (`failOpen`). Uncapped requests now
-carry an output cap; review **Changed** before upgrading.
+per-call check, and the SDK then applies its outage posture (`failOpen`). On hard_deny projects,
+uncapped requests now carry an output cap; review **Changed** before upgrading.
 
 Your LLM calls go directly to your provider. Solwyn receives usage and operational metadata,
 plus tags you explicitly supply. Prompt and response content is not sent to Solwyn or logged by
@@ -28,25 +28,34 @@ the SDK.
   Google, Bedrock Converse, and the AI SDK middleware) sends `estimated_output_bound`, the most
   output tokens the call can produce. Solwyn Cloud reserves input cost plus that bound at the
   model's output rate, so `hard_deny` refuses a call before dispatch when its bound does not fit
-  the remaining budget. The value is the one the run lease already reserves: a positive caller or
-  `defaultParams` cap as is, the largest cap across failover hops, or `leaseOutputBoundDefault`
-  (default `4096`) when there is no cap. A cap above 100,000,000 is sent as 100,000,000. Media
-  checks do not send it.
+  the remaining budget, and alert-only reservations get more accurate. The value is the one the
+  run lease already reserves: a positive caller or `defaultParams` cap as is, the largest cap
+  across failover hops, or `leaseOutputBoundDefault` (default `4096`) when there is no cap. A cap
+  above 100,000,000 is sent as 100,000,000. Media checks do not send it.
 
 ### Changed
 
-- **Uncapped requests get an output cap.** A text request with no positive output cap is now
-  sent to the provider with `leaseOutputBoundDefault` as its cap, so the reserved bound holds on
-  both the per-call and the run-lease path. The cap goes in the dialect's own field:
-  `max_tokens`, or `max_completion_tokens` for OpenAI and Azure o-series and GPT-5 models,
-  Responses `max_output_tokens`, Anthropic `max_tokens`, Google `config.maxOutputTokens`, Bedrock
+- **Uncapped calls on hard_deny projects get an output cap.** An unbounded call cannot honestly
+  be held to a hard cap, so when a hard_deny check allows a text call, or the call draws on a
+  lease with a hard_deny posture, a request with no positive output cap is sent with
+  `leaseOutputBoundDefault` (default `4096`, configurable) as its cap. Set your own cap to choose
+  a different limit. The cap goes in the dialect's own field: `max_tokens`, or
+  `max_completion_tokens` for OpenAI and Azure o-series and GPT-5 models, Responses
+  `max_output_tokens`, Anthropic `max_tokens`, Google `config.maxOutputTokens`, Bedrock
   `inferenceConfig.maxTokens`, and AI SDK `maxOutputTokens`. A zero, negative, non-integer, or
   null cap is replaced. A positive cap is never changed. An uncapped Bedrock command is sent as a
-  rebuilt sibling command instead of the original instance. Responses longer than 4096 tokens
-  now stop at the cap unless you set a cap or raise `leaseOutputBoundDefault`; reasoning models
-  count reasoning tokens against it.
+  rebuilt sibling command instead of the original instance. Reasoning models count reasoning
+  tokens against the cap. Nothing changes on alert-only projects, and SDK-local outage
+  decisions never add a cap.
 - **Allow cache.** A cached allow is reused only for a check with the same output bound, so an
   allow for a small bound never admits a larger one.
+- **`BudgetCheckResult.capsOutput`.** Results report whether hard_deny authority admitted the
+  call.
+
+### Known limitations
+
+- A scoped hard_deny rule on an alert-only project is not visible in the check's `mode`, so
+  uncapped calls under that rule are not capped and one call can still overshoot it.
 
 ## [0.2.0] — 2026-10-21
 

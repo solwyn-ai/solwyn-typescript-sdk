@@ -358,6 +358,11 @@ export class LeaseLedger {
   snapshotFor(runId: string): LeaseSnapshot | null {
     return this.#states.get(runId)?.snapshot ?? null;
   }
+  /** The installed lease's posture mode, or `null` when the run holds no lease. */
+  postureModeFor(runId: string): BudgetMode | null {
+    const state = this.#states.get(runId);
+    return state?.hasLease ? state.postureMode : null;
+  }
   isCurrentOrigin(
     runId: string,
     { leaseId, generation }: { leaseId: string; generation: number },

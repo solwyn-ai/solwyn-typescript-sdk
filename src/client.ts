@@ -2372,6 +2372,8 @@ export class SolwynCore {
       isStreaming,
       estimatedInputTokens,
       estimatedOutputBound,
+      outputCap:
+        budget.allowed && budget.capsOutput ? this.#config.lease_output_bound_default : undefined,
       velocityFlags: velocity.flags,
       priceHints: budget.priceHints,
       funding: Object.freeze({
@@ -3403,6 +3405,7 @@ export class SolwynCore {
       hopReadTimeoutSeconds,
       endpointTransition,
       { ...ctx.requestDefaults.global, ...ctx.requestDefaults.entries.get(runtime) },
+      ctx.outputCap,
     );
     const latencyMs = nowMs() - hopStarted;
     breaker.recordSuccess(admission);
@@ -3524,6 +3527,7 @@ export class SolwynCore {
       hopReadTimeoutSeconds,
       endpointTransition,
       { ...ctx.requestDefaults.global, ...ctx.requestDefaults.entries.get(runtime) },
+      ctx.outputCap,
     );
     let cleanupTarget: unknown = rawResponse;
     let terminationHandoff: ProvisionalTerminationHandoff | undefined;
@@ -3919,6 +3923,7 @@ export class SolwynCore {
     hopReadTimeoutSeconds: number,
     crossProvider: boolean,
     entryDefaultParams: Record<string, unknown>,
+    outputBound: number | undefined,
   ): Promise<unknown> {
     merged = { ...merged };
     delete merged[PER_CALL_IDEMPOTENT_KEY];
@@ -3939,10 +3944,9 @@ export class SolwynCore {
         };
       }
     }
-    // The reserved output bound must be true: a final hop request with no positive output cap
-    // gets the configured default as its cap. Bedrock applies this to its rebuilt command input.
-    const outputBound = this.#config.lease_output_bound_default;
-    if (runtime.adapter.dialect !== "bedrock") {
+    // Under hard_deny admission the reserved output bound must be true: a final hop request with
+    // no positive output cap gets the bound as its cap. Bedrock applies it to its rebuilt input.
+    if (outputBound !== undefined && runtime.adapter.dialect !== "bedrock") {
       merged = applyOutputBound(merged, {
         dialect: runtime.adapter.dialect,
         provider: runtime.adapter.name,
@@ -4284,6 +4288,8 @@ interface DispatchContext {
   isStreaming: boolean;
   estimatedInputTokens: number;
   estimatedOutputBound: number;
+  /** Cap for an uncapped hop request; set only when hard_deny authority admitted the call. */
+  readonly outputCap: number | undefined;
   readonly velocityFlags: readonly VelocityFlag[];
   /** Server price statement for this request only; never retained across calls. */
   priceHints: Record<string, number> | null;

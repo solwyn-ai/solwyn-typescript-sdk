@@ -263,9 +263,3 @@ export function applyOutputBound(
     return withNestedPositiveCap(request, "config", "maxOutputTokens", bound);
   return withNestedPositiveCap(request, "inferenceConfig", "maxTokens", bound);
 }
-
-/** The AI SDK call option equivalent of {@link applyOutputBound}. */
-export function applyAiSdkOutputBound<T extends object>(params: T, bound: number): T {
-  if (positiveOutputBound(Reflect.get(params, "maxOutputTokens")) !== null) return params;
-  return { ...params, maxOutputTokens: bound };
-}

@@ -37,7 +37,7 @@ import { safeErrorClassName } from "../error-class";
 import { ConfigurationError, RunStoppedError, SolwynError } from "../errors";
 import { extractUsageFailSoft, hasSettlementFunding } from "../fail-soft";
 import { consoleLogger, type Logger } from "../logging";
-import { applyAiSdkOutputBound, resolveAiSdkOutputBound } from "../output-bound";
+import { positiveOutputBound, resolveAiSdkOutputBound } from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { MetadataReporter } from "../reporter";
 import { type CurrentRun, getCurrentRun } from "../run-context";
@@ -921,6 +921,9 @@ export function createSolwynMiddleware(
     readonly maxOutputTokens?: unknown;
     readonly abortSignal?: AbortSignal;
   }
+  // Call options copied by `transformParams`. The AI SDK hands this same object to the model, so
+  // preflight may cap it in place without touching a caller-owned record.
+  const ownedParams = new WeakSet<object>();
 
   /**
    * Resolve attribution, size the pre-flight estimate, and run the budget check. On a deny:
@@ -995,6 +998,14 @@ export function createSolwynMiddleware(
         // The typed denial remains authoritative if telemetry construction/enqueue is unavailable.
       }
       throw budget.buildDenialError(decision, estimatedInputTokens, run?.agentRunId);
+    }
+    // Under hard_deny admission the reserved bound must be true: an uncapped call gets it as its cap.
+    if (
+      decision.capsOutput &&
+      ownedParams.has(params) &&
+      positiveOutputBound(params.maxOutputTokens) === null
+    ) {
+      Reflect.set(params, "maxOutputTokens", config.lease_output_bound_default);
     }
 
     return {
@@ -1414,9 +1425,12 @@ export function createSolwynMiddleware(
 
   return {
     middleware: {
-      // The reserved output bound must be true: an uncapped call is sent with the default cap.
-      transformParams: async ({ params }) =>
-        applyAiSdkOutputBound(params, config.lease_output_bound_default),
+      // A Solwyn-owned copy that preflight may cap under hard_deny admission.
+      transformParams: async ({ params }) => {
+        const owned = { ...params };
+        ownedParams.add(owned);
+        return owned;
+      },
       wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
       wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
     },

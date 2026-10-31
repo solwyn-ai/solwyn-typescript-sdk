@@ -923,7 +923,6 @@ describe("failover — a same-dialect bedrock→bedrock hop rebuilds the Convers
     const command = new ConverseCommand({
       modelId: primaryModel,
       messages: [{ role: "user", content: [{ text: "hi" }] }],
-      inferenceConfig: { maxTokens: 256 },
     });
     await (solwyn as unknown as { send(c: unknown): Promise<unknown> }).send(command);
     await solwyn.close();

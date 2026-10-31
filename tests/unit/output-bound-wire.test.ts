@@ -3,7 +3,9 @@
  * path reserves, and the SDK makes that bound true on the provider request.
  *
  * Every dialect sends `estimated_output_bound`: an explicit positive cap as is, otherwise the
- * configured default, which is also injected as the dialect's max-output parameter. The end to
+ * configured default. Only a call admitted under hard_deny (a live or cached hard_deny allow, or a
+ * lease with a hard_deny posture) gets that default injected as the dialect's max-output
+ * parameter; alert_only and outage admissions dispatch the request exactly as built. The end to
  * end case runs against a stub control plane that prices a reservation the way Solwyn Cloud
  * does (input at the input rate plus the bound at the output rate) and refuses it in hard_deny.
  * Fully offline; rates are synthetic.
@@ -13,7 +15,9 @@ import { describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer } from "../../src/budget";
 import { BudgetExceededError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
+import { run } from "../../src/node";
 import type { FetchLike } from "../../src/transport";
+import type { BudgetMode } from "../../src/types";
 
 const API_KEY = `sk_proj_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
@@ -38,7 +42,7 @@ interface Plane {
   checks: Array<Record<string, unknown>>;
 }
 
-function allowPlane(): Plane {
+function allowPlane(mode: BudgetMode = "hard_deny"): Plane {
   const checks: Array<Record<string, unknown>> = [];
   const impl: FetchLike = async (url, init) => {
     const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
@@ -49,7 +53,7 @@ function allowPlane(): Plane {
           allowed: true,
           remaining_budget: 950,
           reservation_id: null,
-          mode: "alert_only",
+          mode,
           budget_limit: 1000,
           current_usage: 50,
           denied_by_period: null,
@@ -267,7 +271,26 @@ describe("estimated_output_bound on the per-call check, per dialect", () => {
       expect(testCase.sentCap(firstArg(call))).toBe(777);
     });
 
-    it(`${testCase.label}: an uncapped call sends the default bound and the provider gets it as its cap`, async () => {
+    it(`${testCase.label}: alert_only sends the default bound but dispatches the request unchanged`, async () => {
+      const { client, call } = testCase.build();
+      const { fetchMock, checks } = allowPlane("alert_only");
+      const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch: fetchMock });
+
+      await testCase.invoke(solwyn, testCase.model, undefined);
+      await testCase.invoke(solwyn, testCase.model, 0);
+      await solwyn.close();
+
+      // The second call replays the cached alert_only allow, which does not cap either.
+      expect(checks).toHaveLength(1);
+      expect(checks[0]?.["estimated_output_bound"]).toBe(4096);
+      expect(testCase.sentCap(call.mock.calls[0]?.[0] as Request)).toBeUndefined();
+      expect(testCase.sentCap(call.mock.calls[1]?.[0] as Request)).toBe(0);
+      for (const key of testCase.absentKeys ?? []) {
+        expect(call.mock.calls[0]?.[0]).not.toHaveProperty(key);
+      }
+    });
+
+    it(`${testCase.label}: hard_deny admission sends the default bound and the provider gets it as its cap`, async () => {
       const { client, call } = testCase.build();
       const { fetchMock, checks } = allowPlane();
       const solwyn = new Solwyn(client, { apiKey: API_KEY, fetch: fetchMock });
@@ -371,6 +394,115 @@ describe("estimated_output_bound on the per-call check, per dialect", () => {
     expect(primaryCreate.mock.calls[0]?.[0]).toMatchObject({ max_tokens: 4096 });
     expect(fallbackCreate.mock.calls[0]?.[0]).toMatchObject({ max_tokens: 9000 });
   });
+
+  it("caps a call admitted by a cached hard_deny allow", async () => {
+    const create = vi.fn((_kwargs: Request) => ({
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }));
+    const { fetchMock, checks } = allowPlane("hard_deny");
+    const solwyn = new Solwyn(
+      { chat: { completions: { create } } },
+      { apiKey: API_KEY, fetch: fetchMock },
+    );
+
+    await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
+    await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
+    await solwyn.close();
+
+    expect(checks).toHaveLength(1);
+    expect(create.mock.calls.map(([kwargs]) => kwargs["max_tokens"])).toEqual([4096, 4096]);
+  });
+
+  it("does not cap a fail-open outage admission, even with a hard_deny constructor mode", async () => {
+    const create = vi.fn((_kwargs: Request) => ({
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    }));
+    const checks: Request[] = [];
+    const unreachable: FetchLike = async (url, init) => {
+      if (url.includes("/api/v1/budgets/check")) {
+        checks.push(JSON.parse(String(init?.body)) as Request);
+        throw new TypeError("fetch failed");
+      }
+      return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+        status: 202,
+      });
+    };
+    const solwyn = new Solwyn(
+      { chat: { completions: { create } } },
+      { apiKey: API_KEY, fetch: unreachable, budgetMode: "hard_deny", failOpen: true },
+    );
+
+    await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
+    await solwyn.close();
+
+    expect(checks[0]?.["estimated_output_bound"]).toBe(4096);
+    expect(create).toHaveBeenCalledOnce();
+    expect(create.mock.calls[0]?.[0]).not.toHaveProperty("max_tokens");
+  });
+
+  for (const posture of ["hard_deny", "alert_only"] as const) {
+    it(`${posture === "hard_deny" ? "caps" : "does not cap"} a lease-funded call under a ${posture} lease posture`, async () => {
+      const create = vi.fn((_kwargs: Request) => ({
+        usage: { prompt_tokens: 1, completion_tokens: 1 },
+      }));
+      const grants: Request[] = [];
+      let perCallChecks = 0;
+      const leasePlane: FetchLike = async (url, init) => {
+        const pathname = new URL(url).pathname;
+        if (pathname === "/api/v1/budgets/lease") {
+          grants.push(JSON.parse(String(init?.body)) as Request);
+          return new Response(
+            JSON.stringify({
+              eligible: true,
+              allowed: true,
+              lease_id: "lease-output-bound",
+              generation: 1,
+              granted_tokens: 50_000,
+              refresh_interval_s: 300,
+              lease_length_s: 600,
+              headroom_share_tokens: 5_000,
+              posture: { mode: posture, on_unreachable: "fail_open" },
+              final_grant: false,
+              project_id: PROJECT_ID,
+              mode: posture,
+              budget_limit: 1_000,
+              current_usage: 100,
+              remaining_budget: 900,
+            }),
+            { status: 200 },
+          );
+        }
+        if (pathname.startsWith("/api/v1/budgets/lease/"))
+          return new Response(null, { status: 204 });
+        if (pathname === "/api/v1/budgets/check") {
+          perCallChecks += 1;
+          throw new TypeError("unexpected per-call check");
+        }
+        if (pathname === "/api/v1/budgets/confirm") return new Response(null, { status: 204 });
+        return new Response(JSON.stringify({ ingested: 0, rejected: [], duplicates: [] }), {
+          status: 202,
+        });
+      };
+      const solwyn = new Solwyn(
+        { chat: { completions: { create } } },
+        { apiKey: API_KEY, fetch: leasePlane },
+      );
+
+      await run("output-bound-lease", () =>
+        solwyn.chat.completions.create({ model: "gpt-4o", messages: [] }),
+      );
+      await solwyn.close();
+
+      expect(grants).toHaveLength(1);
+      expect(perCallChecks).toBe(0);
+      expect(create).toHaveBeenCalledOnce();
+      if (posture === "hard_deny") {
+        expect(create.mock.calls[0]?.[0]).toMatchObject({ max_tokens: 4096 });
+      } else {
+        expect(create.mock.calls[0]?.[0]).not.toHaveProperty("max_tokens");
+      }
+    });
+  }
 
   it("sends a cap above the wire maximum as the maximum", async () => {
     const create = vi.fn((_kwargs: Request) => ({

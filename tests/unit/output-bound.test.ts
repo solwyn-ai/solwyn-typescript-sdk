@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  applyAiSdkOutputBound,
   applyOutputBound,
   resolveAiSdkOutputBound,
   resolveEffectiveOutputBound,
@@ -342,14 +341,5 @@ describe("applyOutputBound", () => {
     expect(applyOutputBound(malformed, { ...openai, dialect: "bedrock", model: "b" })).toBe(
       malformed,
     );
-  });
-
-  it("caps AI SDK params only when maxOutputTokens is not positive", () => {
-    const capped = { prompt: [], maxOutputTokens: 9 };
-    expect(applyAiSdkOutputBound(capped, 4096)).toBe(capped);
-    expect(applyAiSdkOutputBound({ prompt: [], maxOutputTokens: 0 }, 4096)).toEqual({
-      prompt: [],
-      maxOutputTokens: 4096,
-    });
   });
 });

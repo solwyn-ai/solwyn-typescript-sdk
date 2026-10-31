@@ -480,7 +480,6 @@ describe("Responses effective request and budget preflight", () => {
         max_tokens: 7,
         stream_options: { caller: true },
         future_call: 42,
-        max_output_tokens: 4096,
       },
       { timeout: 600_000, maxRetries: 0 },
     );

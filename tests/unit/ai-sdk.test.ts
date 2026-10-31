@@ -965,6 +965,7 @@ describe("ai-sdk middleware — generateText happy path", () => {
   it.each([
     ["alibaba.chat", "qwen3.5-plus", {}, "reasoning_without_budget"],
     ["xai.chat", "grok-4", {}, "reasoning_without_budget"],
+    ["synthetic-gateway.chat", "Qwen/Qwen3-32B", {}, "reasoning_without_budget"],
     ["openai.chat", "gpt-4o", { openai: { maxCompletionTokens: 9000 } }, "unsupported_override"],
     [
       "anthropic.messages",

@@ -430,7 +430,7 @@ const OUTPUT_BOUND_HINTS: Readonly<Record<OutputBoundUnenforceableReason, string
   malformed_candidate_count:
     "Set the candidate count (n or candidateCount) to a positive integer, or leave it unset.",
   reasoning_without_budget:
-    "Reasoning is enabled with no reasoning budget, and this provider's output cap does not include reasoning. Set a positive thinking budget, turn reasoning off, or use a non-reasoning model.",
+    "Reasoning is enabled with no reasoning budget, and this provider's output cap does not include reasoning. Set a positive thinking budget, turn reasoning off, or use a non-reasoning model. If your provider counts reasoning inside the output cap, set the provider explicitly.",
   unsupported_override:
     "Remove keys Solwyn cannot account for from request body extensions (body overrides, provider options, extraBody, or additionalModelRequestFields), and set output limits with the request's own cap parameters.",
   azure_api_version:

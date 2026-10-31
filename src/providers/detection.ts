@@ -117,8 +117,9 @@ export const COMPAT_PROFILES: readonly CompatProfile[] = Object.freeze([
   new CompatProfile({
     name: "qwen",
     hosts: ["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com", "dashscope-us.aliyuncs.com"],
-    // Model Studio workspace endpoints, e.g. <workspace>.ap-southeast-1.maas.aliyuncs.com.
-    hostSuffixes: [".maas.aliyuncs.com"],
+    // Shared regional and plan hosts (cn-hongkong.dashscope..., coding.dashscope...) and Model
+    // Studio workspace, trial, and token-plan hosts (<workspace>.<region>.maas.aliyuncs.com).
+    hostSuffixes: [".dashscope.aliyuncs.com", ".maas.aliyuncs.com"],
     modelPrefixes: ["qwen", "qwq-", "qvq-"],
     supportsIncludeUsage: true,
   }),

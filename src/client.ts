@@ -82,6 +82,7 @@ import { consoleLogger, type Logger } from "./logging";
 import {
   enforceOutputBound,
   normalizeOpenaiOutputCap,
+  reasoningFamily,
   resolveAzureCapAliases,
   resolveEffectiveOutputBound,
 } from "./output-bound";
@@ -2388,14 +2389,23 @@ export class SolwynCore {
       sourceProvider: primaryProvider,
       sourceDialect: primaryDialect,
       sourceModel: primaryModel,
+      sourceReasoningProvider: reasoningFamily(
+        primaryProvider,
+        primaryModel,
+        primary.pinned === true,
+      ),
       globalDefaults: requestDefaults.global,
       callParams: surface === "responses" ? mergedPrimary : callerKwargs,
-      hops: runtimes.map((runtime) => ({
-        provider: runtime.adapter.name,
-        dialect: runtime.adapter.dialect,
-        model: runtime === primary ? primaryModel : runtime.entry.model,
-        defaultParams: requestDefaults.entries.get(runtime),
-      })),
+      hops: runtimes.map((runtime) => {
+        const model = runtime === primary ? primaryModel : runtime.entry.model;
+        return {
+          provider: runtime.adapter.name,
+          dialect: runtime.adapter.dialect,
+          model,
+          defaultParams: requestDefaults.entries.get(runtime),
+          reasoningProvider: reasoningFamily(runtime.adapter.name, model, runtime.pinned === true),
+        };
+      }),
       defaultBound: this.#config.lease_output_bound_default,
       responses: surface === "responses",
     });
@@ -3492,10 +3502,12 @@ export class SolwynCore {
     if (ctx.outputCap === undefined) return hopKwargs;
     const dialect = runtime.adapter.dialect;
     const provider = runtime.adapter.name;
+    const model = typeof hopKwargs["model"] === "string" ? hopKwargs["model"] : "";
     const hop = {
       dialect,
       provider,
-      model: typeof hopKwargs["model"] === "string" ? hopKwargs["model"] : "",
+      model,
+      reasoningProvider: reasoningFamily(provider, model, runtime.pinned === true),
       responses: ctx.surface === "responses",
       defaultCap: ctx.outputCap,
       reserved: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),

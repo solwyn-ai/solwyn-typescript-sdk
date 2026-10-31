@@ -1125,3 +1125,95 @@ describe("Anthropic fallbacks and Qwen workspace hosts", () => {
     expect(bodies).toHaveLength(0);
   });
 });
+
+describe("model-id reasoning classification on hosts without their own rule", () => {
+  function client(baseURL: string) {
+    const transport = openaiTransport();
+    return {
+      client: new OpenAI({ apiKey: "sk-test", baseURL, fetch: transport.fetch }),
+      ...transport,
+    };
+  }
+
+  it.each([
+    "https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1",
+    "https://coding.dashscope.aliyuncs.com/v1",
+    "https://trial.cn-hongkong.maas.aliyuncs.com/compatible-mode/v1",
+  ])("detects %s as Qwen and refuses default thinking", async (baseURL) => {
+    const { client: native, bodies } = client(baseURL);
+    const { fetch } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      chat(solwyn, { model: "qwen3.8-max", messages: MESSAGES, max_tokens: 100 }),
+    );
+    await solwyn.close();
+    expect(error).toMatchObject({ provider: "qwen", reason: "reasoning_without_budget" });
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("keeps a lookalike host generic", async () => {
+    const { client: native, bodies } = client("https://dashscope.aliyuncs.com.example/v1");
+    const { fetch } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    await chat(solwyn, { model: "gpt-4o", messages: MESSAGES, max_tokens: 100 });
+    await solwyn.close();
+    expect(bodies[0]).toMatchObject({ max_tokens: 100 });
+  });
+
+  it("applies the Qwen rule to a Qwen model on an unknown host", async () => {
+    const { client: native, bodies } = client("https://llm.synthetic.example/v1");
+    const { fetch, checks } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    const error = await refusal(
+      chat(solwyn, { model: "Qwen/Qwen3-32B", messages: MESSAGES, max_tokens: 100 }),
+    );
+    expect(error).toMatchObject({
+      provider: "openai_compatible",
+      reason: "reasoning_without_budget",
+    });
+    expect(bodies).toHaveLength(0);
+    await chat(solwyn, {
+      model: "Qwen/Qwen3-32B",
+      messages: MESSAGES,
+      max_tokens: 100,
+      enable_thinking: true,
+      thinking_budget: 2000,
+    });
+    await solwyn.close();
+    expect(checks[1]?.["estimated_output_bound"]).toBe(2100);
+    expect(bodies[0]).toMatchObject({ max_tokens: 100, thinking_budget: 2000 });
+  });
+
+  it("trusts an explicit provider pin", async () => {
+    const { client: native, bodies } = client("https://llm.synthetic.example/v1");
+    const { fetch, checks } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch, provider: "openai_compatible" });
+    await chat(solwyn, { model: "Qwen/Qwen3-32B", messages: MESSAGES, max_tokens: 100 });
+    await solwyn.close();
+    expect(checks[0]?.["estimated_output_bound"]).toBe(100);
+    expect(bodies[0]).toMatchObject({ max_tokens: 100 });
+  });
+
+  it.each([
+    ["https://llm.synthetic.example/v1", "grok-4"],
+    ["https://openrouter.ai/api/v1", "x-ai/grok-4"],
+  ])("applies the xAI rule to a Grok model on %s", async (baseURL, model) => {
+    const { client: native, bodies } = client(baseURL);
+    const { fetch } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    const error = await refusal(chat(solwyn, { model, messages: MESSAGES, max_tokens: 100 }));
+    await solwyn.close();
+    expect(error.reason).toBe("reasoning_without_budget");
+    expect(bodies).toHaveLength(0);
+  });
+
+  it("leaves other models on an unknown host alone", async () => {
+    const { client: native, bodies } = client("https://llm.synthetic.example/v1");
+    const { fetch } = plane();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+    await chat(solwyn, { model: "meta-llama/Llama-3.3-70B", messages: MESSAGES });
+    await chat(solwyn, { model: "x-ai/grok-4-fast-non-reasoning", messages: MESSAGES });
+    await solwyn.close();
+    expect(bodies.map((body) => body["max_tokens"])).toEqual([4096, 4096]);
+  });
+});

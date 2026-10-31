@@ -6,12 +6,16 @@ export interface OutputBoundHop {
   readonly dialect: Dialect;
   readonly model: string;
   readonly defaultParams?: unknown;
+  /** Provider whose reasoning rule governs the hop (see {@link reasoningFamily}). */
+  readonly reasoningProvider?: string;
 }
 
 export interface EffectiveOutputBoundOptions {
   readonly sourceProvider: string;
   readonly sourceDialect: Dialect;
   readonly sourceModel: string;
+  /** Provider whose reasoning rule governs the source request. */
+  readonly sourceReasoningProvider?: string;
   readonly globalDefaults: unknown;
   readonly callParams: unknown;
   readonly hops: readonly OutputBoundHop[];
@@ -116,6 +120,24 @@ export function resolveAzureCapAliases(
   return resolved;
 }
 
+/** Providers whose OpenAI-compatible reasoning semantics the SDK already knows. */
+const OWN_REASONING_RULE = new Set(["openai", "azure_openai", "qwen", "xai"]);
+
+/**
+ * The provider whose reasoning rule governs a call. An auto-detected provider without its own
+ * rule (the generic adapter, a gateway, a self-hosted server) is classified by model id instead,
+ * so a Qwen or Grok model on an unrecognized host keeps its rule. An explicit provider pin is the
+ * caller's statement of the host's semantics and is trusted.
+ */
+export function reasoningFamily(provider: string, model: string, pinned: boolean): string {
+  if (pinned || OWN_REASONING_RULE.has(provider)) return provider;
+  const id = model.toLowerCase();
+  const leaf = id.slice(id.lastIndexOf("/") + 1);
+  if (leaf.startsWith("qwen") || leaf.startsWith("qwq")) return "qwen";
+  if (leaf.startsWith("grok")) return "xai";
+  return provider;
+}
+
 // Two providers' OpenAI-compatible output caps leave reasoning out. Qwen thinks by default on many
 // models and takes a `thinking_budget`, which the hop bound adds. xAI has no reasoning budget, so
 // only its non-reasoning models can be bounded.
@@ -128,7 +150,8 @@ function xaiNonReasoning(model: string): boolean {
  * the request shape is opaque (the AI SDK middleware).
  */
 export function reasoningOutsideCap(provider: string, model: string): boolean {
-  return provider === "qwen" || (provider === "xai" && !xaiNonReasoning(model));
+  const family = reasoningFamily(provider, model, false);
+  return family === "qwen" || (family === "xai" && !xaiNonReasoning(model));
 }
 
 function projectCaps(
@@ -228,13 +251,19 @@ function resolveHop(options: EffectiveOutputBoundOptions, hop: OutputBoundHop): 
   const crossDialect = hop.dialect !== options.sourceDialect;
   const dialect = crossDialect ? options.sourceDialect : hop.dialect;
   const provider = crossDialect ? options.sourceProvider : hop.provider;
+  const reasoningProvider = crossDialect
+    ? (options.sourceReasoningProvider ?? options.sourceProvider)
+    : (hop.reasoningProvider ?? hop.provider);
   const model = crossDialect ? options.sourceModel : hop.model;
   const caps: ProjectedCaps = {};
   overlayCaps(caps, projectCaps(options.globalDefaults, dialect, provider, model));
   overlayCaps(caps, projectCaps(hop.defaultParams, dialect, provider, model));
   overlayCaps(caps, projectCaps(options.callParams, dialect, provider, model));
   const cap = resolvedProjectedCap(caps, dialect) ?? options.defaultBound;
-  return (cap + projectedReasoning(caps, dialect, provider)) * projectedCandidates(caps, dialect);
+  return (
+    (cap + projectedReasoning(caps, dialect, reasoningProvider)) *
+    projectedCandidates(caps, dialect)
+  );
 }
 
 export function resolveEffectiveOutputBound(options: EffectiveOutputBoundOptions): number {
@@ -483,6 +512,8 @@ export interface HopOutputEnforcement {
   readonly azureApiVersion?: unknown;
   /** A client-level body override can rewrite the output limit after serialization. */
   readonly clientBodyOverride?: boolean;
+  /** Provider whose reasoning rule governs the hop (see {@link reasoningFamily}). */
+  readonly reasoningProvider?: string;
 }
 
 function refuse(provider: string, reason: OutputBoundUnenforceableReason): never {
@@ -543,6 +574,7 @@ export function enforceOutputBound(
   hop: HopOutputEnforcement,
 ): Record<string, unknown> {
   const { dialect, provider } = hop;
+  const family = hop.reasoningProvider ?? provider;
   if (hop.clientBodyOverride === true) refuse(provider, "unsupported_override");
   // Anthropic `fallbacks` sends another generation, at its own cap, after the first.
   if (dialect === "anthropic" && presentValue(request, "fallbacks") !== undefined) {
@@ -554,7 +586,7 @@ export function enforceOutputBound(
     onlyKnownKeys(
       request,
       OPENAI_CHAT_PARAMS,
-      provider === "qwen" ? QWEN_EXTENSION_KEYS : NO_KEYS,
+      family === "qwen" ? QWEN_EXTENSION_KEYS : NO_KEYS,
       provider,
     );
   } else if (dialect === "anthropic") {
@@ -604,13 +636,13 @@ export function enforceOutputBound(
       ? capped["max_completion_tokens"]
       : capped["max_tokens"];
     count = candidateCount(provider, presentValue(capped, "n"));
-    if (provider === "qwen" && presentValue(capped, "enable_thinking") !== false) {
+    if (family === "qwen" && presentValue(capped, "enable_thinking") !== false) {
       // Qwen thinks by default on many models, and its caps leave reasoning out.
       reasoning =
         positiveOutputBound(presentValue(capped, "thinking_budget")) ??
         refuse(provider, "reasoning_without_budget");
     }
-    if (provider === "xai" && !xaiNonReasoning(hop.model)) {
+    if (family === "xai" && !xaiNonReasoning(hop.model)) {
       refuse(provider, "reasoning_without_budget");
     }
   } else if (dialect === "anthropic") {

@@ -55,14 +55,17 @@ export interface ProviderRuntime {
   readonly entry: ProviderEntry;
   readonly sdkClient: unknown;
   readonly adapter: ProviderAdapter;
+  /** The caller named this provider explicitly instead of leaving it to detection. */
+  readonly pinned?: boolean;
 }
 
 function freezeRuntime(
   entry: ProviderEntry,
   sdkClient: unknown,
   adapter: ProviderAdapter,
+  pinned: boolean,
 ): ProviderRuntime {
-  return Object.freeze({ entry, sdkClient, adapter });
+  return Object.freeze({ entry, sdkClient, adapter, pinned });
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +215,14 @@ export async function buildRuntimes(
     model: primaryModel ?? "",
     default_params: {},
   };
-  runtimes.push(freezeRuntime(primaryEntry, primaryClient, primaryAdapter));
+  runtimes.push(
+    freezeRuntime(
+      primaryEntry,
+      primaryClient,
+      primaryAdapter,
+      options.primaryProvider !== undefined,
+    ),
+  );
 
   // Fallbacks, in declared order.
   for (const spec of fallbackSpecs) {
@@ -223,7 +233,7 @@ export async function buildRuntimes(
       model,
       default_params: defaultParams,
     };
-    runtimes.push(freezeRuntime(entry, client, adapter));
+    runtimes.push(freezeRuntime(entry, client, adapter, providerOverride !== undefined));
   }
 
   return runtimes;

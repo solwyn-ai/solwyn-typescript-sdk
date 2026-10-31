@@ -244,6 +244,8 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
+    // Both claims were returned: an unreleased claim would leave the grant short and renew.
+    expect(plane.leaseRenewals).toHaveLength(0);
     expect(plane.confirms).toHaveLength(0);
     expect(plane.ingested).toHaveLength(2);
     expect(plane.ingested[0]).toMatchObject({

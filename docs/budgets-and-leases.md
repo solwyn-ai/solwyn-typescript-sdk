@@ -114,6 +114,13 @@ the reservation is kept, and the call reports a possibly-succeeded error. AI SDK
 (`stopWhen`) check and cap every step separately. Tool runners (`runTools`, `toolRunner`) and
 Google `chats` are untracked surfaces with no budget check; `onUnmetered: "raise"` refuses them.
 
+When the provider was detected (not set explicitly) and has no reasoning rule of its own (the
+generic OpenAI-compatible adapter, a gateway, or a self-hosted server), the model id picks the
+rule. A Qwen model (`qwen*` or `qwq*`, after any vendor prefix such as `Qwen/`) follows the Qwen
+rule, and a Grok model (`grok*`, including `x-ai/grok*`) follows the xAI rule. This can refuse a
+call on a host that counts reasoning inside the cap; set a thinking budget, or set the provider
+explicitly.
+
 Azure OpenAI gets `max_completion_tokens`, which api-versions from 2024-09-01 accept for every
 chat deployment. A deployment name never selects the parameter, and an explicit
 `max_completion_tokens` is never rewritten to `max_tokens`. OpenAI, Azure OpenAI, Anthropic,

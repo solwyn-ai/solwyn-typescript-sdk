@@ -80,8 +80,11 @@ the SDK.
   call set different cap keys, the call's key wins.
 - **Allow cache.** A cached allow is reused only for a check with the same output bound, so an
   allow for a small bound never admits a larger one.
-- **Provider detection.** Model Studio workspace hosts (`*.maas.aliyuncs.com`) are detected as
-  Qwen, and xAI regional hosts (`*.api.x.ai`) as xAI, so their reasoning rules apply.
+- **Provider detection.** Alibaba's Hong Kong, Coding Plan, and Model Studio hosts
+  (`*.dashscope.aliyuncs.com`, `*.maas.aliyuncs.com`) are detected as Qwen, and xAI regional hosts
+  (`*.api.x.ai`) as xAI, so their reasoning rules apply. On hard_deny projects, a detected provider
+  with no reasoning rule of its own applies the Qwen rule to `qwen*` and `qwq*` models and the xAI
+  rule to `grok*` models, after any vendor prefix. An explicit provider setting opts out.
 
 ### Known limitations
 

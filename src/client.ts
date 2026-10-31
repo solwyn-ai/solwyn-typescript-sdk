@@ -3568,7 +3568,12 @@ export class SolwynCore {
       hopReadTimeoutSeconds,
       endpointTransition,
       { ...ctx.requestDefaults.global, ...ctx.requestDefaults.entries.get(runtime) },
-      ctx.outputCap,
+      ctx.outputCap === undefined
+        ? undefined
+        : {
+            cap: ctx.outputCap,
+            reserved: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+          },
     );
     const latencyMs = nowMs() - hopStarted;
     breaker.recordSuccess(admission);
@@ -3690,7 +3695,12 @@ export class SolwynCore {
       hopReadTimeoutSeconds,
       endpointTransition,
       { ...ctx.requestDefaults.global, ...ctx.requestDefaults.entries.get(runtime) },
-      ctx.outputCap,
+      ctx.outputCap === undefined
+        ? undefined
+        : {
+            cap: ctx.outputCap,
+            reserved: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+          },
     );
     let cleanupTarget: unknown = rawResponse;
     let terminationHandoff: ProvisionalTerminationHandoff | undefined;
@@ -4086,7 +4096,7 @@ export class SolwynCore {
     hopReadTimeoutSeconds: number,
     crossProvider: boolean,
     entryDefaultParams: Record<string, unknown>,
-    outputBound: number | undefined,
+    hardDeny: { readonly cap: number; readonly reserved: number } | undefined,
   ): Promise<unknown> {
     merged = { ...merged };
     delete merged[PER_CALL_IDEMPOTENT_KEY];
@@ -4127,8 +4137,16 @@ export class SolwynCore {
       // command input still WINS over both). Every other adapter ignores this field (their `merged`
       // bag already carries the fill-absent result).
       entryDefaultParams,
-      outputBound,
-      ...(outputBound === undefined ? {} : { singleGeneration: { defaultFetch: globalFetch } }),
+      outputBound: hardDeny?.cap,
+      ...(hardDeny === undefined
+        ? {}
+        : {
+            singleGeneration: {
+              defaultFetch: globalFetch,
+              reserved: hardDeny.reserved,
+              model: typeof merged["model"] === "string" ? merged["model"] : "",
+            },
+          }),
       responsesLeaf,
     });
     return dispatch(...passthroughArgs);

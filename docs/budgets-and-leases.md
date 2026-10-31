@@ -108,9 +108,11 @@ the check reserved, or the call refuses with `bound_exceeded`.
 
 A hard_deny call makes one model generation. For Google, Solwyn sets
 `automaticContinuation: false` and `automaticFunctionCalling: { disable: true }` when you leave
-them unset; both are SDK-local settings. As a backstop, a Google call that already received one
-successful generation response cannot send another: the next request fails before it is sent,
-the reservation is kept, and the call reports a possibly-succeeded error. AI SDK multi-step runs
+them unset; both are SDK-local settings. As a backstop, every Google generation request is checked
+before it is sent: it must name the admitted model and carry a cap that fits the bound across its
+candidates. A call that already received one successful generation response, or has one in
+flight, cannot send another: the next request fails before it is sent, the reservation is kept,
+and the call reports a possibly-succeeded error. AI SDK multi-step runs
 (`stopWhen`) check and cap every step separately. Tool runners (`runTools`, `toolRunner`) and
 Google `chats` are untracked surfaces with no budget check; `onUnmetered: "raise"` refuses them.
 

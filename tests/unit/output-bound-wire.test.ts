@@ -653,7 +653,10 @@ describe("the single-generation guard on an SDK-internal loop", () => {
         init: unknown,
       ) => Promise<Response>;
       for (let round = 0; round < 2; round++) {
-        await fetch("https://generativelanguage.example/v1beta", { body: "{}" });
+        await fetch(
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+          { body: JSON.stringify({ generationConfig: { maxOutputTokens: 4096 } }) },
+        );
       }
       return { usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
     });

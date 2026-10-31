@@ -1019,15 +1019,18 @@ describe("Google: at most one successful generation request per hard_deny call",
     config: { maxOutputTokens: 100, automaticContinuation: true },
   };
 
+  const guard = {
+    defaultFetch: (input: string, init?: unknown) => globalThis.fetch(input, init as RequestInit),
+    reserved: 100,
+    model: "gemini-2.5-flash",
+  };
+
   it("refuses a second request after a successful generation", async () => {
     const bodies = continuationFetch();
     const native = new GoogleGenAI({ apiKey: "test-key" });
     const dispatch = new GoogleAdapter().prepareCall(native, kwargs, {
       ...options,
-      singleGeneration: {
-        defaultFetch: (input: string, init?: unknown) =>
-          globalThis.fetch(input, init as RequestInit),
-      },
+      singleGeneration: guard,
     });
     const error = await refusal(Promise.resolve().then(() => dispatch()));
     expect(error.reason).toBe("multi_generation_loop");
@@ -1048,10 +1051,7 @@ describe("Google: at most one successful generation request per hard_deny call",
     });
     const dispatch = new GoogleAdapter().prepareCall(native, kwargs, {
       ...options,
-      singleGeneration: {
-        defaultFetch: (input: string, init?: unknown) =>
-          globalThis.fetch(input, init as RequestInit),
-      },
+      singleGeneration: guard,
     });
     await refusal(Promise.resolve().then(() => dispatch()));
     expect(clientBodies).toHaveLength(1);
@@ -1215,5 +1215,128 @@ describe("model-id reasoning classification on hosts without their own rule", ()
     await chat(solwyn, { model: "x-ai/grok-4-fast-non-reasoning", messages: MESSAGES });
     await solwyn.close();
     expect(bodies.map((body) => body["max_tokens"])).toEqual([4096, 4096]);
+  });
+});
+
+describe("Google fetch guard: every send is checked, and the generation slot is claimed first", () => {
+  const options = {
+    surface: "models" as const,
+    isStreaming: false,
+    crossProvider: false,
+    timeout: 600,
+    maxRetries: 0,
+  };
+  const URL_FOR = (model: string) =>
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const body = (generationConfig: Body) => JSON.stringify({ contents: [], generationConfig });
+
+  /** A Google-shaped client whose generateContent drives the per-request fetch directly. */
+  function looping(
+    run: (fetch: (url: string, init: unknown) => Promise<Response>) => Promise<void>,
+  ) {
+    return {
+      models: {
+        generateContent: async (params: Body) => {
+          const fetch = ((params["config"] as Body)["httpOptions"] as Body)["fetch"] as (
+            url: string,
+            init: unknown,
+          ) => Promise<Response>;
+          await run(fetch);
+          return {};
+        },
+        generateContentStream: vi.fn(),
+      },
+    };
+  }
+
+  function guarded(native: unknown, reserved = 100) {
+    return new GoogleAdapter().prepareCall(
+      native,
+      { model: "gemini-2.5-flash", contents: "synthetic", config: { maxOutputTokens: 100 } },
+      {
+        ...options,
+        singleGeneration: {
+          defaultFetch: (input, init) => globalThis.fetch(input, init),
+          reserved,
+          model: "gemini-2.5-flash",
+        },
+      },
+    );
+  }
+
+  it("refuses an overlapping send while the first is in flight", async () => {
+    let release: () => void = () => undefined;
+    const sent: unknown[] = [];
+    vi.stubGlobal("fetch", async (url: unknown) => {
+      sent.push(url);
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return Response.json({});
+    });
+    const outcomes: unknown[] = [];
+    const native = looping(async (fetch) => {
+      const first = fetch(URL_FOR("gemini-2.5-flash"), { body: body({ maxOutputTokens: 100 }) });
+      const second = fetch(URL_FOR("gemini-2.5-flash"), { body: body({ maxOutputTokens: 100 }) });
+      outcomes.push(
+        await second.then(
+          () => "sent",
+          (error: unknown) => error,
+        ),
+      );
+      release();
+      await first;
+    });
+    await guarded(native)();
+    expect(sent).toHaveLength(1);
+    expect(outcomes[0]).toMatchObject({ reason: "multi_generation_loop" });
+  });
+
+  it.each([
+    [
+      "a cap above the reservation",
+      URL_FOR("gemini-2.5-flash"),
+      { maxOutputTokens: 9000 },
+      "bound_exceeded",
+    ],
+    ["no cap", URL_FOR("gemini-2.5-flash"), {}, "bound_exceeded"],
+    [
+      "candidates above the reservation",
+      URL_FOR("gemini-2.5-flash"),
+      { maxOutputTokens: 100, candidateCount: 2 },
+      "bound_exceeded",
+    ],
+    ["another model", URL_FOR("gemini-2.5-pro"), { maxOutputTokens: 100 }, "unsupported_override"],
+  ])("refuses a first request with %s before it is sent", async (_label, url, generationConfig, reason) => {
+    const sent: unknown[] = [];
+    vi.stubGlobal("fetch", async (input: unknown) => {
+      sent.push(input);
+      return Response.json({});
+    });
+    const native = looping(async (fetch) => {
+      await fetch(url, { body: body(generationConfig) });
+    });
+    const error = await refusal(Promise.resolve().then(() => guarded(native)()));
+    expect(error.reason).toBe(reason);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("lets a retry through after a non-2xx response or a network error", async () => {
+    let attempt = 0;
+    vi.stubGlobal("fetch", async () => {
+      attempt += 1;
+      if (attempt === 1) throw new TypeError("fetch failed");
+      if (attempt === 2) return new Response("unavailable", { status: 503 });
+      return Response.json({});
+    });
+    const native = looping(async (fetch) => {
+      const request = () =>
+        fetch(URL_FOR("gemini-2.5-flash"), { body: body({ maxOutputTokens: 100 }) });
+      await request().catch(() => undefined);
+      await request();
+      await request();
+    });
+    await guarded(native)();
+    expect(attempt).toBe(3);
   });
 });

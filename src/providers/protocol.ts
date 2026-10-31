@@ -181,9 +181,14 @@ export interface PrepareCallOptions {
    * Hard_deny admission: the call may make at most one successful generation request. ONLY the
    * Google adapter consumes it, through a per-request fetch guard; no other adapter's metered
    * dispatch loops internally. `defaultFetch` is the runtime fetch the guard wraps when neither
-   * the request nor the client supplies one.
+   * the request nor the client supplies one; every outgoing request must name `model` and fit
+   * `reserved` output tokens.
    */
-  singleGeneration?: { readonly defaultFetch: FetchLike };
+  singleGeneration?: {
+    readonly defaultFetch: FetchLike;
+    readonly reserved: number;
+    readonly model: string;
+  };
 }
 
 /** A bound provider-SDK method (never invoked inside an adapter). */

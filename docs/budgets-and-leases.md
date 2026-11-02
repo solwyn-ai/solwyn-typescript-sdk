@@ -155,7 +155,7 @@ is recorded under its own call id. Media calls are not recorded this way; their 
 until it expires. If the client has already shut down when such a call settles, the record is
 dropped and counted in the reporter's drop counts, so that amount stops counting once its
 reservation expires or its lease ends. Lasting records need Solwyn API support that is live from
-[core deploy date]. Any failure after
+2026-11-02. Any failure after
 the request was sent counts as possibly billed (a caller abort, a response that fails to parse, an
 unrecognized error) unless the provider rejected the call with a 4xx answer (429 included) or
 Anthropic's 529 `overloaded_error` (it rejects before generation starts), or the request provably

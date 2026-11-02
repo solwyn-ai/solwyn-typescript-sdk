@@ -45,7 +45,7 @@ and `decisions.create`.
   the provider billed, for example for a stream you stopped early. A failover hop that may have been
   billed is recorded under its own call id. Media calls are not recorded this way: their
   reservation is held until it expires, as before. Lasting records need Solwyn API support that is
-  live from [core deploy date]. Any failure after the request was sent counts as possibly billed, including a caller abort,
+  live from 2026-11-02. Any failure after the request was sent counts as possibly billed, including a caller abort,
   a response that fails to parse, and an error Solwyn does not recognize, unless the provider
   rejected the call (a 4xx answer, 429 included, or Anthropic's 529 `overloaded_error`, which
   rejects before generation starts) or the request provably never left. Only those are released.

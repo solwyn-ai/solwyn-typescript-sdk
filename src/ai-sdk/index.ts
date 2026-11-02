@@ -740,29 +740,41 @@ function extractStreamUsage(
   outputChars: number,
   part: unknown,
   logger: Logger,
-): ReturnType<typeof extractUsageFailSoft> {
+): ReturnType<typeof extractUsageFailSoft> & { readonly reported: TokenDetails | null } {
   let providerUsageAbsent = true;
+  let reported: TokenDetails | null = null;
   const usageContext = {
     provider: ctx.provider,
     estimatedInputTokens: ctx.estimatedInputTokens,
     outputChars,
   };
-  return extractUsageFailSoft({
+  const usage = extractUsageFailSoft({
     extract: () => {
-      const details = reportedUsageToTokenDetails(getProp(part, "usage"), usageContext);
+      const reportedUsage = getProp(part, "usage");
+      const details = reportedUsageToTokenDetails(reportedUsage, usageContext);
       providerUsageAbsent = details === null;
+      // Only counts the provider reported are observed usage; an unreported dimension is 0.
+      const count = (field: string): number => {
+        const total = readUsageTotal(getProp(reportedUsage, field));
+        return isUsageCount(total) ? total : 0;
+      };
+      reported = buildTokenDetails({
+        input_tokens: count("inputTokens"),
+        output_tokens: count("outputTokens"),
+      });
       return details;
     },
     estimate: () => (providerUsageAbsent ? estimateUsageFromLength(usageContext) : null),
     estimatedInputTokens: ctx.estimatedInputTokens,
     logger,
   });
+  return { ...usage, reported };
 }
 
 /** Held by the finalizer: counts and attribution only, never a stream, source or run lifetime. */
 class MiddlewareStreamSettlement {
   settled = false;
-  #finishUsage: ReturnType<typeof extractUsageFailSoft> | undefined;
+  #finishUsage: ReturnType<typeof extractStreamUsage> | undefined;
   #sawErrorPart = false;
   #outputChars = 0;
 
@@ -810,7 +822,7 @@ class MiddlewareStreamSettlement {
         latencyMs,
         true,
         true,
-        this.#finishUsage?.tokenDetails ?? null,
+        this.#finishUsage?.reported ?? null,
       );
       return;
     }
@@ -1325,7 +1337,8 @@ export function createSolwynMiddleware(
       reporter.report(withLease(ctx, unknownUsage, event));
     }
     if (ctx.funding.leaseId === null || unknownUsage) {
-      endFunding(ctx, unknownUsage, tokenDetails);
+      // Unknown usage here never reached a finish part, so nothing was reported to raise it.
+      endFunding(ctx, unknownUsage);
     }
   };
 

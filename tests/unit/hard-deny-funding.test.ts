@@ -1456,6 +1456,76 @@ describe("floor follow-ups", () => {
     ]);
   });
 
+  describe.each([
+    ["per-call", false],
+    ["lease", true],
+  ] as const)("a middleware stream floor, %s", (_label, leased) => {
+    it.each([
+      "error",
+      "cancel",
+    ] as const)("is raised only by reported usage, not character estimates, after a %s", async (ending) => {
+      const stub = leased ? finalLeasePlane() : plane(1);
+      const native = new MockLanguageModelV3({
+        provider: "openai.chat",
+        modelId: "fallback-model",
+        doStream: async () => {
+          let index = 0;
+          return {
+            stream: new ReadableStream({
+              pull(controller) {
+                const step = index++;
+                // 1,024 characters estimate to 256 output tokens, twice the 128-token bound.
+                if (step === 0 || ending === "cancel")
+                  controller.enqueue({
+                    type: "text-delta",
+                    id: "synthetic",
+                    delta: "x".repeat(1024),
+                  });
+                else if (step === 1)
+                  controller.enqueue({
+                    type: "finish",
+                    finishReason: { unified: "stop", raw: "stop" },
+                    usage: {
+                      inputTokens: { total: 500, noCache: 500, cacheRead: 0, cacheWrite: 0 },
+                      outputTokens: { total: undefined, text: undefined, reasoning: undefined },
+                    },
+                  });
+                else controller.error(Object.assign(new Error("synthetic"), { status: 503 }));
+              },
+            }),
+          };
+        },
+      });
+      const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+      const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+      const act = async () => {
+        const result = await model.doStream({ prompt: [], maxOutputTokens: 128 });
+        const reader = result.stream.getReader();
+        await reader.read();
+        if (ending === "cancel") {
+          await reader.cancel();
+          return;
+        }
+        await reader.read();
+        await expect(reader.read()).rejects.toThrow();
+      };
+      if (leased) await run("floor-chars", act);
+      else await act();
+      await handle.close();
+
+      expect(stub.confirms).toMatchObject([
+        {
+          ...(leased ? { lease_id: "lease-r3" } : { reservation_id: "res-1" }),
+          token_details: {
+            ...(ending === "error" ? { input_tokens: 500 } : {}),
+            output_tokens: 128,
+            is_estimated: true,
+          },
+        },
+      ]);
+    });
+  });
+
   it("floors the multi-generation guard's paid generation and keeps it past expiry", async () => {
     // One gemini floor (its 4096-token bound) fits; a second call does not.
     const stub = plane(6_000 / 1_000_000);

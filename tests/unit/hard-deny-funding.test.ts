@@ -650,13 +650,19 @@ function streamingNative(ending: "reset" | "endless") {
   return new OpenAI({
     apiKey: "sk-test",
     maxRetries: 0,
-    fetch: async (_url: unknown, init?: { body?: unknown }) => {
+    fetch: async (_url: unknown, init?: { body?: unknown; signal?: AbortSignal | null }) => {
       const body = JSON.parse(String(init?.body)) as Body;
       const model = body["model"] as string;
       if (body["stream"] !== true) return completion(model, 128);
       let sent = false;
       return new Response(
         new ReadableStream({
+          start(controller) {
+            const signal = init?.signal;
+            signal?.addEventListener("abort", () => controller.error(signal.reason), {
+              once: true,
+            });
+          },
           pull(controller) {
             if (!sent || ending === "endless") {
               sent = true;
@@ -1174,6 +1180,7 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
   const STREAM_PATHS = new Set([
     "a mid-stream error",
     "an early close",
+    "a caller abort mid-stream",
     "a client close with the stream unread",
   ]);
   const paths: ReadonlyArray<readonly [string, (fetch: FetchLike) => Promise<void>]> = [
@@ -1191,6 +1198,24 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
       async (fetch) => {
         const solwyn = new Solwyn(streamingNative("endless"), { apiKey: API_KEY, fetch });
         await drain(await chat(solwyn, { ...BODY, stream: true }), true);
+        await solwyn.close();
+      },
+    ],
+    [
+      "a caller abort mid-stream",
+      async (fetch) => {
+        const controller = new AbortController();
+        const solwyn = new Solwyn(streamingNative("endless"), { apiKey: API_KEY, fetch });
+        const stream = await (
+          solwyn as unknown as {
+            chat: { completions: { create(b: Body, o: unknown): Promise<unknown> } };
+          }
+        ).chat.completions.create({ ...BODY, stream: true }, { signal: controller.signal });
+        const iterator = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+        await iterator.next();
+        controller.abort();
+        // Native OpenAI ends an aborted stream quietly, as if it had run to its end.
+        await expect(iterator.next()).resolves.toMatchObject({ done: true });
         await solwyn.close();
       },
     ],

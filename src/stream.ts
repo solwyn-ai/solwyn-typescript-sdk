@@ -1234,8 +1234,16 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
         await this.#notifyError(error);
         throw error;
       }
+      // A native stream also ends quietly when its request was aborted; that is a cancel.
+      const controller = isObject(this.#stream) ? this.#stream["controller"] : undefined;
+      const signal = isObject(controller) ? controller["signal"] : undefined;
+      const aborted = isObject(signal) && signal["aborted"] === true;
       try {
-        await this.#onComplete?.(tokenDetails, elapsedMs, this.#iteratorNaturallyFinished);
+        await this.#onComplete?.(
+          tokenDetails,
+          elapsedMs,
+          this.#iteratorNaturallyFinished && !aborted,
+        );
       } catch (callbackError) {
         // WARNING, not ERROR: a user callback throwing is not an SDK-level error — Python's
         // `stream.py` logs the suppressed callback exception at `logger.warning` (behavior of

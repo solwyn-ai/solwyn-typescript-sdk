@@ -45,7 +45,10 @@ the error, including partial usage, and report an `error` event with those token
 usage confirmation is sent. Lease-funded streams, the default for untagged run-scoped text
 calls, still report zero usage on mid-stream provider errors, release the local claim, and send
 no confirmation. Deferred `responses.stream` helpers report a zero-token error event with no
-confirmation.
+confirmation. That settlement is for alert-only projects. On a hard_deny project a mid-stream
+error never refunds: a per-call stream sends no confirmation and keeps its reservation, and a
+lease-funded stream keeps its claim at its reservation (see
+[budget checks, settlement, and run leases](budgets-and-leases.md)).
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.

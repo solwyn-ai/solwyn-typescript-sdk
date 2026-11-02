@@ -550,7 +550,7 @@ Circuit breakers, latency signals, and failover labeling key off the provider **
 **Budgets across failover.** On a hard_deny project, a hop that serves a different provider or
 model gets its own fresh budget check, priced at that hop, before it is called. If it does not fit,
 the call fails with the same `BudgetExceededError` a primary denial raises. See
-[budget checks, settlement, and run leases](docs/budgets-and-leases.md).
+[budget checks, settlement, and run leases](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/budgets-and-leases.md).
 
 **Cross-dialect translation.** A failover hop between two clients of the **same** dialect (e.g. Groq → OpenRouter) is a native passthrough. A hop **across** dialects (e.g. OpenAI → Anthropic) runs a minimal canonical translation subset and **fails loud** rather than silently mangling a request: an untranslatable request raises `UntranslatableRequestError`, and a missing target model mapping raises `UntranslatableModelError`. These errors abort the whole chain — they are never swallowed into a retry.
 

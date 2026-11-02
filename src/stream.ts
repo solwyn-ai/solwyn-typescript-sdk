@@ -40,7 +40,7 @@ import {
   type ChunkTranslator,
   createChunkTranslationCursor,
 } from "./providers/translation/stream-cursor";
-import type { TokenDetails } from "./token-details";
+import { isUsageUnmeasured, type TokenDetails } from "./token-details";
 
 /** Fired once on successful settlement with final usage and elapsed wall-time (ms). */
 /**
@@ -1234,10 +1234,13 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
         await this.#notifyError(error);
         throw error;
       }
-      // A native stream also ends quietly when its request was aborted; that is a cancel.
+      // A native stream also ends quietly when its request was aborted; that is a cancel. The
+      // accumulator records the provider's final usage when it arrives, before body cleanup,
+      // so an abort after that (during cleanup past [DONE]) did not cut the call short.
       const controller = isObject(this.#stream) ? this.#stream["controller"] : undefined;
       const signal = isObject(controller) ? controller["signal"] : undefined;
-      const aborted = isObject(signal) && signal["aborted"] === true;
+      const aborted =
+        isObject(signal) && signal["aborted"] === true && isUsageUnmeasured(tokenDetails);
       try {
         await this.#onComplete?.(
           tokenDetails,

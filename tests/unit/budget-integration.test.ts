@@ -559,7 +559,7 @@ describe("client budget wiring — confirm + call_id reconciliation", () => {
     expect(traffic.ingested.filter((event) => event.status === "success")).toHaveLength(1);
   });
 
-  it("errored call: the error event carries a call_id for reconciliation and sends NO confirm", async () => {
+  it("errored call: the error event carries a call_id for reconciliation and a hard_deny floor confirm", async () => {
     const plane = new FakeControlPlane();
     const traffic = recordPlaneTraffic(plane);
     const boom = new Error("boom");
@@ -578,8 +578,19 @@ describe("client budget wiring — confirm + call_id reconciliation", () => {
     expect(event.status).toBe("error");
     expect(typeof event.call_id).toBe("string");
     expect(event.call_id.length).toBeGreaterThan(0);
-    // Confirm settles only on a served success — an errored call sends none.
-    expect(traffic.confirms).toHaveLength(0);
+    // hard_deny: a failure after dispatch with no proof it billed nothing is recorded at its
+    // floor (estimated input plus the reserved bound), marked estimated, under the same call id.
+    expect(traffic.confirms).toHaveLength(1);
+    expect(traffic.confirms[0]).toMatchObject({
+      reservation_id: expect.any(String),
+      model: "gpt-4o",
+      call_id: event.call_id,
+      token_details: {
+        input_tokens: plane.checks[0]?.estimated_input_tokens,
+        output_tokens: plane.checks[0]?.estimated_output_bound,
+        is_estimated: true,
+      },
+    });
   });
 });
 
@@ -680,8 +691,10 @@ describe("client circuit-breaker wiring — opens after the threshold and blocks
     // none (admission refusal has no metadata event).
     expect(traffic.ingested.filter((event) => event.status === "error")).toHaveLength(3);
     expect(traffic.ingested.some((event) => event.status === "budget_denied")).toBe(false);
-    // No confirm — no call was ever served successfully.
-    expect(traffic.confirms).toHaveLength(0);
+    // No call was served; under hard_deny each possibly billed 503 is recorded at its floor.
+    expect(traffic.confirms).toHaveLength(3);
+    for (const confirm of traffic.confirms)
+      expect(confirm.token_details).toMatchObject({ is_estimated: true });
   });
 });
 

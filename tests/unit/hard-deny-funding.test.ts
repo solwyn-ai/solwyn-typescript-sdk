@@ -1,9 +1,9 @@
 /**
  * Review regressions for hard_deny funding across failover, the allow cache, leases, and
- * untracked surfaces with no output cap. The stub control plane keeps real holds: a check
- * reserves input x input rate plus the output bound x output rate, a confirm replaces its hold with
- * the settled cost, and hard_deny denies a reservation that does not fit the cap. Rates are
- * synthetic.
+ * untracked surfaces with no output cap. The stub control plane follows core's accounting rules
+ * (see `plane`): a check reserves the output bound x output rate, hard_deny denies a reservation
+ * that does not fit the cap, and only receipted or ingested spend survives a hold's expiry, a
+ * lease's surrender and a reconcile. Rates are synthetic.
  */
 
 import { wrapLanguageModel } from "ai";
@@ -46,11 +46,24 @@ function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" 
   const events: Body[] = [];
   const grants: Body[] = [];
   const surrenders: Body[] = [];
+  // Core's rules (solwyn-ai/core d948823d): a per-call hold lives until it expires; an on-time
+  // ordinary per-call confirm moves only the Redis counter, which reconcile lowers to durable
+  // spend; an is_estimated, late or lease confirm writes a durable receipt; durable spend counts
+  // max(receipt, ingested events) per call id, whatever the event's status.
   const holds = new Map<string, number>();
-  let spent = 0;
+  const issued = new Set<string>();
+  const receipts = new Map<string, number>();
+  const eventCost = new Map<string, number>();
+  let redis = 0;
   let reservations = 0;
   const cost = (model: string, output: number) => output * (RATES[model]?.output ?? 0);
   const held = () => [...holds.values()].reduce((sum, value) => sum + value, 0);
+  const durable = () =>
+    [...new Set([...receipts.keys(), ...eventCost.keys()])].reduce(
+      (sum, callId) => sum + Math.max(receipts.get(callId) ?? 0, eventCost.get(callId) ?? 0),
+      0,
+    );
+  const spent = () => Math.max(redis, durable());
   const fetch: FetchLike = async (url, init) => {
     const pathname = new URL(url).pathname;
     const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
@@ -59,6 +72,7 @@ function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" 
       return Response.json(lease.grant);
     }
     if (pathname === "/api/v1/budgets/lease/surrender") {
+      // Advisory: the reported spent_tokens settles nothing; only receipts and events survive.
       surrenders.push(body as Body);
       return Response.json({ lease_id: "", spent_tokens: 0, accepted: true });
     }
@@ -67,16 +81,19 @@ function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" 
       const check = body as Body;
       checks.push(check);
       const reserve = cost(check["model"] as string, check["estimated_output_bound"] as number);
-      const allowed = mode === "alert_only" || spent + held() + reserve <= cap + 1e-12;
+      const allowed = mode === "alert_only" || spent() + held() + reserve <= cap + 1e-12;
       const reservationId = allowed ? `res-${++reservations}` : null;
-      if (reservationId !== null) holds.set(reservationId, reserve);
+      if (reservationId !== null) {
+        holds.set(reservationId, reserve);
+        issued.add(reservationId);
+      }
       return Response.json({
         allowed,
-        remaining_budget: cap - spent - held(),
+        remaining_budget: cap - spent() - held(),
         reservation_id: reservationId,
         mode,
         budget_limit: cap,
-        current_usage: spent,
+        current_usage: spent(),
         denied_by_period: allowed ? null : "monthly",
         project_id: PROJECT_ID,
         price_hints: null,
@@ -85,13 +102,31 @@ function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" 
     if (pathname === "/api/v1/budgets/confirm") {
       const confirm = body as Body;
       confirms.push(confirm);
-      const reservationId = confirm["reservation_id"] as string | undefined;
-      if (reservationId !== undefined) holds.delete(reservationId);
       const details = confirm["token_details"] as Body;
-      spent += cost(confirm["model"] as string, details["output_tokens"] as number);
+      const settled = cost(confirm["model"] as string, details["output_tokens"] as number);
+      const callId = confirm["call_id"] as string;
+      const reservationId = confirm["reservation_id"] as string | undefined;
+      if (reservationId === undefined || !holds.has(reservationId)) {
+        // A lease confirm, or a late per-call confirm within the hour: a durable receipt.
+        if (reservationId !== undefined && !issued.has(reservationId))
+          return new Response(null, { status: 404 });
+        if (!receipts.has(callId)) receipts.set(callId, settled);
+        return new Response(null, { status: 204 });
+      }
+      holds.delete(reservationId);
+      redis += settled;
+      if (details["is_estimated"] === true && !receipts.has(callId)) receipts.set(callId, settled);
       return new Response(null, { status: 204 });
     }
-    if (pathname === "/api/v1/metadata/ingest" && Array.isArray(body)) events.push(...body);
+    if (pathname === "/api/v1/metadata/ingest" && Array.isArray(body)) {
+      events.push(...body);
+      for (const event of body as Body[]) {
+        if (event["status"] === "budget_denied") continue;
+        const callId = event["call_id"] as string;
+        const priced = cost(event["model"] as string, (event["output_tokens"] as number) ?? 0);
+        eventCost.set(callId, (eventCost.get(callId) ?? 0) + priced);
+      }
+    }
     return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
   };
   return {
@@ -102,7 +137,13 @@ function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" 
     grants,
     surrenders,
     held,
-    spent: () => spent,
+    spent,
+    /** Every unconfirmed per-call hold reaches its 300 s expiry. */
+    expire: () => holds.clear(),
+    /** Reconcile past the settle window: the counter falls to durable spend. */
+    reconcile: () => {
+      redis = 0;
+    },
   };
 }
 
@@ -198,12 +239,23 @@ describe("finding 2: a possibly billed hold stays held across later attempts", (
       "primary-model",
       "third-model",
     ]);
-    // The ambiguous hold (res-1) is never settled at zero; only the clean 429 hold is.
-    expect(stub.confirms.map((confirm) => confirm["reservation_id"])).not.toContain("res-1");
+    // The ambiguous hold (res-1) is settled at its floor, never at zero, under its own call id;
+    // only the clean 429 hold is settled at zero.
     expect(stub.confirms).toMatchObject([
+      {
+        reservation_id: "res-1",
+        model: "primary-model",
+        token_details: { input_tokens: 2, output_tokens: 3000, is_estimated: true },
+      },
       { reservation_id: "res-2", token_details: { output_tokens: 0 } },
       { reservation_id: "res-3", model: "third-model", token_details: { output_tokens: 1000 } },
     ]);
+    const floorCallId = stub.confirms[0]?.["call_id"];
+    expect(floorCallId).not.toBe(stub.confirms[2]?.["call_id"]);
+    const ambiguousEvent = stub.events.find(
+      (event) => event["status"] === "error" && event["attempt_index"] === 0,
+    );
+    expect(ambiguousEvent?.["call_id"]).toBe(floorCallId);
   });
 });
 
@@ -274,11 +326,18 @@ describe("finding 5: a lease-funded ambiguous attempt does not fund the next att
 
     expect(stub.grants).toHaveLength(1);
     expect(fallback).toHaveBeenCalledOnce();
-    // The fallback is funded by its own per-call check, not by the possibly billed claim.
+    // The fallback is funded by its own per-call check, not by the possibly billed claim, and the
+    // claim is recorded at its floor under the failed hop's own call id.
     expect(stub.checks.map((check) => check["model"])).toEqual(["fallback-model"]);
     expect(stub.confirms).toMatchObject([
+      {
+        lease_id: "lease-final",
+        model: "primary-model",
+        token_details: { output_tokens: 128, is_estimated: true },
+      },
       { reservation_id: "res-1", model: "fallback-model", token_details: { output_tokens: 128 } },
     ]);
+    expect(stub.confirms[0]?.["call_id"]).not.toBe(stub.confirms[1]?.["call_id"]);
     // The lease reports the ambiguous attempt's whole reservation (input plus 128) as spent.
     expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
   });
@@ -653,7 +712,7 @@ describe("r3 finding 1: an established stream that ends without known usage keep
     expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
   });
 
-  it("keeps a per-call hold when the stream fails mid-stream", async () => {
+  it("settles a per-call hold at its floor when the stream fails mid-stream", async () => {
     const stub = plane(1);
     const solwyn = new Solwyn(streamingNative("reset"), {
       apiKey: API_KEY,
@@ -675,9 +734,17 @@ describe("r3 finding 1: an established stream that ends without known usage keep
     ).rejects.toThrow();
     await solwyn.close();
 
-    // No confirm settles the possibly billed hold below its reservation.
-    expect(stub.confirms).toEqual([]);
-    expect(stub.held()).toBeCloseTo(128 / 1_000_000, 12);
+    // The possibly billed hold is settled at its reservation, durably and marked estimated.
+    expect(stub.confirms).toMatchObject([
+      {
+        reservation_id: "res-1",
+        model: "fallback-model",
+        token_details: { input_tokens: 2, output_tokens: 128, is_estimated: true },
+      },
+    ]);
+    stub.expire();
+    stub.reconcile();
+    expect(stub.spent()).toBeCloseTo(128 / 1_000_000, 12);
   });
 });
 
@@ -1041,12 +1108,261 @@ describe("a response body that fails to decode is post-send ambiguous", () => {
         possibly_succeeded: true,
       });
     if (failsOver && mode === "hard_deny") {
-      // The next hop is re-admitted with its own check; the possibly billed hold is kept.
+      // The next hop is re-admitted with its own check; the possibly billed hold is settled at
+      // its floor first.
       expect(stub.checks.map((check) => check["model"])).toEqual([
         "primary-model",
         "fallback-model",
       ]);
-      expect(stub.confirms.map((confirm) => confirm["model"])).toEqual(["fallback-model"]);
+      expect(stub.confirms).toMatchObject([
+        { model: "primary-model", token_details: { output_tokens: 128, is_estimated: true } },
+        { model: "fallback-model", token_details: { output_tokens: 2 } },
+      ]);
     }
+  });
+});
+
+describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a reconcile", () => {
+  // One 128-token fallback-model floor plus another 128-token call does not fit; either alone does.
+  const CAP = 200 / 1_000_000;
+  const BODY = { model: "fallback-model", messages: MESSAGES, max_tokens: 128 };
+
+  function tightPlane(leased: boolean) {
+    if (!leased) return plane(CAP);
+    return plane(CAP, {
+      grant: {
+        eligible: true,
+        allowed: true,
+        lease_id: "lease-floor",
+        generation: 1,
+        granted_tokens: 200,
+        refresh_interval_s: 300,
+        lease_length_s: 600,
+        headroom_share_tokens: 0,
+        posture: { mode: "hard_deny", on_unreachable: "fail_open" },
+        final_grant: true,
+        project_id: PROJECT_ID,
+        mode: "hard_deny",
+        budget_limit: CAP,
+        current_usage: 0,
+        remaining_budget: CAP,
+      },
+    });
+  }
+
+  async function nextCallIsDenied(stub: ReturnType<typeof plane>): Promise<void> {
+    stub.expire();
+    stub.reconcile();
+    const next = new Solwyn(client(vi.fn((_kwargs: Body) => usage(1))), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+    });
+    try {
+      await expect(chat(next, BODY)).rejects.toBeInstanceOf(BudgetExceededError);
+    } finally {
+      await next.close();
+    }
+  }
+
+  async function drain(stream: unknown, stopEarly = false): Promise<void> {
+    for await (const _part of stream as AsyncIterable<unknown>) {
+      if (stopEarly) break;
+    }
+  }
+
+  const paths: ReadonlyArray<readonly [string, (fetch: FetchLike) => Promise<void>]> = [
+    [
+      "a mid-stream error",
+      async (fetch) => {
+        const solwyn = new Solwyn(streamingNative("reset"), { apiKey: API_KEY, fetch });
+        const stream = await chat(solwyn, { ...BODY, stream: true });
+        await expect(drain(stream)).rejects.toThrow();
+        await solwyn.close();
+      },
+    ],
+    [
+      "an early close",
+      async (fetch) => {
+        const solwyn = new Solwyn(streamingNative("endless"), { apiKey: API_KEY, fetch });
+        await drain(await chat(solwyn, { ...BODY, stream: true }), true);
+        await solwyn.close();
+      },
+    ],
+    [
+      "a client close with the stream unread",
+      async (fetch) => {
+        const solwyn = new Solwyn(streamingNative("endless"), { apiKey: API_KEY, fetch });
+        await chat(solwyn, { ...BODY, stream: true });
+        await solwyn.close();
+      },
+    ],
+    [
+      "a terminal ambiguous failure",
+      async (fetch) => {
+        const solwyn = new Solwyn(client(failing(503)), {
+          apiKey: API_KEY,
+          fetch,
+          provider: "openai",
+        });
+        await expect(chat(solwyn, BODY)).rejects.toMatchObject({ status: 503 });
+        await solwyn.close();
+      },
+    ],
+    [
+      "an unrecognized failure after dispatch",
+      async (fetch) => {
+        const create = vi.fn((_kwargs: Body) => {
+          throw new Error("synthetic unrecognized failure");
+        });
+        const solwyn = new Solwyn(client(create), { apiKey: API_KEY, fetch, provider: "openai" });
+        await expect(chat(solwyn, BODY)).rejects.toThrow("synthetic unrecognized failure");
+        await solwyn.close();
+      },
+    ],
+    [
+      "a caller abort without proof",
+      async (fetch) => {
+        const controller = new AbortController();
+        const native = new OpenAI({
+          apiKey: "sk-test",
+          maxRetries: 0,
+          fetch: async () => {
+            controller.abort();
+            throw Object.assign(new Error("synthetic abort"), { name: "AbortError" });
+          },
+        });
+        const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+        await expect(
+          (
+            solwyn as unknown as {
+              chat: { completions: { create(b: Body, o: unknown): Promise<unknown> } };
+            }
+          ).chat.completions.create(BODY, { signal: controller.signal }),
+        ).rejects.toThrow();
+        await solwyn.close();
+      },
+    ],
+    [
+      "a success without measured usage",
+      async (fetch) => {
+        const create = vi.fn((_kwargs: Body) => ({
+          choices: [
+            { index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } },
+          ],
+        }));
+        const solwyn = new Solwyn(client(create), { apiKey: API_KEY, fetch, provider: "openai" });
+        await chat(solwyn, BODY);
+        await solwyn.close();
+      },
+    ],
+    [
+      "a Responses stream entry failure",
+      async (fetch) => {
+        const native = new OpenAI({
+          apiKey: "sk-test",
+          maxRetries: 0,
+          fetch: async () =>
+            Response.json({ error: { message: "synthetic", type: "synthetic" } }, { status: 500 }),
+        });
+        const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch });
+        const responses = (
+          solwyn as unknown as { responses: { stream(b: Body): { done(): Promise<unknown> } } }
+        ).responses;
+        await expect(
+          responses.stream({ model: "fallback-model", input: [], max_output_tokens: 128 }).done(),
+        ).rejects.toMatchObject({ status: 500 });
+        await solwyn.close();
+      },
+    ],
+  ];
+
+  describe.each([
+    ["per-call", false],
+    ["lease", true],
+  ] as const)("%s", (_label, leased) => {
+    it.each(paths)("after %s", async (_path, act) => {
+      const stub = tightPlane(leased);
+      if (leased) await run("floor-lease", () => act(stub.fetch));
+      else await act(stub.fetch);
+
+      const floors = stub.confirms.filter(
+        (confirm) => (confirm["token_details"] as Body)["is_estimated"] === true,
+      );
+      expect(floors).toHaveLength(1);
+      expect(floors[0]).toMatchObject({
+        ...(leased ? { lease_id: "lease-floor" } : { reservation_id: "res-1" }),
+        model: "fallback-model",
+        provider: "openai",
+        token_details: { input_tokens: expect.any(Number), output_tokens: 128 },
+      });
+      await nextCallIsDenied(stub);
+    });
+  });
+
+  describe.each([
+    ["per-call", false],
+    ["lease", true],
+  ] as const)("AI SDK middleware, %s", (_label, leased) => {
+    const ambiguous = () => Object.assign(new Error("synthetic ambiguity"), { status: 503 });
+    it.each([
+      "generate",
+      "establishment",
+      "midstream",
+      "cancel",
+    ] as const)("after a %s outcome", async (stage) => {
+      const stub = tightPlane(leased);
+      const native = new MockLanguageModelV3({
+        provider: "openai.chat",
+        modelId: "fallback-model",
+        doGenerate: async () => {
+          throw ambiguous();
+        },
+        doStream: async () => {
+          if (stage === "establishment") throw ambiguous();
+          let index = 0;
+          return {
+            stream: new ReadableStream({
+              pull(controller) {
+                if (index++ === 0 || stage === "cancel")
+                  controller.enqueue({ type: "text-delta", id: "synthetic", delta: "synthetic" });
+                else controller.error(ambiguous());
+              },
+            }),
+          };
+        },
+      });
+      const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+      const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+      const act = async () => {
+        if (stage === "generate") {
+          await expect(model.doGenerate({ prompt: [], maxOutputTokens: 128 })).rejects.toThrow();
+          return;
+        }
+        if (stage === "establishment") {
+          await expect(model.doStream({ prompt: [], maxOutputTokens: 128 })).rejects.toThrow();
+          return;
+        }
+        const result = await model.doStream({ prompt: [], maxOutputTokens: 128 });
+        const reader = result.stream.getReader();
+        await reader.read();
+        if (stage === "cancel") await reader.cancel();
+        else await expect(reader.read()).rejects.toThrow();
+      };
+      if (leased) await run("floor-middleware", act);
+      else await act();
+      await handle.close();
+
+      const floors = stub.confirms.filter(
+        (confirm) => (confirm["token_details"] as Body)["is_estimated"] === true,
+      );
+      expect(floors).toHaveLength(1);
+      expect(floors[0]).toMatchObject({
+        ...(leased ? { lease_id: "lease-floor" } : { reservation_id: "res-1" }),
+        model: "fallback-model",
+        token_details: { output_tokens: 128 },
+      });
+      await nextCallIsDenied(stub);
+    });
   });
 });

@@ -149,7 +149,14 @@ describe("post-remediation finding 4: native Google shorthand input", () => {
       } finally {
         await state.wrapped.close();
       }
-      expect(state.plane.confirms.length).toBe(1);
+      // hard_deny: the possibly billed native 503 is recorded at its floor under its own call id,
+      // and the served fallback confirms its measured usage.
+      expect(state.plane.confirms.length).toBe(2);
+      const floor = state.plane.confirms.find((confirm) => confirm.token_details.is_estimated);
+      const served = state.plane.confirms.find((confirm) => !confirm.token_details.is_estimated);
+      expect(floor?.provider).toBe("google");
+      expect(served?.model).toBe("gpt-4o-mini");
+      expect(floor?.call_id).not.toBe(served?.call_id);
     });
   }
 

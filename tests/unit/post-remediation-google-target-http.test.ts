@@ -241,10 +241,17 @@ describe("post-remediation finding 7: Google target HTTP ownership", () => {
       ).rejects.toBe(abort);
       expect(targetAuthorized).toBe(true);
       expect(targetAborted).toBe(true);
-      // Only the superseded source reservation is settled, at zero usage.
-      expect(plane.confirms.filter((confirm) => confirm.model === "gemini-2.5-flash")).toHaveLength(
-        0,
-      );
+      // The superseded source reservation is settled at zero usage. Under hard_deny the target,
+      // aborted by the caller after dispatch with no proof it billed nothing, is recorded at its
+      // floor (the 128-token bound), marked estimated.
+      const target = plane.confirms.filter((confirm) => confirm.model === "gemini-2.5-flash");
+      expect(target).toHaveLength(1);
+      expect(target[0]).toMatchObject({
+        provider: "google",
+        token_details: { output_tokens: 128, is_estimated: true },
+      });
+      for (const closeOut of plane.confirms.filter((confirm) => confirm !== target[0]))
+        expect(closeOut.token_details).toMatchObject({ input_tokens: 0, output_tokens: 0 });
     });
   }
 

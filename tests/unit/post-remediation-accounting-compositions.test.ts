@@ -267,6 +267,8 @@ describe("PR-A1: measured paid stream translation failure", () => {
               throw new Error();
             });
           let reservationFloor = 0;
+          let estimatedInput = 0;
+          let outputBound = 0;
           const check = vi.spyOn(BudgetEnforcer.prototype, "checkBudget");
           try {
             await run("paid-stream-normalization", async () => {
@@ -277,8 +279,9 @@ describe("PR-A1: measured paid stream translation failure", () => {
                 stream: true,
               })) as unknown as StreamWrapper;
               const admission = check.mock.calls[0]?.[0];
-              reservationFloor =
-                (admission?.estimatedInputTokens ?? 0) + (admission?.estimatedOutputBound ?? 0);
+              estimatedInput = admission?.estimatedInputTokens ?? 0;
+              outputBound = admission?.estimatedOutputBound ?? 0;
+              reservationFloor = estimatedInput + outputBound;
               if (malformed)
                 await expect(consume(stream, mode, marker)).rejects.toBeInstanceOf(
                   UntranslatableRequestError,
@@ -306,17 +309,27 @@ describe("PR-A1: measured paid stream translation failure", () => {
             (confirm) => confirm.provider === "google",
           );
           // hard_deny: a translation failure after establishment may have billed more than was
-          // measured, so a per-call hold is kept (no confirm) and a lease claim settles at its floor.
-          const perCallKept = malformed && !lease;
-          const confirmed = (reporting === "delivered" || reporting === "rejected") && !perCallKept;
+          // measured, so its funding (per-call or lease) is recorded at its floor in its own
+          // confirm, marked estimated: max(estimated input, 30) plus max(max_tokens bound, 20). The
+          // floor confirm is not paired with the event, so only its own construction can fail.
+          const floor = malformed;
+          const confirmed = floor
+            ? reporting !== "construction failure"
+            : reporting === "delivered" || reporting === "rejected";
           expect(servedConfirms).toHaveLength(confirmed ? 1 : 0);
           expect(servedPlaneConfirms).toHaveLength(
-            reporting === "delivered" && !perCallKept ? 1 : 0,
+            reporting === "delivered" || (floor && reporting === "enqueue failure") ? 1 : 0,
           );
           if (confirmed) {
             expect(servedConfirms[0]).toMatchObject({
               provider: "google",
-              token_details: { input_tokens: 30, output_tokens: 20 },
+              token_details: floor
+                ? {
+                    input_tokens: Math.max(estimatedInput, 30),
+                    output_tokens: Math.max(outputBound, 20),
+                    is_estimated: true,
+                  }
+                : { input_tokens: 30, output_tokens: 20 },
               is_provider_fallback: true,
             });
             expect(Boolean(servedConfirms[0]?.lease_id)).toBe(lease);

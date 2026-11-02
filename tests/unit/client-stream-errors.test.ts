@@ -216,11 +216,16 @@ it("keeps the served provider breaker neutral after a mid-stream translation fai
     await sdk.close();
   }
   // Each call fails over, so each also settles the superseded primary reservation at zero. The
-  // failed translation may follow billed output, so under hard_deny its hop's hold is kept: only
-  // the second, completed hop confirms.
+  // failed translation may follow billed output, so under hard_deny its hop's reservation is
+  // recorded at its floor (observed input 11, max_tokens 10), marked estimated; the second,
+  // completed hop confirms its measured usage.
   expect(control.confirms.filter((confirm) => confirm["provider"] === "anthropic")).toMatchObject([
+    { token_details: { input_tokens: 11, output_tokens: 10, is_estimated: true } },
     { token_details: { input_tokens: 11, output_tokens: 2 } },
   ]);
+  expect(
+    control.confirms.filter((confirm) => confirm["provider"] === "anthropic")[1]?.["token_details"],
+  ).not.toHaveProperty("is_estimated");
   expect(control.confirms.filter((confirm) => confirm["provider"] === "openai")).toMatchObject([
     { token_details: { input_tokens: 0, output_tokens: 0 } },
     { token_details: { input_tokens: 0, output_tokens: 0 } },

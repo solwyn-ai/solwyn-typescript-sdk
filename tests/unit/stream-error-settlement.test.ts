@@ -283,7 +283,17 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny: the possibly billed reservation is recorded at its floor, marked estimated.
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      reservation_id: expect.any(String),
+      model: "gpt-test",
+      token_details: {
+        input_tokens: 0,
+        output_tokens: plane.checks[0]?.estimated_output_bound,
+        is_estimated: true,
+      },
+    });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",
@@ -342,7 +352,14 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny records the possibly billed funding at its floor (input 3 plus max_tokens 20).
+    expect(plane.confirms).toHaveLength(mode === "hard_deny" ? 1 : 0);
+    if (mode === "hard_deny")
+      expect(plane.confirms[0]).toMatchObject({
+        ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+        model: "deepseek-chat",
+        token_details: { input_tokens: 3, output_tokens: 20, is_estimated: true },
+      });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",
@@ -401,10 +418,18 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny records the possibly billed funding at its floor (input 3 plus max_tokens 20).
+    expect(plane.confirms).toHaveLength(mode === "hard_deny" ? 1 : 0);
+    if (mode === "hard_deny")
+      expect(plane.confirms[0]).toMatchObject({
+        ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+        model: "gpt-test",
+        token_details: { input_tokens: 3, output_tokens: 20, is_estimated: true },
+      });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({ status: "error", input_tokens: 0, output_tokens: 0 });
-    expect(finalize).toHaveBeenCalledTimes(leased ? 0 : 1);
+    // A lease's error event reads no usage; under hard_deny the floor still tries to observe it.
+    expect(finalize).toHaveBeenCalledTimes(leased && mode === "alert_only" ? 0 : 1);
     // hard_deny settles the possibly billed claim at its reservation (input plus max_tokens 20).
     if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(mode === "hard_deny" ? 23 : 0);
   });
@@ -508,9 +533,15 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    // The error may follow billed output: no confirm settles the per-call hold below its
-    // reservation, and a lease claim settles at its reservation (max_tokens 20, no input).
-    expect(plane.confirms).toHaveLength(0);
+    // The error may follow billed output: the funding is recorded at its floor, the observed
+    // input 12 (above its estimate) plus max_tokens 20, and the lease claim settles locally at
+    // its reservation (max_tokens 20, no estimated input).
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+      model: "claude-test",
+      token_details: { input_tokens: 12, output_tokens: 20, is_estimated: true },
+    });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",

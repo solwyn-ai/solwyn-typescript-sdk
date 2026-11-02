@@ -76,7 +76,7 @@ import {
   outageTermination,
   runObservedAt,
 } from "./run-control";
-import { type TokenDetails, totalTokens } from "./token-details";
+import { buildTokenDetails, type TokenDetails, totalTokens } from "./token-details";
 import { withoutTraceContext } from "./trace-context";
 import {
   BUDGET_CHECK_PATH,
@@ -323,6 +323,25 @@ function stickyDenyReason(
  * `"alert_only"`, `budgetLimit`/`currentUsage` → `0`. (budget.md behavior 21 — the
  * result is a real typed structure with these exact defaults.)
  */
+/**
+ * The usage a hard_deny attempt with unknown, possibly billed usage settles at: its reservation
+ * (estimated input plus the attempt's reserved output bound), or the observed count where that is
+ * larger, per dimension. Marked estimated, so Solwyn Cloud keeps it as a durable receipt.
+ */
+export function floorTokenDetails(
+  observed: TokenDetails | null,
+  estimatedInputTokens: number,
+  outputBound: number,
+): TokenDetails {
+  const floor = (reserved: number, seen: number | undefined): number =>
+    Math.min(Math.max(reserved, seen ?? 0, 0), ORDINARY_TOKEN_COUNT_MAX);
+  return buildTokenDetails({
+    input_tokens: floor(estimatedInputTokens, observed?.input_tokens),
+    output_tokens: floor(outputBound, observed?.output_tokens),
+    is_estimated: true,
+  });
+}
+
 export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudgetCheckResult {
   return {
     ...(init.callId === undefined ? {} : { callId: init.callId }),

@@ -483,8 +483,10 @@ describe("AI SDK middleware shutdown", () => {
     expect(plane.leaseSurrenders).toMatchObject([{ spent_tokens: 100 }]);
     expect(plane.confirms).toHaveLength(0);
     expect(plane.ingested).toHaveLength(0);
+    // Under hard_deny the unmeasured stream's floor confirm and its event are enqueued separately,
+    // after the reporter shut down: both are dropped and counted, and only the local floor stays.
     expect(reporterClose.mock.contexts[0]).toHaveProperty("droppedCounts", {
-      "settlement_confirm.closed_enqueue": 1,
+      "confirm.closed_enqueue": 1,
       "event.closed_enqueue": 1,
     });
   });
@@ -504,7 +506,12 @@ describe("AI SDK middleware shutdown", () => {
       await handle.close();
       await reader.cancel();
     });
+    // hard_deny: the unmeasured stream's claim is recorded at its floor (maxOutputTokens 100).
     expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      lease_id: expect.any(String),
+      token_details: { input_tokens: 0, output_tokens: 100, is_estimated: true },
+    });
     expect(plane.ingested).toMatchObject([
       { status: "success", output_tokens: 1, token_details: { is_estimated: true } },
     ]);

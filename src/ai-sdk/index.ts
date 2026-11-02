@@ -30,7 +30,12 @@
  */
 
 import type { LanguageModelMiddleware } from "ai";
-import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } from "../budget";
+import {
+  BudgetEnforcer,
+  type BuildConfirmRequestOptions,
+  budgetCheckResult,
+  floorTokenDetails,
+} from "../budget";
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
@@ -693,6 +698,8 @@ interface CallContext {
   /** OpenTelemetry identifiers captured once at call start; never re-read during a stream. */
   trace: TraceSnapshot | undefined;
   estimatedInputTokens: number;
+  /** The reserved output bound: a hard_deny floor confirm settles at input plus this. */
+  estimatedOutputBound: number;
   abortSignal: AbortSignal | undefined;
   /** Immutable process-local settlement/release authority captured from preflight. */
   funding: Readonly<{
@@ -1080,6 +1087,7 @@ export function createSolwynMiddleware(
       run,
       trace,
       estimatedInputTokens,
+      estimatedOutputBound: Math.min(estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
       abortSignal: params.abortSignal,
       funding: Object.freeze({
         reservationId: decision.reservationId,
@@ -1092,16 +1100,40 @@ export function createSolwynMiddleware(
 
   /**
    * End a call's funding once its outcome is reported (the client's rule). Possibly billed
-   * hard_deny funding with unknown usage is never refunded: a lease claim settles at its floor, and
-   * a per-call hold is kept. Anything else is released.
+   * hard_deny funding with unknown usage is never refunded: the local lease claim settles at its
+   * reservation, and an `is_estimated` confirm records the floor durably for a lease claim or a
+   * per-call reservation. Anything else is released.
    */
-  const endFunding = (ctx: StreamSettlementContext, keep: boolean): void => {
+  const endFunding = (
+    ctx: StreamSettlementContext,
+    keep: boolean,
+    observed: TokenDetails | null = null,
+  ): void => {
     if (!keep) {
       releaseFunding(ctx);
       return;
     }
     try {
       budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+      if (!hasSettlementFunding(ctx.funding)) return;
+      reporter.reportConfirm(
+        budget.buildConfirmRequest({
+          reservationId: ctx.funding.reservationId,
+          leaseId: ctx.funding.leaseId,
+          leaseClaimToken: ctx.funding.leaseClaimToken,
+          model: ctx.model,
+          provider: ctx.provider,
+          isProviderFallback: false,
+          callId: ctx.callId,
+          providerRegion: null,
+          serviceTier: null,
+          tokenDetails: floorTokenDetails(
+            observed,
+            ctx.estimatedInputTokens,
+            ctx.estimatedOutputBound,
+          ),
+        }),
+      );
     } catch {
       // Local capability cleanup is best effort; the provider/bookkeeping value wins.
     }
@@ -1258,7 +1290,7 @@ export function createSolwynMiddleware(
       failoverErrorClass: null,
       possiblySucceeded: null,
     });
-    if (hasSettlementFunding(ctx.funding) && !(unknownUsage && ctx.funding.leaseId === null)) {
+    if (hasSettlementFunding(ctx.funding) && !unknownUsage) {
       settlePaidSuccess(event, {
         reservationId: ctx.funding.reservationId,
         leaseId: ctx.funding.leaseId,
@@ -1270,13 +1302,13 @@ export function createSolwynMiddleware(
         callId: ctx.callId,
         providerRegion: null,
         serviceTier: null,
-        floorAtReservation: usageUnmeasured || unknownUsage,
+        floorAtReservation: usageUnmeasured,
       });
     } else {
       reporter.report(event);
     }
-    if (ctx.funding.leaseId === null) {
-      endFunding(ctx, unknownUsage);
+    if (ctx.funding.leaseId === null || unknownUsage) {
+      endFunding(ctx, unknownUsage, tokenDetails);
     }
   };
 
@@ -1422,6 +1454,7 @@ export function createSolwynMiddleware(
           model: ctx.model,
           callId: ctx.callId,
           estimatedInputTokens: ctx.estimatedInputTokens,
+          estimatedOutputBound: ctx.estimatedOutputBound,
           funding: ctx.funding,
           hardDenyAdmitted: ctx.hardDenyAdmitted,
           trace: ctx.trace,

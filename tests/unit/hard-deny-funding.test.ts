@@ -1589,6 +1589,68 @@ describe("floor follow-ups", () => {
     expect((stub.confirms[0]?.["token_details"] as Body)["is_estimated"]).not.toBe(true);
   });
 
+  it.each([
+    ["per-call", false],
+    ["lease", true],
+  ] as const)("floors a %s stream aborted after interim usage with no finish reason", async (_label, leased) => {
+    const stub = leased ? finalLeasePlane() : plane(1);
+    const caller = new AbortController();
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async (_url: unknown, init?: { signal?: AbortSignal | null }) => {
+        // Continuous usage stats: every content chunk carries usage, none carries a finish reason.
+        const interim = {
+          id: "chatcmpl-r3",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "fallback-model",
+          choices: [{ index: 0, delta: { content: "synthetic" }, finish_reason: null }],
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        };
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              const signal = init?.signal;
+              signal?.addEventListener("abort", () => controller.error(signal.reason), {
+                once: true,
+              });
+            },
+            pull(controller) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(interim)}\n\n`));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const act = async () => {
+      const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch });
+      const stream = await (
+        solwyn as unknown as {
+          chat: { completions: { create(b: Body, o: unknown): Promise<unknown> } };
+        }
+      ).chat.completions.create(
+        { model: "fallback-model", messages: MESSAGES, max_tokens: 128, stream: true },
+        { signal: caller.signal },
+      );
+      const iterator = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+      await iterator.next();
+      caller.abort();
+      await expect(iterator.next()).resolves.toMatchObject({ done: true });
+      await solwyn.close();
+    };
+    if (leased) await run("floor-interim-abort", act);
+    else await act();
+
+    expect(stub.confirms).toMatchObject([
+      {
+        ...(leased ? { lease_id: "lease-r3" } : { reservation_id: "res-1" }),
+        token_details: { input_tokens: 2, output_tokens: 128, is_estimated: true },
+      },
+    ]);
+  });
+
   it("floors the multi-generation guard's paid generation and keeps it past expiry", async () => {
     // One gemini floor (its 4096-token bound) fits; a second call does not.
     const stub = plane(6_000 / 1_000_000);

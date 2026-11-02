@@ -598,6 +598,7 @@ export class BedrockStreamAccumulator implements StreamUsageAccumulator {
   #usage: Record<string, unknown> | null = null;
   #serviceTier: string | null = null;
   #sawEvent = false;
+  #sawStop = false;
   readonly #logger: Logger;
 
   constructor(logger: Logger = consoleLogger) {
@@ -612,8 +613,10 @@ export class BedrockStreamAccumulator implements StreamUsageAccumulator {
     }
     // Every mapping chunk marks the stream as observed — INCLUDING a metadata-keyed chunk.
     this.#sawEvent = true;
+    if (isObject(getProp(chunk, "messageStop"))) this.#sawStop = true;
     const metadata = getProp(chunk, "metadata");
     if (isObject(metadata)) {
+      this.#sawStop = true;
       const usage = getProp(metadata, "usage");
       if (isObject(usage)) {
         this.#usage = usage;
@@ -642,5 +645,9 @@ export class BedrockStreamAccumulator implements StreamUsageAccumulator {
 
   getServiceTier(): string | null {
     return this.#serviceTier;
+  }
+
+  sawCompletion(): boolean {
+    return this.#sawStop;
   }
 }

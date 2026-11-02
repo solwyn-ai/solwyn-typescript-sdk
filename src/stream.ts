@@ -1235,12 +1235,13 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
         throw error;
       }
       // A native stream also ends quietly when its request was aborted; that is a cancel. The
-      // accumulator records the provider's final usage when it arrives, before body cleanup,
-      // so an abort after that (during cleanup past [DONE]) did not cut the call short.
+      // accumulator records the provider's finish or stop signal when it arrives, before body
+      // cleanup, so an abort after that (during cleanup past [DONE]) did not cut the call short.
+      // An accumulator without that signal falls back to whether usage was measured.
       const controller = isObject(this.#stream) ? this.#stream["controller"] : undefined;
       const signal = isObject(controller) ? controller["signal"] : undefined;
-      const aborted =
-        isObject(signal) && signal["aborted"] === true && isUsageUnmeasured(tokenDetails);
+      const completed = this.#accumulator.sawCompletion?.() ?? !isUsageUnmeasured(tokenDetails);
+      const aborted = isObject(signal) && signal["aborted"] === true && !completed;
       try {
         await this.#onComplete?.(
           tokenDetails,

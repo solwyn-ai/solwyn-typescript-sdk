@@ -45,6 +45,7 @@ import {
   boundServiceTier,
   extractOpenAIUsage,
   extractServiceTier,
+  isChatCompletionChunk,
   settledServiceTier,
   usageValue,
 } from "./accumulator";
@@ -465,6 +466,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
   #serviceTier: BoundedServiceTier = boundServiceTier(null);
   /** Accumulated delta content character length across all observed chunks. */
   #contentChars = 0;
+  #sawCompletion = false;
 
   constructor(options: CompatStreamAccumulatorOptions) {
     this.#adapter = options.adapter;
@@ -477,6 +479,8 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
     // tier. Afterwards retain usage/tier extraction below, but avoid walking later delta bodies.
     if (this.#standardUsage === null && this.#xGroqUsage === null) {
       this.#contentChars += estimateStreamChunkContentLength(chunk);
+      // Choices are not read once usage latches, so a finish seen only afterwards still floors.
+      this.#sawCompletion ||= isChatCompletionChunk(chunk);
     }
     try {
       const usage = getProp(chunk, "usage");
@@ -499,6 +503,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
           // above retain their existing non-latching behavior.
           usageHolder = response;
           this.#standardUsage = extractOpenAIUsage(response);
+          this.#sawCompletion = true;
         }
       }
       const xGroqUsage = getProp(getProp(chunk, "x_groq"), "usage");
@@ -544,6 +549,10 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
 
   getServiceTier(): string | null {
     return settledServiceTier(this.#serviceTier, this.#logger);
+  }
+
+  sawCompletion(): boolean {
+    return this.#sawCompletion;
   }
 }
 

@@ -33,13 +33,14 @@ and `decisions.create`.
   `failoverIdempotency: "always"`), its reservation or lease claim is kept at its full amount, and
   every later attempt in the call, on any provider or model, gets its own fresh per-call check.
   This applies to lease-funded calls too.
-- **hard_deny now covers `decisions.create`.** OpenAI `decisions.create` has no output-cap
-  parameter, so no budget check can bound it. On a hard_deny project it now fails before it is
-  sent with `OutputBoundUnenforceableError` (`reason: "no_output_cap"`), whatever `onUnmetered` is
-  set to. The SDK runs one budget check to learn the project's mode and settles that check's
-  reservation at zero, so the refusal leaves no hold on your budget. On an alert-only project the
-  call still goes through as an untracked surface: its spend is not counted, and
-  `onUnmetered: "raise"` refuses it.
+- **hard_deny now covers `decisions.create`.** OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
+  without an acknowledgment, `onUnmetered: "raise"` refuses it first with
+  `UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn
+  the project's mode and settles that check's reservation at zero, so it leaves no hold. If that
+  check denies, the call fails with the usual budget denial (`BudgetExceededError`). On a hard_deny
+  project it then fails before it is sent with `OutputBoundUnenforceableError`
+  (`reason: "no_output_cap"`). On an alert-only project it goes through as an untracked surface,
+  and its spend is not counted.
 - **A local refusal leaves no hold.** When a hard_deny call is refused with
   `OutputBoundUnenforceableError` after its budget check but before anything is sent (in a wrapped
   client or the AI SDK middleware), the check's reservation is settled at zero instead of holding

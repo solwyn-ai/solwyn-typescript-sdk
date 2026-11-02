@@ -630,11 +630,16 @@ export class MetadataReporter {
     if (this.shuttingDown || target === null || this.activeRound !== null) return;
     if (this.continuationPending) return;
     if (this.tickTimer !== null) clearTimeout(this.tickTimer);
-    try {
-      this.tickTimer = armFlushTick(target, 0);
-    } catch (error) {
-      this._warnFlushScheduleFailure(error);
-    }
+    // Like start(): the re-arming tick chain must not inherit the caller's run or trace scope.
+    runOutsideRun(() =>
+      withoutTraceContext(() => {
+        try {
+          this.tickTimer = armFlushTick(target, 0);
+        } catch (error) {
+          this._warnFlushScheduleFailure(error);
+        }
+      }),
+    );
   }
 
   /** Fire-and-forget a confirm+event pair; count both halves after close. */

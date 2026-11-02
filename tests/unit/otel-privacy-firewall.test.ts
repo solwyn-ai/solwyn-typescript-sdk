@@ -352,6 +352,7 @@ describe("OpenTelemetry privacy firewall", () => {
       "release-dispatcher.ts:#pump",
       "reporter.ts:close",
       "reporter.ts:close",
+      "reporter.ts:flushSoon",
       "reporter.ts:start",
       "untracked-reporter.ts:#requestFlush",
     ]);

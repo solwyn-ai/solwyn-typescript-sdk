@@ -8,7 +8,11 @@
 
 import OpenAI from "openai";
 import { describe, expect, it, vi } from "vitest";
-import { BudgetExceededError, OutputBoundUnenforceableError } from "../../src/errors";
+import {
+  BudgetExceededError,
+  OutputBoundUnenforceableError,
+  UntrackedSpendSurfaceError,
+} from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import { run } from "../../src/node";
 import type { FetchLike } from "../../src/transport";
@@ -380,6 +384,40 @@ describe("finding 3: decisions.create has no output cap", () => {
     expect(sent).toHaveLength(1);
   });
 
+  it("is refused by onUnmetered raise first, with no budget check", async () => {
+    const stub = plane(1);
+    const { native, sent } = decisionsClient();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch, onUnmetered: "raise" });
+    const read = () =>
+      (solwyn as unknown as { decisions: { create(b: Body): Promise<unknown> } }).decisions.create({
+        model: "gpt-6-luna",
+        input: "synthetic",
+      });
+    expect(read).toThrow(UntrackedSpendSurfaceError);
+    await solwyn.close();
+    expect(stub.checks).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+  });
+
+  it("goes through untracked on an alert-only project after one zero-settled check", async () => {
+    const stub = plane(1);
+    const alertOnly: FetchLike = async (url, init) => {
+      const response = await stub.fetch(url, init);
+      if (!url.includes("/budgets/check")) return response;
+      return Response.json({ ...((await response.json()) as Body), mode: "alert_only" });
+    };
+    const { native, sent } = decisionsClient();
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: alertOnly });
+    await (
+      solwyn as unknown as { decisions: { create(b: Body): Promise<unknown> } }
+    ).decisions.create({ model: "gpt-6-luna", input: "synthetic" });
+    await vi.waitFor(() => expect(stub.held()).toBe(0));
+    await solwyn.close();
+    expect(stub.checks).toHaveLength(1);
+    expect(stub.confirms).toMatchObject([{ token_details: { output_tokens: 0 } }]);
+    expect(sent).toHaveLength(1);
+  });
+
   it("is still denied as a budget denial when nothing fits", async () => {
     const stub = plane(0);
     const { native, sent } = decisionsClient();
@@ -431,5 +469,66 @@ describe("a pre-send refusal leaves no hold", () => {
     await chat(solwyn, { model: "grok-4-fast-non-reasoning", messages: MESSAGES });
     await solwyn.close();
     expect(sent).toHaveLength(1);
+  });
+});
+
+describe("a terminal possibly billed attempt keeps its lease claim", () => {
+  function finalLease() {
+    return plane(1, {
+      grant: {
+        eligible: true,
+        allowed: true,
+        lease_id: "lease-terminal",
+        generation: 1,
+        granted_tokens: 200,
+        refresh_interval_s: 300,
+        lease_length_s: 600,
+        headroom_share_tokens: 0,
+        posture: { mode: "hard_deny", on_unreachable: "fail_open" },
+        final_grant: true,
+        project_id: PROJECT_ID,
+        mode: "hard_deny",
+        budget_limit: 1,
+        current_usage: 0,
+        remaining_budget: 1,
+      },
+    });
+  }
+
+  it.each([
+    ["the primary", false],
+    ["the last fallback", true],
+  ])("consumes the claim when %s fails ambiguously and the walk ends", async (_label, withFallback) => {
+    const stub = finalLease();
+    let calls = 0;
+    const primary = vi.fn((_kwargs: Body) => {
+      calls += 1;
+      if (calls === 1)
+        throw Object.assign(new Error("synthetic"), { status: withFallback ? 429 : 503 });
+      return usage(128);
+    });
+    const fallback = failing(503);
+    const solwyn = new Solwyn(client(primary), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+      failoverIdempotency: "always",
+      ...(withFallback
+        ? { fallback: [[client(fallback), "fallback-model", { max_tokens: 128 }, "openai"]] }
+        : {}),
+    });
+
+    await run("terminal-ambiguous", async () => {
+      await expect(
+        chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 }),
+      ).rejects.toMatchObject({ status: 503 });
+      // The possibly billed claim was not refunded, so the final lease cannot fund this call.
+      await chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+    });
+    await solwyn.close();
+
+    expect(stub.grants).toHaveLength(1);
+    expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
   });
 });

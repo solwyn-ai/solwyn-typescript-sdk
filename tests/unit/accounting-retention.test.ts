@@ -37,6 +37,7 @@ it.concurrent.each([
   "pending-renewal",
   "revival-during-retirement",
   "idle-release-dispatcher",
+  "flush-soon-run-isolation",
 ])(
   "reclaims unreachable accounting owners: %s",
   async (scenario) => {

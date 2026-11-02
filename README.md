@@ -492,10 +492,14 @@ Three current posture details are deliberate:
   or cost event is emitted.
 - `audio.translations` is not intercepted yet. It passes through untracked with a one-time
   warning.
-- OpenAI `decisions.create` takes no output cap. On a hard_deny project it fails before it is sent
-  with `OutputBoundUnenforceableError` (`reason: "no_output_cap"`); the one budget check used to
-  learn the project's mode is settled at zero. On an alert-only project it passes through
-  untracked.
+- OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
+  without an acknowledgment, `onUnmetered: "raise"` refuses it first with
+  `UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn
+  the project's mode and settles that check's reservation at zero, so it leaves no hold. If that
+  check denies, the call fails with the usual budget denial (`BudgetExceededError`). On a hard_deny
+  project it then fails before it is sent with `OutputBoundUnenforceableError`
+  (`reason: "no_output_cap"`). On an alert-only project it goes through as an untracked surface,
+  and its spend is not counted.
 
 ## Strict coverage controls
 

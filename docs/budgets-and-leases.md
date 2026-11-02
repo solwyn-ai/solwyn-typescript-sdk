@@ -146,10 +146,14 @@ On hard_deny projects the allow cache is not used: a cached allow carries no res
 lease covers only the (provider, model) pairs it declared; the same model id from another provider
 gets a per-call check.
 
-OpenAI `decisions.create` has no output-cap parameter. On a hard_deny project it fails before it is
-sent with `OutputBoundUnenforceableError` (`reason: "no_output_cap"`), whatever `onUnmetered` is
-set to. The SDK runs one budget check to learn the project's mode and settles that check's
-reservation at zero, so no hold is left. On an alert-only project it stays an untracked surface.
+OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
+without an acknowledgment, `onUnmetered: "raise"` refuses it first with
+`UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn
+the project's mode and settles that check's reservation at zero, so it leaves no hold. If that
+check denies, the call fails with the usual budget denial (`BudgetExceededError`). On a hard_deny
+project it then fails before it is sent with `OutputBoundUnenforceableError`
+(`reason: "no_output_cap"`). On an alert-only project it goes through as an untracked surface,
+and its spend is not counted.
 
 Known limitations: a scoped hard_deny rule on an alert-only project does not show in the check's
 `mode`, so uncapped calls under that rule are not capped and one call can still overshoot it. A

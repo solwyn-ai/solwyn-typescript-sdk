@@ -2589,7 +2589,14 @@ export class SolwynCore {
     try {
       return await this.#walk(ctx, runtimes, mode);
     } catch (error) {
-      if (!ctx.bufferedSettlementComplete) this.#releaseFunding(ctx.callId, ctx.funding);
+      if (!ctx.bufferedSettlementComplete) {
+        // Possibly billed funding is consumed at its floor, never refunded.
+        if (ctx.fundingMaybeBilled) {
+          this.#budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+        } else {
+          this.#releaseFunding(ctx.callId, ctx.funding);
+        }
+      }
       throw error;
     } finally {
       if (streamTermination !== undefined && !streamTermination.transferred) {
@@ -3048,6 +3055,8 @@ export class SolwynCore {
           if (
             callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect)?.aborted
           ) {
+            // A caller abort mid-request is reported possibly succeeded; keep its funding too.
+            if (ctx.readmission !== null) ctx.fundingMaybeBilled = true;
             breaker.releaseProbe(admission);
             const region = safeExtractRegion(
               () => runtime.adapter.extractRegion(runtime.sdkClient),
@@ -3080,6 +3089,12 @@ export class SolwynCore {
           anyAttemptFailed = true;
           const latencyMs = nowMs() - hopStarted;
           const disposition = classifyException(error);
+          // Under hard_deny, a post-send-ambiguous failure may have produced billed output,
+          // whether the walk advances past it or ends on it. Its funding stays marked until it is
+          // replaced, so neither a later hop nor the terminal cleanup refunds it.
+          if (disposition === Disposition.POST_SEND_AMBIGUOUS && ctx.readmission !== null) {
+            ctx.fundingMaybeBilled = true;
+          }
 
           // The PRIMARY was attempted and raised in this walk → a later cross-provider success is
           // a REACTIVE failover (primary_error), not a proactive circuit-open reroute (#29).
@@ -3171,9 +3186,6 @@ export class SolwynCore {
           }
           // Advance: FAILOVER (retry exhausted/none), or POST_SEND_AMBIGUOUS under "always"
           // (#22/#23). Move to the next candidate.
-          // A post-send-ambiguous failure that still advances (idempotency "always") may have
-          // produced billed output; the funding it drew on stays marked until it is replaced.
-          if (disposition === Disposition.POST_SEND_AMBIGUOUS) ctx.fundingMaybeBilled = true;
           break;
         }
       }

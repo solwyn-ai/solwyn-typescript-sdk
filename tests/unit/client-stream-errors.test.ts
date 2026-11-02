@@ -9,7 +9,11 @@ import type { FetchLike } from "../../src/transport";
 
 afterEach(() => vi.restoreAllMocks());
 
-function controlPlane() {
+/**
+ * `mode` defaults to hard_deny. Tests about observed-usage settlement run alert_only: under
+ * hard_deny, funding whose usage is unknown is kept instead (tests/unit/hard-deny-funding.test.ts).
+ */
+function controlPlane(mode: "hard_deny" | "alert_only" = "hard_deny") {
   const confirms: Record<string, unknown>[] = [];
   const events: Record<string, unknown>[] = [];
   const fetch: FetchLike = async (url, init) => {
@@ -19,7 +23,7 @@ function controlPlane() {
         allowed: true,
         remaining_budget: 100,
         reservation_id: "reservation-stream-error",
-        mode: "hard_deny",
+        mode,
         budget_limit: 100,
         current_usage: 0,
         denied_by_period: null,
@@ -124,7 +128,7 @@ it("caller abort still settles when the stream usage extractor throws", async ()
     },
     getServiceTier: () => null,
   });
-  const control = controlPlane();
+  const control = controlPlane("alert_only");
   const warn = vi.fn();
   const caller = new AbortController();
   const error = new DOMException("synthetic abort", "AbortError");
@@ -211,8 +215,12 @@ it("keeps the served provider breaker neutral after a mid-stream translation fai
   } finally {
     await sdk.close();
   }
-  // Each call fails over, so each also settles the superseded primary reservation at zero.
-  expect(control.confirms.filter((confirm) => confirm["provider"] === "anthropic")).toHaveLength(2);
+  // Each call fails over, so each also settles the superseded primary reservation at zero. The
+  // failed translation may follow billed output, so under hard_deny its hop's hold is kept: only
+  // the second, completed hop confirms.
+  expect(control.confirms.filter((confirm) => confirm["provider"] === "anthropic")).toMatchObject([
+    { token_details: { input_tokens: 11, output_tokens: 2 } },
+  ]);
   expect(control.confirms.filter((confirm) => confirm["provider"] === "openai")).toMatchObject([
     { token_details: { input_tokens: 0, output_tokens: 0 } },
     { token_details: { input_tokens: 0, output_tokens: 0 } },

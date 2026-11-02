@@ -126,6 +126,7 @@ import {
 } from "./request-options";
 import {
   ambiguousFailoverAllowed,
+  attemptMaybeBilled,
   buildCandidate,
   CostPolicy,
   classifyException,
@@ -3055,8 +3056,10 @@ export class SolwynCore {
           if (
             callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect)?.aborted
           ) {
-            // A caller abort mid-request is reported possibly succeeded; keep its funding too.
-            if (ctx.readmission !== null) ctx.fundingMaybeBilled = true;
+            // A caller abort keeps its funding unless the provider provably billed nothing.
+            if (ctx.readmission !== null && attemptMaybeBilled(error, true)) {
+              ctx.fundingMaybeBilled = true;
+            }
             breaker.releaseProbe(admission);
             const region = safeExtractRegion(
               () => runtime.adapter.extractRegion(runtime.sdkClient),
@@ -3313,6 +3316,16 @@ export class SolwynCore {
   }
 
   /** Consume an escaping/non-lease funding boundary without masking its primary outcome. */
+  /**
+   * End a call's funding once its outcome is reported. Possibly billed hard_deny funding with
+   * unknown usage is never refunded: a lease claim settles at its reservation floor, and a
+   * per-call hold is kept until its server TTL. Anything else is released as before.
+   */
+  #endFunding(callId: string, funding: FundingContext, keep: boolean): void {
+    if (keep) this.#budget.consumeUnknownUsage(callId, funding.leaseClaimToken);
+    else this.#releaseFunding(callId, funding);
+  }
+
   #releaseFunding(callId: string, funding: FundingContext): void {
     if (funding.leaseClaimToken === null) {
       return;
@@ -3827,7 +3840,9 @@ export class SolwynCore {
       possiblySucceeded: null,
       velocityFlags: ctx.velocityFlags,
     });
-    if (hasSettlementFunding(ctx.funding)) {
+    // Under hard_deny, estimated usage cannot settle a per-call hold below its reservation.
+    const unknownUsage = ctx.readmission !== null && usage.usageUnmeasured;
+    if (hasSettlementFunding(ctx.funding) && !(unknownUsage && ctx.funding.leaseId === null)) {
       this.#settlePaidCall(event, {
         reservationId: ctx.funding.reservationId,
         leaseId: ctx.funding.leaseId,
@@ -3845,7 +3860,7 @@ export class SolwynCore {
       this.#reporter.report(event);
     }
     if (ctx.funding.leaseId === null) {
-      this.#releaseFunding(ctx.callId, ctx.funding);
+      this.#endFunding(ctx.callId, ctx.funding, unknownUsage);
     }
     ctx.bufferedSettlementComplete = true;
     if (normalizationFailure !== undefined) throw normalizationFailure.error;
@@ -3935,6 +3950,8 @@ export class SolwynCore {
       // The stream callbacks below outlive this frame for as long as the caller holds the
       // stream, so they close over only what settlement reads — never `ctx`, whose caller
       // kwargs, passthrough arguments and request defaults carry the request content.
+      // Funding admitted under hard_deny never refunds possibly billed output (#endFunding).
+      const hardDenyFunding = ctx.readmission !== null;
       const settlement: StreamSettlementContext = {
         surface: ctx.surface,
         callId: ctx.callId,
@@ -3986,12 +4003,13 @@ export class SolwynCore {
           logger: this.#logger,
         });
         // Shutdown and GC timing measure ownership delay rather than provider completion.
-        completeStream(usage.tokenDetails, nowMs() - hopStarted, false);
+        completeStream(usage.tokenDetails, nowMs() - hopStarted, false, false);
       };
       const completeStream = (
         tokenDetails: TokenDetails,
         elapsedMs: number,
         recordLatency = true,
+        naturallyFinished = false,
       ): void => {
         if (streamSettled) return;
         streamSettled = true;
@@ -4023,7 +4041,12 @@ export class SolwynCore {
             serviceTier,
             region,
           });
-          if (hasSettlementFunding(settlement.funding)) {
+          // A stream that did not run to its end with measured usage may have billed more.
+          const unknownUsage = hardDenyFunding && (!naturallyFinished || usageUnmeasured);
+          if (
+            hasSettlementFunding(settlement.funding) &&
+            !(unknownUsage && settlement.funding.leaseId === null)
+          ) {
             // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
             // reportSettlement — the same queue path used by buffered settlement (behavior 26).
             this.#settlePaidCall(event, {
@@ -4037,18 +4060,18 @@ export class SolwynCore {
               callId: settlement.callId,
               providerRegion: region,
               serviceTier,
-              ...(settlement.surface === "responses" || usageUnmeasured
-                ? { floorAtReservation: usageUnmeasured }
+              ...(settlement.surface === "responses" || usageUnmeasured || unknownUsage
+                ? { floorAtReservation: usageUnmeasured || unknownUsage }
                 : {}),
             });
           } else {
             this.#reporter.report(event);
           }
           if (settlement.funding.leaseId === null) {
-            this.#releaseFunding(settlement.callId, settlement.funding);
+            this.#endFunding(settlement.callId, settlement.funding, unknownUsage);
           }
         } catch (error) {
-          this.#releaseFunding(settlement.callId, settlement.funding);
+          this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
           throw error;
         }
       };
@@ -4064,7 +4087,8 @@ export class SolwynCore {
         stream: source,
         accumulator,
         startTime: hopStarted,
-        onComplete: completeStream,
+        onComplete: (tokenDetails, elapsedMs, naturallyFinished) =>
+          completeStream(tokenDetails, elapsedMs, true, naturallyFinished === true),
         onError: (error) => {
           if (streamSettled) return;
           if (settlement.callerSignal?.aborted || isCallerAbort(error)) {
@@ -4107,7 +4131,10 @@ export class SolwynCore {
               possiblySucceeded: null,
               velocityFlags: settlement.velocityFlags,
             });
-            if (hasSettlementFunding(settlement.funding)) {
+            if (
+              hasSettlementFunding(settlement.funding) &&
+              !(hardDenyFunding && settlement.funding.leaseId === null)
+            ) {
               this.#settlePaidCall(event, {
                 reservationId: settlement.funding.reservationId,
                 leaseId: settlement.funding.leaseId,
@@ -4119,13 +4146,13 @@ export class SolwynCore {
                 callId: settlement.callId,
                 providerRegion: region,
                 serviceTier,
-                floorAtReservation: usage.usageUnmeasured,
+                floorAtReservation: usage.usageUnmeasured || hardDenyFunding,
               });
             } else {
               this.#reporter.report(event);
             }
             if (settlement.funding.leaseId === null)
-              this.#releaseFunding(settlement.callId, settlement.funding);
+              this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
             return;
           }
           try {
@@ -4168,7 +4195,8 @@ export class SolwynCore {
                 possiblySucceeded: true,
                 velocityFlags: settlement.velocityFlags,
               });
-              if (hasSettlementFunding(settlement.funding)) {
+              // Under hard_deny the stream may have billed past what it observed: keep the hold.
+              if (hasSettlementFunding(settlement.funding) && !hardDenyFunding) {
                 this.#settlePaidCall(event, {
                   reservationId: settlement.funding.reservationId,
                   leaseId: settlement.funding.leaseId,
@@ -4190,9 +4218,9 @@ export class SolwynCore {
                 this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
               );
             }
-            this.#releaseFunding(settlement.callId, settlement.funding);
+            this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
           } catch (settlementError) {
-            this.#releaseFunding(settlement.callId, settlement.funding);
+            this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
             throw settlementError;
           }
         },
@@ -4236,7 +4264,7 @@ export class SolwynCore {
                   ),
                 );
               } finally {
-                this.#releaseFunding(settlement.callId, settlement.funding);
+                this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
               }
             })
           : wrapStream(streamOptions);

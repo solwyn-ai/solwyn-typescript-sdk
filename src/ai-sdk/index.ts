@@ -53,6 +53,7 @@ import {
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { ORDINARY_TOKEN_COUNT_MAX } from "../receipt-fold";
 import { MetadataReporter } from "../reporter";
+import { attemptMaybeBilled } from "../routing";
 import { type CurrentRun, getCurrentRun } from "../run-context";
 import {
   acquireTerminationHandle,
@@ -699,6 +700,8 @@ interface CallContext {
     leaseId: string | null;
     leaseClaimToken: number | null;
   }>;
+  /** Admitted under hard_deny: possibly billed funding is never refunded. */
+  hardDenyAdmitted: boolean;
 }
 
 type StreamSettlementContext = Omit<CallContext, "run" | "abortSignal"> & {
@@ -713,12 +716,14 @@ interface StreamSettlementOwner {
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
+    usageKnown?: boolean,
   ): void;
   reportErrorAndRelease(
     ctx: StreamSettlementContext,
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    maybeBilled?: boolean,
   ): void;
 }
 
@@ -797,7 +802,16 @@ class MiddlewareStreamSettlement {
       const usage =
         this.#finishUsage ??
         extractStreamUsage(this.ctx, this.#outputChars, undefined, this.owner.logger);
-      this.owner.settleSuccess(this.ctx, usage.tokenDetails, latencyMs, usage.usageUnmeasured);
+      // Only the provider's finish part with measured usage is known; a close, cancel or
+      // collection before it may have billed more than the stream observed.
+      const usageKnown = this.#finishUsage !== undefined && !usage.usageUnmeasured;
+      this.owner.settleSuccess(
+        this.ctx,
+        usage.tokenDetails,
+        latencyMs,
+        usage.usageUnmeasured,
+        usageKnown,
+      );
     } catch (error) {
       this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
       throw error;
@@ -1072,7 +1086,25 @@ export function createSolwynMiddleware(
         leaseId: decision.leaseId,
         leaseClaimToken: decision.leaseClaimToken,
       }),
+      hardDenyAdmitted: decision.hardDenyAdmitted,
     };
+  };
+
+  /**
+   * End a call's funding once its outcome is reported (the client's rule). Possibly billed
+   * hard_deny funding with unknown usage is never refunded: a lease claim settles at its floor, and
+   * a per-call hold is kept. Anything else is released.
+   */
+  const endFunding = (ctx: StreamSettlementContext, keep: boolean): void => {
+    if (!keep) {
+      releaseFunding(ctx);
+      return;
+    }
+    try {
+      budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+    } catch {
+      // Local capability cleanup is best effort; the provider/bookkeeping value wins.
+    }
   };
 
   /** Consume one escaping/non-lease claim boundary without masking its primary outcome. */
@@ -1209,7 +1241,9 @@ export function createSolwynMiddleware(
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
+    usageKnown = !usageUnmeasured,
   ): void => {
+    const unknownUsage = ctx.hardDenyAdmitted && !usageKnown;
     const event = buildEvent({
       status: "success",
       provider: ctx.provider,
@@ -1224,7 +1258,7 @@ export function createSolwynMiddleware(
       failoverErrorClass: null,
       possiblySucceeded: null,
     });
-    if (hasSettlementFunding(ctx.funding)) {
+    if (hasSettlementFunding(ctx.funding) && !(unknownUsage && ctx.funding.leaseId === null)) {
       settlePaidSuccess(event, {
         reservationId: ctx.funding.reservationId,
         leaseId: ctx.funding.leaseId,
@@ -1236,13 +1270,13 @@ export function createSolwynMiddleware(
         callId: ctx.callId,
         providerRegion: null,
         serviceTier: null,
-        floorAtReservation: usageUnmeasured,
+        floorAtReservation: usageUnmeasured || unknownUsage,
       });
     } else {
       reporter.report(event);
     }
     if (ctx.funding.leaseId === null) {
-      releaseFunding(ctx);
+      endFunding(ctx, unknownUsage);
     }
   };
 
@@ -1285,13 +1319,14 @@ export function createSolwynMiddleware(
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    maybeBilled = possiblySucceeded === true,
   ): void => {
     try {
       reportError(ctx, failoverErrorClass, latencyMs, possiblySucceeded);
     } catch {
       // Telemetry construction/enqueue must not mask the provider/bookkeeping failure.
     } finally {
-      releaseFunding(ctx);
+      endFunding(ctx, ctx.hardDenyAdmitted && maybeBilled);
     }
   };
 
@@ -1338,7 +1373,13 @@ export function createSolwynMiddleware(
         settleBufferedSuccess(ctx, usage.tokenDetails, latencyMs, usage.usageUnmeasured);
         return result;
       } catch (error) {
-        reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        reportErrorAndRelease(
+          ctx,
+          safeErrorClassName(error),
+          performance.now() - started,
+          null,
+          attemptMaybeBilled(error, ctx.abortSignal?.aborted === true),
+        );
         throw error;
       }
     },
@@ -1362,7 +1403,13 @@ export function createSolwynMiddleware(
         // failure (#buildErrorEvent); it is a failover-eligible health signal, unlike a
         // mid-stream drop. Report one error event and propagate.
         terminationHandle?.release();
-        reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        reportErrorAndRelease(
+          ctx,
+          safeErrorClassName(error),
+          performance.now() - started,
+          null,
+          attemptMaybeBilled(error, ctx.abortSignal?.aborted === true),
+        );
         throw error;
       }
 
@@ -1376,6 +1423,7 @@ export function createSolwynMiddleware(
           callId: ctx.callId,
           estimatedInputTokens: ctx.estimatedInputTokens,
           funding: ctx.funding,
+          hardDenyAdmitted: ctx.hardDenyAdmitted,
           trace: ctx.trace,
           run:
             ctx.run === undefined
@@ -1433,7 +1481,14 @@ export function createSolwynMiddleware(
           // Non-success setup cleanup is best effort; preserve the original failure.
         }
         if (released) {
-          reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+          // The provider stream was already established, so it may have billed output.
+          reportErrorAndRelease(
+            ctx,
+            safeErrorClassName(error),
+            performance.now() - started,
+            null,
+            true,
+          );
         }
         throw error;
       }

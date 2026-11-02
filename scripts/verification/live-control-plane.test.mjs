@@ -221,10 +221,17 @@ test("a Solwyn control plane with fake providers", {
     async () => {
       const before = await totals();
       const beforeBudget = await budget();
+      // Observed usage settles on alert_only. Under hard_deny the SDK keeps possibly billed
+      // funding instead (no per-call confirm, lease claim at its reservation).
+      assert.equal(
+        beforeBudget.budget_mode,
+        "alert_only",
+        "stream-error settlement needs alert_only",
+      );
       let runCost = 0;
       for (const provider of ["openai", "anthropic", "google", "bedrock"]) {
         for (const leased of [false, true]) {
-          for (const plane of [null, new probes.FakeControlPlane()]) {
+          for (const plane of [null, new probes.FakeControlPlane({ mode: "alert_only" })]) {
             const beforeCase = plane ? null : { budget: await budget(), totals: await totals() };
             const wire = captureControlPlane(plane?.apiUrl ?? apiUrl, plane?.fetch);
             const failure = new Error("synthetic mid-stream provider failure");

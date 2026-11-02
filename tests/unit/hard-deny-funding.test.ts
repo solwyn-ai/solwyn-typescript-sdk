@@ -6,8 +6,11 @@
  * synthetic.
  */
 
+import { wrapLanguageModel } from "ai";
+import { MockLanguageModelV3 } from "ai/test";
 import OpenAI from "openai";
 import { describe, expect, it, vi } from "vitest";
+import { createSolwynMiddleware } from "../../src/ai-sdk/index";
 import {
   BudgetExceededError,
   OutputBoundUnenforceableError,
@@ -530,5 +533,284 @@ describe("a terminal possibly billed attempt keeps its lease claim", () => {
     expect(stub.grants).toHaveLength(1);
     expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
     expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
+  });
+});
+
+/** A final hard_deny lease of 200 tokens: one 128-token call fits, a second does not. */
+function finalLeasePlane() {
+  return plane(1, {
+    grant: {
+      eligible: true,
+      allowed: true,
+      lease_id: "lease-r3",
+      generation: 1,
+      granted_tokens: 200,
+      refresh_interval_s: 300,
+      lease_length_s: 600,
+      headroom_share_tokens: 0,
+      posture: { mode: "hard_deny", on_unreachable: "fail_open" },
+      final_grant: true,
+      project_id: PROJECT_ID,
+      mode: "hard_deny",
+      budget_limit: 1,
+      current_usage: 0,
+      remaining_budget: 1,
+    },
+  });
+}
+
+const encoder = new TextEncoder();
+
+function sseChunk(model: string, content: string): Uint8Array {
+  const chunk = {
+    id: "chatcmpl-r3",
+    object: "chat.completion.chunk",
+    created: 1,
+    model,
+    choices: [{ index: 0, delta: { content }, finish_reason: null }],
+  };
+  return encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+function completion(model: string, output: number) {
+  return Response.json({
+    id: "chatcmpl-r3",
+    object: "chat.completion",
+    created: 1,
+    model,
+    choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+    usage: { prompt_tokens: 0, completion_tokens: output, total_tokens: output },
+  });
+}
+
+/**
+ * A native OpenAI client whose first streamed call sends one chunk and then either fails with a
+ * socket reset or keeps sending chunks until the reader stops. Buffered calls bill 128 tokens.
+ */
+function streamingNative(ending: "reset" | "endless") {
+  return new OpenAI({
+    apiKey: "sk-test",
+    maxRetries: 0,
+    fetch: async (_url: unknown, init?: { body?: unknown }) => {
+      const body = JSON.parse(String(init?.body)) as Body;
+      const model = body["model"] as string;
+      if (body["stream"] !== true) return completion(model, 128);
+      let sent = false;
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            if (!sent || ending === "endless") {
+              sent = true;
+              controller.enqueue(sseChunk(model, "synthetic"));
+              return;
+            }
+            controller.error(
+              Object.assign(new TypeError("synthetic socket closed"), {
+                cause: { code: "ECONNRESET" },
+              }),
+            );
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+}
+
+describe("r3 finding 1: an established stream that ends without known usage keeps its claim", () => {
+  it.each([
+    ["fails mid-stream", "reset"],
+    ["is closed by the caller", "endless"],
+  ] as const)("consumes the claim when the stream %s", async (_label, ending) => {
+    const stub = finalLeasePlane();
+    const solwyn = new Solwyn(streamingNative(ending), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+    });
+
+    await run("r3-stream", async () => {
+      const stream = (await chat(solwyn, {
+        model: "primary-model",
+        messages: MESSAGES,
+        max_tokens: 128,
+        stream: true,
+      })) as AsyncIterable<unknown>;
+      const consume = async () => {
+        for await (const _part of stream) {
+          if (ending === "endless") break;
+        }
+      };
+      if (ending === "reset") await expect(consume()).rejects.toThrow();
+      else await consume();
+      // The stream may have billed its whole bound, so the final lease cannot fund this call.
+      await chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+    });
+    await solwyn.close();
+
+    expect(stub.grants).toHaveLength(1);
+    expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
+  });
+
+  it("keeps a per-call hold when the stream fails mid-stream", async () => {
+    const stub = plane(1);
+    const solwyn = new Solwyn(streamingNative("reset"), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+    });
+    const stream = (await chat(solwyn, {
+      model: "fallback-model",
+      messages: MESSAGES,
+      max_tokens: 128,
+      stream: true,
+    })) as AsyncIterable<unknown>;
+    await expect(
+      (async () => {
+        for await (const _part of stream) {
+          // drain
+        }
+      })(),
+    ).rejects.toThrow();
+    await solwyn.close();
+
+    // No confirm settles the possibly billed hold below its reservation.
+    expect(stub.confirms).toEqual([]);
+    expect(stub.held()).toBeCloseTo(128 / 1_000_000, 12);
+  });
+});
+
+describe("r3 finding 3: a known rejection wins over a caller abort", () => {
+  it.each([
+    [400, false],
+    [400, true],
+    [429, false],
+    [429, true],
+  ])("releases the claim when OpenAI answers %i after the abort (stream %s)", async (status, streaming) => {
+    const stub = finalLeasePlane();
+    const controller = new AbortController();
+    let fetches = 0;
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async () => {
+        fetches += 1;
+        controller.abort();
+        return Response.json(
+          { error: { message: "synthetic rejection", type: "synthetic", code: "synthetic" } },
+          { status },
+        );
+      },
+    });
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch, provider: "openai" });
+
+    await run("r3-abort", async () => {
+      await expect(
+        (
+          solwyn as unknown as {
+            chat: { completions: { create(b: Body, o: unknown): Promise<unknown> } };
+          }
+        ).chat.completions.create(
+          { model: "gpt-6-luna", messages: MESSAGES, max_tokens: 128, stream: streaming },
+          { signal: controller.signal },
+        ),
+      ).rejects.toMatchObject({ status });
+    });
+    await solwyn.close();
+
+    expect(fetches).toBe(1);
+    expect(stub.checks).toEqual([]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBe(0);
+  });
+});
+
+describe("r3 finding 2: the AI SDK middleware keeps possibly billed hard_deny funding", () => {
+  const finished = {
+    content: [{ type: "text" as const, text: "synthetic" }],
+    finishReason: { unified: "stop" as const, raw: "stop" },
+    usage: {
+      inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+      outputTokens: { total: 128, text: 128, reasoning: 0 },
+    },
+    warnings: [],
+  };
+  const ambiguous = () => Object.assign(new Error("synthetic ambiguity"), { status: 503 });
+
+  it.each([
+    "generate",
+    "establishment",
+    "midstream",
+  ] as const)("consumes the claim after a %s failure", async (stage) => {
+    const stub = finalLeasePlane();
+    let calls = 0;
+    const native = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "primary-model",
+      doGenerate: async () => {
+        calls += 1;
+        if (calls === 1) throw ambiguous();
+        return finished;
+      },
+      doStream: async () => {
+        calls += 1;
+        if (stage === "establishment") throw ambiguous();
+        let index = 0;
+        return {
+          stream: new ReadableStream({
+            pull(controller) {
+              if (index++ === 0)
+                controller.enqueue({ type: "text-delta", id: "synthetic", delta: "synthetic" });
+              else controller.error(ambiguous());
+            },
+          }),
+        };
+      },
+    });
+    const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+    const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+
+    await run("r3-middleware", async () => {
+      const first = async () => {
+        if (stage === "generate") {
+          await model.doGenerate({ prompt: [], maxOutputTokens: 128 });
+          return;
+        }
+        const result = await model.doStream({ prompt: [], maxOutputTokens: 128 });
+        for await (const _part of result.stream as unknown as AsyncIterable<unknown>) {
+          // drain
+        }
+      };
+      await expect(first()).rejects.toThrow();
+      // The possibly billed claim was not refunded, so the final lease cannot fund this call.
+      await model.doGenerate({ prompt: [], maxOutputTokens: 128 });
+    });
+    await handle.close();
+
+    expect(calls).toBe(2);
+    expect(stub.grants).toHaveLength(1);
+    expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
+  });
+
+  it("releases the claim when the provider rejects the call with a 400", async () => {
+    const stub = finalLeasePlane();
+    const native = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "primary-model",
+      doGenerate: async () => {
+        throw Object.assign(new Error("synthetic rejection"), { status: 400 });
+      },
+    });
+    const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+    const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+
+    await run("r3-middleware-rejected", async () => {
+      await expect(model.doGenerate({ prompt: [], maxOutputTokens: 128 })).rejects.toThrow();
+    });
+    await handle.close();
+
+    expect(stub.checks).toEqual([]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBe(0);
   });
 });

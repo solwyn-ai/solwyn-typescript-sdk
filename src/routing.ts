@@ -501,6 +501,25 @@ export function classifyException(exc: unknown): Disposition {
   }
 }
 
+/**
+ * Whether a failed provider attempt may have produced billed output. A post-send-ambiguous
+ * failure may have. A caller abort may have too, unless there is positive evidence it was not:
+ * the provider answered with a 4xx status (429 included), or the request provably never left.
+ * Any other failure carries no billed output.
+ */
+export function attemptMaybeBilled(exc: unknown, callerAborted: boolean): boolean {
+  try {
+    const inner = classifyInspectableException(exc);
+    if (inner === Disposition.POST_SEND_AMBIGUOUS) return true;
+    if (!callerAborted && !isCallerAbort(exc)) return false;
+    const status = readStatus(exc);
+    if (status !== null && status >= 400 && status < 500) return false;
+    return inner !== Disposition.FAILOVER;
+  } catch {
+    return true;
+  }
+}
+
 /** Established streams need positive evidence before an error is health-neutral. */
 export function isNeutralStreamError(error: unknown): boolean {
   try {

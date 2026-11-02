@@ -40,7 +40,9 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
           allowed: true,
           remaining_budget: 100,
           reservation_id: "reservation-remediation",
-          mode: "hard_deny",
+          // Settles observed usage once: alert_only, since hard_deny keeps unknown-usage funding
+          // instead (tests/unit/hard-deny-funding.test.ts).
+          mode: "alert_only",
           budget_limit: 100,
           current_usage: 0,
           denied_by_period: null,

@@ -142,6 +142,13 @@ An attempt that may have produced billed output (a post-send failure under
 `failoverIdempotency: "always"`) keeps its reservation or lease claim at its full amount, and every
 later attempt in the call gets its own per-call check.
 
+On a hard_deny call, in a wrapped client or the AI SDK middleware, Solwyn never refunds funding
+whose usage it could not measure. That covers a failure after the request was sent (buffered, at
+stream setup, or mid-stream), a stream closed, cancelled or stopped before the provider's final
+usage, and estimated usage. A lease claim settles at its reservation; a per-call reservation is held
+until Solwyn Cloud expires it. A caller abort counts as possibly billed unless the provider already
+rejected the call with a 4xx answer (429 included) or the call failed before it was sent.
+
 On hard_deny projects the allow cache is not used: a cached allow carries no reservation. A run
 lease covers only the (provider, model) pairs it declared; the same model id from another provider
 gets a per-call check.

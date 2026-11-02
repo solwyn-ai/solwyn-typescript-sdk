@@ -39,8 +39,11 @@ function stream(
   return wrap({ model, params, doStream });
 }
 
-function fixture(options: Parameters<typeof createSolwynMiddleware>[0] = {}) {
-  const plane = new FakeControlPlane();
+function fixture(
+  options: Parameters<typeof createSolwynMiddleware>[0] = {},
+  mode: "alert_only" | "hard_deny" = "hard_deny",
+) {
+  const plane = new FakeControlPlane({ mode });
   const handle = createSolwynMiddleware({
     apiKey: plane.apiKey,
     apiUrl: plane.apiUrl,
@@ -418,7 +421,12 @@ describe("AI SDK middleware shutdown", () => {
   });
 
   it("counts late settlement drops without enqueuing after reporting shutdown", async () => {
-    const { plane, handle } = fixture({ leaseEnabled: false, reporterShutdownDeadline: 0 });
+    // Alert-only: on hard_deny a stream cancelled before its finish part keeps its hold and sends
+    // no confirm (tests/unit/hard-deny-funding.test.ts); this pins the late-drop counters.
+    const { plane, handle } = fixture(
+      { leaseEnabled: false, reporterShutdownDeadline: 0 },
+      "alert_only",
+    );
     const reporterClose = vi.spyOn(MetadataReporter.prototype, "close");
     const entered = deferred<void>();
     const response = deferred<{ stream: ReadableStream<unknown> }>();

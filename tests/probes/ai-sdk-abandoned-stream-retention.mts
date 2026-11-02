@@ -27,7 +27,9 @@ MetadataReporter.prototype.report = function (event) {
 };
 
 function fixture() {
-  const plane = new FakeControlPlane();
+  // Alert-only: on hard_deny an abandoned stream keeps its funding (tests/unit/hard-deny-funding.test.ts);
+  // this probe pins finalization and close settling once at observed usage.
+  const plane = new FakeControlPlane({ mode: "alert_only" });
   const handle = createSolwynMiddleware({
     apiKey: plane.apiKey,
     apiUrl: plane.apiUrl,

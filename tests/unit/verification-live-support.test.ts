@@ -87,7 +87,9 @@ describe("live integration support (offline)", () => {
     ])(`settles observed %s stream-error usage only without lease funding (lease=${leased})`, async (provider) => {
       const { assertDelivery, captureControlPlane, consume, metadata, providerFixture } =
         await import(supportUrl);
-      const plane = new FakeControlPlane();
+      // Observed usage settles on alert_only. Under hard_deny the SDK keeps possibly billed
+      // funding instead (tests/unit/hard-deny-funding.test.ts, stream-error-settlement.test.ts).
+      const plane = new FakeControlPlane({ mode: "alert_only" });
       const wire = captureControlPlane(plane.apiUrl, plane.fetch);
       const failure = new Error("synthetic mid-stream provider failure");
       const fixture = providerFixture(provider, { streamError: failure });

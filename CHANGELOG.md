@@ -37,8 +37,9 @@ and `decisions.create`.
   call, in a wrapped client or the AI SDK middleware, Solwyn records the call at its reserved
   amount (the estimated input plus the call's output limit, or more where it saw more), marked as
   estimated, whenever the provider may have billed output that Solwyn did not measure. That covers
-  a failure after the request was sent (buffered, at stream setup, or mid-stream), a stream closed,
-  cancelled or stopped before the provider's final usage, and usage that had to be estimated. The
+  a failure after the request was sent (buffered, at stream setup, or mid-stream), and a stream
+  closed, cancelled or stopped before the provider's final usage. A completed call that reports no
+  usage is still recorded at an estimate from its response, as before. The
   amount is recorded with Solwyn Cloud for both per-call checks and run leases, so it still counts
   after the reservation expires or the lease ends. Your dashboard can therefore show more spend than
   the provider billed, for example for a stream you stopped early. A failover hop that may have been

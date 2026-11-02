@@ -731,6 +731,7 @@ interface StreamSettlementOwner {
     latencyMs: number,
     possiblySucceeded: boolean | null,
     maybeBilled?: boolean,
+    observed?: TokenDetails | null,
   ): void;
 }
 
@@ -802,16 +803,24 @@ class MiddlewareStreamSettlement {
       outcome === "error" ||
       (outcome === "success" && this.#sawErrorPart && this.#finishUsage === undefined)
     ) {
-      this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
+      // Usage the stream already reported raises the floor; the event stays as it was.
+      this.owner.reportErrorAndRelease(
+        this.ctx,
+        null,
+        latencyMs,
+        true,
+        true,
+        this.#finishUsage?.tokenDetails ?? null,
+      );
       return;
     }
     try {
       const usage =
         this.#finishUsage ??
         extractStreamUsage(this.ctx, this.#outputChars, undefined, this.owner.logger);
-      // Only the provider's finish part with measured usage is known; a close, cancel or
-      // collection before it may have billed more than the stream observed.
-      const usageKnown = this.#finishUsage !== undefined && !usage.usageUnmeasured;
+      // A stream that reached its finish part settles its usage, estimated or not; a close,
+      // cancel or collection before it may have billed more than the stream observed.
+      const usageKnown = this.#finishUsage !== undefined;
       this.owner.settleSuccess(
         this.ctx,
         usage.tokenDetails,
@@ -1139,6 +1148,14 @@ export function createSolwynMiddleware(
     }
   };
 
+  /** A floor-funded lease event is queued apart from its confirm, so it carries the lease id. */
+  const withLease = (
+    ctx: StreamSettlementContext,
+    floored: boolean,
+    event: MetadataEvent,
+  ): MetadataEvent =>
+    floored && ctx.funding.leaseId !== null ? { ...event, lease_id: ctx.funding.leaseId } : event;
+
   /** Consume one escaping/non-lease claim boundary without masking its primary outcome. */
   const releaseFunding = (ctx: StreamSettlementContext): void => {
     if (ctx.funding.leaseClaimToken === null) {
@@ -1273,7 +1290,7 @@ export function createSolwynMiddleware(
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
-    usageKnown = !usageUnmeasured,
+    usageKnown = true,
   ): void => {
     const unknownUsage = ctx.hardDenyAdmitted && !usageKnown;
     const event = buildEvent({
@@ -1305,7 +1322,7 @@ export function createSolwynMiddleware(
         floorAtReservation: usageUnmeasured,
       });
     } else {
-      reporter.report(event);
+      reporter.report(withLease(ctx, unknownUsage, event));
     }
     if (ctx.funding.leaseId === null || unknownUsage) {
       endFunding(ctx, unknownUsage, tokenDetails);
@@ -1326,22 +1343,27 @@ export function createSolwynMiddleware(
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    floored = false,
   ): void => {
     reporter.report(
-      buildEvent({
-        status: "error",
-        provider: ctx.provider,
-        model: ctx.model,
-        callId: ctx.callId,
-        run: ctx.run,
-        trace: ctx.trace,
-        inputTokens: 0,
-        outputTokens: 0,
-        tokenDetails: null,
-        latencyMs,
-        failoverErrorClass,
-        possiblySucceeded,
-      }),
+      withLease(
+        ctx,
+        floored,
+        buildEvent({
+          status: "error",
+          provider: ctx.provider,
+          model: ctx.model,
+          callId: ctx.callId,
+          run: ctx.run,
+          trace: ctx.trace,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenDetails: null,
+          latencyMs,
+          failoverErrorClass,
+          possiblySucceeded,
+        }),
+      ),
     );
   };
 
@@ -1352,13 +1374,15 @@ export function createSolwynMiddleware(
     latencyMs: number,
     possiblySucceeded: boolean | null,
     maybeBilled = possiblySucceeded === true,
+    observed: TokenDetails | null = null,
   ): void => {
+    const floored = ctx.hardDenyAdmitted && maybeBilled;
     try {
-      reportError(ctx, failoverErrorClass, latencyMs, possiblySucceeded);
+      reportError(ctx, failoverErrorClass, latencyMs, possiblySucceeded, floored);
     } catch {
       // Telemetry construction/enqueue must not mask the provider/bookkeeping failure.
     } finally {
-      endFunding(ctx, ctx.hardDenyAdmitted && maybeBilled);
+      endFunding(ctx, floored, observed);
     }
   };
 

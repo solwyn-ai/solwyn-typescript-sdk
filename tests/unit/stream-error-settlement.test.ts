@@ -501,6 +501,54 @@ describe("provider usage observed before a stream error", () => {
   it.each([
     false,
     true,
+  ])("floors a priority-tier stream at its tier and keeps the lease on its event (lease=%s)", async (leased) => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic Anthropic stream failure");
+    const client = plane.wrap(
+      {
+        messages: {
+          create: async function* (_params: Record<string, unknown>) {
+            yield {
+              type: "message_start",
+              message: { usage: { input_tokens: 12, service_tier: "priority" } },
+            };
+            throw failure;
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      const call = async () => {
+        await expect(
+          consume(
+            await client.messages.create({
+              model: "claude-test",
+              messages: [],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      };
+      if (leased) await run("priority-stream-error", call);
+      else await call();
+    } finally {
+      await client.close();
+    }
+    // The floor confirm carries the tier the event carries, so it is priced at that tier.
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      service_tier: "priority",
+      token_details: { input_tokens: 12, output_tokens: 20, is_estimated: true },
+    });
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]?.lease_id).toBe(leased ? plane.confirms[0]?.lease_id : undefined);
+  });
+
+  it.each([
+    false,
+    true,
   ])("keeps partial Anthropic funding under hard_deny (lease=%s)", async (leased) => {
     const plane = new FakeControlPlane();
     const failure = new Error("synthetic Anthropic stream failure");

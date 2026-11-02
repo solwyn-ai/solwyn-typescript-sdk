@@ -3904,9 +3904,7 @@ export class SolwynCore {
       possiblySucceeded: null,
       velocityFlags: ctx.velocityFlags,
     });
-    // Under hard_deny, estimated usage settles at the attempt's floor, never below its reservation.
-    const unknownUsage = ctx.readmission !== null && usage.usageUnmeasured;
-    if (hasSettlementFunding(ctx.funding) && !unknownUsage) {
+    if (hasSettlementFunding(ctx.funding)) {
       this.#settlePaidCall(event, {
         reservationId: ctx.funding.reservationId,
         leaseId: ctx.funding.leaseId,
@@ -3923,21 +3921,8 @@ export class SolwynCore {
     } else {
       this.#reporter.report(event);
     }
-    if (ctx.funding.leaseId === null || unknownUsage) {
-      this.#endFunding(
-        ctx.callId,
-        ctx.funding,
-        unknownUsage
-          ? {
-              hop,
-              region,
-              serviceTier,
-              estimatedInputTokens: ctx.estimatedInputTokens,
-              outputBound: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
-              observed: usage.tokenDetails,
-            }
-          : null,
-      );
+    if (ctx.funding.leaseId === null) {
+      this.#releaseFunding(ctx.callId, ctx.funding);
     }
     ctx.bufferedSettlementComplete = true;
     if (normalizationFailure !== undefined) throw normalizationFailure.error;
@@ -4039,6 +4024,12 @@ export class SolwynCore {
         primaryDialect: ctx.primaryDialect,
         callerSignal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
       };
+      // A floor-funded lease event is queued apart from its confirm, so it carries the lease id
+      // that `reportSettlement` would have added.
+      const withLease = (event: MetadataEvent): MetadataEvent =>
+        hardDenyFunding && settlement.funding.leaseId !== null
+          ? { ...event, lease_id: settlement.funding.leaseId }
+          : event;
       const floorOutputBound = Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX);
       const floorOf = (
         observed: TokenDetails | null,
@@ -4134,8 +4125,9 @@ export class SolwynCore {
             serviceTier,
             region,
           });
-          // A stream that did not run to its end with measured usage may have billed more.
-          const unknownUsage = hardDenyFunding && (!naturallyFinished || usageUnmeasured);
+          // A stream that did not run to its end may have billed more than it observed. A finished
+          // stream settles its usage, estimated or not, as before.
+          const unknownUsage = hardDenyFunding && !naturallyFinished;
           if (hasSettlementFunding(settlement.funding) && !unknownUsage) {
             confirmed = true;
             // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
@@ -4156,7 +4148,7 @@ export class SolwynCore {
                 : {}),
             });
           } else {
-            this.#reporter.report(event);
+            this.#reporter.report(withLease(event));
           }
           if (settlement.funding.leaseId === null || unknownUsage) {
             confirmed = true;
@@ -4242,7 +4234,7 @@ export class SolwynCore {
                 floorAtReservation: usage.usageUnmeasured,
               });
             } else {
-              this.#reporter.report(event);
+              this.#reporter.report(withLease(event));
             }
             if (settlement.funding.leaseId === null || hardDenyFunding)
               this.#endFunding(
@@ -4308,11 +4300,13 @@ export class SolwynCore {
                   floorAtReservation: usage.usageUnmeasured,
                 });
               } else {
-                this.#reporter.report(event);
+                this.#reporter.report(withLease(event));
               }
             } else {
               this.#reporter.report(
-                this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
+                withLease(
+                  this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
+                ),
               );
             }
             ended = true;
@@ -4329,6 +4323,7 @@ export class SolwynCore {
                         logger: this.#logger,
                       }).tokenDetails
                     : null),
+                safeExtractServiceTier(() => accumulator.getServiceTier(), this.#logger),
               ),
             );
           } catch (settlementError) {

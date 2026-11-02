@@ -1171,6 +1171,11 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
     }
   }
 
+  const STREAM_PATHS = new Set([
+    "a mid-stream error",
+    "an early close",
+    "a client close with the stream unread",
+  ]);
   const paths: ReadonlyArray<readonly [string, (fetch: FetchLike) => Promise<void>]> = [
     [
       "a mid-stream error",
@@ -1244,19 +1249,6 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
       },
     ],
     [
-      "a success without measured usage",
-      async (fetch) => {
-        const create = vi.fn((_kwargs: Body) => ({
-          choices: [
-            { index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } },
-          ],
-        }));
-        const solwyn = new Solwyn(client(create), { apiKey: API_KEY, fetch, provider: "openai" });
-        await chat(solwyn, BODY);
-        await solwyn.close();
-      },
-    ],
-    [
       "a Responses stream entry failure",
       async (fetch) => {
         const native = new OpenAI({
@@ -1296,6 +1288,12 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
         provider: "openai",
         token_details: { input_tokens: expect.any(Number), output_tokens: 128 },
       });
+      if (leased && STREAM_PATHS.has(_path)) {
+        // A stream's floor-funded event is queued apart from its confirm and keeps the lease id.
+        const attempt = stub.events.filter((event) => event["call_id"] === floors[0]?.["call_id"]);
+        expect(attempt).not.toHaveLength(0);
+        for (const event of attempt) expect(event["lease_id"]).toBe("lease-floor");
+      }
       await nextCallIsDenied(stub);
     });
   });
@@ -1362,7 +1360,137 @@ describe("a hard_deny floor survives a hold's expiry, a lease's surrender and a 
         model: "fallback-model",
         token_details: { output_tokens: 128 },
       });
+      if (leased) {
+        const attempt = stub.events.filter((event) => event["call_id"] === floors[0]?.["call_id"]);
+        expect(attempt).not.toHaveLength(0);
+        for (const event of attempt) expect(event["lease_id"]).toBe("lease-floor");
+      }
       await nextCallIsDenied(stub);
     });
+  });
+});
+
+describe("floor follow-ups", () => {
+  it("confirms a completed call's estimated usage as before, not its floor", async () => {
+    const stub = plane(1);
+    const create = vi.fn((_kwargs: Body) => ({
+      choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } }],
+    }));
+    const solwyn = new Solwyn(client(create), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+    });
+    await chat(solwyn, { model: "fallback-model", messages: MESSAGES, max_tokens: 128 });
+    await solwyn.close();
+
+    // A completed call has a response, so its usage is estimated from it, not floored.
+    expect(stub.confirms).toHaveLength(1);
+    expect(stub.confirms[0]).toMatchObject({
+      reservation_id: "res-1",
+      token_details: { is_estimated: true },
+    });
+    expect((stub.confirms[0]?.["token_details"] as Body)["output_tokens"]).toBeLessThan(128);
+  });
+
+  it("raises a middleware stream floor to the usage the stream already reported", async () => {
+    const stub = plane(1);
+    const native = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "fallback-model",
+      doStream: async () => {
+        let index = 0;
+        return {
+          stream: new ReadableStream({
+            pull(controller) {
+              if (index++ === 0)
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 500, noCache: 500, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 1, text: 1, reasoning: 0 },
+                  },
+                });
+              else controller.error(Object.assign(new Error("synthetic"), { status: 503 }));
+            },
+          }),
+        };
+      },
+    });
+    const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+    const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+    const result = await model.doStream({ prompt: [], maxOutputTokens: 128 });
+    const reader = result.stream.getReader();
+    await reader.read();
+    await expect(reader.read()).rejects.toThrow();
+    await handle.close();
+
+    expect(stub.confirms).toMatchObject([
+      { token_details: { input_tokens: 500, output_tokens: 128, is_estimated: true } },
+    ]);
+  });
+
+  it("floors the multi-generation guard's paid generation and keeps it past expiry", async () => {
+    // One gemini floor (its 4096-token bound) fits; a second call does not.
+    const stub = plane(6_000 / 1_000_000);
+    RATES["gemini-2.5-flash"] = { input: 0, output: 1 / 1_000_000 };
+    const generateContent = vi.fn(async (params: Body) => {
+      const fetch = ((params["config"] as Body)["httpOptions"] as Body)["fetch"] as (
+        url: string,
+        init: unknown,
+      ) => Promise<Response>;
+      for (let round = 0; round < 2; round++) {
+        await fetch(
+          "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+          { body: JSON.stringify({ generationConfig: { maxOutputTokens: 4096 } }) },
+        );
+      }
+      return { usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
+    });
+    vi.stubGlobal("fetch", async () => Response.json({}));
+    const google = (target: unknown) =>
+      new Solwyn(target, {
+        apiKey: API_KEY,
+        fetch: stub.fetch,
+        leaseEnabled: false,
+      }) as unknown as {
+        models: { generateContent(p: Body): Promise<unknown> };
+        close(): Promise<void>;
+      };
+    try {
+      const solwyn = google({ models: { generateContent, generateContentStream: vi.fn() } });
+      await expect(
+        solwyn.models.generateContent({ model: "gemini-2.5-flash", contents: "synthetic" }),
+      ).rejects.toMatchObject({ reason: "multi_generation_loop" });
+      await solwyn.close();
+
+      const bound = stub.checks[0]?.["estimated_output_bound"];
+      expect(stub.confirms).toMatchObject([
+        {
+          reservation_id: "res-1",
+          model: "gemini-2.5-flash",
+          provider: "google",
+          token_details: { output_tokens: bound, is_estimated: true },
+        },
+      ]);
+      stub.expire();
+      stub.reconcile();
+      const next = google({
+        models: {
+          generateContent: vi.fn(async () => ({
+            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
+          })),
+          generateContentStream: vi.fn(),
+        },
+      });
+      await expect(
+        next.models.generateContent({ model: "gemini-2.5-flash", contents: "synthetic" }),
+      ).rejects.toBeInstanceOf(BudgetExceededError);
+      await next.close();
+    } finally {
+      vi.unstubAllGlobals();
+      delete RATES["gemini-2.5-flash"];
+    }
   });
 });

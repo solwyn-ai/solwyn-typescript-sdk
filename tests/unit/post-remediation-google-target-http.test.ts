@@ -188,8 +188,12 @@ describe("post-remediation finding 7: Google target HTTP ownership", () => {
       expect(dispatchedCap).toBe(128);
       expect(dispatchedTemperature).toBe(0.3);
       expect(check.mock.calls[0]?.[0].estimatedOutputBound).toBe(128);
-      expect(plane.confirms).toHaveLength(1);
-      expect(plane.confirms[0]?.provider).toBe("google");
+      // Failover re-admission settles the superseded source reservation at zero usage.
+      const served = plane.confirms.filter((confirm) => confirm.model === "gemini-2.5-flash");
+      expect(served).toHaveLength(1);
+      expect(served[0]?.provider).toBe("google");
+      for (const closeOut of plane.confirms.filter((confirm) => confirm !== served[0]))
+        expect(closeOut.token_details).toMatchObject({ input_tokens: 0, output_tokens: 0 });
     });
 
     it.each(
@@ -237,7 +241,10 @@ describe("post-remediation finding 7: Google target HTTP ownership", () => {
       ).rejects.toBe(abort);
       expect(targetAuthorized).toBe(true);
       expect(targetAborted).toBe(true);
-      expect(plane.confirms).toHaveLength(0);
+      // Only the superseded source reservation is settled, at zero usage.
+      expect(plane.confirms.filter((confirm) => confirm.model === "gemini-2.5-flash")).toHaveLength(
+        0,
+      );
     });
   }
 

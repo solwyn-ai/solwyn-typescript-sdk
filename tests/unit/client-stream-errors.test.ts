@@ -211,7 +211,12 @@ it("keeps the served provider breaker neutral after a mid-stream translation fai
   } finally {
     await sdk.close();
   }
-  expect(control.confirms).toHaveLength(2);
+  // Each call fails over, so each also settles the superseded primary reservation at zero.
+  expect(control.confirms.filter((confirm) => confirm["provider"] === "anthropic")).toHaveLength(2);
+  expect(control.confirms.filter((confirm) => confirm["provider"] === "openai")).toMatchObject([
+    { token_details: { input_tokens: 0, output_tokens: 0 } },
+    { token_details: { input_tokens: 0, output_tokens: 0 } },
+  ]);
   expect(control.events).toEqual(
     expect.arrayContaining([
       expect.objectContaining({ provider: "anthropic", status: "error", input_tokens: 11 }),

@@ -87,6 +87,7 @@ produce more output than the bound, the call fails before it reaches the provide
 | `azure_api_version` | an uncapped Azure OpenAI call on an api-version older than 2024-09-01 |
 | `bound_exceeded` | the final request can still produce more than the bound, for example a cap above 100,000,000 |
 | `multi_generation_loop` | the provider SDK would generate more than once in the call: Google `automaticContinuation` or an enabled `automaticFunctionCalling` config, Anthropic `fallbacks` |
+| `no_output_cap` | the API has no output-cap parameter (reserved for parity; no metered TypeScript surface uses it) |
 
 On a hard_deny project, body-extension channels may carry only keys Solwyn counts in the bound;
 any other key, including `model`, refuses the call with `unsupported_override`:
@@ -129,6 +130,13 @@ chat deployment. A deployment name never selects the parameter, and an explicit
 Gemini, and Bedrock count reasoning inside the cap. Nothing changes on alert-only projects, and an
 SDK-local outage decision never adds a cap: those calls reach the provider exactly as you built
 them.
+
+A per-call check prices the primary model, and a call settles at the price of the model that
+served it. So on a hard_deny project, before a call fails over to a different provider or model,
+Solwyn re-admits that hop: the earlier hop's reservation is settled at zero usage, and the hop gets
+its own check with its own model and output bound. If it does not fit, the call fails with the
+same denial a primary would raise, and the hop's provider is never called. A lease-funded call
+needs no re-check, because its lease is priced at the most expensive model in its declared chain.
 
 Known limitations: a scoped hard_deny rule on an alert-only project does not show in the check's
 `mode`, so uncapped calls under that rule are not capped and one call can still overshoot it. A

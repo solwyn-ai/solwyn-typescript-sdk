@@ -9,6 +9,33 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-01
+
+Public-preview patch release with two `hard_deny` bug fixes: hard_deny now also covers failover
+hops, and the `decisions.create` gap is closed on the SDK side.
+
+### Fixed
+
+- **hard_deny now also covers failover hops.** A per-call budget check priced the primary model,
+  but a call settles at the price of the model that served it. A call whose primary failed could
+  fail over to a pricier model and settle above what its check reserved. Now, when a call admitted
+  by a hard_deny per-call check is about to fail over to a different provider or model, Solwyn
+  first runs a new check for that hop: its own model, its own output bound, and its own cap. If
+  the hop does not fit the remaining budget, the call fails with the same `BudgetExceededError`
+  (or `RunStoppedError`) a primary denial raises, a `budget_denied` event is reported for the hop,
+  and the hop's provider is never called. A hop that fits is reserved and settled at its own price.
+- **The superseded reservation is closed.** Before the hop's check, the earlier hop's reservation
+  is settled at zero usage, under a new call id so the served call keeps its own. A failed attempt
+  that may have produced billed output keeps its reservation instead. A lease claim is released.
+- Retries on the same provider and model are not re-checked. Alert-only projects, SDK-local
+  outage decisions, and lease-funded calls are unchanged: a lease is already priced at the most
+  expensive model in its declared chain.
+- **`decisions.create`.** OpenAI `decisions.create` has no output-cap parameter, so no budget
+  check can bound it. In this SDK it is an untracked surface: it makes no budget check, its spend
+  is not counted against your budget, and `onUnmetered: "raise"` refuses it. The closed set of
+  `OutputBoundUnenforceableError` reasons gains `no_output_cap`, the reason the Python SDK uses to
+  refuse such an API under hard_deny.
+
 ## [0.3.0] — 2026-10-31
 
 Public-preview minor release that makes `hard_deny` bound a call's output. Before this release a
@@ -758,7 +785,8 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...v0.1.1

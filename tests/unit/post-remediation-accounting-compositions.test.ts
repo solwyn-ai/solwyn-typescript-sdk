@@ -288,17 +288,28 @@ describe("PR-A1: measured paid stream translation failure", () => {
           }
           expect(sourceCalls).toBe(1);
           expect(targetCalls).toBe(1);
+          // Failover re-admission also settles the superseded primary reservation at zero usage.
+          const closeOuts = attemptedConfirms.filter((confirm) => confirm.provider === "openai");
+          expect(closeOuts).toHaveLength(!lease && reporting !== "construction failure" ? 1 : 0);
+          for (const closeOut of closeOuts)
+            expect(closeOut.token_details).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+          const servedConfirms = attemptedConfirms.filter(
+            (confirm) => confirm.provider === "google",
+          );
+          const servedPlaneConfirms = plane.confirms.filter(
+            (confirm) => confirm.provider === "google",
+          );
           const confirmed = reporting === "delivered" || reporting === "rejected";
-          expect(attemptedConfirms).toHaveLength(confirmed ? 1 : 0);
-          expect(plane.confirms).toHaveLength(reporting === "delivered" ? 1 : 0);
+          expect(servedConfirms).toHaveLength(confirmed ? 1 : 0);
+          expect(servedPlaneConfirms).toHaveLength(reporting === "delivered" ? 1 : 0);
           if (confirmed) {
-            expect(attemptedConfirms[0]).toMatchObject({
+            expect(servedConfirms[0]).toMatchObject({
               provider: "google",
               token_details: { input_tokens: 30, output_tokens: 20 },
               is_provider_fallback: true,
             });
-            expect(Boolean(attemptedConfirms[0]?.lease_id)).toBe(lease);
-            expect(Boolean(attemptedConfirms[0]?.reservation_id)).toBe(!lease);
+            expect(Boolean(servedConfirms[0]?.lease_id)).toBe(lease);
+            expect(Boolean(servedConfirms[0]?.reservation_id)).toBe(!lease);
           }
           const paid = plane.ingested.filter((event) => event.provider === "google");
           expect(attemptedEvents.filter((event) => event.provider === "google")).toHaveLength(1);
@@ -314,7 +325,7 @@ describe("PR-A1: measured paid stream translation failure", () => {
           expect(paid[0]?.failover_error_class ?? null).toBe(
             malformed ? "UntranslatableRequestError" : null,
           );
-          if (confirmed) expect(paid[0]?.call_id).toBe(attemptedConfirms[0]?.call_id);
+          if (confirmed) expect(paid[0]?.call_id).toBe(servedConfirms[0]?.call_id);
           expect(plane.leaseSurrenders).toHaveLength(lease ? 1 : 0);
           if (lease)
             expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(

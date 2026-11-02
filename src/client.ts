@@ -2385,30 +2385,36 @@ export class SolwynCore {
         : estimateContentLength(mergedPrimary);
     const estimatedInputTokens =
       charCount > 0 ? estimateTokensFromLength(charCount, primaryProvider) : 0;
-    const estimatedOutputBound = resolveEffectiveOutputBound({
-      sourceProvider: primaryProvider,
-      sourceDialect: primaryDialect,
-      sourceModel: primaryModel,
-      sourceReasoningProvider: reasoningFamily(
-        primaryProvider,
-        primaryModel,
-        primary.pinned === true,
-      ),
-      globalDefaults: requestDefaults.global,
-      callParams: surface === "responses" ? mergedPrimary : callerKwargs,
-      hops: runtimes.map((runtime) => {
-        const model = runtime === primary ? primaryModel : runtime.entry.model;
-        return {
-          provider: runtime.adapter.name,
-          dialect: runtime.adapter.dialect,
-          model,
-          defaultParams: requestDefaults.entries.get(runtime),
-          reasoningProvider: reasoningFamily(runtime.adapter.name, model, runtime.pinned === true),
-        };
-      }),
-      defaultBound: this.#config.lease_output_bound_default,
-      responses: surface === "responses",
-    });
+    const outputBoundFor = (hops: readonly ProviderRuntime[]) =>
+      resolveEffectiveOutputBound({
+        sourceProvider: primaryProvider,
+        sourceDialect: primaryDialect,
+        sourceModel: primaryModel,
+        sourceReasoningProvider: reasoningFamily(
+          primaryProvider,
+          primaryModel,
+          primary.pinned === true,
+        ),
+        globalDefaults: requestDefaults.global,
+        callParams: surface === "responses" ? mergedPrimary : callerKwargs,
+        hops: hops.map((runtime) => {
+          const model = runtime === primary ? primaryModel : runtime.entry.model;
+          return {
+            provider: runtime.adapter.name,
+            dialect: runtime.adapter.dialect,
+            model,
+            defaultParams: requestDefaults.entries.get(runtime),
+            reasoningProvider: reasoningFamily(
+              runtime.adapter.name,
+              model,
+              runtime.pinned === true,
+            ),
+          };
+        }),
+        defaultBound: this.#config.lease_output_bound_default,
+        responses: surface === "responses",
+      });
+    const estimatedOutputBound = outputBoundFor(runtimes);
     const admission: AdmissionContext = {
       callId,
       run,
@@ -2470,6 +2476,13 @@ export class SolwynCore {
         leaseId: budget.allowed ? budget.leaseId : null,
         leaseClaimToken: budget.allowed ? budget.leaseClaimToken : null,
       }),
+      // A per-call hard_deny check priced only the primary. A lease admission is already priced
+      // at its whole declared chain's worst-case rate, so it needs no re-admission.
+      readmission:
+        budget.allowed && budget.hardDenyAdmitted && budget.leaseId === null
+          ? { provider: primaryProvider, model: primaryModel }
+          : null,
+      hopOutputBound: (runtime) => outputBoundFor([runtime]),
       passthroughArgs,
       requestDefaults,
       callerKwargs: surface === "responses" ? mergedPrimary : callerKwargs,
@@ -2876,6 +2889,9 @@ export class SolwynCore {
     // hop reports its OWN error event in the catch, so there is no separate terminal report.
     let lastError: unknown;
     let anyAttemptFailed = false;
+    // Whether the last failed hop may have produced billed output (a post-send-ambiguous failure
+    // that still advanced under idempotency "always"). Its reservation is then kept, not released.
+    let previousMaybeBilled = false;
 
     for (let i = 0; i < candidates.length; i += 1) {
       // Re-check the deadline BETWEEN hops (#17), not only at entry.
@@ -2908,6 +2924,12 @@ export class SolwynCore {
       // health verdict) and PROPAGATE — never swallow it into a failover/retry.
       let hopKwargs: Record<string, unknown>;
       try {
+        if (
+          ctx.readmission !== null &&
+          (hop.provider !== ctx.readmission.provider || hop.model !== ctx.readmission.model)
+        ) {
+          await this.#readmitHop(ctx, runtime, hop, previousMaybeBilled);
+        }
         hopKwargs = this.#enforceHopOutput(runtime, ctx, this.#prepareHopKwargs(runtime, hop, ctx));
       } catch (prepError) {
         breaker.releaseProbe(admission);
@@ -3078,6 +3100,7 @@ export class SolwynCore {
           }
           // Advance: FAILOVER (retry exhausted/none), or POST_SEND_AMBIGUOUS under "always"
           // (#22/#23). Move to the next candidate.
+          previousMaybeBilled = disposition === Disposition.POST_SEND_AMBIGUOUS;
           break;
         }
       }
@@ -3486,6 +3509,83 @@ export class SolwynCore {
     return servedDialect === "google"
       ? restoreGoogleTargetTransport(targetKwargs, entryDefaults)
       : targetKwargs;
+  }
+
+  /**
+   * Re-admit a failover hop under per-call hard_deny admission. The earlier check priced the
+   * identity in `ctx.readmission`; serving a different provider or model settles at that hop's
+   * price, so the hop gets its own check first. The earlier funding is closed the way a failed
+   * attempt's is: a lease claim is released, and a per-call reservation is settled at zero usage
+   * under a fresh call id (the call's own id stays with the served hop's settlement). A failure
+   * that may have produced billed output keeps both at their floor instead. A denial throws the
+   * primary's typed denial after a `budget_denied` event, and the hop is never called.
+   */
+  async #readmitHop(
+    ctx: DispatchContext,
+    runtime: ProviderRuntime,
+    hop: HopAttribution,
+    previousMaybeBilled: boolean,
+  ): Promise<void> {
+    const previous = ctx.readmission;
+    if (previous === null) return;
+    const funding = ctx.funding;
+    if (previousMaybeBilled) {
+      this.#budget.consumeUnknownUsage(ctx.callId, funding.leaseClaimToken);
+    } else {
+      this.#releaseFunding(ctx.callId, funding);
+      if (funding.reservationId) {
+        try {
+          this.#reporter.reportConfirm(
+            this.#budget.buildConfirmRequest({
+              reservationId: funding.reservationId,
+              model: previous.model,
+              provider: previous.provider as ProviderName,
+              tokenDetails: zeroTokenDetails(),
+              callId: crypto.randomUUID(),
+            }),
+          );
+        } catch {
+          // The held estimate self-heals at its TTL; the re-check then only sees less budget.
+          this.#safeWarn("budget.readmission_release_failed: reservation held until expiry");
+        }
+      }
+    }
+    ctx.funding = Object.freeze({ reservationId: null, leaseId: null, leaseClaimToken: null });
+
+    const estimatedOutputBound = ctx.hopOutputBound(runtime);
+    const result = budgetCheckResult(
+      await this.#budget.checkBudget({
+        runLifetime: ctx.run?.lifetime,
+        agentRunId: ctx.run?.agentRunId,
+        tags: ctx.run.tags,
+        callId: ctx.callId,
+        estimatedInputTokens: ctx.estimatedInputTokens,
+        estimatedOutputBound,
+        model: hop.model,
+        provider: hop.provider as ProviderName,
+        fallbackProviders: [],
+        fallbackModels: [],
+        timeout: this.#config.budget_check_timeout,
+        deadline: ctx.deadline,
+        signal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
+      }),
+    );
+    ctx.estimatedOutputBound = estimatedOutputBound;
+    if (!result.allowed) {
+      const region = safeExtractRegion(
+        () => runtime.adapter.extractRegion(runtime.sdkClient),
+        this.#logger,
+      );
+      this.#reportBudgetDenied(() => this.#buildBudgetDeniedEvent(ctx, hop, region, result));
+      throw this.#budget.buildDenialError(result, ctx.estimatedInputTokens, ctx.run?.agentRunId);
+    }
+    ctx.funding = Object.freeze({
+      reservationId: result.reservationId,
+      leaseId: result.leaseId,
+      leaseClaimToken: result.leaseClaimToken,
+    });
+    ctx.outputCap = result.hardDenyAdmitted ? this.#config.lease_output_bound_default : undefined;
+    ctx.readmission = result.hardDenyAdmitted ? { provider: hop.provider, model: hop.model } : null;
   }
 
   /**
@@ -4460,7 +4560,14 @@ interface DispatchContext {
   estimatedInputTokens: number;
   estimatedOutputBound: number;
   /** Cap for an uncapped hop request; set only when hard_deny authority admitted the call. */
-  readonly outputCap: number | undefined;
+  outputCap: number | undefined;
+  /**
+   * Under per-call hard_deny admission, the provider and model the current funding was priced
+   * for. A hop serving anything else is re-admitted first; `null` when no re-admission applies.
+   */
+  readmission: { readonly provider: string; readonly model: string } | null;
+  /** The output bound a single hop can produce, for that hop's re-admission. */
+  readonly hopOutputBound: (runtime: ProviderRuntime) => number;
   readonly velocityFlags: readonly VelocityFlag[];
   /** Server price statement for this request only; never retained across calls. */
   priceHints: Record<string, number> | null;

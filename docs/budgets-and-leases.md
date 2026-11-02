@@ -142,11 +142,19 @@ An attempt that may have produced billed output (a post-send failure under
 `failoverIdempotency: "always"`) keeps its reservation or lease claim at its full amount, and every
 later attempt in the call gets its own per-call check.
 
-On a hard_deny call, in a wrapped client or the AI SDK middleware, Solwyn never refunds funding
-whose usage it could not measure. That covers a failure after the request was sent (buffered, at
-stream setup, or mid-stream), a stream closed, cancelled or stopped before the provider's final
-usage, and estimated usage. A lease claim is kept at its reservation, so the lease cannot fund
-another call with it; a per-call reservation is held until Solwyn Cloud expires it. Any failure after
+On a hard_deny call, in a wrapped client or the AI SDK middleware, a call whose usage Solwyn could
+not measure, and which may have been billed, is recorded at its reserved amount, marked as
+estimated: the estimated input plus the call's output limit, or more in either part where Solwyn saw
+more. That covers a failure after the request was sent (buffered, at stream setup, or mid-stream), a
+stream closed, cancelled or stopped before the provider's final usage, and estimated usage. The
+amount is recorded with Solwyn Cloud for both per-call checks and run leases, so it still counts
+after the reservation expires or the lease ends, and your dashboard can show more spend than the
+provider billed (for example, a stream you stopped early). A failover hop that may have been billed
+is recorded under its own call id. Media calls are not recorded this way; their reservation is held
+until it expires. If the client has already shut down when such a call settles, the record is
+dropped and counted in the reporter's drop counts, so that amount stops counting once its
+reservation expires or its lease ends. Lasting records need Solwyn API support that is live from
+[core deploy date]. Any failure after
 the request was sent counts as possibly billed (a caller abort, a response that fails to parse, an
 unrecognized error) unless the provider rejected the call with a 4xx answer (429 included) or
 Anthropic's 529 `overloaded_error` (it rejects before generation starts), or the request provably

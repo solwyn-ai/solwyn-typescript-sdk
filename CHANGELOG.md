@@ -33,13 +33,18 @@ and `decisions.create`.
   `failoverIdempotency: "always"`), its reservation or lease claim is kept at its full amount, and
   every later attempt in the call, on any provider or model, gets its own fresh per-call check.
   This applies to lease-funded calls too.
-- **hard_deny keeps funding whose usage is unknown.** On a hard_deny call, in a wrapped client or
-  the AI SDK middleware, funding is kept at its full amount whenever the provider may have billed
-  output that Solwyn did not measure: a failure after the request was sent (buffered, at stream
-  setup, or mid-stream), a stream closed, cancelled or stopped before the provider's final usage,
-  and usage that had to be estimated. A lease claim is kept at its reservation, so the lease
-  cannot fund another call with it, and a per-call reservation is held until Solwyn Cloud expires
-  it. Any failure after the request was sent counts as possibly billed, including a caller abort,
+- **hard_deny records unmeasured, possibly billed calls at their reserved amount.** On a hard_deny
+  call, in a wrapped client or the AI SDK middleware, Solwyn records the call at its reserved
+  amount (the estimated input plus the call's output limit, or more where it saw more), marked as
+  estimated, whenever the provider may have billed output that Solwyn did not measure. That covers
+  a failure after the request was sent (buffered, at stream setup, or mid-stream), a stream closed,
+  cancelled or stopped before the provider's final usage, and usage that had to be estimated. The
+  amount is recorded with Solwyn Cloud for both per-call checks and run leases, so it still counts
+  after the reservation expires or the lease ends. Your dashboard can therefore show more spend than
+  the provider billed, for example for a stream you stopped early. A failover hop that may have been
+  billed is recorded under its own call id. Media calls are not recorded this way: their
+  reservation is held until it expires, as before. Lasting records need Solwyn API support that is
+  live from [core deploy date]. Any failure after the request was sent counts as possibly billed, including a caller abort,
   a response that fails to parse, and an error Solwyn does not recognize, unless the provider
   rejected the call (a 4xx answer, 429 included, or Anthropic's 529 `overloaded_error`, which
   rejects before generation starts) or the request provably never left. Only those are released.

@@ -87,7 +87,7 @@ produce more output than the bound, the call fails before it reaches the provide
 | `azure_api_version` | an uncapped Azure OpenAI call on an api-version older than 2024-09-01 |
 | `bound_exceeded` | the final request can still produce more than the bound, for example a cap above 100,000,000 |
 | `multi_generation_loop` | the provider SDK would generate more than once in the call: Google `automaticContinuation` or an enabled `automaticFunctionCalling` config, Anthropic `fallbacks` |
-| `no_output_cap` | the API has no output-cap parameter (reserved for parity; no metered TypeScript surface uses it) |
+| `no_output_cap` | the API has no output-cap parameter: OpenAI `decisions.create` on a hard_deny project |
 
 On a hard_deny project, body-extension channels may carry only keys Solwyn counts in the bound;
 any other key, including `model`, refuses the call with `unsupported_override`:
@@ -134,9 +134,22 @@ them.
 A per-call check prices the primary model, and a call settles at the price of the model that
 served it. So on a hard_deny project, before a call fails over to a different provider or model,
 Solwyn re-admits that hop: the earlier hop's reservation is settled at zero usage, and the hop gets
-its own check with its own model and output bound. If it does not fit, the call fails with the
-same denial a primary would raise, and the hop's provider is never called. A lease-funded call
-needs no re-check, because its lease is priced at the most expensive model in its declared chain.
+its own check with its own model and output bound. That check is always fresh, never answered
+from the allow cache. If it does not fit, the call fails with the same denial a primary would
+raise, and the hop's provider is never called. A lease-funded call needs no re-check for a
+pricier hop, because its lease is priced at the most expensive (provider, model) pair it declared.
+An attempt that may have produced billed output (a post-send failure under
+`failoverIdempotency: "always"`) keeps its reservation or lease claim at its full amount, and every
+later attempt in the call gets its own per-call check.
+
+On hard_deny projects the allow cache is not used: a cached allow carries no reservation. A run
+lease covers only the (provider, model) pairs it declared; the same model id from another provider
+gets a per-call check.
+
+OpenAI `decisions.create` has no output-cap parameter. On a hard_deny project it fails before it is
+sent with `OutputBoundUnenforceableError` (`reason: "no_output_cap"`), whatever `onUnmetered` is
+set to. The SDK runs one budget check to learn the project's mode and settles that check's
+reservation at zero, so no hold is left. On an alert-only project it stays an untracked surface.
 
 Known limitations: a scoped hard_deny rule on an alert-only project does not show in the check's
 `mode`, so uncapped calls under that rule are not capped and one call can still overshoot it. A

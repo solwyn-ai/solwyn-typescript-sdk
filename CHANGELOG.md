@@ -11,8 +11,8 @@ corresponding release notes before users upgrade.
 
 ## [0.3.1] — 2026-11-01
 
-Public-preview patch release with two `hard_deny` bug fixes: hard_deny now also covers failover
-hops, and the `decisions.create` gap is closed on the SDK side.
+Public-preview patch release with `hard_deny` bug fixes: hard_deny now also covers failover hops
+and `decisions.create`.
 
 ### Fixed
 
@@ -24,17 +24,34 @@ hops, and the `decisions.create` gap is closed on the SDK side.
   the hop does not fit the remaining budget, the call fails with the same `BudgetExceededError`
   (or `RunStoppedError`) a primary denial raises, a `budget_denied` event is reported for the hop,
   and the hop's provider is never called. A hop that fits is reserved and settled at its own price.
+  The hop's check is always fresh: it is never answered from the allow cache.
 - **The superseded reservation is closed.** Before the hop's check, the earlier hop's reservation
-  is settled at zero usage, under a new call id so the served call keeps its own. A failed attempt
-  that may have produced billed output keeps its reservation instead. A lease claim is released.
-- Retries on the same provider and model are not re-checked. Alert-only projects, SDK-local
-  outage decisions, and lease-funded calls are unchanged: a lease is already priced at the most
-  expensive model in its declared chain.
-- **`decisions.create`.** OpenAI `decisions.create` has no output-cap parameter, so no budget
-  check can bound it. In this SDK it is an untracked surface: it makes no budget check, its spend
-  is not counted against your budget, and `onUnmetered: "raise"` refuses it. The closed set of
-  `OutputBoundUnenforceableError` reasons gains `no_output_cap`, the reason the Python SDK uses to
-  refuse such an API under hard_deny.
+  is settled at zero usage, under a new call id so the served call keeps its own. A lease claim is
+  released.
+- **A possibly billed attempt is never refunded.** If an attempt fails in a way that may have
+  produced billed output (a post-send failure that still fails over under
+  `failoverIdempotency: "always"`), its reservation or lease claim is kept at its full amount, and
+  every later attempt in the call, on any provider or model, gets its own fresh per-call check.
+  This applies to lease-funded calls too.
+- **hard_deny now covers `decisions.create`.** OpenAI `decisions.create` has no output-cap
+  parameter, so no budget check can bound it. On a hard_deny project it now fails before it is
+  sent with `OutputBoundUnenforceableError` (`reason: "no_output_cap"`), whatever `onUnmetered` is
+  set to. The SDK runs one budget check to learn the project's mode and settles that check's
+  reservation at zero, so the refusal leaves no hold on your budget. On an alert-only project the
+  call still goes through as an untracked surface: its spend is not counted, and
+  `onUnmetered: "raise"` refuses it.
+- **A local refusal leaves no hold.** When a hard_deny call is refused with
+  `OutputBoundUnenforceableError` after its budget check but before anything is sent (in a wrapped
+  client or the AI SDK middleware), the check's reservation is settled at zero instead of holding
+  part of your budget until it expires.
+- **The allow cache never answers a hard_deny check.** A cached allow carries no reservation, so on
+  hard_deny projects every check now reaches Solwyn Cloud and reserves. Alert-only projects keep
+  the cache.
+- **Lease coverage matches provider and model.** A run lease covers the (provider, model) pairs it
+  declared, as Solwyn Cloud prices them. A declared model id served by another provider now gets a
+  per-call check instead of drawing on the lease.
+- Retries on the same provider and model after a clean failure are not re-checked. Alert-only
+  projects and SDK-local outage decisions are unchanged.
 
 ## [0.3.0] — 2026-10-31
 

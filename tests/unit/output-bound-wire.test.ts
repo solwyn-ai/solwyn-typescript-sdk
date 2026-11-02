@@ -395,7 +395,7 @@ describe("estimated_output_bound on the per-call check, per dialect", () => {
     expect(fallbackCreate.mock.calls[0]?.[0]).toMatchObject({ max_tokens: 9000 });
   });
 
-  it("caps a call admitted by a cached hard_deny allow", async () => {
+  it("never serves a hard_deny allow from the cache: each call is checked and capped", async () => {
     const create = vi.fn((_kwargs: Request) => ({
       usage: { prompt_tokens: 1, completion_tokens: 1 },
     }));
@@ -409,7 +409,8 @@ describe("estimated_output_bound on the per-call check, per dialect", () => {
     await solwyn.chat.completions.create({ model: "gpt-4o", messages: [] });
     await solwyn.close();
 
-    expect(checks).toHaveLength(1);
+    // A cached allow carries no reservation, so it cannot fund a hard_deny admission.
+    expect(checks).toHaveLength(2);
     expect(create.mock.calls.map(([kwargs]) => kwargs["max_tokens"])).toEqual([4096, 4096]);
   });
 
@@ -621,7 +622,7 @@ describe("BudgetEnforcer output bound", () => {
   });
 
   it("does not let a cached allow for a small bound admit a larger one", async () => {
-    const plane = allowPlane();
+    const plane = allowPlane("alert_only");
     const enforcer = new BudgetEnforcer({
       apiUrl: API_URL,
       apiKey: API_KEY,

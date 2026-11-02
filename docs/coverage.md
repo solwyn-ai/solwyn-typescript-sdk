@@ -30,7 +30,9 @@ SDK version. Google ApiClient's `apiCall`, `downloadFile`, `fetchUploadUrl`, `ge
 `request`, `requestStream`, `streamApiCall`, `unaryApiCall`, `uploadFile` and
 `uploadFileToFileSearchStore` have `arbitrary_endpoint` scope on every parent.
 
-These operations have no Solwyn budget check or settlement event. Use `onUnmetered: "raise"`
+These operations have no Solwyn settlement event. One exception: on a hard_deny project, OpenAI
+`decisions.create` runs one budget check and fails with `no_output_cap`, because it takes no output
+cap. Otherwise these operations have no Solwyn budget check. Use `onUnmetered: "raise"`
 to refuse them, or explicitly review each exact acknowledgment token before permitting one.
 Administrative, read-only and unevaluated accessor observations in the test baselines are
 structural evidence; they do not grant metering or runtime safety to an otherwise unknown path.

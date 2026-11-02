@@ -6,7 +6,7 @@ import {
   type CircuitBreakerOptions,
 } from "../../src/circuit-breaker";
 import { ConfigurationError } from "../../src/errors";
-import type { LeaseLedger, LeaseState } from "../../src/lease";
+import { type LeaseLedger, type LeaseState, leaseModelKey } from "../../src/lease";
 import type { Logger } from "../../src/logging";
 import { resetRunControlForTest, runTermination } from "../../src/run-control";
 import { createTokenDetails, zeroTokenDetails } from "../../src/token-details";
@@ -4170,7 +4170,10 @@ describe("BudgetEnforcer off-path lease renewal", () => {
       renewalInFlight: false,
       consecutiveFailures: 0,
     });
-    expect([...new Set(leaseState(budget)?.declaredModels)]).toEqual(["gpt-5.5", "claude-opus-4"]);
+    expect([...new Set(leaseState(budget)?.declaredModels)]).toEqual([
+      leaseModelKey("openai", "gpt-5.5"),
+      leaseModelKey("anthropic", "claude-opus-4"),
+    ]);
   });
 
   it.each([

@@ -10,6 +10,7 @@ import {
   LEASE_REFUSAL_LATCH_S,
   LeaseDecision,
   LeaseLedger,
+  leaseModelKey,
   RESERVATION_MAX_AGE_S,
 } from "../../src/lease";
 import type { LeaseGrantResponse } from "../../src/types";
@@ -810,6 +811,15 @@ describe("LeaseLedger recovery after an ineligible renewal", () => {
 });
 
 describe("LeaseLedger widening claims and refused models", () => {
+  // These chains name providers, so declared entries are (provider, model) keys.
+  const PROVIDERS: Record<string, string> = {
+    "gpt-5": "openai",
+    "gpt-5-mini": "openai",
+    "gpt-5-nano": "openai",
+    "claude-sonnet-4-5": "anthropic",
+    other: "openai",
+  };
+  const key = (model: string) => leaseModelKey(PROVIDERS[model], model);
   const INELIGIBLE = grant({
     eligible: false,
     lease_id: null,
@@ -831,9 +841,9 @@ describe("LeaseLedger widening claims and refused models", () => {
   });
 
   it("claims one renewal re-declaring the full chain and names only the models it adds", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     const claim = value.claimWideningRequest(RUN, chain());
-    expect(claim?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    expect(claim?.addedModels).toEqual([key("claude-sonnet-4-5"), key("gpt-5-mini")]);
     expect(claim?.request).toMatchObject({
       lease_id: "lse-1",
       generation: 1,
@@ -849,14 +859,16 @@ describe("LeaseLedger widening claims and refused models", () => {
     expect(
       value.applyGrantResponse(RUN, grant({ generation: 2 }), {
         now: 1_002,
-        declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+        declaredModels: [key("gpt-5"), key("claude-sonnet-4-5"), key("gpt-5-mini")],
         expectedLeaseId: "lse-1",
         expectedGeneration: 1,
         wideningModels: claim?.addedModels ?? [],
       }),
     ).toBe(GrantOutcome.Applied);
     expect(value.stateFor(RUN)?.refusedModels.size).toBe(0);
-    expect(value.stateFor(RUN)?.covers("gpt-5", ["claude-sonnet-4-5", "gpt-5-mini"])).toBe(true);
+    expect(
+      value.stateFor(RUN)?.covers([key("gpt-5"), key("claude-sonnet-4-5"), key("gpt-5-mini")]),
+    ).toBe(true);
     // A covered chain claims nothing.
     expect(value.claimWideningRequest(RUN, chain({ now: 1_003 }))).toBeNull();
   });
@@ -885,7 +897,7 @@ describe("LeaseLedger widening claims and refused models", () => {
       1_001,
     ],
   ] as const)("applies renewalDue's gates: never claims with %s", (_name, arrange, now) => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     arrange(value);
     const before = value.stateFor(RUN)?.renewalInFlight;
     expect(value.claimWideningRequest(RUN, chain({ now }))).toBeNull();
@@ -893,19 +905,22 @@ describe("LeaseLedger widening claims and refused models", () => {
   });
 
   it("records only a refused widening's added models, and keeps their chains off every declaration", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     const claim = value.claimWideningRequest(RUN, chain());
     expect(
       value.applyGrantResponse(RUN, INELIGIBLE, {
         now: 1_002,
-        declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+        declaredModels: [key("gpt-5"), key("claude-sonnet-4-5"), key("gpt-5-mini")],
         expectedLeaseId: "lse-1",
         expectedGeneration: 1,
         wideningModels: claim?.addedModels ?? [],
       }),
     ).toBe(GrantOutcome.Ineligible);
     const state = value.stateFor(RUN);
-    expect([...(state?.refusedModels ?? [])]).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    expect([...(state?.refusedModels ?? [])]).toEqual([
+      key("claude-sonnet-4-5"),
+      key("gpt-5-mini"),
+    ]);
     expect(state?.releasePending).not.toBeNull();
     expect(value.resolveRefusalRelease(RUN, state?.releasePending?.token ?? -1, true)).toBe(true);
 
@@ -914,7 +929,13 @@ describe("LeaseLedger widening claims and refused models", () => {
       ["refused-primary", "gpt-5-mini", []],
       ["refused-fallback", "gpt-5", ["claude-sonnet-4-5"]],
     ] as const) {
-      expect(admit(value, { callId, now: 1_003, model, fallbackModels })).toMatchObject({
+      const providers = {
+        provider: PROVIDERS[model],
+        fallbackProviders: fallbackModels.map((item) => PROVIDERS[item] ?? ""),
+      };
+      expect(
+        admit(value, { callId, now: 1_003, model, fallbackModels, ...providers }),
+      ).toMatchObject({
         decision: LeaseDecision.LegacyCheck,
         reason: "model_refused_for_lease",
       });
@@ -926,7 +947,7 @@ describe("LeaseLedger widening claims and refused models", () => {
     // A re-granted lease never widens to a refused model, and the record outlives it.
     value.applyGrantResponse(RUN, grant({ lease_id: "lse-2" }), {
       now: 1_004,
-      declaredModels: ["gpt-5"],
+      declaredModels: [key("gpt-5")],
     });
     expect(value.claimWideningRequest(RUN, chain({ now: 1_005 }))).toBeNull();
     expect(
@@ -934,15 +955,15 @@ describe("LeaseLedger widening claims and refused models", () => {
         RUN,
         chain({ now: 1_005, fallbackProviders: [], fallbackModels: [], model: "gpt-5-nano" }),
       )?.addedModels,
-    ).toEqual(["gpt-5-nano"]);
+    ).toEqual([key("gpt-5-nano")]);
     expect([...(value.stateFor(RUN)?.refusedModels ?? [])]).toEqual([
-      "claude-sonnet-4-5",
-      "gpt-5-mini",
+      key("claude-sonnet-4-5"),
+      key("gpt-5-mini"),
     ]);
   });
 
   it("records nothing for an ordinary renewal or an initial grant answered eligible:false", () => {
-    const renewed = installed();
+    const renewed = installed(grant(), [key("gpt-5")]);
     renewed.claimRenewalRequest(RUN, { model: "gpt-5", provider: "openai" });
     renewed.applyGrantResponse(RUN, INELIGIBLE, {
       now: 1_002,
@@ -952,14 +973,14 @@ describe("LeaseLedger widening claims and refused models", () => {
     expect(renewed.stateFor(RUN)?.refusedModels.size).toBe(0);
 
     const initial = ledger();
-    initial.applyGrantResponse(RUN, INELIGIBLE, { now: 1_000, wideningModels: ["gpt-5"] });
+    initial.applyGrantResponse(RUN, INELIGIBLE, { now: 1_000, wideningModels: [key("gpt-5")] });
     expect(initial.stateFor(RUN)?.refusedModels.size).toBe(0);
   });
 
   it("re-sends the first declaration on every retry at the same lease and generation", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     const first = value.claimWideningRequest(RUN, chain());
-    expect(first?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    expect(first?.addedModels).toEqual([key("claude-sonnet-4-5"), key("gpt-5-mini")]);
     // The outcome is unknown: the control plane may have applied it and stored its answer.
     expect(
       value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 }),
@@ -977,7 +998,7 @@ describe("LeaseLedger widening claims and refused models", () => {
     const byOther = value.claimWideningRequest(RUN, chain(other));
     expect(byOther).toMatchObject({
       retry: true,
-      addedModels: ["claude-sonnet-4-5", "gpt-5-mini"],
+      addedModels: [key("claude-sonnet-4-5"), key("gpt-5-mini")],
       request: {
         lease_id: "lse-1",
         generation: 1,
@@ -994,7 +1015,7 @@ describe("LeaseLedger widening claims and refused models", () => {
     // Any retry at the origin, whoever claims it, re-sends the first declaration and added models.
     const retry = value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" });
     expect(retry?.retry).toBe(true);
-    expect(retry?.addedModels).toEqual(["claude-sonnet-4-5", "gpt-5-mini"]);
+    expect(retry?.addedModels).toEqual([key("claude-sonnet-4-5"), key("gpt-5-mini")]);
     expect(retry?.request).toMatchObject({
       lease_id: "lse-1",
       generation: 1,
@@ -1013,19 +1034,19 @@ describe("LeaseLedger widening claims and refused models", () => {
     // Once the generation is superseded, nothing is owed and the next claim declares afresh.
     value.applyGrantResponse(RUN, grant({ generation: 2 }), {
       now: 1_006,
-      declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+      declaredModels: [key("gpt-5"), key("claude-sonnet-4-5"), key("gpt-5-mini")],
       expectedLeaseId: "lse-1",
       expectedGeneration: 1,
     });
     expect(value.owedRenewalDeclaration(RUN)).toBeNull();
     expect(value.claimWideningRequest(RUN, chain(other))).toMatchObject({
-      addedModels: ["gpt-5-nano"],
+      addedModels: [key("gpt-5-nano")],
       request: { generation: 2, model: "gpt-5-nano", fallback_models: [] },
     });
   });
 
   it("keeps a declaration an earlier attempt may have delivered when a later attempt is skipped", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     value.claimWideningRequest(RUN, chain());
     // The first attempt was sent and its outcome is unknown: the plane may hold its answer.
     value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 });
@@ -1058,7 +1079,7 @@ describe("LeaseLedger widening claims and refused models", () => {
   });
 
   it("records that a claimed declaration was dispatched, whatever the attempt reports later", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     value.claimWideningRequest(RUN, chain());
     expect(value.owedRenewalDeclaration(RUN)?.dispatched).toBe(false);
     // A dispatch report for another origin changes nothing.
@@ -1084,7 +1105,7 @@ describe("LeaseLedger widening claims and refused models", () => {
     // A superseding generation clears it, as always.
     value.applyGrantResponse(RUN, grant({ generation: 2 }), {
       now: 1_002,
-      declaredModels: ["gpt-5", "claude-sonnet-4-5", "gpt-5-mini"],
+      declaredModels: [key("gpt-5"), key("claude-sonnet-4-5"), key("gpt-5-mini")],
       expectedLeaseId: "lse-1",
       expectedGeneration: 1,
     });
@@ -1092,7 +1113,7 @@ describe("LeaseLedger widening claims and refused models", () => {
   });
 
   it("owes nothing for a renewal that never reached the control plane", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     value.claimWideningRequest(RUN, chain());
     value.renewalFailed(RUN, {
       now: 1_001,
@@ -1106,11 +1127,11 @@ describe("LeaseLedger widening claims and refused models", () => {
         RUN,
         chain({ now: 1_003, model: "gpt-5-nano", fallbackProviders: [], fallbackModels: [] }),
       ),
-    ).toMatchObject({ addedModels: ["gpt-5-nano"], request: { model: "gpt-5-nano" } });
+    ).toMatchObject({ addedModels: [key("gpt-5-nano")], request: { model: "gpt-5-nano" } });
   });
 
   it("records a retried widening's added models when the retry is refused", () => {
-    const value = installed();
+    const value = installed(grant(), [key("gpt-5")]);
     value.claimWideningRequest(RUN, chain());
     value.renewalFailed(RUN, { now: 1_001, expectedLeaseId: "lse-1", expectedGeneration: 1 });
     const retry = value.claimRenewal(RUN, { model: "gpt-5", provider: "openai" });
@@ -1123,8 +1144,8 @@ describe("LeaseLedger widening claims and refused models", () => {
       }),
     ).toBe(GrantOutcome.Ineligible);
     expect([...(value.stateFor(RUN)?.refusedModels ?? [])]).toEqual([
-      "claude-sonnet-4-5",
-      "gpt-5-mini",
+      key("claude-sonnet-4-5"),
+      key("gpt-5-mini"),
     ]);
     expect(value.owedRenewalDeclaration(RUN)).toBeNull();
   });

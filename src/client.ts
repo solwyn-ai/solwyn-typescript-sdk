@@ -394,6 +394,9 @@ function withoutSolwynTags(layer: Record<string, unknown>): Record<string, unkno
 }
 
 /** Clamp a reported token quantity without changing enforcement or settlement math. */
+/** Untracked provider surfaces that take no output cap; hard_deny refuses them. */
+const NO_OUTPUT_CAP_SURFACES: ReadonlySet<string> = new Set(["decisions.create"]);
+
 /** Azure keeps each layer's cap key; the merged request keeps the highest layer's. */
 function azureCapAliases(
   provider: string,
@@ -1705,7 +1708,73 @@ export class SolwynCore {
       decision.kind === "unmetered_spend" &&
       decision.capabilityScope === "raw_response" &&
       this.#config.acknowledge_untracked.includes(decision.acknowledgmentToken);
+    if (NO_OUTPUT_CAP_SURFACES.has(surface) && typeof rawValue === "function") {
+      const method = rawValue as (...args: unknown[]) => unknown;
+      return (...args: unknown[]) => this.#noOutputCapCall(surface, target, method, args);
+    }
     return exactRawResponse ? value : guardEvaluatedValue(rawValue);
+  }
+
+  /**
+   * An untracked surface with no output-cap parameter cannot be held to a hard budget. A budget
+   * check learns the project's mode: under hard_deny the call is refused with `no_output_cap`, and
+   * otherwise it dispatches untracked as before. The check is per-call only, and its reservation is
+   * settled at zero usage either way, so it leaves no hold behind.
+   */
+  async #noOutputCapCall(
+    surface: string,
+    target: object,
+    method: (...args: unknown[]) => unknown,
+    args: unknown[],
+  ): Promise<unknown> {
+    const { primary } = await this.#ensureInit();
+    const provider = primary.adapter.name as ProviderName;
+    const params = args[0];
+    const requested = isRecord(params) ? Reflect.get(params, "model") : undefined;
+    const model = typeof requested === "string" ? requested : primary.entry.model;
+    const run = captureCallAttribution(
+      undefined,
+      this.#config.tags,
+      this.#tagLogger,
+      this.#budget,
+      this.#config.trace_correlation,
+    );
+    const result = budgetCheckResult(
+      await this.#budget.checkBudget({
+        runLifetime: run?.lifetime,
+        agentRunId: run?.agentRunId,
+        tags: run.tags,
+        callId: crypto.randomUUID(),
+        estimatedInputTokens: 0,
+        model,
+        provider,
+        timeout: this.#config.budget_check_timeout,
+        perCallOnly: true,
+      }),
+    );
+    if (result.reservationId) {
+      try {
+        this.#reporter.reportConfirm(
+          this.#budget.buildConfirmRequest({
+            reservationId: result.reservationId,
+            model,
+            provider,
+            tokenDetails: zeroTokenDetails(),
+            callId: crypto.randomUUID(),
+          }),
+        );
+        this.#reporter.flushSoon();
+      } catch {
+        this.#safeWarn(`budget.${surface}_release_failed: reservation held until expiry`);
+      }
+    }
+    if (!result.allowed) {
+      throw this.#budget.buildDenialError(result, 0, run?.agentRunId);
+    }
+    if (result.hardDenyAdmitted) {
+      throw new OutputBoundUnenforceableError({ provider, reason: "no_output_cap" });
+    }
+    return Reflect.apply(method, target, args);
   }
 
   /** Resolve one wrapper-owned operation before the interception pipeline starts. */
@@ -2476,12 +2545,13 @@ export class SolwynCore {
         leaseId: budget.allowed ? budget.leaseId : null,
         leaseClaimToken: budget.allowed ? budget.leaseClaimToken : null,
       }),
-      // A per-call hard_deny check priced only the primary. A lease admission is already priced
-      // at its whole declared chain's worst-case rate, so it needs no re-admission.
+      // A per-call hard_deny check priced only the primary. A lease admission is priced at its
+      // declared chain's worst-case rate, so only a possibly billed attempt re-admits it.
       readmission:
-        budget.allowed && budget.hardDenyAdmitted && budget.leaseId === null
-          ? { provider: primaryProvider, model: primaryModel }
+        budget.allowed && budget.hardDenyAdmitted
+          ? { provider: primaryProvider, model: primaryModel, chainPriced: budget.leaseId !== null }
           : null,
+      fundingMaybeBilled: false,
       hopOutputBound: (runtime) => outputBoundFor([runtime]),
       passthroughArgs,
       requestDefaults,
@@ -2889,9 +2959,6 @@ export class SolwynCore {
     // hop reports its OWN error event in the catch, so there is no separate terminal report.
     let lastError: unknown;
     let anyAttemptFailed = false;
-    // Whether the last failed hop may have produced billed output (a post-send-ambiguous failure
-    // that still advanced under idempotency "always"). Its reservation is then kept, not released.
-    let previousMaybeBilled = false;
 
     for (let i = 0; i < candidates.length; i += 1) {
       // Re-check the deadline BETWEEN hops (#17), not only at entry.
@@ -2926,13 +2993,17 @@ export class SolwynCore {
       try {
         if (
           ctx.readmission !== null &&
-          (hop.provider !== ctx.readmission.provider || hop.model !== ctx.readmission.model)
+          (ctx.fundingMaybeBilled ||
+            (!ctx.readmission.chainPriced &&
+              (hop.provider !== ctx.readmission.provider || hop.model !== ctx.readmission.model)))
         ) {
-          await this.#readmitHop(ctx, runtime, hop, previousMaybeBilled);
+          await this.#readmitHop(ctx, runtime, hop);
         }
         hopKwargs = this.#enforceHopOutput(runtime, ctx, this.#prepareHopKwargs(runtime, hop, ctx));
       } catch (prepError) {
         breaker.releaseProbe(admission);
+        // A local refusal before send must not strand the hold its check took.
+        if (prepError instanceof OutputBoundUnenforceableError) this.#closeFunding(ctx);
         throw prepError;
       }
 
@@ -3100,7 +3171,9 @@ export class SolwynCore {
           }
           // Advance: FAILOVER (retry exhausted/none), or POST_SEND_AMBIGUOUS under "always"
           // (#22/#23). Move to the next candidate.
-          previousMaybeBilled = disposition === Disposition.POST_SEND_AMBIGUOUS;
+          // A post-send-ambiguous failure that still advances (idempotency "always") may have
+          // produced billed output; the funding it drew on stays marked until it is replaced.
+          if (disposition === Disposition.POST_SEND_AMBIGUOUS) ctx.fundingMaybeBilled = true;
           break;
         }
       }
@@ -3512,6 +3585,43 @@ export class SolwynCore {
   }
 
   /**
+   * Close the call's current funding without settling usage: a lease claim is released, and a
+   * per-call reservation is settled at zero usage under a fresh call id (the call's own id stays
+   * with whatever settlement follows). Funding whose attempt may have produced billed output is
+   * kept at its floor instead. Afterwards the call holds no funding.
+   */
+  #closeFunding(ctx: DispatchContext): void {
+    const funding = ctx.funding;
+    const identity = ctx.readmission ?? {
+      provider: ctx.primaryProvider,
+      model: ctx.primaryModel,
+    };
+    if (ctx.fundingMaybeBilled) {
+      this.#budget.consumeUnknownUsage(ctx.callId, funding.leaseClaimToken);
+    } else {
+      this.#releaseFunding(ctx.callId, funding);
+      if (funding.reservationId) {
+        try {
+          this.#reporter.reportConfirm(
+            this.#budget.buildConfirmRequest({
+              reservationId: funding.reservationId,
+              model: identity.model,
+              provider: identity.provider as ProviderName,
+              tokenDetails: zeroTokenDetails(),
+              callId: crypto.randomUUID(),
+            }),
+          );
+          this.#reporter.flushSoon();
+        } catch {
+          // The held estimate self-heals at its TTL; a later check only sees less budget.
+          this.#safeWarn("budget.release_failed: reservation held until expiry");
+        }
+      }
+    }
+    ctx.funding = Object.freeze({ reservationId: null, leaseId: null, leaseClaimToken: null });
+  }
+
+  /**
    * Re-admit a failover hop under per-call hard_deny admission. The earlier check priced the
    * identity in `ctx.readmission`; serving a different provider or model settles at that hop's
    * price, so the hop gets its own check first. The earlier funding is closed the way a failed
@@ -3524,33 +3634,9 @@ export class SolwynCore {
     ctx: DispatchContext,
     runtime: ProviderRuntime,
     hop: HopAttribution,
-    previousMaybeBilled: boolean,
   ): Promise<void> {
-    const previous = ctx.readmission;
-    if (previous === null) return;
-    const funding = ctx.funding;
-    if (previousMaybeBilled) {
-      this.#budget.consumeUnknownUsage(ctx.callId, funding.leaseClaimToken);
-    } else {
-      this.#releaseFunding(ctx.callId, funding);
-      if (funding.reservationId) {
-        try {
-          this.#reporter.reportConfirm(
-            this.#budget.buildConfirmRequest({
-              reservationId: funding.reservationId,
-              model: previous.model,
-              provider: previous.provider as ProviderName,
-              tokenDetails: zeroTokenDetails(),
-              callId: crypto.randomUUID(),
-            }),
-          );
-        } catch {
-          // The held estimate self-heals at its TTL; the re-check then only sees less budget.
-          this.#safeWarn("budget.readmission_release_failed: reservation held until expiry");
-        }
-      }
-    }
-    ctx.funding = Object.freeze({ reservationId: null, leaseId: null, leaseClaimToken: null });
+    if (ctx.readmission === null) return;
+    this.#closeFunding(ctx);
 
     const estimatedOutputBound = ctx.hopOutputBound(runtime);
     const result = budgetCheckResult(
@@ -3568,9 +3654,12 @@ export class SolwynCore {
         timeout: this.#config.budget_check_timeout,
         deadline: ctx.deadline,
         signal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
+        // The call id already names the earlier funding; the hop takes a per-call reservation.
+        perCallOnly: true,
       }),
     );
     ctx.estimatedOutputBound = estimatedOutputBound;
+    ctx.fundingMaybeBilled = false;
     if (!result.allowed) {
       const region = safeExtractRegion(
         () => runtime.adapter.extractRegion(runtime.sdkClient),
@@ -3585,7 +3674,9 @@ export class SolwynCore {
       leaseClaimToken: result.leaseClaimToken,
     });
     ctx.outputCap = result.hardDenyAdmitted ? this.#config.lease_output_bound_default : undefined;
-    ctx.readmission = result.hardDenyAdmitted ? { provider: hop.provider, model: hop.model } : null;
+    ctx.readmission = result.hardDenyAdmitted
+      ? { provider: hop.provider, model: hop.model, chainPriced: false }
+      : null;
   }
 
   /**
@@ -4565,7 +4656,18 @@ interface DispatchContext {
    * Under per-call hard_deny admission, the provider and model the current funding was priced
    * for. A hop serving anything else is re-admitted first; `null` when no re-admission applies.
    */
-  readmission: { readonly provider: string; readonly model: string } | null;
+  readmission: {
+    readonly provider: string;
+    readonly model: string;
+    /** Lease funding is priced for the whole declared chain; a per-call check is not. */
+    readonly chainPriced: boolean;
+  } | null;
+  /**
+   * An attempt on the current funding failed in a way that may have produced billed output.
+   * Sticky until the funding is replaced: any further attempt is funded separately, and the
+   * possibly billed hold is kept at its floor rather than released.
+   */
+  fundingMaybeBilled: boolean;
   /** The output bound a single hop can produce, for that hop's re-admission. */
   readonly hopOutputBound: (runtime: ProviderRuntime) => number;
   readonly velocityFlags: readonly VelocityFlag[];

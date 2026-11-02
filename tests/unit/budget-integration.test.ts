@@ -520,8 +520,8 @@ describe("client budget wiring — confirm + call_id reconciliation", () => {
 
   it("cache hit skips confirm entirely; the lone success event reconciles (behavior 24)", async () => {
     // First call → fresh allow (with reservation → confirm). Second call within TTL →
-    // cache hit → reservationId null → NO confirm.
-    const plane = new FakeControlPlane();
+    // cache hit → reservationId null → NO confirm. Only alert-only allows are cached.
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     const traffic = recordPlaneTraffic(plane);
     const client = openAIClient(() => ({ usage: { prompt_tokens: 2, completion_tokens: 2 } }));
     const solwyn = new Solwyn(client, clientOptions(plane, { fetch: traffic.fetch }));

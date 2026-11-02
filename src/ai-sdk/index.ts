@@ -60,7 +60,12 @@ import {
   runTermination,
   type TerminationHandle,
 } from "../run-control";
-import { buildTokenDetails, isUsageCount, type TokenDetails } from "../token-details";
+import {
+  buildTokenDetails,
+  isUsageCount,
+  type TokenDetails,
+  zeroTokenDetails,
+} from "../token-details";
 import { applyTraceFields, captureTrace, type TraceSnapshot } from "../trace-context";
 import type { FetchLike } from "../transport";
 import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
@@ -1019,6 +1024,23 @@ export function createSolwynMiddleware(
             budget.releaseReservation(callId, decision.leaseClaimToken);
           } catch {
             // Local capability cleanup is best effort; the refusal is authoritative.
+          }
+        }
+        // Nothing is sent, so the check's per-call hold is settled at zero under a fresh id.
+        if (decision.reservationId) {
+          try {
+            reporter.reportConfirm(
+              budget.buildConfirmRequest({
+                reservationId: decision.reservationId,
+                model: modelId,
+                provider,
+                tokenDetails: zeroTokenDetails(),
+                callId: crypto.randomUUID(),
+              }),
+            );
+            reporter.flushSoon();
+          } catch {
+            // The held estimate self-heals at its TTL.
           }
         }
         throw new OutputBoundUnenforceableError({ provider, reason });

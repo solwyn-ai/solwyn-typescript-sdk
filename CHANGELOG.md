@@ -9,7 +9,7 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
-## [0.3.1] — 2026-11-01
+## [0.3.1] — 2026-11-02
 
 Public-preview patch release with `hard_deny` bug fixes: hard_deny now also covers failover hops
 and `decisions.create`.

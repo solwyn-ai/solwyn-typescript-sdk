@@ -1378,7 +1378,7 @@ export function createSolwynMiddleware(
           safeErrorClassName(error),
           performance.now() - started,
           null,
-          attemptMaybeBilled(error, ctx.abortSignal?.aborted === true),
+          attemptMaybeBilled(error),
         );
         throw error;
       }
@@ -1408,7 +1408,7 @@ export function createSolwynMiddleware(
           safeErrorClassName(error),
           performance.now() - started,
           null,
-          attemptMaybeBilled(error, ctx.abortSignal?.aborted === true),
+          attemptMaybeBilled(error),
         );
         throw error;
       }

@@ -814,3 +814,145 @@ describe("r3 finding 2: the AI SDK middleware keeps possibly billed hard_deny fu
     expect(stub.surrenders[0]?.["spent_tokens"]).toBe(0);
   });
 });
+
+describe("r4 finding 3: a deferred Responses entry rejection releases its claim", () => {
+  it.each([
+    400, 429,
+  ])("releases the claim when responses.stream() is answered %i before connect", async (status) => {
+    const stub = finalLeasePlane();
+    let fetches = 0;
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        fetches += 1;
+        const body = JSON.parse(String(init?.body)) as Body;
+        if (fetches === 1)
+          return Response.json(
+            { error: { message: "synthetic rejection", type: "synthetic" } },
+            { status },
+          );
+        return completion(body["model"] as string, 128);
+      },
+    });
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch, provider: "openai" });
+
+    await run("r4-responses-rejection", async () => {
+      const responses = (
+        solwyn as unknown as {
+          responses: { stream(b: Body): { done(): Promise<unknown> } };
+        }
+      ).responses;
+      await expect(
+        responses.stream({ model: "primary-model", input: [], max_output_tokens: 128 }).done(),
+      ).rejects.toMatchObject({ status });
+      // Nothing was billed, so the final lease still funds this call.
+      await chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+    });
+    await solwyn.close();
+
+    expect(fetches).toBe(2);
+    expect(stub.checks).toEqual([]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBe(128);
+  });
+});
+
+describe("r4 finding 4: an unrecognized failure after dispatch keeps its funding", () => {
+  it("consumes the claim when a native OpenAI 200 response fails to parse", async () => {
+    const stub = finalLeasePlane();
+    let fetches = 0;
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async (_url: unknown, init?: { body?: unknown }) => {
+        fetches += 1;
+        const body = JSON.parse(String(init?.body)) as Body;
+        if (fetches === 1)
+          return new Response('{"id":"chatcmpl-r4","usage":', {
+            headers: { "content-type": "application/json" },
+          });
+        return completion(body["model"] as string, 128);
+      },
+    });
+    const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch, provider: "openai" });
+
+    await run("r4-parse", async () => {
+      await expect(
+        chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 }),
+      ).rejects.toBeInstanceOf(SyntaxError);
+      // The truncated 200 may have billed its bound, so the final lease cannot fund this call.
+      await chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+    });
+    await solwyn.close();
+
+    expect(fetches).toBe(2);
+    expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
+  });
+
+  it("consumes the claim when a wrapped AI SDK model throws an unrecognized error", async () => {
+    const stub = finalLeasePlane();
+    let calls = 0;
+    const native = new MockLanguageModelV3({
+      provider: "openai.chat",
+      modelId: "primary-model",
+      doGenerate: async () => {
+        calls += 1;
+        if (calls === 1) throw new SyntaxError("synthetic paid response parse failure");
+        return {
+          content: [{ type: "text" as const, text: "synthetic" }],
+          finishReason: { unified: "stop" as const, raw: "stop" },
+          usage: {
+            inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 128, text: 128, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+    });
+    const handle = createSolwynMiddleware({ apiKey: API_KEY, fetch: stub.fetch });
+    const model = wrapLanguageModel({ model: native, middleware: handle.middleware });
+
+    await run("r4-middleware-parse", async () => {
+      await expect(model.doGenerate({ prompt: [], maxOutputTokens: 128 })).rejects.toBeInstanceOf(
+        SyntaxError,
+      );
+      await model.doGenerate({ prompt: [], maxOutputTokens: 128 });
+    });
+    await handle.close();
+
+    expect(calls).toBe(2);
+    expect(stub.checks.map((check) => check["model"])).toEqual(["primary-model"]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBeGreaterThanOrEqual(128);
+  });
+
+  it("releases the claim when preparing the call fails before dispatch", async () => {
+    const stub = finalLeasePlane();
+    const create = vi.fn((_kwargs: Body) => usage(128));
+    const solwyn = new Solwyn(client(create), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+    });
+    const { OpenAIAdapter } = await import("../../src/providers/openai");
+    const prepare = vi.spyOn(OpenAIAdapter.prototype, "prepareCall").mockImplementationOnce(() => {
+      throw new Error("synthetic local preparation failure");
+    });
+
+    try {
+      await run("r4-undispatched", async () => {
+        await expect(
+          chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 }),
+        ).rejects.toThrow("synthetic local preparation failure");
+        await chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+      });
+    } finally {
+      prepare.mockRestore();
+      await solwyn.close();
+    }
+
+    expect(create).toHaveBeenCalledOnce();
+    expect(stub.checks).toEqual([]);
+    expect(stub.surrenders[0]?.["spent_tokens"]).toBe(128);
+  });
+});

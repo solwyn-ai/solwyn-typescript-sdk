@@ -502,22 +502,49 @@ export function classifyException(exc: unknown): Disposition {
 }
 
 /**
- * Whether a failed provider attempt may have produced billed output. A post-send-ambiguous
- * failure may have. A caller abort may have too, unless there is positive evidence it was not:
- * the provider answered with a 4xx status (429 included), or the request provably never left.
- * Any other failure carries no billed output.
+ * Whether a failed attempt may have produced billed output. Routing dispositions answer a
+ * different question (is it safe to try another provider?), so they are not reused here: refusing
+ * to fail over proves nothing about billing. After dispatch, a failure counts as possibly billed
+ * unless it carries positive evidence that it was not:
+ *  - it was raised locally before dispatch ({@link markUndispatched}),
+ *  - the provider answered with a 4xx status (429 included), or
+ *  - the transport proves the request never left (a pre-send name or code, alone or in a bounded
+ *    cause chain with no ambiguous link).
+ * Everything else counts as billed: 5xx and 529 answers, timeouts, read/write and reset
+ * failures, a bare connection wrapper with no cause, caller aborts without such evidence, response
+ * parse failures, and any unrecognized or non-Error throw.
  */
-export function attemptMaybeBilled(exc: unknown, callerAborted: boolean): boolean {
+const undispatched = new WeakSet<object>();
+
+/** Mark a failure raised locally before the provider request was dispatched: it billed nothing. */
+export function markUndispatched<T>(error: T): T {
+  if (error !== null && typeof error === "object") undispatched.add(error);
+  return error;
+}
+
+export function attemptMaybeBilled(exc: unknown): boolean {
   try {
-    const inner = classifyInspectableException(exc);
-    if (inner === Disposition.POST_SEND_AMBIGUOUS) return true;
-    if (!callerAborted && !isCallerAbort(exc)) return false;
-    const status = readStatus(exc);
-    if (status !== null && status >= 400 && status < 500) return false;
-    return inner !== Disposition.FAILOVER;
+    return !provablyUnbilled(exc);
   } catch {
     return true;
   }
+}
+
+function provablyUnbilled(exc: unknown): boolean {
+  if (exc !== null && typeof exc === "object" && undispatched.has(exc)) return true;
+  const names = errorTypeNames(exc);
+  if (names.has("APITimeoutError") || names.has("APIConnectionTimeoutError")) {
+    const cause = getCause(exc);
+    return cause !== undefined && classifyApiConnectionCause(cause) === Disposition.FAILOVER;
+  }
+  for (const name of names) if (PRE_SEND_NAMES.has(name)) return true;
+  for (const name of names) if (AMBIGUOUS_TRANSPORT_NAMES.has(name)) return false;
+  if (names.has("TypeError") || names.has("APIConnectionError")) {
+    const cause = getCause(exc);
+    if (cause !== undefined) return classifyApiConnectionCause(cause) === Disposition.FAILOVER;
+  }
+  const status = readStatus(exc);
+  return status !== null && status >= 400 && status < 500;
 }
 
 /** Established streams need positive evidence before an error is health-neutral. */

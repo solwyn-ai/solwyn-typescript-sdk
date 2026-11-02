@@ -100,6 +100,7 @@ import {
   type Dialect,
   type DispatchSurface,
   type MediaSurfaceSpec,
+  type PreparedDispatch,
 } from "./providers/protocol";
 // Namespace import (NOT destructured) so the native-happy-path zero-translation guarantee stays
 // spy-able: `translation.md` pins `TestZeroTranslationOnNativePath` (a `vi.spyOn` on the module's
@@ -137,6 +138,7 @@ import {
   type IdempotencyMode,
   isNeutralStreamError,
   LatencyTracker,
+  markUndispatched,
   type ProviderCandidate,
   providerNameOf,
   type RoutingRequest,
@@ -2759,6 +2761,7 @@ export class SolwynCore {
     }
     const started = nowMs();
     let region: string | null = null;
+    let dispatched = false;
     try {
       region = safeExtractRegion(
         () => primary.adapter.extractRegion(primary.sdkClient),
@@ -2772,6 +2775,7 @@ export class SolwynCore {
         timeout: tuning.hopReadTimeout,
         maxRetries: 0,
       });
+      dispatched = true;
       const response = await prepared.method(prepared.kwargs, ...passthroughArgs);
       const { tokenDetails, mediaUsage } = extractMediaUsageFailSoft({
         extractUsage: () => spec.extractUsage(response, { effectiveModel: model, provider }),
@@ -2844,7 +2848,12 @@ export class SolwynCore {
       } catch {
         // Error telemetry is best effort and must never mask the original failure.
       }
-      this.#releaseFunding(callId, funding);
+      // Under hard_deny a dispatched media call is possibly billed unless proven otherwise.
+      this.#endFunding(
+        callId,
+        funding,
+        budget.hardDenyAdmitted && dispatched && attemptMaybeBilled(error),
+      );
       throw error;
     }
   }
@@ -3057,7 +3066,7 @@ export class SolwynCore {
             callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect)?.aborted
           ) {
             // A caller abort keeps its funding unless the provider provably billed nothing.
-            if (ctx.readmission !== null && attemptMaybeBilled(error, true)) {
+            if (ctx.readmission !== null && attemptMaybeBilled(error)) {
               ctx.fundingMaybeBilled = true;
             }
             breaker.releaseProbe(admission);
@@ -3092,10 +3101,11 @@ export class SolwynCore {
           anyAttemptFailed = true;
           const latencyMs = nowMs() - hopStarted;
           const disposition = classifyException(error);
-          // Under hard_deny, a post-send-ambiguous failure may have produced billed output,
-          // whether the walk advances past it or ends on it. Its funding stays marked until it is
-          // replaced, so neither a later hop nor the terminal cleanup refunds it.
-          if (disposition === Disposition.POST_SEND_AMBIGUOUS && ctx.readmission !== null) {
+          // Under hard_deny, a dispatched attempt may have produced billed output unless it failed
+          // with positive evidence otherwise (attemptMaybeBilled), whether the walk advances past
+          // it or ends on it. Its funding stays marked until it is replaced, so neither a later
+          // hop nor the terminal cleanup refunds it.
+          if (ctx.readmission !== null && attemptMaybeBilled(error)) {
             ctx.fundingMaybeBilled = true;
           }
 
@@ -4264,7 +4274,12 @@ export class SolwynCore {
                   ),
                 );
               } finally {
-                this.#endFunding(settlement.callId, settlement.funding, hardDenyFunding);
+                // Before connect: a known rejection or a pre-send failure billed nothing.
+                this.#endFunding(
+                  settlement.callId,
+                  settlement.funding,
+                  hardDenyFunding && attemptMaybeBilled(error),
+                );
               }
             })
           : wrapStream(streamOptions);
@@ -4348,38 +4363,44 @@ export class SolwynCore {
         };
       }
     }
-    const dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
-      surface,
-      isStreaming,
-      // A hop serving a request authored for a DIFFERENT provider (adapters may sanitize
-      // options meant for the original endpoint under this flag; the dispatcher never branches).
-      crossProvider,
-      // SECONDS — the `PrepareCallOptions.timeout` contract. Every owning adapter converts this
-      // immutable per-call provider bound exactly once to its SDK's millisecond carrier.
-      timeout: hopReadTimeoutSeconds,
-      maxRetries: 0,
-      // The fill-absent-layered request defaults for this hop (global config default_params <
-      // per-entry default_params). ONLY the Bedrock adapter reads it (D14): its wire command is
-      // opaque to the pipeline's merged-kwargs fill-absent result, so it rebuilds a sibling command
-      // to honor a model override OR any non-empty default (global or entry). The layered spread is
-      // required for Python parity — Python's `_build_hop_kwargs` merges `{**global, **entry}` into
-      // the boto3 wire request, so a client-level `defaultParams` (e.g. an `inferenceConfig`
-      // maxTokens cap) must reach this seam too, not just entry-level defaults (client-base.md #13;
-      // command input still WINS over both). Every other adapter ignores this field (their `merged`
-      // bag already carries the fill-absent result).
-      entryDefaultParams,
-      outputBound: hardDeny?.cap,
-      ...(hardDeny === undefined
-        ? {}
-        : {
-            singleGeneration: {
-              defaultFetch: globalFetch,
-              reserved: hardDeny.reserved,
-              model: typeof merged["model"] === "string" ? merged["model"] : "",
-            },
-          }),
-      responsesLeaf,
-    });
+    let dispatch: PreparedDispatch;
+    try {
+      dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
+        surface,
+        isStreaming,
+        // A hop serving a request authored for a DIFFERENT provider (adapters may sanitize
+        // options meant for the original endpoint under this flag; the dispatcher never branches).
+        crossProvider,
+        // SECONDS — the `PrepareCallOptions.timeout` contract. Every owning adapter converts this
+        // immutable per-call provider bound exactly once to its SDK's millisecond carrier.
+        timeout: hopReadTimeoutSeconds,
+        maxRetries: 0,
+        // The fill-absent-layered request defaults for this hop (global config default_params <
+        // per-entry default_params). ONLY the Bedrock adapter reads it (D14): its wire command is
+        // opaque to the pipeline's merged-kwargs fill-absent result, so it rebuilds a sibling command
+        // to honor a model override OR any non-empty default (global or entry). The layered spread is
+        // required for Python parity — Python's `_build_hop_kwargs` merges `{**global, **entry}` into
+        // the boto3 wire request, so a client-level `defaultParams` (e.g. an `inferenceConfig`
+        // maxTokens cap) must reach this seam too, not just entry-level defaults (client-base.md #13;
+        // command input still WINS over both). Every other adapter ignores this field (their `merged`
+        // bag already carries the fill-absent result).
+        entryDefaultParams,
+        outputBound: hardDeny?.cap,
+        ...(hardDeny === undefined
+          ? {}
+          : {
+              singleGeneration: {
+                defaultFetch: globalFetch,
+                reserved: hardDeny.reserved,
+                model: typeof merged["model"] === "string" ? merged["model"] : "",
+              },
+            }),
+        responsesLeaf,
+      });
+    } catch (error) {
+      // Preparing the call is local: nothing reached the provider.
+      throw markUndispatched(error);
+    }
     return dispatch(...passthroughArgs);
   }
 

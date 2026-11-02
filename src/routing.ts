@@ -507,10 +507,11 @@ export function classifyException(exc: unknown): Disposition {
  * to fail over proves nothing about billing. After dispatch, a failure counts as possibly billed
  * unless it carries positive evidence that it was not:
  *  - it was raised locally before dispatch ({@link markUndispatched}),
- *  - the provider answered with a 4xx status (429 included), or
+ *  - the provider answered with a 4xx status (429 included), or with 529: Anthropic's
+ *    `overloaded_error` rejects the call before generation starts, or
  *  - the transport proves the request never left (a pre-send name or code, alone or in a bounded
  *    cause chain with no ambiguous link).
- * Everything else counts as billed: 5xx and 529 answers, timeouts, read/write and reset
+ * Everything else counts as billed: every other 5xx answer, timeouts, read/write and reset
  * failures, a bare connection wrapper with no cause, caller aborts without such evidence, response
  * parse failures, and any unrecognized or non-Error throw.
  */
@@ -544,7 +545,7 @@ function provablyUnbilled(exc: unknown): boolean {
     if (cause !== undefined) return classifyApiConnectionCause(cause) === Disposition.FAILOVER;
   }
   const status = readStatus(exc);
-  return status !== null && status >= 400 && status < 500;
+  return status !== null && ((status >= 400 && status < 500) || status === 529);
 }
 
 /** Established streams need positive evidence before an error is health-neutral. */

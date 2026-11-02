@@ -956,3 +956,40 @@ describe("r4 finding 4: an unrecognized failure after dispatch keeps its funding
     expect(stub.surrenders[0]?.["spent_tokens"]).toBe(128);
   });
 });
+
+describe("Anthropic 529 overloaded_error is a known rejection", () => {
+  it.each([
+    [529, "releases"],
+    [500, "keeps"],
+  ] as const)("a hard_deny %i failover %s the failed attempt's funding", async (status, outcome) => {
+    const stub = finalLeasePlane();
+    const primary = failing(status);
+    const fallback = vi.fn((_kwargs: Body) => usage(128));
+    const solwyn = new Solwyn(client(primary), {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+      failoverIdempotency: "always",
+      fallback: [[client(fallback), "fallback-model", { max_tokens: 128 }, "openai"]],
+    });
+
+    await run("overloaded-failover", () =>
+      chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 }),
+    );
+    await solwyn.close();
+
+    expect(primary).toHaveBeenCalledOnce();
+    expect(fallback).toHaveBeenCalledOnce();
+    expect(stub.grants).toHaveLength(1);
+    if (outcome === "releases") {
+      // The 529 billed nothing, so the call's claim still funds the fallback.
+      expect(stub.checks).toEqual([]);
+      expect(stub.confirms).toMatchObject([
+        { lease_id: "lease-r3", model: "fallback-model", token_details: { output_tokens: 128 } },
+      ]);
+    } else {
+      // A 500 may have billed: its claim is kept and the fallback gets its own check.
+      expect(stub.checks.map((check) => check["model"])).toEqual(["fallback-model"]);
+    }
+  });
+});

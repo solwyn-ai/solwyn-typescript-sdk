@@ -41,8 +41,8 @@ and `decisions.create`.
   cannot fund another call with it, and a per-call reservation is held until Solwyn Cloud expires
   it. Any failure after the request was sent counts as possibly billed, including a caller abort,
   a response that fails to parse, and an error Solwyn does not recognize, unless the provider
-  rejected the call (a 4xx answer, 429 included) or the request provably never left. Only those
-  are released.
+  rejected the call (a 4xx answer, 429 included, or Anthropic's 529 `overloaded_error`, which
+  rejects before generation starts) or the request provably never left. Only those are released.
 - **hard_deny now covers `decisions.create`.** OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
   without an acknowledgment, `onUnmetered: "raise"` refuses it first with
   `UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn

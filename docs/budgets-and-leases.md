@@ -148,8 +148,9 @@ stream setup, or mid-stream), a stream closed, cancelled or stopped before the p
 usage, and estimated usage. A lease claim is kept at its reservation, so the lease cannot fund
 another call with it; a per-call reservation is held until Solwyn Cloud expires it. Any failure after
 the request was sent counts as possibly billed (a caller abort, a response that fails to parse, an
-unrecognized error) unless the provider rejected the call with a 4xx answer (429 included) or the
-request provably never left.
+unrecognized error) unless the provider rejected the call with a 4xx answer (429 included) or
+Anthropic's 529 `overloaded_error` (it rejects before generation starts), or the request provably
+never left. Every other 5xx answer counts as possibly billed.
 
 On hard_deny projects the allow cache is not used: a cached allow carries no reservation. A run
 lease covers only the (provider, model) pairs it declared; the same model id from another provider

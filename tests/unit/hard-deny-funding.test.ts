@@ -40,7 +40,7 @@ interface LeaseSpec {
 }
 
 /** A hard_deny plane with real holds; optionally grants one lease. */
-function plane(cap: number, lease?: LeaseSpec) {
+function plane(cap: number, lease?: LeaseSpec, mode: "hard_deny" | "alert_only" = "hard_deny") {
   const checks: Body[] = [];
   const confirms: Body[] = [];
   const events: Body[] = [];
@@ -67,14 +67,14 @@ function plane(cap: number, lease?: LeaseSpec) {
       const check = body as Body;
       checks.push(check);
       const reserve = cost(check["model"] as string, check["estimated_output_bound"] as number);
-      const allowed = spent + held() + reserve <= cap + 1e-12;
+      const allowed = mode === "alert_only" || spent + held() + reserve <= cap + 1e-12;
       const reservationId = allowed ? `res-${++reservations}` : null;
       if (reservationId !== null) holds.set(reservationId, reserve);
       return Response.json({
         allowed,
         remaining_budget: cap - spent - held(),
         reservation_id: reservationId,
-        mode: "hard_deny",
+        mode,
         budget_limit: cap,
         current_usage: spent,
         denied_by_period: allowed ? null : "monthly",
@@ -990,6 +990,63 @@ describe("Anthropic 529 overloaded_error is a known rejection", () => {
     } else {
       // A 500 may have billed: its claim is kept and the fallback gets its own check.
       expect(stub.checks.map((check) => check["model"])).toEqual(["fallback-model"]);
+    }
+  });
+});
+
+describe("a response body that fails to decode is post-send ambiguous", () => {
+  function truncatedPrimary() {
+    let fetches = 0;
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async () => {
+        fetches += 1;
+        return new Response('{"id":"chatcmpl-decode","usage":', {
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { native, fetches: () => fetches };
+  }
+
+  it.each([
+    ["hard_deny", "always", true],
+    ["hard_deny", "safe", false],
+    ["alert_only", "always", true],
+    ["alert_only", "safe", false],
+  ] as const)("on %s under %s, fails over: %s", async (mode, failoverIdempotency, failsOver) => {
+    const stub = plane(1, undefined, mode);
+    const primary = truncatedPrimary();
+    const fallback = vi.fn((_kwargs: Body) => usage(2));
+    const solwyn = new Solwyn(primary.native, {
+      apiKey: API_KEY,
+      fetch: stub.fetch,
+      provider: "openai",
+      failoverIdempotency,
+      fallback: [[client(fallback), "fallback-model", { max_tokens: 128 }, "openai"]],
+    });
+
+    const call = chat(solwyn, { model: "primary-model", messages: MESSAGES, max_tokens: 128 });
+    if (failsOver) await call;
+    else await expect(call).rejects.toBeInstanceOf(SyntaxError);
+    await solwyn.close();
+
+    expect(primary.fetches()).toBe(1);
+    expect(fallback).toHaveBeenCalledTimes(failsOver ? 1 : 0);
+    // An ambiguous failure that ends the call is reported as possibly succeeded.
+    if (!failsOver)
+      expect(stub.events.find((event) => event["status"] === "error")).toMatchObject({
+        model: "primary-model",
+        possibly_succeeded: true,
+      });
+    if (failsOver && mode === "hard_deny") {
+      // The next hop is re-admitted with its own check; the possibly billed hold is kept.
+      expect(stub.checks.map((check) => check["model"])).toEqual([
+        "primary-model",
+        "fallback-model",
+      ]);
+      expect(stub.confirms.map((confirm) => confirm["model"])).toEqual(["fallback-model"]);
     }
   });
 });

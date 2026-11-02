@@ -29,6 +29,7 @@ import {
   LatencyPolicy,
   LatencyTracker,
   MIN_HOP_TIMEOUT,
+  markUndispatched,
   type ProviderCandidate,
   providerNameOf,
   RoutingRequestSchema,
@@ -1025,6 +1026,46 @@ describe("classifyException — default + built-in connection reset", () => {
     expect(classifyException(reset)).toBe(Disposition.FAIL_FAST);
     // A plain error literally named "ConnectionError" must also not failover.
     expect(classifyException(namedError(["ConnectionError"]))).toBe(Disposition.FAIL_FAST);
+  });
+});
+
+describe("classifyException: a response body that fails to decode", () => {
+  it("is post-send ambiguous for a truncated or unparseable JSON body", () => {
+    expect(classifyException(new SyntaxError("Unexpected end of JSON input"))).toBe(
+      Disposition.POST_SEND_AMBIGUOUS,
+    );
+    for (const name of ["JSONDecodeError", "DecodingError", "DecodeError", "ResponseParserError"])
+      expect(classifyException(namedError([name]))).toBe(Disposition.POST_SEND_AMBIGUOUS);
+  });
+
+  it("keeps status routing when an error answer's body failed to decode", () => {
+    expect(classifyException(namedError(["SyntaxError"], { status: 400 }))).toBe(
+      Disposition.FAIL_FAST,
+    );
+    expect(classifyException(namedError(["SyntaxError"], { status: 429 }))).toBe(
+      Disposition.FAILOVER,
+    );
+  });
+
+  it("is post-send ambiguous for a corrupt gzip body, even under a connection wrapper", () => {
+    const zlib = Object.assign(new Error("incorrect header check"), { code: "Z_DATA_ERROR" });
+    expect(classifyException(new TypeError("terminated", { cause: zlib }))).toBe(
+      Disposition.POST_SEND_AMBIGUOUS,
+    );
+    expect(classifyException(namedError(["APIConnectionError"], { cause: zlib }))).toBe(
+      Disposition.POST_SEND_AMBIGUOUS,
+    );
+    expect(
+      classifyException(
+        namedError(["APIConnectionError"], { cause: namedError(["DecodingError"]) }),
+      ),
+    ).toBe(Disposition.POST_SEND_AMBIGUOUS);
+  });
+
+  it("fails fast when the failure was raised before dispatch", () => {
+    expect(classifyException(markUndispatched(new SyntaxError("local")))).toBe(
+      Disposition.FAIL_FAST,
+    );
   });
 });
 

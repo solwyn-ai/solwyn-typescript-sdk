@@ -61,6 +61,12 @@ and `decisions.create`.
 - **Lease coverage matches provider and model.** A run lease covers the (provider, model) pairs it
   declared, as Solwyn Cloud prices them. A declared model id served by another provider now gets a
   per-call check instead of drawing on the lease.
+- **A response body that fails to decode is an ambiguous failure.** A truncated or unparseable
+  JSON body, or a corrupt gzip body, after the provider answered now counts as a possibly
+  completed call in every budget mode, unless its HTTP status already decides the outcome. With
+  `failoverIdempotency: "safe"` the call does not fail over and its error event reports
+  `possibly_succeeded: true`. With `"always"` it may fail over, and on a hard_deny project the
+  next hop gets its own budget check. Before, an unparseable JSON body failed fast.
 - Retries on the same provider and model after a clean failure are not re-checked. Alert-only
   projects and SDK-local outage decisions are unchanged.
 

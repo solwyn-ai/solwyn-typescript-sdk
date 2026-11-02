@@ -49,6 +49,10 @@ confirmation.
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.
+A response whose body fails to decode (a truncated or unparseable JSON body, or a corrupt gzip
+body) is an ambiguous failure after send, unless its HTTP status already decides the outcome.
+`"safe"` does not fail over on it; under `"always"` the next hop is tried, and on a hard_deny
+project that hop gets its own budget check.
 The per-call request field `solwynIdempotent: false` tightens `"always"` to `"safe"` and keeps
 `"never"` unchanged; `true` preserves the configured policy. Solwyn strips this field before
 every intercepted provider dispatch, including media and Bedrock command input. It never

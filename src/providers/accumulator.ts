@@ -205,16 +205,14 @@ function warnServiceTierTruncated(logger: Logger): void {
  * (a single async consumer of one stream's chunks is the only supported driver).
  */
 /**
- * A chat chunk that ends generation: a choice with a finish reason, or the usage-only final chunk.
+ * The usage-only final chat chunk (`choices: []` with usage), which ends the whole stream.
+ * One choice's finish reason does not: with `n > 1` the other choices may still be generating.
  */
 export function isChatCompletionChunk(chunk: unknown): boolean {
   const choices = getProp(chunk, "choices");
-  if (!Array.isArray(choices)) return false;
-  if (choices.length === 0) {
-    const usage = getProp(chunk, "usage");
-    return usage !== undefined && usage !== null;
-  }
-  return choices.some((choice) => typeof getProp(choice, "finish_reason") === "string");
+  if (!Array.isArray(choices) || choices.length !== 0) return false;
+  const usage = getProp(chunk, "usage");
+  return usage !== undefined && usage !== null;
 }
 
 export class OpenAIStreamAccumulator implements StreamUsageAccumulator {

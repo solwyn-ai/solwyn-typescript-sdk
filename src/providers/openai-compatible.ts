@@ -479,7 +479,7 @@ export class CompatStreamAccumulator implements StreamUsageAccumulator {
     // tier. Afterwards retain usage/tier extraction below, but avoid walking later delta bodies.
     if (this.#standardUsage === null && this.#xGroqUsage === null) {
       this.#contentChars += estimateStreamChunkContentLength(chunk);
-      // Choices are not read once usage latches, so a finish seen only afterwards still floors.
+      // Choices are not read once usage latches, so a final chunk seen only afterwards floors.
       this.#sawCompletion ||= isChatCompletionChunk(chunk);
     }
     try {

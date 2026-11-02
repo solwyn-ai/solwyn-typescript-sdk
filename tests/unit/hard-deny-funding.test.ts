@@ -596,14 +596,14 @@ describe("a terminal possibly billed attempt keeps its lease claim", () => {
 });
 
 /** A final hard_deny lease of 200 tokens: one 128-token call fits, a second does not. */
-function finalLeasePlane() {
+function finalLeasePlane(grantedTokens = 200) {
   return plane(1, {
     grant: {
       eligible: true,
       allowed: true,
       lease_id: "lease-r3",
       generation: 1,
-      granted_tokens: 200,
+      granted_tokens: grantedTokens,
       refresh_interval_s: 300,
       lease_length_s: 600,
       headroom_share_tokens: 0,
@@ -1647,6 +1647,72 @@ describe("floor follow-ups", () => {
       {
         ...(leased ? { lease_id: "lease-r3" } : { reservation_id: "res-1" }),
         token_details: { input_tokens: 2, output_tokens: 128, is_estimated: true },
+      },
+    ]);
+  });
+
+  it.each([
+    ["per-call", false],
+    ["lease", true],
+  ] as const)("floors a %s n: 2 stream aborted after only one choice finished", async (_label, leased) => {
+    // Two choices reserve 256 output tokens, more than the default 200-token grant.
+    const stub = leased ? finalLeasePlane(1_000) : plane(1);
+    const caller = new AbortController();
+    const native = new OpenAI({
+      apiKey: "sk-test",
+      maxRetries: 0,
+      fetch: async (_url: unknown, init?: { signal?: AbortSignal | null }) => {
+        // Choice 0 has finished; choice 1 is still generating. Usage is interim.
+        const interim = {
+          id: "chatcmpl-r3",
+          object: "chat.completion.chunk",
+          created: 1,
+          model: "fallback-model",
+          choices: [
+            { index: 0, delta: {}, finish_reason: "stop" },
+            { index: 1, delta: { content: "synthetic" }, finish_reason: null },
+          ],
+          usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+        };
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              const signal = init?.signal;
+              signal?.addEventListener("abort", () => controller.error(signal.reason), {
+                once: true,
+              });
+            },
+            pull(controller) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(interim)}\n\n`));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    const act = async () => {
+      const solwyn = new Solwyn(native, { apiKey: API_KEY, fetch: stub.fetch });
+      const stream = await (
+        solwyn as unknown as {
+          chat: { completions: { create(b: Body, o: unknown): Promise<unknown> } };
+        }
+      ).chat.completions.create(
+        { model: "fallback-model", messages: MESSAGES, max_tokens: 128, n: 2, stream: true },
+        { signal: caller.signal },
+      );
+      const iterator = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+      await iterator.next();
+      caller.abort();
+      await expect(iterator.next()).resolves.toMatchObject({ done: true });
+      await solwyn.close();
+    };
+    if (leased) await run("floor-n2-abort", act);
+    else await act();
+
+    expect(stub.confirms).toMatchObject([
+      {
+        ...(leased ? { lease_id: "lease-r3" } : { reservation_id: "res-1" }),
+        token_details: { input_tokens: 2, output_tokens: 256, is_estimated: true },
       },
     ]);
   });

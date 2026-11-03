@@ -697,6 +697,108 @@ scenarios["idle-release-dispatcher"] = async () => {
   results["idle_release_dispatcher"] = true;
 };
 
+scenarios["flush-soon-run-isolation"] = async () => {
+  // A local refusal inside a run queues a zero-usage release and asks the reporter to flush soon.
+  // That tick must not capture the run: the finished run is collected and its lease surrendered
+  // while the client is still open.
+  const { default: OpenAI } = await import("openai");
+  let surrenders = 0;
+  const fetch: FetchLike = async (url, init) => {
+    const path = new URL(url).pathname;
+    const body =
+      typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+    if (path.endsWith("/budgets/lease")) {
+      return Response.json({
+        eligible: true,
+        allowed: true,
+        lease_id: "lse_flush_soon",
+        generation: 1,
+        granted_tokens: 100_000,
+        refresh_interval_s: 300,
+        lease_length_s: 600,
+        headroom_share_tokens: 0,
+        posture: { mode: "hard_deny", on_unreachable: "fail_open" },
+        final_grant: true,
+        project_id: projectId,
+        mode: "hard_deny",
+        budget_limit: 1,
+        current_usage: 0,
+        remaining_budget: 1,
+      });
+    }
+    if (path.endsWith("/budgets/lease/surrender")) {
+      surrenders += 1;
+      return Response.json({
+        lease_id: body["lease_id"],
+        spent_tokens: body["spent_tokens"],
+        accepted: true,
+      });
+    }
+    if (path.endsWith("/budgets/check")) {
+      return Response.json({
+        allowed: true,
+        remaining_budget: 1,
+        reservation_id: `res-${crypto.randomUUID()}`,
+        mode: "hard_deny",
+        budget_limit: 1,
+        current_usage: 0,
+        denied_by_period: null,
+        project_id: projectId,
+        price_hints: null,
+      });
+    }
+    if (path.endsWith("/budgets/confirm")) return new Response(null, { status: 204 });
+    return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+  };
+  const native = new OpenAI({
+    apiKey: "sk-synthetic",
+    baseURL: "https://api.x.ai/v1",
+    fetch: async (_url: unknown, init?: { body?: unknown }) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return Response.json({
+        id: "chatcmpl-synthetic",
+        object: "chat.completion",
+        created: 1,
+        model: body["model"],
+        choices: [
+          { index: 0, finish_reason: "stop", message: { role: "assistant", content: "ok" } },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 1, total_tokens: 1 },
+      });
+    },
+  });
+  const client = new Solwyn(native, {
+    apiKey,
+    fetch,
+    logger: noopLogger,
+    reporterFlushInterval: 0.02,
+    velocityMode: "off",
+  }) as unknown as {
+    chat: { completions: { create(body: Record<string, unknown>): Promise<unknown> } };
+    close(): Promise<void>;
+  };
+  // Start the provider runtime and the reporter outside any run.
+  await client.chat.completions.create({ model: "grok-4-fast-non-reasoning", messages: [] });
+  let owner: WeakRef<object> | undefined;
+  await run("flush-soon", async () => {
+    const reader = (globalThis as Record<symbol, unknown>)[
+      Symbol.for("@solwyn/sdk.currentRunReader")
+    ];
+    owner = new WeakRef((reader as () => { lifetime: object })().lifetime);
+    await client.chat.completions.create({ model: "grok-4-fast-non-reasoning", messages: [] });
+    await client.chat.completions.create({ model: "grok-4", messages: [] }).then(
+      () => assert.fail("the reasoning model must be refused"),
+      (error: { reason?: string }) => assert.equal(error.reason, "reasoning_without_budget"),
+    );
+  });
+  await collectUntil(
+    () => owner?.deref() === undefined && surrenders === 1,
+    () => `flush-soon run: alive=${Number(owner?.deref() !== undefined)} surrenders=${surrenders}`,
+  );
+  await client.close();
+  results["flush_soon_run_isolation"] = true;
+};
+
 const name = process.argv[2] ?? "";
 const scenario = scenarios[name];
 assert.ok(scenario, "unknown scenario");

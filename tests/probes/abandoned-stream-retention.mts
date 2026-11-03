@@ -34,6 +34,8 @@ MetadataReporter.prototype.reportSettlement = function (request, event) {
   reportSettlement.call(this, request, event);
 };
 let grants = 0;
+// Alert-only: on hard_deny an abandoned stream keeps its claim at the floor
+// (tests/unit/hard-deny-funding.test.ts); this probe pins finalization at observed usage.
 const fetch: FetchLike = async (url, init) => {
   const body = JSON.parse(String(init?.body ?? "null"));
   if (url.endsWith("/budgets/lease"))
@@ -46,10 +48,10 @@ const fetch: FetchLike = async (url, init) => {
       refresh_interval_s: 300,
       lease_length_s: 600,
       headroom_share_tokens: 0,
-      posture: { mode: "hard_deny", on_unreachable: "local_enforce" },
-      final_grant: true,
+      posture: { mode: "alert_only", on_unreachable: "local_enforce" },
+      final_grant: false,
       project_id: `proj_${"0".repeat(24)}`,
-      mode: "hard_deny",
+      mode: "alert_only",
       budget_limit: 100,
       current_usage: 0,
       remaining_budget: 100,
@@ -59,7 +61,7 @@ const fetch: FetchLike = async (url, init) => {
       allowed: true,
       remaining_budget: 100,
       reservation_id: "reservation-abandoned",
-      mode: "hard_deny",
+      mode: "alert_only",
       budget_limit: 100,
       current_usage: 0,
       denied_by_period: null,

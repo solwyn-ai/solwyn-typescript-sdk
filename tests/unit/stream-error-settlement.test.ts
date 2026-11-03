@@ -283,7 +283,17 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny: the possibly billed reservation is recorded at its floor, marked estimated.
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      reservation_id: expect.any(String),
+      model: "gpt-test",
+      token_details: {
+        input_tokens: 0,
+        output_tokens: plane.checks[0]?.estimated_output_bound,
+        is_estimated: true,
+      },
+    });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",
@@ -294,16 +304,21 @@ describe("provider usage observed before a stream error", () => {
     expect(plane.ingested[0]?.token_details).toBeUndefined();
   });
 
-  it.each([
-    { chunk: false, leased: false },
-    { chunk: true, leased: false },
-    { chunk: false, leased: true },
-    { chunk: true, leased: true },
-  ])("does not settle compatible fallback estimates (chunk=$chunk, lease=$leased)", async ({
+  // Under hard_deny a mid-stream error may follow billed output, so a lease claim settles at its
+  // reservation (estimated input plus max_tokens 20) instead of zero.
+  it.each(
+    (["alert_only", "hard_deny"] as const).flatMap((mode) => [
+      { chunk: false, leased: false, mode },
+      { chunk: true, leased: false, mode },
+      { chunk: false, leased: true, mode },
+      { chunk: true, leased: true, mode },
+    ]),
+  )("does not settle compatible fallback estimates (chunk=$chunk, lease=$leased, $mode)", async ({
     chunk,
     leased,
+    mode,
   }) => {
-    const plane = new FakeControlPlane();
+    const plane = new FakeControlPlane({ mode });
     const failure = new Error("synthetic compatible stream failure");
     const client = plane.wrap(
       {
@@ -337,7 +352,14 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny records the possibly billed funding at its floor (input 3 plus max_tokens 20).
+    expect(plane.confirms).toHaveLength(mode === "hard_deny" ? 1 : 0);
+    if (mode === "hard_deny")
+      expect(plane.confirms[0]).toMatchObject({
+        ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+        model: "deepseek-chat",
+        token_details: { input_tokens: 3, output_tokens: 20, is_estimated: true },
+      });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({
       status: "error",
@@ -346,13 +368,15 @@ describe("provider usage observed before a stream error", () => {
       possibly_succeeded: true,
     });
     expect(plane.leaseSurrenders).toHaveLength(leased ? 1 : 0);
-    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(mode === "hard_deny" ? 23 : 0);
   });
 
-  it.each([
-    false,
-    true,
-  ])("preserves the provider error when finalization throws (lease=%s)", async (leased) => {
+  it.each(
+    (["alert_only", "hard_deny"] as const).flatMap((mode) => [
+      [false, mode] as const,
+      [true, mode] as const,
+    ]),
+  )("preserves the provider error when finalization throws (lease=%s, %s)", async (leased, mode) => {
     const finalize = vi.fn(() => {
       throw new Error("synthetic usage extraction failure");
     });
@@ -361,7 +385,7 @@ describe("provider usage observed before a stream error", () => {
       finalize,
       getServiceTier: () => null,
     });
-    const plane = new FakeControlPlane();
+    const plane = new FakeControlPlane({ mode });
     const failure = new Error("synthetic provider failure");
     const client = plane.wrap(
       {
@@ -394,18 +418,28 @@ describe("provider usage observed before a stream error", () => {
     } finally {
       await client.close();
     }
-    expect(plane.confirms).toHaveLength(0);
+    // hard_deny records the possibly billed funding at its floor (input 3 plus max_tokens 20).
+    expect(plane.confirms).toHaveLength(mode === "hard_deny" ? 1 : 0);
+    if (mode === "hard_deny")
+      expect(plane.confirms[0]).toMatchObject({
+        ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+        model: "gpt-test",
+        token_details: { input_tokens: 3, output_tokens: 20, is_estimated: true },
+      });
     expect(plane.ingested).toHaveLength(1);
     expect(plane.ingested[0]).toMatchObject({ status: "error", input_tokens: 0, output_tokens: 0 });
-    expect(finalize).toHaveBeenCalledTimes(leased ? 0 : 1);
-    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(0);
+    // A lease's error event reads no usage; under hard_deny the floor still tries to observe it.
+    expect(finalize).toHaveBeenCalledTimes(leased && mode === "alert_only" ? 0 : 1);
+    // hard_deny settles the possibly billed claim at its reservation (input plus max_tokens 20).
+    if (leased) expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(mode === "hard_deny" ? 23 : 0);
   });
 
   it.each([
     false,
     true,
   ])("settles partial Anthropic input only without lease funding (lease=%s)", async (leased) => {
-    const plane = new FakeControlPlane();
+    // On alert_only. Under hard_deny the possibly billed funding is kept instead (below).
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     const failure = new Error("synthetic Anthropic stream failure");
     const client = plane.wrap(
       {
@@ -461,6 +495,113 @@ describe("provider usage observed before a stream error", () => {
         output_tokens: 0,
         is_estimated: true,
       });
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("floors a priority-tier stream at its tier and keeps the lease on its event (lease=%s)", async (leased) => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic Anthropic stream failure");
+    const client = plane.wrap(
+      {
+        messages: {
+          create: async function* (_params: Record<string, unknown>) {
+            yield {
+              type: "message_start",
+              message: { usage: { input_tokens: 12, service_tier: "priority" } },
+            };
+            throw failure;
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      const call = async () => {
+        await expect(
+          consume(
+            await client.messages.create({
+              model: "claude-test",
+              messages: [],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      };
+      if (leased) await run("priority-stream-error", call);
+      else await call();
+    } finally {
+      await client.close();
+    }
+    // The floor confirm carries the tier the event carries, so it is priced at that tier.
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      service_tier: "priority",
+      token_details: { input_tokens: 12, output_tokens: 20, is_estimated: true },
+    });
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]?.lease_id).toBe(leased ? plane.confirms[0]?.lease_id : undefined);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps partial Anthropic funding under hard_deny (lease=%s)", async (leased) => {
+    const plane = new FakeControlPlane();
+    const failure = new Error("synthetic Anthropic stream failure");
+    const client = plane.wrap(
+      {
+        messages: {
+          create: async function* (_params: Record<string, unknown>) {
+            yield { type: "message_start", message: { usage: { input_tokens: 12 } } };
+            throw failure;
+          },
+        },
+      },
+      { breakerReportingEnabled: false, logger: noopLogger },
+    );
+    try {
+      const call = async () => {
+        await expect(
+          consume(
+            await client.messages.create({
+              model: "claude-test",
+              messages: [],
+              max_tokens: 20,
+              stream: true,
+            }),
+          ),
+        ).rejects.toBe(failure);
+      };
+      if (leased) await run("partial-stream-error", call);
+      else await call();
+    } finally {
+      await client.close();
+    }
+    // The error may follow billed output: the funding is recorded at its floor, the observed
+    // input 12 (above its estimate) plus max_tokens 20, and the lease claim settles locally at
+    // its reservation (max_tokens 20, no estimated input).
+    expect(plane.confirms).toHaveLength(1);
+    expect(plane.confirms[0]).toMatchObject({
+      ...(leased ? { lease_id: expect.any(String) } : { reservation_id: expect.any(String) }),
+      model: "claude-test",
+      token_details: { input_tokens: 12, output_tokens: 20, is_estimated: true },
+    });
+    expect(plane.ingested).toHaveLength(1);
+    expect(plane.ingested[0]).toMatchObject({
+      status: "error",
+      output_tokens: 0,
+      possibly_succeeded: true,
+    });
+    if (leased) {
+      expect(plane.checks).toHaveLength(0);
+      expect(plane.leaseSurrenders).toHaveLength(1);
+      expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(20);
+    } else {
+      expect(plane.checks).toHaveLength(1);
     }
   });
 

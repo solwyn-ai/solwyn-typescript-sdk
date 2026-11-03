@@ -292,7 +292,31 @@ const PRE_SEND_CODES = new Set<string>([
  * connection reset can fire after the request was sent, so an `ECONNRESET`-only chain stays
  * ambiguous, never pre-send failover.
  */
-const POST_SEND_CODES = new Set<string>(["ECONNRESET"]);
+const POST_SEND_CODES = new Set<string>([
+  "ECONNRESET",
+  // zlib (gzip/deflate) body decode failures: a response arrived, so the call may have billed.
+  "Z_DATA_ERROR",
+  "Z_BUF_ERROR",
+]);
+
+/**
+ * A response arrived but its body failed to decode (a truncated or unparseable JSON body):
+ * post-send ambiguous, at the top level or anywhere in the cause chain. `SyntaxError` is the JS
+ * JSON.parse failure; the rest keep the shared name table aligned with the Python SDK (stdlib
+ * `JSONDecodeError`, httpx `DecodingError`, urllib3 `DecodeError`, botocore `ResponseParserError`).
+ */
+const RESPONSE_DECODE_NAMES = new Set<string>([
+  "SyntaxError",
+  "JSONDecodeError",
+  "DecodingError",
+  "DecodeError",
+  "ResponseParserError",
+]);
+
+/** Post-send-possible names: transport phases after send, and response body decode failures. */
+function isAmbiguousName(name: string): boolean {
+  return AMBIGUOUS_TRANSPORT_NAMES.has(name) || RESPONSE_DECODE_NAMES.has(name);
+}
 
 /**
  * Cause-chain constructor names that are post-send-POSSIBLE (a read/write phase timeout implies
@@ -437,7 +461,7 @@ function classifyApiConnectionCause(root: unknown): Disposition {
     let ambiguous = false;
     for (const name of errorTypeNames(node)) {
       preSend ||= PRE_SEND_NAMES.has(name);
-      ambiguous ||= AMBIGUOUS_TRANSPORT_NAMES.has(name);
+      ambiguous ||= isAmbiguousName(name);
     }
     const code = (node as { code?: unknown }).code;
     if (typeof code === "string") {
@@ -480,8 +504,11 @@ function classifyApiConnectionCause(root: unknown): Disposition {
  *  2. Recognized top-level transport certainty precedes status: provably pre-send names fail over,
  *     while timeout/read/write/transport/protocol families stay post-send ambiguous. Native fetch
  *     TypeError causes use bounded positive pre-send proof; uncertain causes stay ambiguous.
+ *     A failure marked {@link markUndispatched} (raised before dispatch) always fails fast.
  *  3. Numeric status then applies: `429`/`529` fail over, ordinary `4xx` fail fast, and `5xx`
- *     remain post-send ambiguous.
+ *     remain post-send ambiguous. Without a status, a response body decode failure
+ *     (`RESPONSE_DECODE_NAMES` at the top, or a decode name or zlib code in a cause chain) is
+ *     post-send ambiguous.
  *  4. `APIConnectionError` uses the same bounded, cycle-safe cause proof; a bare wrapper keeps the
  *     canonical failover default, while read/uncertain causes remain ambiguous.
  *  5. Anything unrecognized, including non-Error throws, fails fast.
@@ -501,6 +528,53 @@ export function classifyException(exc: unknown): Disposition {
   }
 }
 
+/**
+ * Whether a failed attempt may have produced billed output. Routing dispositions answer a
+ * different question (is it safe to try another provider?), so they are not reused here: refusing
+ * to fail over proves nothing about billing. After dispatch, a failure counts as possibly billed
+ * unless it carries positive evidence that it was not:
+ *  - it was raised locally before dispatch ({@link markUndispatched}),
+ *  - the provider answered with a 4xx status (429 included), or with 529: Anthropic's
+ *    `overloaded_error` rejects the call before generation starts, or
+ *  - the transport proves the request never left (a pre-send name or code, alone or in a bounded
+ *    cause chain with no ambiguous link).
+ * Everything else counts as billed: every other 5xx answer, timeouts, read/write and reset
+ * failures, a bare connection wrapper with no cause, caller aborts without such evidence, response
+ * parse failures, and any unrecognized or non-Error throw.
+ */
+const undispatched = new WeakSet<object>();
+
+/** Mark a failure raised locally before the provider request was dispatched: it billed nothing. */
+export function markUndispatched<T>(error: T): T {
+  if (error !== null && typeof error === "object") undispatched.add(error);
+  return error;
+}
+
+export function attemptMaybeBilled(exc: unknown): boolean {
+  try {
+    return !provablyUnbilled(exc);
+  } catch {
+    return true;
+  }
+}
+
+function provablyUnbilled(exc: unknown): boolean {
+  if (exc !== null && typeof exc === "object" && undispatched.has(exc)) return true;
+  const names = errorTypeNames(exc);
+  if (names.has("APITimeoutError") || names.has("APIConnectionTimeoutError")) {
+    const cause = getCause(exc);
+    return cause !== undefined && classifyApiConnectionCause(cause) === Disposition.FAILOVER;
+  }
+  for (const name of names) if (PRE_SEND_NAMES.has(name)) return true;
+  for (const name of names) if (AMBIGUOUS_TRANSPORT_NAMES.has(name)) return false;
+  if (names.has("TypeError") || names.has("APIConnectionError")) {
+    const cause = getCause(exc);
+    if (cause !== undefined) return classifyApiConnectionCause(cause) === Disposition.FAILOVER;
+  }
+  const status = readStatus(exc);
+  return status !== null && ((status >= 400 && status < 500) || status === 529);
+}
+
 /** Established streams need positive evidence before an error is health-neutral. */
 export function isNeutralStreamError(error: unknown): boolean {
   try {
@@ -513,6 +587,9 @@ export function isNeutralStreamError(error: unknown): boolean {
 }
 
 function classifyInspectableException(exc: unknown): Disposition {
+  // A local failure before dispatch has no response: never ambiguous, never failover.
+  if (exc !== null && typeof exc === "object" && undispatched.has(exc))
+    return Disposition.FAIL_FAST;
   const names = errorTypeNames(exc);
 
   // Step 1 — timeout wrappers require positive cause proof; uncertainty remains ambiguous.
@@ -553,6 +630,10 @@ function classifyInspectableException(exc: unknown): Disposition {
       return Disposition.POST_SEND_AMBIGUOUS;
     }
     // Any other numeric status (1xx/2xx/3xx/≥600) falls through to the cause/default logic.
+  }
+  // Step 3b — a response arrived but its body failed to decode. A status answer above wins.
+  for (const name of names) {
+    if (RESPONSE_DECODE_NAMES.has(name)) return Disposition.POST_SEND_AMBIGUOUS;
   }
   // Step 4 — bare/wrapped connection error: the cause CHAIN decides pre- vs post-send.
   if (names.has("APIConnectionError")) {

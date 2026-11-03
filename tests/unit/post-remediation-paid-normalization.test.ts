@@ -110,19 +110,30 @@ describe("post-remediation finding 3: paid normalization ownership", () => {
         }
         expect(primaryCalls).toBe(1);
         expect(fallbackCalls).toBe(1);
+        // Failover re-admission also settles the superseded primary reservation at zero usage.
+        const closeOuts = attemptedConfirms.filter((confirm) => confirm.provider === "openai");
+        expect(closeOuts).toHaveLength(!lease && reporting !== "construction failure" ? 1 : 0);
+        for (const closeOut of closeOuts)
+          expect(closeOut.token_details).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+        const servedConfirms = attemptedConfirms.filter(
+          (confirm) => confirm.provider === "anthropic",
+        );
+        const servedPlaneConfirms = plane.confirms.filter(
+          (confirm) => confirm.provider === "anthropic",
+        );
         const confirmExpected = reporting === "delivered" || reporting === "rejected";
-        expect(attemptedConfirms).toHaveLength(confirmExpected ? 1 : 0);
-        expect(plane.confirms).toHaveLength(reporting === "delivered" ? 1 : 0);
+        expect(servedConfirms).toHaveLength(confirmExpected ? 1 : 0);
+        expect(servedPlaneConfirms).toHaveLength(reporting === "delivered" ? 1 : 0);
         if (confirmExpected) {
-          expect(attemptedConfirms[0]).toMatchObject({
+          expect(servedConfirms[0]).toMatchObject({
             model: "claude-sonnet-4-5",
             provider: "anthropic",
             is_provider_fallback: true,
             token_details: { input_tokens: 30, output_tokens: 20 },
           });
-          expect(attemptedConfirms[0]?.token_details?.is_estimated === true).toBe(false);
-          expect(Boolean(attemptedConfirms[0]?.lease_id)).toBe(lease);
-          expect(Boolean(attemptedConfirms[0]?.reservation_id)).toBe(!lease);
+          expect(servedConfirms[0]?.token_details?.is_estimated === true).toBe(false);
+          expect(Boolean(servedConfirms[0]?.lease_id)).toBe(lease);
+          expect(Boolean(servedConfirms[0]?.reservation_id)).toBe(!lease);
         }
         const paidEvents = plane.ingested.filter((event) => event.provider === "anthropic");
         expect(attemptedEvents.filter((event) => event.provider === "anthropic")).toHaveLength(1);
@@ -139,7 +150,7 @@ describe("post-remediation finding 3: paid normalization ownership", () => {
           malformed ? "UntranslatableRequestError" : null,
         );
         expect(paidEvents[0]?.failover_reason ?? null).toBe(malformed ? null : "primary_error");
-        if (confirmExpected) expect(paidEvents[0]?.call_id).toBe(attemptedConfirms[0]?.call_id);
+        if (confirmExpected) expect(paidEvents[0]?.call_id).toBe(servedConfirms[0]?.call_id);
         expect(plane.ingested.filter((event) => event.provider === "openai")).toHaveLength(1);
         expect(plane.leaseSurrenders).toHaveLength(lease ? 1 : 0);
         if (lease) {

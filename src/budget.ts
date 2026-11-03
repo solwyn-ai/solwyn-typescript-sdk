@@ -54,6 +54,7 @@ import {
   LeaseLedger,
   type LeaseSnapshot,
   type LeaseState,
+  leaseChainKeys,
 } from "./lease";
 import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
@@ -75,7 +76,7 @@ import {
   outageTermination,
   runObservedAt,
 } from "./run-control";
-import { type TokenDetails, totalTokens } from "./token-details";
+import { buildTokenDetails, type TokenDetails, totalTokens } from "./token-details";
 import { withoutTraceContext } from "./trace-context";
 import {
   BUDGET_CHECK_PATH,
@@ -322,6 +323,25 @@ function stickyDenyReason(
  * `"alert_only"`, `budgetLimit`/`currentUsage` → `0`. (budget.md behavior 21 — the
  * result is a real typed structure with these exact defaults.)
  */
+/**
+ * The usage a hard_deny attempt with unknown, possibly billed usage settles at: its reservation
+ * (estimated input plus the attempt's reserved output bound), or the observed count where that is
+ * larger, per dimension. Marked estimated, so Solwyn Cloud keeps it as a durable receipt.
+ */
+export function floorTokenDetails(
+  observed: TokenDetails | null,
+  estimatedInputTokens: number,
+  outputBound: number,
+): TokenDetails {
+  const floor = (reserved: number, seen: number | undefined): number =>
+    Math.min(Math.max(reserved, seen ?? 0, 0), ORDINARY_TOKEN_COUNT_MAX);
+  return buildTokenDetails({
+    input_tokens: floor(estimatedInputTokens, observed?.input_tokens),
+    output_tokens: floor(outputBound, observed?.output_tokens),
+    is_estimated: true,
+  });
+}
+
 export function budgetCheckResult(init: BudgetCheckResultInit): MaterializedBudgetCheckResult {
   return {
     ...(init.callId === undefined ? {} : { callId: init.callId }),
@@ -428,6 +448,11 @@ export interface CheckBudgetOptions {
   callId?: string;
   /** Positive structural output cap reserved in addition to the input estimate. */
   estimatedOutputBound?: number;
+  /**
+   * @internal Fund this check with a per-call reservation only, never a lease claim. A failover
+   * hop's re-admission uses it: the call's id already names its earlier funding.
+   */
+  perCallOnly?: boolean;
 }
 
 /** Validate then defensively copy raw tag attribution before any authority decision. */
@@ -505,6 +530,7 @@ interface CapturedCheck {
   readonly hasEstimatedMedia: boolean;
   readonly deadlineMs: number;
   readonly signal: AbortSignal | undefined;
+  readonly perCallOnly: boolean;
 }
 
 type InitialGrantResult =
@@ -1114,6 +1140,7 @@ export class BudgetEnforcer {
         checkOptions.estimatedMedia !== null && checkOptions.estimatedMedia !== undefined,
       deadlineMs,
       signal: checkOptions.signal,
+      perCallOnly: checkOptions.perCallOnly === true,
     });
     const cacheKey = this.allowCacheKey(stableOptions);
     let leaseCallId: string | null = null;
@@ -1282,6 +1309,7 @@ export class BudgetEnforcer {
   private leaseEntryEligible(captured: CapturedCheck): boolean {
     const runId = captured.agentRunId;
     if (
+      captured.perCallOnly ||
       this.closed ||
       this.retiringRuns.has(runId ?? "") ||
       !this.leaseLedger.enabled ||
@@ -1331,7 +1359,9 @@ export class BudgetEnforcer {
       estimatedInputTokens: captured.estimatedInputTokens,
       outputBound: captured.estimatedOutputBound,
       model: captured.model,
+      provider: captured.provider,
       fallbackModels: captured.fallbackModels,
+      fallbackProviders: captured.fallbackProviders,
       modality: captured.modality,
       hasEstimatedMedia: captured.hasEstimatedMedia,
       now: this.monotonicNow() / 1000,
@@ -1462,10 +1492,9 @@ export class BudgetEnforcer {
       originGeneration,
       closeEpoch: this.closeEpoch,
       // An applied renewal covers exactly what the request declared, never the caller's chain.
-      declaredModels: Object.freeze([
-        ...(request.model === null || request.model === undefined ? [] : [request.model]),
-        ...fallbackModels,
-      ]),
+      declaredModels: Object.freeze(
+        leaseChainKeys(request.provider, request.model ?? null, fallbackProviders, fallbackModels),
+      ),
       wideningModels,
       wire: Object.freeze(serializeLeaseRenewRequest(request)),
     });
@@ -1820,7 +1849,12 @@ export class BudgetEnforcer {
 
       const outcome = this.leaseLedger.applyGrantResponse(runId, effective, {
         now: responseObservation.runObservedAt / 1000,
-        declaredModels: [captured.model, ...captured.fallbackModels],
+        declaredModels: leaseChainKeys(
+          captured.provider,
+          captured.model,
+          captured.fallbackProviders,
+          captured.fallbackModels,
+        ),
       });
       if (outcome === GrantOutcome.Denied) {
         const authorityOrder: GlobalAuthorityOrder = globalFence.superseded
@@ -2539,10 +2573,15 @@ export class BudgetEnforcer {
     ]);
   }
 
-  /** Global allows are authoritative only for unscoped, untagged checks. */
+  /**
+   * Global allows are authoritative only for unscoped, untagged checks. A per-call-only check
+   * must be fresh and reservation-backed, so it never reads or fills the cache.
+   */
   private allowCacheEligible(options: CheckBudgetOptions): boolean {
     return (
-      options.agentRunId === undefined && (options.tags === null || options.tags === undefined)
+      options.perCallOnly !== true &&
+      options.agentRunId === undefined &&
+      (options.tags === null || options.tags === undefined)
     );
   }
 
@@ -2555,7 +2594,11 @@ export class BudgetEnforcer {
     if (entry === undefined) {
       return null;
     }
-    if (!entry.response.allowed || this.now() >= entry.expiresAt) {
+    if (
+      !entry.response.allowed ||
+      entry.response.mode === "hard_deny" ||
+      this.now() >= entry.expiresAt
+    ) {
       this.allowCache.delete(cacheKey);
       return null;
     }
@@ -2570,7 +2613,8 @@ export class BudgetEnforcer {
     response: BudgetCheckResponse,
     options: CheckBudgetOptions,
   ): void {
-    if (!this.allowCacheEligible(options)) {
+    // A cached allow carries no reservation, so it cannot fund a hard_deny admission.
+    if (!this.allowCacheEligible(options) || response.mode === "hard_deny") {
       return;
     }
     this.allowCache.delete(cacheKey);

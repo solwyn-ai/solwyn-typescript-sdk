@@ -881,10 +881,16 @@ describe("OpenAI Agents hierarchy and enforcement", () => {
         expect(transport.requests).toHaveLength(2);
         expect(state.plane.checks).toHaveLength(tagged ? 2 : 0);
         expect(state.plane.leaseGrants).toHaveLength(tagged ? 0 : 1);
-        expect(state.plane.confirms).toHaveLength(1);
+        // hard_deny: the possibly billed 500 is recorded at its floor under its own call id; the
+        // retried call confirms its measured usage under its own.
+        expect(state.plane.confirms).toHaveLength(2);
         expect(state.plane.ingested.map((event) => event.status)).toEqual(["error", "success"]);
-        expect(state.plane.confirms[0]?.call_id).toBe(state.plane.ingested[1]?.call_id);
-        expect(state.plane.confirms[0]?.call_id).not.toBe(state.plane.ingested[0]?.call_id);
+        const floor = state.plane.confirms.find((confirm) => confirm.token_details.is_estimated);
+        const served = state.plane.confirms.find((confirm) => !confirm.token_details.is_estimated);
+        expect(floor?.call_id).toBe(state.plane.ingested[0]?.call_id);
+        expect(Boolean(floor?.lease_id)).toBe(!tagged);
+        expect(served?.call_id).toBe(state.plane.ingested[1]?.call_id);
+        expect(served?.call_id).not.toBe(state.plane.ingested[0]?.call_id);
         expect(new Set(state.plane.ingested.map((event) => event.agent_run_id)).size).toBe(1);
       }
   });

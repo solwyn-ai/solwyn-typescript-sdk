@@ -45,10 +45,17 @@ the error, including partial usage, and report an `error` event with those token
 usage confirmation is sent. Lease-funded streams, the default for untagged run-scoped text
 calls, still report zero usage on mid-stream provider errors, release the local claim, and send
 no confirmation. Deferred `responses.stream` helpers report a zero-token error event with no
-confirmation.
+confirmation. That settlement is for alert-only projects. On a hard_deny project a mid-stream
+error never refunds: the stream is recorded at its reserved amount, marked as estimated, whether
+it was funded by a per-call check or a run lease (see
+[budget checks, settlement, and run leases](budgets-and-leases.md)).
 
 `failoverIdempotency: "never"` prevents cross-provider hops, `"safe"` permits only failures
 known to be eligible for failover, and `"always"` also permits ambiguous failures after send.
+A response whose body fails to decode (a truncated or unparseable JSON body, or a corrupt gzip
+body) is an ambiguous failure after send, unless its HTTP status already decides the outcome.
+`"safe"` does not fail over on it; under `"always"` the next hop is tried, and on a hard_deny
+project that hop gets its own budget check.
 The per-call request field `solwynIdempotent: false` tightens `"always"` to `"safe"` and keeps
 `"never"` unchanged; `true` preserves the configured policy. Solwyn strips this field before
 every intercepted provider dispatch, including media and Bedrock command input. It never

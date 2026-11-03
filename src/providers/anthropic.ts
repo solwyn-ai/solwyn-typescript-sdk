@@ -321,6 +321,7 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
   #invalidDetails = false;
   #sawMessageStart = false;
   #sawMessageDelta = false;
+  #sawStop = false;
   #inputMeasured = false;
   #outputMeasured = false;
   readonly #logger: Logger;
@@ -371,8 +372,11 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
       }
       return;
     }
+    if (type === "message_stop") this.#sawStop = true;
     if (type === "message_delta") {
       this.#sawMessageDelta = true;
+      const stopReason = getProp(getProp(chunk, "delta"), "stop_reason");
+      if (typeof stopReason === "string") this.#sawStop = true;
       const usage = getProp(chunk, "usage");
       if (usage !== undefined && usage !== null) {
         this.#invalidDetails ||= invalidAnthropicDetails(usage);
@@ -458,5 +462,9 @@ export class AnthropicStreamAccumulator implements StreamUsageAccumulator {
 
   getServiceTier(): string | null {
     return anthropicServiceTier(this.#serviceTier);
+  }
+
+  sawCompletion(): boolean {
+    return this.#sawStop;
   }
 }

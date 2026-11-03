@@ -204,9 +204,21 @@ function warnServiceTierTruncated(logger: Logger): void {
  * CONCURRENCY: one instance must never be shared across two concurrent stream reads
  * (a single async consumer of one stream's chunks is the only supported driver).
  */
+/**
+ * The usage-only final chat chunk (`choices: []` with usage), which ends the whole stream.
+ * One choice's finish reason does not: with `n > 1` the other choices may still be generating.
+ */
+export function isChatCompletionChunk(chunk: unknown): boolean {
+  const choices = getProp(chunk, "choices");
+  if (!Array.isArray(choices) || choices.length !== 0) return false;
+  const usage = getProp(chunk, "usage");
+  return usage !== undefined && usage !== null;
+}
+
 export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
   /** `usage` of the last usage-bearing chunk; `null` until one is observed. */
   #usage: unknown = null;
+  #sawCompletion = false;
   /** Bounded `service_tier` read off that same chunk. */
   #serviceTier: BoundedServiceTier = NO_SERVICE_TIER;
   readonly #logger: Logger;
@@ -216,6 +228,7 @@ export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
   }
 
   observe(chunk: unknown): void {
+    this.#sawCompletion ||= isChatCompletionChunk(chunk);
     // Presence (not truthiness) of a non-null usage block selects the chunk, so an
     // all-zero usage still wins.
     const usage = getProp(chunk, "usage");
@@ -230,6 +243,10 @@ export class OpenAIStreamAccumulator implements StreamUsageAccumulator {
 
   getServiceTier(): string | null {
     return settledServiceTier(this.#serviceTier, this.#logger);
+  }
+
+  sawCompletion(): boolean {
+    return this.#sawCompletion;
   }
 }
 

@@ -40,10 +40,18 @@ import {
   type ChunkTranslator,
   createChunkTranslationCursor,
 } from "./providers/translation/stream-cursor";
-import type { TokenDetails } from "./token-details";
+import { isUsageUnmeasured, type TokenDetails } from "./token-details";
 
 /** Fired once on successful settlement with final usage and elapsed wall-time (ms). */
-export type OnComplete = (tokenDetails: TokenDetails, elapsedMs: number) => void | Promise<void>;
+/**
+ * Fired once when the stream ends without an error. `naturallyFinished` is true only when the
+ * provider stream ran to its end; a consumer close, a stop, or an abort reports false.
+ */
+export type OnComplete = (
+  tokenDetails: TokenDetails,
+  elapsedMs: number,
+  naturallyFinished?: boolean,
+) => void | Promise<void>;
 
 /** Fired once when the inner stream raises; receives the original error. */
 export type OnError = (error: unknown) => void | Promise<void>;
@@ -645,7 +653,7 @@ export function observeResponseStream(
   const cleanupSubscriptions = (): void => {
     for (const record of [...subscriptions]) removeSubscription(record);
   };
-  const finish = (failed: boolean, error?: unknown): void => {
+  const finish = (failed: boolean, error?: unknown, naturallyFinished = true): void => {
     if (settled) return;
     settled = true;
     let outcome: void | Promise<void>;
@@ -653,7 +661,7 @@ export function observeResponseStream(
       if (failed) outcome = (connected ? onError : entryError)?.(error);
       else {
         const details = accumulator.finalize();
-        outcome = onComplete?.(details, performance.now() - startTime);
+        outcome = onComplete?.(details, performance.now() - startTime, naturallyFinished);
       }
     } catch (error) {
       outcome = undefined;
@@ -707,7 +715,7 @@ export function observeResponseStream(
           }
         }
         cleanupSubscriptions();
-        finish(false);
+        finish(false, undefined, false);
         provider.abort();
         return;
       }
@@ -719,7 +727,7 @@ export function observeResponseStream(
   listen("error", (error) => finish(true, error));
   listen("abort", (error) => {
     // Before connect this is a rejected request entry, not abandoned generated output.
-    if (connected) finish(false);
+    if (connected) finish(false, undefined, false);
     else finish(true, markCallerAbort(error, provider.controller.signal));
   });
   listen("response.completed", () => finish(false));
@@ -1226,8 +1234,20 @@ export class StreamWrapper implements AsyncIterableIterator<unknown> {
         await this.#notifyError(error);
         throw error;
       }
+      // A native stream also ends quietly when its request was aborted; that is a cancel. The
+      // accumulator records the provider's finish or stop signal when it arrives, before body
+      // cleanup, so an abort after that (during cleanup past [DONE]) did not cut the call short.
+      // An accumulator without that signal falls back to whether usage was measured.
+      const controller = isObject(this.#stream) ? this.#stream["controller"] : undefined;
+      const signal = isObject(controller) ? controller["signal"] : undefined;
+      const completed = this.#accumulator.sawCompletion?.() ?? !isUsageUnmeasured(tokenDetails);
+      const aborted = isObject(signal) && signal["aborted"] === true && !completed;
       try {
-        await this.#onComplete?.(tokenDetails, elapsedMs);
+        await this.#onComplete?.(
+          tokenDetails,
+          elapsedMs,
+          this.#iteratorNaturallyFinished && !aborted,
+        );
       } catch (callbackError) {
         // WARNING, not ERROR: a user callback throwing is not an SDK-level error — Python's
         // `stream.py` logs the suppressed callback exception at `logger.warning` (behavior of

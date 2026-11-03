@@ -52,7 +52,13 @@ describe("post-remediation native converted HALF_OPEN accounting", () => {
       "error",
       "provider translation error",
     ] as const)(`${mode} retains actual cross-dialect admission ownership on %s`, async (outcome) => {
-      const plane = new FakeControlPlane({ grantedTokens: 2048, finalGrant: true });
+      // Alert-only: on hard_deny an unfinished stream keeps its claim at the floor
+      // (tests/unit/hard-deny-funding.test.ts); this pins breaker ownership and observed usage.
+      const plane = new FakeControlPlane({
+        mode: "alert_only",
+        grantedTokens: 2048,
+        finalGrant: true,
+      });
       const failures = vi.spyOn(CircuitBreaker.prototype, "recordFailure");
       const successes = vi.spyOn(CircuitBreaker.prototype, "recordSuccess");
       let fallbackCalls = 0;
@@ -261,6 +267,8 @@ describe("PR-A1: measured paid stream translation failure", () => {
               throw new Error();
             });
           let reservationFloor = 0;
+          let estimatedInput = 0;
+          let outputBound = 0;
           const check = vi.spyOn(BudgetEnforcer.prototype, "checkBudget");
           try {
             await run("paid-stream-normalization", async () => {
@@ -271,8 +279,9 @@ describe("PR-A1: measured paid stream translation failure", () => {
                 stream: true,
               })) as unknown as StreamWrapper;
               const admission = check.mock.calls[0]?.[0];
-              reservationFloor =
-                (admission?.estimatedInputTokens ?? 0) + (admission?.estimatedOutputBound ?? 0);
+              estimatedInput = admission?.estimatedInputTokens ?? 0;
+              outputBound = admission?.estimatedOutputBound ?? 0;
+              reservationFloor = estimatedInput + outputBound;
               if (malformed)
                 await expect(consume(stream, mode, marker)).rejects.toBeInstanceOf(
                   UntranslatableRequestError,
@@ -288,17 +297,43 @@ describe("PR-A1: measured paid stream translation failure", () => {
           }
           expect(sourceCalls).toBe(1);
           expect(targetCalls).toBe(1);
-          const confirmed = reporting === "delivered" || reporting === "rejected";
-          expect(attemptedConfirms).toHaveLength(confirmed ? 1 : 0);
-          expect(plane.confirms).toHaveLength(reporting === "delivered" ? 1 : 0);
+          // Failover re-admission also settles the superseded primary reservation at zero usage.
+          const closeOuts = attemptedConfirms.filter((confirm) => confirm.provider === "openai");
+          expect(closeOuts).toHaveLength(!lease && reporting !== "construction failure" ? 1 : 0);
+          for (const closeOut of closeOuts)
+            expect(closeOut.token_details).toMatchObject({ input_tokens: 0, output_tokens: 0 });
+          const servedConfirms = attemptedConfirms.filter(
+            (confirm) => confirm.provider === "google",
+          );
+          const servedPlaneConfirms = plane.confirms.filter(
+            (confirm) => confirm.provider === "google",
+          );
+          // hard_deny: a translation failure after establishment may have billed more than was
+          // measured, so its funding (per-call or lease) is recorded at its floor in its own
+          // confirm, marked estimated: max(estimated input, 30) plus max(max_tokens bound, 20). The
+          // floor confirm is not paired with the event, so only its own construction can fail.
+          const floor = malformed;
+          const confirmed = floor
+            ? reporting !== "construction failure"
+            : reporting === "delivered" || reporting === "rejected";
+          expect(servedConfirms).toHaveLength(confirmed ? 1 : 0);
+          expect(servedPlaneConfirms).toHaveLength(
+            reporting === "delivered" || (floor && reporting === "enqueue failure") ? 1 : 0,
+          );
           if (confirmed) {
-            expect(attemptedConfirms[0]).toMatchObject({
+            expect(servedConfirms[0]).toMatchObject({
               provider: "google",
-              token_details: { input_tokens: 30, output_tokens: 20 },
+              token_details: floor
+                ? {
+                    input_tokens: Math.max(estimatedInput, 30),
+                    output_tokens: Math.max(outputBound, 20),
+                    is_estimated: true,
+                  }
+                : { input_tokens: 30, output_tokens: 20 },
               is_provider_fallback: true,
             });
-            expect(Boolean(attemptedConfirms[0]?.lease_id)).toBe(lease);
-            expect(Boolean(attemptedConfirms[0]?.reservation_id)).toBe(!lease);
+            expect(Boolean(servedConfirms[0]?.lease_id)).toBe(lease);
+            expect(Boolean(servedConfirms[0]?.reservation_id)).toBe(!lease);
           }
           const paid = plane.ingested.filter((event) => event.provider === "google");
           expect(attemptedEvents.filter((event) => event.provider === "google")).toHaveLength(1);
@@ -314,11 +349,11 @@ describe("PR-A1: measured paid stream translation failure", () => {
           expect(paid[0]?.failover_error_class ?? null).toBe(
             malformed ? "UntranslatableRequestError" : null,
           );
-          if (confirmed) expect(paid[0]?.call_id).toBe(attemptedConfirms[0]?.call_id);
+          if (confirmed) expect(paid[0]?.call_id).toBe(servedConfirms[0]?.call_id);
           expect(plane.leaseSurrenders).toHaveLength(lease ? 1 : 0);
           if (lease)
             expect(plane.leaseSurrenders[0]?.spent_tokens).toBe(
-              reporting === "construction failure" ? reservationFloor : 50,
+              reporting === "construction failure" || malformed ? reservationFloor : 50,
             );
           expect(
             JSON.stringify([attemptedConfirms, attemptedEvents, plane.leaseSurrenders]).includes(
@@ -337,7 +372,13 @@ describe("PR-A1: native translated error authority", () => {
       "translation",
       "stop",
     ] as const)(`keeps HALF_OPEN ${mode} accounting and stop precedence for %s`, async (outcome) => {
-      const plane = new FakeControlPlane({ grantedTokens: 512, finalGrant: true });
+      // Alert-only: on hard_deny an unfinished stream keeps its claim at the floor
+      // (tests/unit/hard-deny-funding.test.ts); this pins breaker ownership and stop precedence.
+      const plane = new FakeControlPlane({
+        mode: "alert_only",
+        grantedTokens: 512,
+        finalGrant: true,
+      });
       const failures = vi.spyOn(CircuitBreaker.prototype, "recordFailure");
       const successes = vi.spyOn(CircuitBreaker.prototype, "recordSuccess");
       const releases = vi.spyOn(CircuitBreaker.prototype, "releaseProbe");

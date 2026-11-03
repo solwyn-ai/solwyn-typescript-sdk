@@ -621,6 +621,27 @@ export class MetadataReporter {
     }
   }
 
+  /**
+   * Run the next round on the next timer turn instead of after the flush interval. Used after a
+   * zero-usage release so the held estimate leaves the budget before the next check, when it can.
+   */
+  flushSoon(): void {
+    const target = this.tickTarget;
+    if (this.shuttingDown || target === null || this.activeRound !== null) return;
+    if (this.continuationPending) return;
+    if (this.tickTimer !== null) clearTimeout(this.tickTimer);
+    // Like start(): the re-arming tick chain must not inherit the caller's run or trace scope.
+    runOutsideRun(() =>
+      withoutTraceContext(() => {
+        try {
+          this.tickTimer = armFlushTick(target, 0);
+        } catch (error) {
+          this._warnFlushScheduleFailure(error);
+        }
+      }),
+    );
+  }
+
   /** Fire-and-forget a confirm+event pair; count both halves after close. */
   reportSettlement(request: BudgetConfirmRequest, event: MetadataEvent): void {
     if (this.shuttingDown) {

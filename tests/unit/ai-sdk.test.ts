@@ -974,7 +974,7 @@ describe("ai-sdk middleware — generateText happy path", () => {
       "unsupported_override",
     ],
   ] as const)("refuses %s under hard_deny when the bound cannot hold (%s)", async (providerId, modelId, providerOptions, reason) => {
-    const { fetchMock } = makeFetch(() => allow({ mode: "hard_deny" }));
+    const { fetchMock, captured } = makeFetch(() => allow({ mode: "hard_deny" }));
     const solwyn = createSolwynMiddleware({
       apiKey: API_KEY,
       fetch: fetchMock,
@@ -1002,6 +1002,10 @@ describe("ai-sdk middleware — generateText happy path", () => {
     expect(error).toBeInstanceOf(OutputBoundUnenforceableError);
     expect((error as OutputBoundUnenforceableError).reason).toBe(reason);
     expect(doGenerate).not.toHaveBeenCalled();
+    // Nothing was sent, so the check's reservation is settled at zero and leaves no hold.
+    expect(captured.confirms).toMatchObject([
+      { reservation_id: "res-1", token_details: { output_tokens: 0 } },
+    ]);
   });
 
   it.each([

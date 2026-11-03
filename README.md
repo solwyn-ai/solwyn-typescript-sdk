@@ -14,7 +14,7 @@ explicitly supply. Prompt and response content is not sent to Solwyn or logged b
 [Providers](#providers) · [Vercel AI SDK](#vercel-ai-sdk) · [Framework integrations](#framework-integrations) ·
 [Configuration](#configuration) · [Data transparency](#data-transparency)
 
-> **Public preview (`0.3.0`).** Install from npm's default `latest` tag. APIs may change before
+> **Public preview (`0.3.1`).** Install from npm's default `latest` tag. APIs may change before
 > 1.0; breaking changes are announced in the [changelog](CHANGELOG.md) and release notes before
 > users upgrade.
 
@@ -492,6 +492,14 @@ Three current posture details are deliberate:
   or cost event is emitted.
 - `audio.translations` is not intercepted yet. It passes through untracked with a one-time
   warning.
+- OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
+  without an acknowledgment, `onUnmetered: "raise"` refuses it first with
+  `UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn
+  the project's mode and settles that check's reservation at zero, so it leaves no hold. If that
+  check denies, the call fails with the usual budget denial (`BudgetExceededError`). On a hard_deny
+  project it then fails before it is sent with `OutputBoundUnenforceableError`
+  (`reason: "no_output_cap"`). On an alert-only project it goes through as an untracked surface,
+  and its spend is not counted.
 
 ## Strict coverage controls
 
@@ -538,6 +546,11 @@ Circuit breakers, latency signals, and failover labeling key off the provider **
 - `HealthBasedPolicy` — health-tier ordering (default).
 - `LatencyPolicy` — prefers lower observed p50 latency.
 - `CostPolicy` — prefers cheaper providers using server-supplied price hints.
+
+**Budgets across failover.** On a hard_deny project, a hop that serves a different provider or
+model gets its own fresh budget check, priced at that hop, before it is called. If it does not fit,
+the call fails with the same `BudgetExceededError` a primary denial raises. See
+[budget checks, settlement, and run leases](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/budgets-and-leases.md).
 
 **Cross-dialect translation.** A failover hop between two clients of the **same** dialect (e.g. Groq → OpenRouter) is a native passthrough. A hop **across** dialects (e.g. OpenAI → Anthropic) runs a minimal canonical translation subset and **fails loud** rather than silently mangling a request: an untranslatable request raises `UntranslatableRequestError`, and a missing target model mapping raises `UntranslatableModelError`. These errors abort the whole chain — they are never swallowed into a retry.
 

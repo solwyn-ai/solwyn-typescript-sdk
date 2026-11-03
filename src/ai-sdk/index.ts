@@ -30,7 +30,12 @@
  */
 
 import type { LanguageModelMiddleware } from "ai";
-import { BudgetEnforcer, type BuildConfirmRequestOptions, budgetCheckResult } from "../budget";
+import {
+  BudgetEnforcer,
+  type BuildConfirmRequestOptions,
+  budgetCheckResult,
+  floorTokenDetails,
+} from "../budget";
 import { CircuitBreaker } from "../circuit-breaker";
 import { resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
@@ -53,6 +58,7 @@ import {
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
 import { ORDINARY_TOKEN_COUNT_MAX } from "../receipt-fold";
 import { MetadataReporter } from "../reporter";
+import { attemptMaybeBilled } from "../routing";
 import { type CurrentRun, getCurrentRun } from "../run-context";
 import {
   acquireTerminationHandle,
@@ -60,7 +66,12 @@ import {
   runTermination,
   type TerminationHandle,
 } from "../run-control";
-import { buildTokenDetails, isUsageCount, type TokenDetails } from "../token-details";
+import {
+  buildTokenDetails,
+  isUsageCount,
+  type TokenDetails,
+  zeroTokenDetails,
+} from "../token-details";
 import { applyTraceFields, captureTrace, type TraceSnapshot } from "../trace-context";
 import type { FetchLike } from "../transport";
 import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
@@ -687,6 +698,8 @@ interface CallContext {
   /** OpenTelemetry identifiers captured once at call start; never re-read during a stream. */
   trace: TraceSnapshot | undefined;
   estimatedInputTokens: number;
+  /** The reserved output bound: a hard_deny floor confirm settles at input plus this. */
+  estimatedOutputBound: number;
   abortSignal: AbortSignal | undefined;
   /** Immutable process-local settlement/release authority captured from preflight. */
   funding: Readonly<{
@@ -694,6 +707,8 @@ interface CallContext {
     leaseId: string | null;
     leaseClaimToken: number | null;
   }>;
+  /** Admitted under hard_deny: possibly billed funding is never refunded. */
+  hardDenyAdmitted: boolean;
 }
 
 type StreamSettlementContext = Omit<CallContext, "run" | "abortSignal"> & {
@@ -708,12 +723,15 @@ interface StreamSettlementOwner {
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
+    usageKnown?: boolean,
   ): void;
   reportErrorAndRelease(
     ctx: StreamSettlementContext,
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    maybeBilled?: boolean,
+    observed?: TokenDetails | null,
   ): void;
 }
 
@@ -722,29 +740,41 @@ function extractStreamUsage(
   outputChars: number,
   part: unknown,
   logger: Logger,
-): ReturnType<typeof extractUsageFailSoft> {
+): ReturnType<typeof extractUsageFailSoft> & { readonly reported: TokenDetails | null } {
   let providerUsageAbsent = true;
+  let reported: TokenDetails | null = null;
   const usageContext = {
     provider: ctx.provider,
     estimatedInputTokens: ctx.estimatedInputTokens,
     outputChars,
   };
-  return extractUsageFailSoft({
+  const usage = extractUsageFailSoft({
     extract: () => {
-      const details = reportedUsageToTokenDetails(getProp(part, "usage"), usageContext);
+      const reportedUsage = getProp(part, "usage");
+      const details = reportedUsageToTokenDetails(reportedUsage, usageContext);
       providerUsageAbsent = details === null;
+      // Only counts the provider reported are observed usage; an unreported dimension is 0.
+      const count = (field: string): number => {
+        const total = readUsageTotal(getProp(reportedUsage, field));
+        return isUsageCount(total) ? total : 0;
+      };
+      reported = buildTokenDetails({
+        input_tokens: count("inputTokens"),
+        output_tokens: count("outputTokens"),
+      });
       return details;
     },
     estimate: () => (providerUsageAbsent ? estimateUsageFromLength(usageContext) : null),
     estimatedInputTokens: ctx.estimatedInputTokens,
     logger,
   });
+  return { ...usage, reported };
 }
 
 /** Held by the finalizer: counts and attribution only, never a stream, source or run lifetime. */
 class MiddlewareStreamSettlement {
   settled = false;
-  #finishUsage: ReturnType<typeof extractUsageFailSoft> | undefined;
+  #finishUsage: ReturnType<typeof extractStreamUsage> | undefined;
   #sawErrorPart = false;
   #outputChars = 0;
 
@@ -785,14 +815,31 @@ class MiddlewareStreamSettlement {
       outcome === "error" ||
       (outcome === "success" && this.#sawErrorPart && this.#finishUsage === undefined)
     ) {
-      this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
+      // Usage the stream already reported raises the floor; the event stays as it was.
+      this.owner.reportErrorAndRelease(
+        this.ctx,
+        null,
+        latencyMs,
+        true,
+        true,
+        this.#finishUsage?.reported ?? null,
+      );
       return;
     }
     try {
       const usage =
         this.#finishUsage ??
         extractStreamUsage(this.ctx, this.#outputChars, undefined, this.owner.logger);
-      this.owner.settleSuccess(this.ctx, usage.tokenDetails, latencyMs, usage.usageUnmeasured);
+      // A stream that reached its finish part settles its usage, estimated or not; a close,
+      // cancel or collection before it may have billed more than the stream observed.
+      const usageKnown = this.#finishUsage !== undefined;
+      this.owner.settleSuccess(
+        this.ctx,
+        usage.tokenDetails,
+        latencyMs,
+        usage.usageUnmeasured,
+        usageKnown,
+      );
     } catch (error) {
       this.owner.reportErrorAndRelease(this.ctx, null, latencyMs, true);
       throw error;
@@ -1021,6 +1068,23 @@ export function createSolwynMiddleware(
             // Local capability cleanup is best effort; the refusal is authoritative.
           }
         }
+        // Nothing is sent, so the check's per-call hold is settled at zero under a fresh id.
+        if (decision.reservationId) {
+          try {
+            reporter.reportConfirm(
+              budget.buildConfirmRequest({
+                reservationId: decision.reservationId,
+                model: modelId,
+                provider,
+                tokenDetails: zeroTokenDetails(),
+                callId: crypto.randomUUID(),
+              }),
+            );
+            reporter.flushSoon();
+          } catch {
+            // The held estimate self-heals at its TTL.
+          }
+        }
         throw new OutputBoundUnenforceableError({ provider, reason });
       };
       if (reasoningOutsideCap(provider, modelId) || aiSdkReasoningRaisesCap(params, provider)) {
@@ -1044,14 +1108,65 @@ export function createSolwynMiddleware(
       run,
       trace,
       estimatedInputTokens,
+      estimatedOutputBound: Math.min(estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
       abortSignal: params.abortSignal,
       funding: Object.freeze({
         reservationId: decision.reservationId,
         leaseId: decision.leaseId,
         leaseClaimToken: decision.leaseClaimToken,
       }),
+      hardDenyAdmitted: decision.hardDenyAdmitted,
     };
   };
+
+  /**
+   * End a call's funding once its outcome is reported (the client's rule). Possibly billed
+   * hard_deny funding with unknown usage is never refunded: the local lease claim settles at its
+   * reservation, and an `is_estimated` confirm records the floor durably for a lease claim or a
+   * per-call reservation. Anything else is released.
+   */
+  const endFunding = (
+    ctx: StreamSettlementContext,
+    keep: boolean,
+    observed: TokenDetails | null = null,
+  ): void => {
+    if (!keep) {
+      releaseFunding(ctx);
+      return;
+    }
+    try {
+      budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+      if (!hasSettlementFunding(ctx.funding)) return;
+      reporter.reportConfirm(
+        budget.buildConfirmRequest({
+          reservationId: ctx.funding.reservationId,
+          leaseId: ctx.funding.leaseId,
+          leaseClaimToken: ctx.funding.leaseClaimToken,
+          model: ctx.model,
+          provider: ctx.provider,
+          isProviderFallback: false,
+          callId: ctx.callId,
+          providerRegion: null,
+          serviceTier: null,
+          tokenDetails: floorTokenDetails(
+            observed,
+            ctx.estimatedInputTokens,
+            ctx.estimatedOutputBound,
+          ),
+        }),
+      );
+    } catch {
+      // Local capability cleanup is best effort; the provider/bookkeeping value wins.
+    }
+  };
+
+  /** A floor-funded lease event is queued apart from its confirm, so it carries the lease id. */
+  const withLease = (
+    ctx: StreamSettlementContext,
+    floored: boolean,
+    event: MetadataEvent,
+  ): MetadataEvent =>
+    floored && ctx.funding.leaseId !== null ? { ...event, lease_id: ctx.funding.leaseId } : event;
 
   /** Consume one escaping/non-lease claim boundary without masking its primary outcome. */
   const releaseFunding = (ctx: StreamSettlementContext): void => {
@@ -1187,7 +1302,9 @@ export function createSolwynMiddleware(
     tokenDetails: TokenDetails,
     latencyMs: number,
     usageUnmeasured: boolean,
+    usageKnown = true,
   ): void => {
+    const unknownUsage = ctx.hardDenyAdmitted && !usageKnown;
     const event = buildEvent({
       status: "success",
       provider: ctx.provider,
@@ -1202,7 +1319,7 @@ export function createSolwynMiddleware(
       failoverErrorClass: null,
       possiblySucceeded: null,
     });
-    if (hasSettlementFunding(ctx.funding)) {
+    if (hasSettlementFunding(ctx.funding) && !unknownUsage) {
       settlePaidSuccess(event, {
         reservationId: ctx.funding.reservationId,
         leaseId: ctx.funding.leaseId,
@@ -1217,10 +1334,11 @@ export function createSolwynMiddleware(
         floorAtReservation: usageUnmeasured,
       });
     } else {
-      reporter.report(event);
+      reporter.report(withLease(ctx, unknownUsage, event));
     }
-    if (ctx.funding.leaseId === null) {
-      releaseFunding(ctx);
+    if (ctx.funding.leaseId === null || unknownUsage) {
+      // Unknown usage here never reached a finish part, so nothing was reported to raise it.
+      endFunding(ctx, unknownUsage);
     }
   };
 
@@ -1238,22 +1356,27 @@ export function createSolwynMiddleware(
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    floored = false,
   ): void => {
     reporter.report(
-      buildEvent({
-        status: "error",
-        provider: ctx.provider,
-        model: ctx.model,
-        callId: ctx.callId,
-        run: ctx.run,
-        trace: ctx.trace,
-        inputTokens: 0,
-        outputTokens: 0,
-        tokenDetails: null,
-        latencyMs,
-        failoverErrorClass,
-        possiblySucceeded,
-      }),
+      withLease(
+        ctx,
+        floored,
+        buildEvent({
+          status: "error",
+          provider: ctx.provider,
+          model: ctx.model,
+          callId: ctx.callId,
+          run: ctx.run,
+          trace: ctx.trace,
+          inputTokens: 0,
+          outputTokens: 0,
+          tokenDetails: null,
+          latencyMs,
+          failoverErrorClass,
+          possiblySucceeded,
+        }),
+      ),
     );
   };
 
@@ -1263,13 +1386,16 @@ export function createSolwynMiddleware(
     failoverErrorClass: string | null,
     latencyMs: number,
     possiblySucceeded: boolean | null,
+    maybeBilled = possiblySucceeded === true,
+    observed: TokenDetails | null = null,
   ): void => {
+    const floored = ctx.hardDenyAdmitted && maybeBilled;
     try {
-      reportError(ctx, failoverErrorClass, latencyMs, possiblySucceeded);
+      reportError(ctx, failoverErrorClass, latencyMs, possiblySucceeded, floored);
     } catch {
       // Telemetry construction/enqueue must not mask the provider/bookkeeping failure.
     } finally {
-      releaseFunding(ctx);
+      endFunding(ctx, floored, observed);
     }
   };
 
@@ -1316,7 +1442,13 @@ export function createSolwynMiddleware(
         settleBufferedSuccess(ctx, usage.tokenDetails, latencyMs, usage.usageUnmeasured);
         return result;
       } catch (error) {
-        reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        reportErrorAndRelease(
+          ctx,
+          safeErrorClassName(error),
+          performance.now() - started,
+          null,
+          attemptMaybeBilled(error),
+        );
         throw error;
       }
     },
@@ -1340,7 +1472,13 @@ export function createSolwynMiddleware(
         // failure (#buildErrorEvent); it is a failover-eligible health signal, unlike a
         // mid-stream drop. Report one error event and propagate.
         terminationHandle?.release();
-        reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+        reportErrorAndRelease(
+          ctx,
+          safeErrorClassName(error),
+          performance.now() - started,
+          null,
+          attemptMaybeBilled(error),
+        );
         throw error;
       }
 
@@ -1353,7 +1491,9 @@ export function createSolwynMiddleware(
           model: ctx.model,
           callId: ctx.callId,
           estimatedInputTokens: ctx.estimatedInputTokens,
+          estimatedOutputBound: ctx.estimatedOutputBound,
           funding: ctx.funding,
+          hardDenyAdmitted: ctx.hardDenyAdmitted,
           trace: ctx.trace,
           run:
             ctx.run === undefined
@@ -1411,7 +1551,14 @@ export function createSolwynMiddleware(
           // Non-success setup cleanup is best effort; preserve the original failure.
         }
         if (released) {
-          reportErrorAndRelease(ctx, safeErrorClassName(error), performance.now() - started, null);
+          // The provider stream was already established, so it may have billed output.
+          reportErrorAndRelease(
+            ctx,
+            safeErrorClassName(error),
+            performance.now() - started,
+            null,
+            true,
+          );
         }
         throw error;
       }

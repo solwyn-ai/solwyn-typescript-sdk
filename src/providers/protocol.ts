@@ -266,6 +266,8 @@ export interface StreamUsageAccumulator {
   finalize(options?: { estimateMissingUsage?: boolean }): TokenDetails;
   /** Service tier settled from observed chunks, or `null`. */
   getServiceTier(): string | null;
+  /** Whether a chunk signalled the provider finished generating (a finish or stop reason). */
+  sawCompletion?(): boolean;
 }
 
 /**

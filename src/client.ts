@@ -43,6 +43,7 @@ import {
   BudgetEnforcer,
   type BuildConfirmRequestOptions,
   budgetCheckResult,
+  floorTokenDetails,
 } from "./budget";
 import {
   CircuitBreaker,
@@ -100,6 +101,7 @@ import {
   type Dialect,
   type DispatchSurface,
   type MediaSurfaceSpec,
+  type PreparedDispatch,
 } from "./providers/protocol";
 // Namespace import (NOT destructured) so the native-happy-path zero-translation guarantee stays
 // spy-able: `translation.md` pins `TestZeroTranslationOnNativePath` (a `vi.spyOn` on the module's
@@ -126,6 +128,7 @@ import {
 } from "./request-options";
 import {
   ambiguousFailoverAllowed,
+  attemptMaybeBilled,
   buildCandidate,
   CostPolicy,
   classifyException,
@@ -136,6 +139,7 @@ import {
   type IdempotencyMode,
   isNeutralStreamError,
   LatencyTracker,
+  markUndispatched,
   type ProviderCandidate,
   providerNameOf,
   type RoutingRequest,
@@ -394,6 +398,9 @@ function withoutSolwynTags(layer: Record<string, unknown>): Record<string, unkno
 }
 
 /** Clamp a reported token quantity without changing enforcement or settlement math. */
+/** Untracked provider surfaces that take no output cap; hard_deny refuses them. */
+const NO_OUTPUT_CAP_SURFACES: ReadonlySet<string> = new Set(["decisions.create"]);
+
 /** Azure keeps each layer's cap key; the merged request keeps the highest layer's. */
 function azureCapAliases(
   provider: string,
@@ -1705,7 +1712,73 @@ export class SolwynCore {
       decision.kind === "unmetered_spend" &&
       decision.capabilityScope === "raw_response" &&
       this.#config.acknowledge_untracked.includes(decision.acknowledgmentToken);
+    if (NO_OUTPUT_CAP_SURFACES.has(surface) && typeof rawValue === "function") {
+      const method = rawValue as (...args: unknown[]) => unknown;
+      return (...args: unknown[]) => this.#noOutputCapCall(surface, target, method, args);
+    }
     return exactRawResponse ? value : guardEvaluatedValue(rawValue);
+  }
+
+  /**
+   * An untracked surface with no output-cap parameter cannot be held to a hard budget. A budget
+   * check learns the project's mode: under hard_deny the call is refused with `no_output_cap`, and
+   * otherwise it dispatches untracked as before. The check is per-call only, and its reservation is
+   * settled at zero usage either way, so it leaves no hold behind.
+   */
+  async #noOutputCapCall(
+    surface: string,
+    target: object,
+    method: (...args: unknown[]) => unknown,
+    args: unknown[],
+  ): Promise<unknown> {
+    const { primary } = await this.#ensureInit();
+    const provider = primary.adapter.name as ProviderName;
+    const params = args[0];
+    const requested = isRecord(params) ? Reflect.get(params, "model") : undefined;
+    const model = typeof requested === "string" ? requested : primary.entry.model;
+    const run = captureCallAttribution(
+      undefined,
+      this.#config.tags,
+      this.#tagLogger,
+      this.#budget,
+      this.#config.trace_correlation,
+    );
+    const result = budgetCheckResult(
+      await this.#budget.checkBudget({
+        runLifetime: run?.lifetime,
+        agentRunId: run?.agentRunId,
+        tags: run.tags,
+        callId: crypto.randomUUID(),
+        estimatedInputTokens: 0,
+        model,
+        provider,
+        timeout: this.#config.budget_check_timeout,
+        perCallOnly: true,
+      }),
+    );
+    if (result.reservationId) {
+      try {
+        this.#reporter.reportConfirm(
+          this.#budget.buildConfirmRequest({
+            reservationId: result.reservationId,
+            model,
+            provider,
+            tokenDetails: zeroTokenDetails(),
+            callId: crypto.randomUUID(),
+          }),
+        );
+        this.#reporter.flushSoon();
+      } catch {
+        this.#safeWarn(`budget.${surface}_release_failed: reservation held until expiry`);
+      }
+    }
+    if (!result.allowed) {
+      throw this.#budget.buildDenialError(result, 0, run?.agentRunId);
+    }
+    if (result.hardDenyAdmitted) {
+      throw new OutputBoundUnenforceableError({ provider, reason: "no_output_cap" });
+    }
+    return Reflect.apply(method, target, args);
   }
 
   /** Resolve one wrapper-owned operation before the interception pipeline starts. */
@@ -2385,30 +2458,36 @@ export class SolwynCore {
         : estimateContentLength(mergedPrimary);
     const estimatedInputTokens =
       charCount > 0 ? estimateTokensFromLength(charCount, primaryProvider) : 0;
-    const estimatedOutputBound = resolveEffectiveOutputBound({
-      sourceProvider: primaryProvider,
-      sourceDialect: primaryDialect,
-      sourceModel: primaryModel,
-      sourceReasoningProvider: reasoningFamily(
-        primaryProvider,
-        primaryModel,
-        primary.pinned === true,
-      ),
-      globalDefaults: requestDefaults.global,
-      callParams: surface === "responses" ? mergedPrimary : callerKwargs,
-      hops: runtimes.map((runtime) => {
-        const model = runtime === primary ? primaryModel : runtime.entry.model;
-        return {
-          provider: runtime.adapter.name,
-          dialect: runtime.adapter.dialect,
-          model,
-          defaultParams: requestDefaults.entries.get(runtime),
-          reasoningProvider: reasoningFamily(runtime.adapter.name, model, runtime.pinned === true),
-        };
-      }),
-      defaultBound: this.#config.lease_output_bound_default,
-      responses: surface === "responses",
-    });
+    const outputBoundFor = (hops: readonly ProviderRuntime[]) =>
+      resolveEffectiveOutputBound({
+        sourceProvider: primaryProvider,
+        sourceDialect: primaryDialect,
+        sourceModel: primaryModel,
+        sourceReasoningProvider: reasoningFamily(
+          primaryProvider,
+          primaryModel,
+          primary.pinned === true,
+        ),
+        globalDefaults: requestDefaults.global,
+        callParams: surface === "responses" ? mergedPrimary : callerKwargs,
+        hops: hops.map((runtime) => {
+          const model = runtime === primary ? primaryModel : runtime.entry.model;
+          return {
+            provider: runtime.adapter.name,
+            dialect: runtime.adapter.dialect,
+            model,
+            defaultParams: requestDefaults.entries.get(runtime),
+            reasoningProvider: reasoningFamily(
+              runtime.adapter.name,
+              model,
+              runtime.pinned === true,
+            ),
+          };
+        }),
+        defaultBound: this.#config.lease_output_bound_default,
+        responses: surface === "responses",
+      });
+    const estimatedOutputBound = outputBoundFor(runtimes);
     const admission: AdmissionContext = {
       callId,
       run,
@@ -2470,6 +2549,14 @@ export class SolwynCore {
         leaseId: budget.allowed ? budget.leaseId : null,
         leaseClaimToken: budget.allowed ? budget.leaseClaimToken : null,
       }),
+      // A per-call hard_deny check priced only the primary. A lease admission is priced at its
+      // declared chain's worst-case rate, so only a possibly billed attempt re-admits it.
+      readmission:
+        budget.allowed && budget.hardDenyAdmitted
+          ? { provider: primaryProvider, model: primaryModel, chainPriced: budget.leaseId !== null }
+          : null,
+      fundingMaybeBilled: false,
+      hopOutputBound: (runtime) => outputBoundFor([runtime]),
       passthroughArgs,
       requestDefaults,
       callerKwargs: surface === "responses" ? mergedPrimary : callerKwargs,
@@ -2506,7 +2593,14 @@ export class SolwynCore {
     try {
       return await this.#walk(ctx, runtimes, mode);
     } catch (error) {
-      if (!ctx.bufferedSettlementComplete) this.#releaseFunding(ctx.callId, ctx.funding);
+      if (!ctx.bufferedSettlementComplete) {
+        // Possibly billed funding is consumed at its floor, never refunded.
+        if (ctx.fundingMaybeBilled) {
+          this.#budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
+        } else {
+          this.#releaseFunding(ctx.callId, ctx.funding);
+        }
+      }
       throw error;
     } finally {
       if (streamTermination !== undefined && !streamTermination.transferred) {
@@ -2753,6 +2847,8 @@ export class SolwynCore {
       } catch {
         // Error telemetry is best effort and must never mask the original failure.
       }
+      // Media is never lease-funded, so this keeps a per-call hold until it expires. No floor is
+      // confirmed: a unit-priced media confirm needs media_usage, which a failed call lacks.
       this.#releaseFunding(callId, funding);
       throw error;
     }
@@ -2908,9 +3004,19 @@ export class SolwynCore {
       // health verdict) and PROPAGATE — never swallow it into a failover/retry.
       let hopKwargs: Record<string, unknown>;
       try {
+        if (
+          ctx.readmission !== null &&
+          (ctx.fundingMaybeBilled ||
+            (!ctx.readmission.chainPriced &&
+              (hop.provider !== ctx.readmission.provider || hop.model !== ctx.readmission.model)))
+        ) {
+          await this.#readmitHop(ctx, runtime, hop);
+        }
         hopKwargs = this.#enforceHopOutput(runtime, ctx, this.#prepareHopKwargs(runtime, hop, ctx));
       } catch (prepError) {
         breaker.releaseProbe(admission);
+        // A local refusal before send must not strand the hold its check took.
+        if (prepError instanceof OutputBoundUnenforceableError) this.#closeFunding(ctx);
         throw prepError;
       }
 
@@ -2955,6 +3061,8 @@ export class SolwynCore {
           if (
             callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect)?.aborted
           ) {
+            // A caller abort keeps its funding unless the provider provably billed nothing.
+            const billed = ctx.readmission !== null && attemptMaybeBilled(error);
             breaker.releaseProbe(admission);
             const region = safeExtractRegion(
               () => runtime.adapter.extractRegion(runtime.sdkClient),
@@ -2963,6 +3071,17 @@ export class SolwynCore {
             this.#reporter.report(
               this.#buildErrorEvent(ctx, hop, error, nowMs() - hopStarted, true, region),
             );
+            if (billed) {
+              ctx.fundingMaybeBilled = true;
+              this.#endFunding(ctx.callId, ctx.funding, {
+                hop,
+                region,
+                serviceTier: null,
+                estimatedInputTokens: ctx.estimatedInputTokens,
+                outputBound: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+                observed: null,
+              });
+            }
             throw error;
           }
           if (
@@ -2973,7 +3092,6 @@ export class SolwynCore {
             // generation: keep the reservation at its floor, report a possibly-succeeded error,
             // and stop the chain with no breaker verdict and no failover.
             breaker.releaseProbe(admission);
-            this.#budget.consumeUnknownUsage(ctx.callId, ctx.funding.leaseClaimToken);
             const guardRegion = safeExtractRegion(
               () => runtime.adapter.extractRegion(runtime.sdkClient),
               this.#logger,
@@ -2981,12 +3099,26 @@ export class SolwynCore {
             this.#reporter.report(
               this.#buildErrorEvent(ctx, hop, error, nowMs() - hopStarted, true, guardRegion),
             );
+            this.#endFunding(ctx.callId, ctx.funding, {
+              hop,
+              region: guardRegion,
+              serviceTier: null,
+              estimatedInputTokens: ctx.estimatedInputTokens,
+              outputBound: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+              observed: null,
+            });
             throw error;
           }
           lastError = error;
           anyAttemptFailed = true;
           const latencyMs = nowMs() - hopStarted;
           const disposition = classifyException(error);
+          // Under hard_deny, a dispatched attempt may have produced billed output unless it failed
+          // with positive evidence otherwise (attemptMaybeBilled), whether the walk advances past
+          // it or ends on it. Its funding is settled at its floor with its error event below and
+          // stays marked, so neither a later hop nor the terminal cleanup refunds it.
+          const billed = ctx.readmission !== null && attemptMaybeBilled(error);
+          if (billed) ctx.fundingMaybeBilled = true;
 
           // The PRIMARY was attempted and raised in this walk → a later cross-provider success is
           // a REACTIVE failover (primary_error), not a proactive circuit-open reroute (#29).
@@ -3052,16 +3184,33 @@ export class SolwynCore {
             () => runtime.adapter.extractRegion(runtime.sdkClient),
             this.#logger,
           );
-          this.#reporter.report(
-            this.#buildErrorEvent(
-              ctx,
-              hop,
-              error,
-              latencyMs,
-              possiblySucceeded ? true : null,
-              failedRegion,
-            ),
+          const failedEvent = this.#buildErrorEvent(
+            ctx,
+            hop,
+            error,
+            latencyMs,
+            possiblySucceeded ? true : null,
+            failedRegion,
           );
+          // A possibly billed hop the walk advances past settles under its own call id, so its
+          // floor and event never net against the served hop's settlement for the call's id.
+          const advances =
+            retryAbort === undefined && disposition !== Disposition.FAIL_FAST && !possiblySucceeded;
+          const floorCallId = billed && advances ? crypto.randomUUID() : ctx.callId;
+          this.#reporter.report(
+            floorCallId === ctx.callId ? failedEvent : { ...failedEvent, call_id: floorCallId },
+          );
+          if (billed) {
+            this.#endFunding(ctx.callId, ctx.funding, {
+              callId: floorCallId,
+              hop,
+              region: failedRegion,
+              serviceTier: null,
+              estimatedInputTokens: ctx.estimatedInputTokens,
+              outputBound: Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX),
+              observed: null,
+            });
+          }
 
           if (retryAbort !== undefined) {
             // The caller aborted during the Retry-After sleep: end the call, never advance.
@@ -3204,7 +3353,43 @@ export class SolwynCore {
     }
   }
 
-  /** Consume an escaping/non-lease funding boundary without masking its primary outcome. */
+  /**
+   * End a call's funding once its outcome is reported. Possibly billed hard_deny funding with
+   * unknown usage (`floor` set) is never refunded: the local lease claim settles at its
+   * reservation, and an `is_estimated` confirm records the floor durably with Solwyn Cloud for
+   * both a lease claim and a per-call reservation. Anything else is released as before.
+   */
+  #endFunding(callId: string, funding: FundingContext, floor: FloorAttempt | null): void {
+    if (floor === null) {
+      this.#releaseFunding(callId, funding);
+      return;
+    }
+    this.#budget.consumeUnknownUsage(callId, funding.leaseClaimToken);
+    if (!hasSettlementFunding(funding)) return;
+    try {
+      this.#reporter.reportConfirm(
+        this.#budget.buildConfirmRequest({
+          reservationId: funding.reservationId,
+          leaseId: funding.leaseId,
+          leaseClaimToken: funding.leaseClaimToken,
+          model: floor.hop.model,
+          provider: floor.hop.provider,
+          isProviderFallback: floor.hop.isProviderFallback,
+          callId: floor.callId ?? callId,
+          providerRegion: floor.region,
+          serviceTier: floor.serviceTier,
+          tokenDetails: floorTokenDetails(
+            floor.observed,
+            floor.estimatedInputTokens,
+            floor.outputBound,
+          ),
+        }),
+      );
+    } catch {
+      this.#safeWarn("budget.floor_confirm_failed: possibly billed usage kept locally only");
+    }
+  }
+
   #releaseFunding(callId: string, funding: FundingContext): void {
     if (funding.leaseClaimToken === null) {
       return;
@@ -3489,6 +3674,101 @@ export class SolwynCore {
   }
 
   /**
+   * Close the call's current funding without settling usage: a lease claim is released, and a
+   * per-call reservation is settled at zero usage under a fresh call id (the call's own id stays
+   * with whatever settlement follows). Funding whose attempt may have produced billed output is
+   * kept at its floor instead. Afterwards the call holds no funding.
+   */
+  #closeFunding(ctx: DispatchContext): void {
+    const funding = ctx.funding;
+    const identity = ctx.readmission ?? {
+      provider: ctx.primaryProvider,
+      model: ctx.primaryModel,
+    };
+    if (ctx.fundingMaybeBilled) {
+      this.#budget.consumeUnknownUsage(ctx.callId, funding.leaseClaimToken);
+    } else {
+      this.#releaseFunding(ctx.callId, funding);
+      if (funding.reservationId) {
+        try {
+          this.#reporter.reportConfirm(
+            this.#budget.buildConfirmRequest({
+              reservationId: funding.reservationId,
+              model: identity.model,
+              provider: identity.provider as ProviderName,
+              tokenDetails: zeroTokenDetails(),
+              callId: crypto.randomUUID(),
+            }),
+          );
+          this.#reporter.flushSoon();
+        } catch {
+          // The held estimate self-heals at its TTL; a later check only sees less budget.
+          this.#safeWarn("budget.release_failed: reservation held until expiry");
+        }
+      }
+    }
+    ctx.funding = Object.freeze({ reservationId: null, leaseId: null, leaseClaimToken: null });
+  }
+
+  /**
+   * Re-admit a failover hop under per-call hard_deny admission. The earlier check priced the
+   * identity in `ctx.readmission`; serving a different provider or model settles at that hop's
+   * price, so the hop gets its own check first. The earlier funding is closed the way a failed
+   * attempt's is: a lease claim is released, and a per-call reservation is settled at zero usage
+   * under a fresh call id (the call's own id stays with the served hop's settlement). A failure
+   * that may have produced billed output keeps both at their floor instead. A denial throws the
+   * primary's typed denial after a `budget_denied` event, and the hop is never called.
+   */
+  async #readmitHop(
+    ctx: DispatchContext,
+    runtime: ProviderRuntime,
+    hop: HopAttribution,
+  ): Promise<void> {
+    if (ctx.readmission === null) return;
+    this.#closeFunding(ctx);
+
+    const estimatedOutputBound = ctx.hopOutputBound(runtime);
+    const result = budgetCheckResult(
+      await this.#budget.checkBudget({
+        runLifetime: ctx.run?.lifetime,
+        agentRunId: ctx.run?.agentRunId,
+        tags: ctx.run.tags,
+        callId: ctx.callId,
+        estimatedInputTokens: ctx.estimatedInputTokens,
+        estimatedOutputBound,
+        model: hop.model,
+        provider: hop.provider as ProviderName,
+        fallbackProviders: [],
+        fallbackModels: [],
+        timeout: this.#config.budget_check_timeout,
+        deadline: ctx.deadline,
+        signal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
+        // The call id already names the earlier funding; the hop takes a per-call reservation.
+        perCallOnly: true,
+      }),
+    );
+    ctx.estimatedOutputBound = estimatedOutputBound;
+    ctx.fundingMaybeBilled = false;
+    if (!result.allowed) {
+      const region = safeExtractRegion(
+        () => runtime.adapter.extractRegion(runtime.sdkClient),
+        this.#logger,
+      );
+      this.#reportBudgetDenied(() => this.#buildBudgetDeniedEvent(ctx, hop, region, result));
+      throw this.#budget.buildDenialError(result, ctx.estimatedInputTokens, ctx.run?.agentRunId);
+    }
+    ctx.funding = Object.freeze({
+      reservationId: result.reservationId,
+      leaseId: result.leaseId,
+      leaseClaimToken: result.leaseClaimToken,
+    });
+    ctx.outputCap = result.hardDenyAdmitted ? this.#config.lease_output_bound_default : undefined;
+    ctx.readmission = result.hardDenyAdmitted
+      ? { provider: hop.provider, model: hop.model, chainPriced: false }
+      : null;
+  }
+
+  /**
    * Under hard_deny admission, hold the final hop request to the reserved output bound: inject the
    * default cap where the request has none, or throw `OutputBoundUnenforceableError` before any
    * provider I/O. Bedrock's wire command is rebuilt in its adapter, so this validates the same
@@ -3732,6 +4012,8 @@ export class SolwynCore {
       // The stream callbacks below outlive this frame for as long as the caller holds the
       // stream, so they close over only what settlement reads — never `ctx`, whose caller
       // kwargs, passthrough arguments and request defaults carry the request content.
+      // Funding admitted under hard_deny never refunds possibly billed output (#endFunding).
+      const hardDenyFunding = ctx.readmission !== null;
       const settlement: StreamSettlementContext = {
         surface: ctx.surface,
         callId: ctx.callId,
@@ -3742,6 +4024,27 @@ export class SolwynCore {
         primaryDialect: ctx.primaryDialect,
         callerSignal: callerAbortSignal(ctx.passthroughArgs, ctx.callerKwargs, ctx.primaryDialect),
       };
+      // A floor-funded lease event is queued apart from its confirm, so it carries the lease id
+      // that `reportSettlement` would have added.
+      const withLease = (event: MetadataEvent): MetadataEvent =>
+        hardDenyFunding && settlement.funding.leaseId !== null
+          ? { ...event, lease_id: settlement.funding.leaseId }
+          : event;
+      const floorOutputBound = Math.min(ctx.estimatedOutputBound, ORDINARY_TOKEN_COUNT_MAX);
+      const floorOf = (
+        observed: TokenDetails | null,
+        serviceTier: string | null = null,
+      ): FloorAttempt | null =>
+        hardDenyFunding
+          ? {
+              hop,
+              region,
+              serviceTier,
+              estimatedInputTokens: settlement.estimatedInputTokens,
+              outputBound: floorOutputBound,
+              observed,
+            }
+          : null;
       // Cross-dialect: translate each raw served chunk to the caller's dialect (the
       // accumulator still observes the RAW served chunk, so usage settles against what was
       // served). Same-dialect: null → strict passthrough (translator never invoked).
@@ -3783,16 +4086,18 @@ export class SolwynCore {
           logger: this.#logger,
         });
         // Shutdown and GC timing measure ownership delay rather than provider completion.
-        completeStream(usage.tokenDetails, nowMs() - hopStarted, false);
+        completeStream(usage.tokenDetails, nowMs() - hopStarted, false, false);
       };
       const completeStream = (
         tokenDetails: TokenDetails,
         elapsedMs: number,
         recordLatency = true,
+        naturallyFinished = false,
       ): void => {
         if (streamSettled) return;
         streamSettled = true;
         this.#streamSettlements.delete(streamToken);
+        let confirmed = false;
         try {
           let settledTokenDetails = tokenDetails;
           let usageUnmeasured = isUsageUnmeasured(tokenDetails);
@@ -3820,7 +4125,11 @@ export class SolwynCore {
             serviceTier,
             region,
           });
-          if (hasSettlementFunding(settlement.funding)) {
+          // A stream that did not run to its end may have billed more than it observed. A finished
+          // stream settles its usage, estimated or not, as before.
+          const unknownUsage = hardDenyFunding && !naturallyFinished;
+          if (hasSettlementFunding(settlement.funding) && !unknownUsage) {
+            confirmed = true;
             // Build the confirm (no I/O) and send it TOGETHER with the event via a SINGLE
             // reportSettlement — the same queue path used by buffered settlement (behavior 26).
             this.#settlePaidCall(event, {
@@ -3839,13 +4148,18 @@ export class SolwynCore {
                 : {}),
             });
           } else {
-            this.#reporter.report(event);
+            this.#reporter.report(withLease(event));
           }
-          if (settlement.funding.leaseId === null) {
-            this.#releaseFunding(settlement.callId, settlement.funding);
+          if (settlement.funding.leaseId === null || unknownUsage) {
+            confirmed = true;
+            this.#endFunding(
+              settlement.callId,
+              settlement.funding,
+              unknownUsage ? floorOf(settledTokenDetails, serviceTier) : null,
+            );
           }
         } catch (error) {
-          this.#releaseFunding(settlement.callId, settlement.funding);
+          this.#endFunding(settlement.callId, settlement.funding, confirmed ? null : floorOf(null));
           throw error;
         }
       };
@@ -3861,7 +4175,8 @@ export class SolwynCore {
         stream: source,
         accumulator,
         startTime: hopStarted,
-        onComplete: completeStream,
+        onComplete: (tokenDetails, elapsedMs, naturallyFinished) =>
+          completeStream(tokenDetails, elapsedMs, true, naturallyFinished === true),
         onError: (error) => {
           if (streamSettled) return;
           if (settlement.callerSignal?.aborted || isCallerAbort(error)) {
@@ -3904,7 +4219,7 @@ export class SolwynCore {
               possiblySucceeded: null,
               velocityFlags: settlement.velocityFlags,
             });
-            if (hasSettlementFunding(settlement.funding)) {
+            if (hasSettlementFunding(settlement.funding) && !hardDenyFunding) {
               this.#settlePaidCall(event, {
                 reservationId: settlement.funding.reservationId,
                 leaseId: settlement.funding.leaseId,
@@ -3919,12 +4234,17 @@ export class SolwynCore {
                 floorAtReservation: usage.usageUnmeasured,
               });
             } else {
-              this.#reporter.report(event);
+              this.#reporter.report(withLease(event));
             }
-            if (settlement.funding.leaseId === null)
-              this.#releaseFunding(settlement.callId, settlement.funding);
+            if (settlement.funding.leaseId === null || hardDenyFunding)
+              this.#endFunding(
+                settlement.callId,
+                settlement.funding,
+                floorOf(usage.tokenDetails, serviceTier),
+              );
             return;
           }
+          let ended = false;
           try {
             if (isNeutralStreamError(error)) breaker.releaseProbe(admission);
             else
@@ -3934,8 +4254,7 @@ export class SolwynCore {
                 failedBreakerProviders,
                 admission,
               );
-            // Cloud lease netting currently covers only success events with a receipt.
-            // Pairing a lease confirmation with an error event would count the spend twice.
+            // A lease's error event stays zero-usage; its spend is settled by the confirm.
             const usage =
               deferredResponses || settlement.funding.leaseId !== null
                 ? null
@@ -3965,7 +4284,8 @@ export class SolwynCore {
                 possiblySucceeded: true,
                 velocityFlags: settlement.velocityFlags,
               });
-              if (hasSettlementFunding(settlement.funding)) {
+              // Under hard_deny the stream may have billed past what it observed: keep the hold.
+              if (hasSettlementFunding(settlement.funding) && !hardDenyFunding) {
                 this.#settlePaidCall(event, {
                   reservationId: settlement.funding.reservationId,
                   leaseId: settlement.funding.leaseId,
@@ -3980,16 +4300,34 @@ export class SolwynCore {
                   floorAtReservation: usage.usageUnmeasured,
                 });
               } else {
-                this.#reporter.report(event);
+                this.#reporter.report(withLease(event));
               }
             } else {
               this.#reporter.report(
-                this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
+                withLease(
+                  this.#buildStreamErrorEvent(settlement, hop, nowMs() - hopStarted, region),
+                ),
               );
             }
-            this.#releaseFunding(settlement.callId, settlement.funding);
+            ended = true;
+            this.#endFunding(
+              settlement.callId,
+              settlement.funding,
+              floorOf(
+                usage?.tokenDetails ??
+                  (hardDenyFunding
+                    ? extractUsageFailSoft({
+                        extract: () => accumulator.finalize({ estimateMissingUsage: false }),
+                        estimate: () => null,
+                        estimatedInputTokens: 0,
+                        logger: this.#logger,
+                      }).tokenDetails
+                    : null),
+                safeExtractServiceTier(() => accumulator.getServiceTier(), this.#logger),
+              ),
+            );
           } catch (settlementError) {
-            this.#releaseFunding(settlement.callId, settlement.funding);
+            if (!ended) this.#endFunding(settlement.callId, settlement.funding, floorOf(null));
             throw settlementError;
           }
         },
@@ -4033,7 +4371,12 @@ export class SolwynCore {
                   ),
                 );
               } finally {
-                this.#releaseFunding(settlement.callId, settlement.funding);
+                // Before connect: a known rejection or a pre-send failure billed nothing.
+                this.#endFunding(
+                  settlement.callId,
+                  settlement.funding,
+                  attemptMaybeBilled(error) ? floorOf(null) : null,
+                );
               }
             })
           : wrapStream(streamOptions);
@@ -4117,38 +4460,44 @@ export class SolwynCore {
         };
       }
     }
-    const dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
-      surface,
-      isStreaming,
-      // A hop serving a request authored for a DIFFERENT provider (adapters may sanitize
-      // options meant for the original endpoint under this flag; the dispatcher never branches).
-      crossProvider,
-      // SECONDS — the `PrepareCallOptions.timeout` contract. Every owning adapter converts this
-      // immutable per-call provider bound exactly once to its SDK's millisecond carrier.
-      timeout: hopReadTimeoutSeconds,
-      maxRetries: 0,
-      // The fill-absent-layered request defaults for this hop (global config default_params <
-      // per-entry default_params). ONLY the Bedrock adapter reads it (D14): its wire command is
-      // opaque to the pipeline's merged-kwargs fill-absent result, so it rebuilds a sibling command
-      // to honor a model override OR any non-empty default (global or entry). The layered spread is
-      // required for Python parity — Python's `_build_hop_kwargs` merges `{**global, **entry}` into
-      // the boto3 wire request, so a client-level `defaultParams` (e.g. an `inferenceConfig`
-      // maxTokens cap) must reach this seam too, not just entry-level defaults (client-base.md #13;
-      // command input still WINS over both). Every other adapter ignores this field (their `merged`
-      // bag already carries the fill-absent result).
-      entryDefaultParams,
-      outputBound: hardDeny?.cap,
-      ...(hardDeny === undefined
-        ? {}
-        : {
-            singleGeneration: {
-              defaultFetch: globalFetch,
-              reserved: hardDeny.reserved,
-              model: typeof merged["model"] === "string" ? merged["model"] : "",
-            },
-          }),
-      responsesLeaf,
-    });
+    let dispatch: PreparedDispatch;
+    try {
+      dispatch = runtime.adapter.prepareCall(runtime.sdkClient, merged, {
+        surface,
+        isStreaming,
+        // A hop serving a request authored for a DIFFERENT provider (adapters may sanitize
+        // options meant for the original endpoint under this flag; the dispatcher never branches).
+        crossProvider,
+        // SECONDS — the `PrepareCallOptions.timeout` contract. Every owning adapter converts this
+        // immutable per-call provider bound exactly once to its SDK's millisecond carrier.
+        timeout: hopReadTimeoutSeconds,
+        maxRetries: 0,
+        // The fill-absent-layered request defaults for this hop (global config default_params <
+        // per-entry default_params). ONLY the Bedrock adapter reads it (D14): its wire command is
+        // opaque to the pipeline's merged-kwargs fill-absent result, so it rebuilds a sibling command
+        // to honor a model override OR any non-empty default (global or entry). The layered spread is
+        // required for Python parity — Python's `_build_hop_kwargs` merges `{**global, **entry}` into
+        // the boto3 wire request, so a client-level `defaultParams` (e.g. an `inferenceConfig`
+        // maxTokens cap) must reach this seam too, not just entry-level defaults (client-base.md #13;
+        // command input still WINS over both). Every other adapter ignores this field (their `merged`
+        // bag already carries the fill-absent result).
+        entryDefaultParams,
+        outputBound: hardDeny?.cap,
+        ...(hardDeny === undefined
+          ? {}
+          : {
+              singleGeneration: {
+                defaultFetch: globalFetch,
+                reserved: hardDeny.reserved,
+                model: typeof merged["model"] === "string" ? merged["model"] : "",
+              },
+            }),
+        responsesLeaf,
+      });
+    } catch (error) {
+      // Preparing the call is local: nothing reached the provider.
+      throw markUndispatched(error);
+    }
     return dispatch(...passthroughArgs);
   }
 
@@ -4460,7 +4809,25 @@ interface DispatchContext {
   estimatedInputTokens: number;
   estimatedOutputBound: number;
   /** Cap for an uncapped hop request; set only when hard_deny authority admitted the call. */
-  readonly outputCap: number | undefined;
+  outputCap: number | undefined;
+  /**
+   * Under per-call hard_deny admission, the provider and model the current funding was priced
+   * for. A hop serving anything else is re-admitted first; `null` when no re-admission applies.
+   */
+  readmission: {
+    readonly provider: string;
+    readonly model: string;
+    /** Lease funding is priced for the whole declared chain; a per-call check is not. */
+    readonly chainPriced: boolean;
+  } | null;
+  /**
+   * An attempt on the current funding failed in a way that may have produced billed output.
+   * Sticky until the funding is replaced: any further attempt is funded separately, and the
+   * possibly billed hold is kept at its floor rather than released.
+   */
+  fundingMaybeBilled: boolean;
+  /** The output bound a single hop can produce, for that hop's re-admission. */
+  readonly hopOutputBound: (runtime: ProviderRuntime) => number;
   readonly velocityFlags: readonly VelocityFlag[];
   /** Server price statement for this request only; never retained across calls. */
   priceHints: Record<string, number> | null;
@@ -4541,6 +4908,18 @@ interface FundingContext {
   readonly reservationId: string | null;
   readonly leaseId: string | null;
   readonly leaseClaimToken: number | null;
+}
+
+/** The attempt a hard_deny floor confirm settles: its served hop and what it observed. */
+interface FloorAttempt {
+  /** The confirm's call id when it differs from the funding's (a possibly billed failed hop). */
+  readonly callId?: string;
+  readonly hop: HopAttribution;
+  readonly region: string | null;
+  readonly serviceTier: string | null;
+  readonly estimatedInputTokens: number;
+  readonly outputBound: number;
+  readonly observed: TokenDetails | null;
 }
 
 /** Content-free attribution shared by one media call's confirm/event settlement. */

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer, type BudgetEnforcerOptions } from "../../src/budget";
 import { CircuitBreaker } from "../../src/circuit-breaker";
-import type { LeaseLedger, LeaseState } from "../../src/lease";
+import { type LeaseLedger, type LeaseState, leaseModelKey } from "../../src/lease";
 import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import { FakeControlPlane } from "../../src/testing/index";
 import type { LeaseGrantResponse } from "../../src/types";
@@ -232,7 +232,10 @@ describe("lease widening to a newly seen model chain", () => {
         fallback_models: [],
       }),
     ]);
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([
+      leaseModelKey("openai", "gpt-4o"),
+      leaseModelKey("openai", "gpt-4o-mini"),
+    ]);
 
     for (let index = 3; index <= 22; index += 1) {
       await expect(check(h, index, index % 2 === 0 ? MINI : {})).resolves.toMatchObject({
@@ -343,7 +346,9 @@ describe("lease widening to a newly seen model chain", () => {
     await flushUntil(() => internal(h.budget).renewalOperations.size === 3);
 
     await check(h, 3, MINI);
-    await flushUntil(() => h.state()?.declaredModels.has("gpt-4o-mini") === true);
+    await flushUntil(
+      () => h.state()?.declaredModels.has(leaseModelKey("openai", "gpt-4o-mini")) === true,
+    );
     expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
     await expect(check(h, 4, MINI)).resolves.toMatchObject({ leaseId: `${RUN}-lease` });
     expect(h.since()).toEqual([]);
@@ -422,7 +427,7 @@ describe("lease widening never fires outside an allowed per-call check", () => {
     expect(h.since()).toEqual([CHECK_URL]);
     expect(h.renewals).toHaveLength(0);
     expect(h.state()).toMatchObject({ leaseId: "lease-1", generation: 1, renewalInFlight: false });
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o"]);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([leaseModelKey("openai", "gpt-4o")]);
     await expect(check(h, 3)).resolves.toMatchObject({ leaseId: "lease-1" });
   });
 
@@ -435,7 +440,7 @@ describe("lease widening never fires outside an allowed per-call check", () => {
     });
     await settleRenewals(h);
     expect(h.since()).toEqual([CHECK_URL]);
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o"]);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([leaseModelKey("openai", "gpt-4o")]);
   });
 
   it("never widens for a media call on an undeclared model", async () => {
@@ -480,7 +485,7 @@ describe("a refused widening", () => {
     expect(h.surrenders).toEqual([
       { lease_id: "lease-1", holder_id: "sdk-instance-1", generation: 1, spent_tokens: 0 },
     ]);
-    expect([...(h.state()?.refusedModels ?? [])]).toEqual(["local-zero"]);
+    expect([...(h.state()?.refusedModels ?? [])]).toEqual([leaseModelKey("openai", "local-zero")]);
 
     // The first model re-grants on its next call: it left the lease for no call at all.
     await expect(check(h, 3)).resolves.toMatchObject({ leaseId: "lease-2" });
@@ -583,8 +588,11 @@ describe("a lease renewal retried after an unknown outcome", () => {
       fallback_models: [],
     });
     expect(h.state()?.generation).toBe(2);
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
-    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([
+      leaseModelKey("openai", "gpt-4o"),
+      leaseModelKey("openai", "gpt-4o-mini"),
+    ]);
+    expect(h.state()?.covers([leaseModelKey(OTHER.provider, OTHER.model)])).toBe(false);
     await expect(check(h, 4, MINI)).resolves.toMatchObject({ leaseId: "lease-1" });
     expect(h.since()).toEqual([]);
 
@@ -666,8 +674,11 @@ describe("a lease renewal retried after an unknown outcome", () => {
       [1, ["gpt-4o-mini"]],
     ]);
     expect(h.state()?.generation).toBe(2);
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["gpt-4o", "gpt-4o-mini"]);
-    expect(h.state()?.covers(OTHER.model, [])).toBe(false);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([
+      leaseModelKey("openai", "gpt-4o"),
+      leaseModelKey("openai", "gpt-4o-mini"),
+    ]);
+    expect(h.state()?.covers([leaseModelKey(OTHER.provider, OTHER.model)])).toBe(false);
     await expect(check(h, 5, OTHER)).resolves.toMatchObject({ allowed: true, leaseId: null });
     await settleRenewals(h);
     expect(h.since()).toEqual([CHECK_URL, RENEW_URL]);
@@ -698,7 +709,9 @@ describe("a lease renewal retried after an unknown outcome", () => {
       provider: "anthropic",
     });
     expect(h.state()).toMatchObject({ leaseId: "lease-2", generation: 1 });
-    expect([...(h.state()?.declaredModels ?? [])]).toEqual(["claude-sonnet-4-5"]);
+    expect([...(h.state()?.declaredModels ?? [])]).toEqual([
+      leaseModelKey("anthropic", "claude-sonnet-4-5"),
+    ]);
     expect(internal(h.budget).leaseLedger.owedRenewalDeclaration(RUN)).toBeNull();
     await expect(check(h, 4, OTHER)).resolves.toMatchObject({ leaseId: "lease-2" });
     expect(h.since()).toEqual([]);
@@ -733,7 +746,7 @@ describe("a lease renewal retried after an unknown outcome", () => {
       [1, ["gpt-4o-mini"]],
       [1, ["gpt-4o-mini"]],
     ]);
-    expect([...(h.state()?.refusedModels ?? [])]).toEqual(["gpt-4o-mini"]);
+    expect([...(h.state()?.refusedModels ?? [])]).toEqual([leaseModelKey("openai", "gpt-4o-mini")]);
     expect(h.surrenders).toEqual([expect.objectContaining({ lease_id: "lease-1", generation: 1 })]);
   });
 });

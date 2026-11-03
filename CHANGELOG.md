@@ -9,6 +9,73 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-02
+
+Public-preview patch release with `hard_deny` bug fixes: hard_deny now also covers failover hops
+and `decisions.create`.
+
+### Fixed
+
+- **hard_deny now also covers failover hops.** A per-call budget check priced the primary model,
+  but a call settles at the price of the model that served it. A call whose primary failed could
+  fail over to a pricier model and settle above what its check reserved. Now, when a call admitted
+  by a hard_deny per-call check is about to fail over to a different provider or model, Solwyn
+  first runs a new check for that hop: its own model, its own output bound, and its own cap. If
+  the hop does not fit the remaining budget, the call fails with the same `BudgetExceededError`
+  (or `RunStoppedError`) a primary denial raises, a `budget_denied` event is reported for the hop,
+  and the hop's provider is never called. A hop that fits is reserved and settled at its own price.
+  The hop's check is always fresh: it is never answered from the allow cache.
+- **The superseded reservation is closed.** Before the hop's check, the earlier hop's reservation
+  is settled at zero usage, under a new call id so the served call keeps its own. A lease claim is
+  released.
+- **A possibly billed attempt is never refunded.** If an attempt fails in a way that may have
+  produced billed output (a post-send failure that still fails over under
+  `failoverIdempotency: "always"`), its reservation or lease claim is kept at its full amount, and
+  every later attempt in the call, on any provider or model, gets its own fresh per-call check.
+  This applies to lease-funded calls too.
+- **hard_deny records unmeasured, possibly billed calls at their reserved amount.** On a hard_deny
+  call, in a wrapped client or the AI SDK middleware, Solwyn records the call at its reserved
+  amount (the estimated input plus the call's output limit, or more where it saw more), marked as
+  estimated, whenever the provider may have billed output that Solwyn did not measure. That covers
+  a failure after the request was sent (buffered, at stream setup, or mid-stream), and a stream
+  closed, cancelled or stopped before the provider's final usage. A completed call that reports no
+  usage is still recorded at an estimate from its response, as before. The
+  amount is recorded with Solwyn Cloud for both per-call checks and run leases, so it still counts
+  after the reservation expires or the lease ends. Your dashboard can therefore show more spend than
+  the provider billed, for example for a stream you stopped early. A failover hop that may have been
+  billed is recorded under its own call id. Media calls are not recorded this way: their
+  reservation is held until it expires, as before. Lasting records need Solwyn API support that is
+  live from 2026-11-02. Any failure after the request was sent counts as possibly billed, including a caller abort,
+  a response that fails to parse, and an error Solwyn does not recognize, unless the provider
+  rejected the call (a 4xx answer, 429 included, or Anthropic's 529 `overloaded_error`, which
+  rejects before generation starts) or the request provably never left. Only those are released.
+- **hard_deny now covers `decisions.create`.** OpenAI `decisions.create` takes no output cap, so no budget check can bound it. In order:
+  without an acknowledgment, `onUnmetered: "raise"` refuses it first with
+  `UntrackedSpendSurfaceError` and no budget check. Otherwise the SDK runs one budget check to learn
+  the project's mode and settles that check's reservation at zero, so it leaves no hold. If that
+  check denies, the call fails with the usual budget denial (`BudgetExceededError`). On a hard_deny
+  project it then fails before it is sent with `OutputBoundUnenforceableError`
+  (`reason: "no_output_cap"`). On an alert-only project it goes through as an untracked surface,
+  and its spend is not counted.
+- **A local refusal leaves no hold.** When a hard_deny call is refused with
+  `OutputBoundUnenforceableError` after its budget check but before anything is sent (in a wrapped
+  client or the AI SDK middleware), the check's reservation is settled at zero instead of holding
+  part of your budget until it expires.
+- **The allow cache never answers a hard_deny check.** A cached allow carries no reservation, so on
+  hard_deny projects every check now reaches Solwyn Cloud and reserves. Alert-only projects keep
+  the cache.
+- **Lease coverage matches provider and model.** A run lease covers the (provider, model) pairs it
+  declared, as Solwyn Cloud prices them. A declared model id served by another provider now gets a
+  per-call check instead of drawing on the lease.
+- **A response body that fails to decode is an ambiguous failure.** A truncated or unparseable
+  JSON body, or a corrupt gzip body, after the provider answered now counts as a possibly
+  completed call in every budget mode, unless its HTTP status already decides the outcome. With
+  `failoverIdempotency: "safe"` the call does not fail over and its error event reports
+  `possibly_succeeded: true`. With `"always"` it may fail over, and on a hard_deny project the
+  next hop gets its own budget check. Before, an unparseable JSON body failed fast.
+- Retries on the same provider and model after a clean failure are not re-checked. Alert-only
+  projects and SDK-local outage decisions are unchanged.
+
 ## [0.3.0] — 2026-10-31
 
 Public-preview minor release that makes `hard_deny` bound a call's output. Before this release a
@@ -758,7 +825,8 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.0...v0.1.1

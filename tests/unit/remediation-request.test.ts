@@ -741,7 +741,9 @@ describe("review request/admission regressions", () => {
     "close",
     "stop",
   ])("F9 closes native Google reader exactly once on %s", async (mode) => {
-    const plane = new FakeControlPlane();
+    // Settles observed usage once: alert_only, since hard_deny keeps unknown-usage funding instead
+    // (tests/unit/hard-deny-funding.test.ts).
+    const plane = new FakeControlPlane({ mode: "alert_only" });
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const body = new ReadableStream<Uint8Array>({
       start(value) {

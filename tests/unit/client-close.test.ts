@@ -11,7 +11,11 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function fixture() {
+/**
+ * `mode` defaults to hard_deny. Tests about observed-usage settlement run alert_only: under
+ * hard_deny, funding whose usage is unknown is kept instead (tests/unit/hard-deny-funding.test.ts).
+ */
+function fixture(mode: "hard_deny" | "alert_only" = "hard_deny") {
   const confirms: Record<string, unknown>[] = [];
   const checks: unknown[] = [];
   const events: Record<string, unknown>[] = [];
@@ -23,7 +27,7 @@ function fixture() {
         allowed: true,
         remaining_budget: 100,
         reservation_id: "reservation-close",
-        mode: "hard_deny",
+        mode,
         budget_limit: 100,
         current_usage: 0,
         denied_by_period: null,
@@ -131,7 +135,7 @@ describe("client shutdown", () => {
   });
 
   it("settles an open stream's observed usage without waiting for its consumer", async () => {
-    const control = fixture();
+    const control = fixture("alert_only");
     const latency = vi.spyOn(LatencyTracker.prototype, "recordLatency");
     const create = async (_params: Record<string, unknown>) =>
       (async function* () {
@@ -151,7 +155,7 @@ describe("client shutdown", () => {
   });
 
   it("throws the closed-client error on the next provider chunk after close", async () => {
-    const control = fixture();
+    const control = fixture("alert_only");
     const create = async (_params: Record<string, unknown>) =>
       (async function* () {
         yield { usage: { prompt_tokens: 13, completion_tokens: 5 } };
@@ -173,7 +177,7 @@ describe("client shutdown", () => {
   });
 
   it("drains stream setup and settles the returned unread stream before provider close", async () => {
-    const control = fixture();
+    const control = fixture("alert_only");
     const started = deferred<void>();
     const ready = deferred<AsyncGenerator<unknown>>();
     const create = async (_params: Record<string, unknown>) => {

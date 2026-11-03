@@ -421,6 +421,7 @@ export const OUTPUT_BOUND_UNENFORCEABLE_REASONS = [
   "azure_api_version",
   "bound_exceeded",
   "multi_generation_loop",
+  "no_output_cap",
 ] as const;
 export type OutputBoundUnenforceableReason = (typeof OUTPUT_BOUND_UNENFORCEABLE_REASONS)[number];
 
@@ -439,6 +440,8 @@ const OUTPUT_BOUND_HINTS: Readonly<Record<OutputBoundUnenforceableReason, string
     "Set the output cap and candidate count on the call itself so the request fits the output bound Solwyn priced.",
   multi_generation_loop:
     "This call lets the provider SDK generate more than once (automatic continuation or automatic function calling). Turn those off for this call, or run the loop yourself so Solwyn checks each generation.",
+  no_output_cap:
+    "This API has no output-cap parameter, so Solwyn cannot hold the call to a hard budget. Run it on an alert_only project, or use an API that takes an output cap.",
 };
 
 /** Options for {@link OutputBoundUnenforceableError}. */

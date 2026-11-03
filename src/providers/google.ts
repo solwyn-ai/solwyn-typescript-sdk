@@ -660,4 +660,8 @@ export class GoogleStreamAccumulator implements StreamUsageAccumulator {
   getServiceTier(): string | null {
     return null;
   }
+
+  sawCompletion(): boolean {
+    return this.#sawFinishReason;
+  }
 }

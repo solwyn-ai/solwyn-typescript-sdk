@@ -15,7 +15,11 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function controlPlane(extra: SolwynOptions = {}) {
+/**
+ * `mode` defaults to hard_deny. Tests about observed-usage settlement run alert_only: under
+ * hard_deny, funding whose usage is unknown is kept instead (tests/unit/hard-deny-funding.test.ts).
+ */
+function controlPlane(extra: SolwynOptions = {}, mode: "hard_deny" | "alert_only" = "hard_deny") {
   const confirms: Record<string, unknown>[] = [];
   const events: Record<string, unknown>[] = [];
   const fetch: FetchLike = async (url, init) => {
@@ -25,7 +29,7 @@ function controlPlane(extra: SolwynOptions = {}) {
         allowed: true,
         remaining_budget: 100,
         reservation_id: "reservation-cancel",
-        mode: "hard_deny",
+        mode,
         budget_limit: 100,
         current_usage: 0,
         denied_by_period: null,
@@ -125,18 +129,21 @@ describe("caller cancellation", () => {
         })();
       });
       const fallbackCreate = vi.fn(async () => ({ usage }));
-      const control = controlPlane({
-        failoverIdempotency,
-        fallback: [
-          [
-            {
-              baseURL: "https://api.deepseek.com/v1",
-              chat: { completions: { create: fallbackCreate } },
-            },
-            "deepseek-chat",
+      const control = controlPlane(
+        {
+          failoverIdempotency,
+          fallback: [
+            [
+              {
+                baseURL: "https://api.deepseek.com/v1",
+                chat: { completions: { create: fallbackCreate } },
+              },
+              "deepseek-chat",
+            ],
           ],
-        ],
-      });
+        },
+        "alert_only",
+      );
       const sdk = new Solwyn({ chat: { completions: { create } } }, control.options);
       try {
         for (let i = 0; i < 4; i += 1) {
@@ -204,7 +211,10 @@ describe("caller cancellation", () => {
         }),
       },
     };
-    const control = controlPlane({ failoverIdempotency, fallback: [[fallback, "gemini-2.5-pro"]] });
+    const control = controlPlane(
+      { failoverIdempotency, fallback: [[fallback, "gemini-2.5-pro"]] },
+      "alert_only",
+    );
     const sdk = new Solwyn(new GoogleGenAI({ apiKey: "synthetic" }), control.options);
     try {
       for (let i = 0; i < 4; i += 1) {
@@ -272,10 +282,13 @@ describe("caller cancellation", () => {
       class BedrockRuntimeClient {
         constructor(readonly send: Send) {}
       }
-      const control = controlPlane({
-        failoverIdempotency,
-        fallback: [[new BedrockRuntimeClient(fallbackSend), "anthropic.claude-3-5-sonnet"]],
-      });
+      const control = controlPlane(
+        {
+          failoverIdempotency,
+          fallback: [[new BedrockRuntimeClient(fallbackSend), "anthropic.claude-3-5-sonnet"]],
+        },
+        "alert_only",
+      );
       const sdk = new Solwyn(new BedrockRuntimeClient(send), control.options);
       try {
         for (let i = 0; i < 4; i += 1) {
@@ -373,7 +386,10 @@ describe("caller cancellation", () => {
         }),
       },
     };
-    const control = controlPlane({ failoverIdempotency, fallback: [[fallback, "gemini-2.5-pro"]] });
+    const control = controlPlane(
+      { failoverIdempotency, fallback: [[fallback, "gemini-2.5-pro"]] },
+      "alert_only",
+    );
     const sdk = new Solwyn({ models: { generateContent, generateContentStream } }, control.options);
     try {
       for (let i = 0; i < 4; i += 1) {

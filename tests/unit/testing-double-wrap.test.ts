@@ -214,7 +214,8 @@ describe("FakeControlPlane.wrap wiring", () => {
     expect(uncachedPlane.checks).toHaveLength(2);
     expect(uncachedProvider.create).toHaveBeenCalledTimes(2);
 
-    const cachedPlane = plane();
+    // Only alert-only allows are cached; a hard_deny allow carries no reservation.
+    const cachedPlane = plane({ mode: "alert_only" });
     const cachedProvider = successClient();
     const cached = cachedPlane.wrap(cachedProvider.client, {
       budgetCheckCacheTtl: 60,

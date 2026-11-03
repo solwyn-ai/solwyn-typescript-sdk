@@ -152,6 +152,28 @@ export interface RefusalRelease {
  * superseded, every retry at the same origin re-sends it: the control plane may answer a retry
  * with its stored result for the first request, so a retry must never declare anything else.
  */
+/**
+ * One declared lease entry. Core prices a lease per (provider, model) pair, so the same model id
+ * served by another provider is a different entry. A ledger caller that names no provider keys
+ * by model alone.
+ */
+export function leaseModelKey(provider: string | null | undefined, model: string): string {
+  return provider ? `${provider}\u0000${model}` : model;
+}
+
+/** The declared entries a call chain needs, primary first. */
+export function leaseChainKeys(
+  provider: string | null | undefined,
+  model: string | null,
+  fallbackProviders: readonly string[],
+  fallbackModels: readonly string[],
+): string[] {
+  const fallbacks = fallbackModels.map((item, index) =>
+    leaseModelKey(fallbackProviders[index] ?? null, item),
+  );
+  return model === null ? fallbacks : [leaseModelKey(provider, model), ...fallbacks];
+}
+
 export interface RenewalDeclaration {
   readonly leaseId: string;
   readonly generation: number;
@@ -225,19 +247,15 @@ export class LeaseState {
     return total;
   }
 
-  covers(model: string, fallbackModels: readonly string[]): boolean {
-    return (
-      this.declaredModels.has(model) &&
-      fallbackModels.every((item) => this.declaredModels.has(item))
-    );
+  /** Whether every declared entry the chain needs ({@link leaseChainKeys}) is declared. */
+  covers(chain: readonly string[]): boolean {
+    return chain.every((item) => this.declaredModels.has(item));
   }
 
-  /** Whether the chain names a model a refused widening recorded for this run. */
-  refuses(model: string, fallbackModels: readonly string[]): boolean {
+  /** Whether the chain names an entry a refused widening recorded for this run. */
+  refuses(chain: readonly string[]): boolean {
     if (this.refusedModels.size === 0) return false;
-    return (
-      this.refusedModels.has(model) || fallbackModels.some((item) => this.refusedModels.has(item))
-    );
+    return chain.some((item) => this.refusedModels.has(item));
   }
 }
 
@@ -253,16 +271,20 @@ export interface AdmitOptions {
   callId: string;
   estimatedInputTokens: number;
   model: string;
+  /** The primary's provider; with it, coverage matches (provider, model) entries. */
+  provider?: string;
   now: number;
   breakerOpen: boolean;
   outputBound?: number;
   modality?: Modality;
   hasEstimatedMedia?: boolean;
   fallbackModels?: readonly string[];
+  fallbackProviders?: readonly string[];
   claimToken?: number | null;
 }
 export interface ApplyGrantResponseOptions {
   now: number;
+  /** Declared entries, keyed by {@link leaseModelKey}. */
   declaredModels?: readonly string[];
   expectedLeaseId?: string | null;
   expectedGeneration?: number | null;
@@ -428,8 +450,10 @@ export class LeaseLedger {
       modality = "text",
       hasEstimatedMedia = false,
       fallbackModels = [],
+      fallbackProviders = [],
       claimToken = null,
     } = options;
+    const chain = leaseChainKeys(options.provider, model, fallbackProviders, fallbackModels);
     if (!this.enabled)
       return this.#admission(LeaseDecision.LegacyCheck, { reason: "lease_disabled" });
     if (modality !== "text" || hasEstimatedMedia) {
@@ -450,14 +474,14 @@ export class LeaseLedger {
       state.ineligibleRetryAt = 0;
       state.releasePending = null;
     }
-    if (state?.refuses(model, fallbackModels)) {
+    if (state?.refuses(chain)) {
       // Never declared again: no widening and no grant for a chain with a refused model.
       return this.#admission(LeaseDecision.LegacyCheck, {
         reason: "model_refused_for_lease",
         claimToken: ownedClaimToken,
       });
     }
-    if (state?.hasLease && !state.covers(model, fallbackModels)) {
+    if (state?.hasLease && !state.covers(chain)) {
       if (now >= state.leaseDeadline && !breakerOpen) {
         // An expired lease cannot widen, and only this call's chain can drive its re-grant:
         // drop it and re-grant for that chain, as a covered chain's call does at expiry.
@@ -855,7 +879,8 @@ export class LeaseLedger {
    * undeclared allowed call widens for that chain once the retry resolves.
    */
   claimWideningRequest(runId: string, options: WideningOptions): WideningClaim | null {
-    const { now, model, fallbackModels } = options;
+    const { now, model, provider, fallbackProviders, fallbackModels } = options;
+    const chain = leaseChainKeys(provider, model, fallbackProviders, fallbackModels);
     const state = this.#states.get(runId);
     if (
       !state?.hasLease ||
@@ -865,12 +890,10 @@ export class LeaseLedger {
       state.grantedTokens <= 0 ||
       now >= state.leaseDeadline ||
       now < state.nextAttemptAt ||
-      state.refuses(model, fallbackModels)
+      state.refuses(chain)
     )
       return null;
-    const addedModels = [...new Set([model, ...fallbackModels])].filter(
-      (item) => !state.declaredModels.has(item),
-    );
+    const addedModels = [...new Set(chain)].filter((item) => !state.declaredModels.has(item));
     if (addedModels.length === 0) return null;
     return this.claimRenewal(runId, options);
   }
@@ -1069,7 +1092,12 @@ export class LeaseLedger {
   #newDeclaration(state: LeaseState, leaseId: string, options: RenewalOptions): RenewalDeclaration {
     const model = options.model ?? null;
     const fallbackModels = Object.freeze([...(options.fallbackModels ?? [])]);
-    const chain = model === null ? fallbackModels : [model, ...fallbackModels];
+    const chain = leaseChainKeys(
+      options.provider,
+      model,
+      options.fallbackProviders ?? [],
+      fallbackModels,
+    );
     return Object.freeze({
       leaseId,
       generation: state.generation,

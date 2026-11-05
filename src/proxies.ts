@@ -70,7 +70,7 @@ import { observeEvaluatedProperty } from "./surface-graph";
 import { guardedSurfaceDescriptor } from "./surface-guard";
 import type { SurfaceDialect } from "./surfaces";
 import { buildReportedTokenDetails, buildTokenDetails, isUsageCount } from "./token-details";
-import type { MediaUsage } from "./types";
+import type { AuthKeyResponse, MediaUsage } from "./types";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -1362,10 +1362,11 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
 /** The Solwyn-owned surface added on top of the wrapped client's own surface. */
 export interface Solwyn {
   /**
-   * Check the API key and project with Solwyn now. Throws `ApiKeyRefusedError` (a
-   * `ConfigurationError`) on any refusal; wrapped calls otherwise validate lazily.
+   * Check the API key and project with Solwyn now. Resolves with the key's details, or `null`
+   * when Solwyn could not be reached; throws `ApiKeyRefusedError` (a `ConfigurationError`) on
+   * any refusal. Wrapped calls otherwise validate lazily.
    */
-  validate(): Promise<void>;
+  validate(): Promise<AuthKeyResponse | null>;
   /** Flush reporter work, close budget-enforcer resources, then forward provider shutdown. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link Solwyn.close}. */

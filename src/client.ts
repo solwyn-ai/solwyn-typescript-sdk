@@ -204,6 +204,7 @@ import {
 } from "./trace-context";
 import { type FetchLike, globalFetch, requireFetchLike } from "./transport";
 import type {
+  AuthKeyResponse,
   BudgetMode,
   DenySource,
   FailoverReason,
@@ -4731,12 +4732,13 @@ export class SolwynCore {
   }
 
   /**
-   * Check the API key and project with Solwyn now (`GET /api/v1/auth/key`). Resolves when the
-   * key is valid for the project; throws `ApiKeyRefusedError` (a `ConfigurationError`) on any
-   * refusal, or `SolwynError` when Solwyn could not be reached. Wrapped calls validate lazily
-   * on their own; call this to fail at startup instead of on the first call.
+   * Check the API key and project with Solwyn now (`GET /api/v1/auth/key`). Resolves with the
+   * key's details and pins the project id when the key is valid for the project, or `null` when
+   * Solwyn could not be reached (calls keep following `failOpen`). Throws `ApiKeyRefusedError`
+   * (a `ConfigurationError`) on any refusal. Wrapped calls validate lazily on their own; call
+   * this to fail at startup instead of on the first call.
    */
-  validate(): Promise<void> {
+  validate(): Promise<AuthKeyResponse | null> {
     return this.#binding.validate();
   }
 

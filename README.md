@@ -187,7 +187,8 @@ for preflight deadlines, reporter delivery, and lease eligibility and renewal.
 Every request to Solwyn carries the key and the project (`Solwyn-Project` header). The SDK checks
 both once, lazily, before the first call that needs Solwyn, and pins the project's `proj_` id, so
 renaming the project later does not break a running app. Call `await client.validate()` to check at
-startup instead; it throws `ApiKeyRefusedError` (a `ConfigurationError`) on any refusal.
+startup instead; it throws `ApiKeyRefusedError` (a `ConfigurationError`) on any refusal and
+resolves `null` if Solwyn cannot be reached.
 
 When Solwyn refuses the key or the project, the SDK does not fall back to `failOpen`:
 

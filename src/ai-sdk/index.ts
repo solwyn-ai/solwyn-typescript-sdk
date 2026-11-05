@@ -75,7 +75,7 @@ import {
 } from "../token-details";
 import { applyTraceFields, captureTrace, type TraceSnapshot } from "../trace-context";
 import type { FetchLike } from "../transport";
-import type { BudgetMode, MetadataEvent, ProviderName } from "../types";
+import type { AuthKeyResponse, BudgetMode, MetadataEvent, ProviderName } from "../types";
 
 // ---------------------------------------------------------------------------
 // Provider attribution — AI SDK provider id → Solwyn ProviderName.
@@ -520,10 +520,11 @@ export interface SolwynMiddlewareHandle {
   /** Pass to `wrapLanguageModel({ model, middleware })`. */
   readonly middleware: LanguageModelMiddleware;
   /**
-   * Check the API key and project with Solwyn now. Throws `ApiKeyRefusedError` (a
-   * `ConfigurationError`) on any refusal; calls otherwise validate lazily.
+   * Check the API key and project with Solwyn now. Resolves with the key's details, or `null`
+   * when Solwyn could not be reached; throws `ApiKeyRefusedError` (a `ConfigurationError`) on
+   * any refusal. Calls otherwise validate lazily.
    */
-  validate(): Promise<void>;
+  validate(): Promise<AuthKeyResponse | null>;
   /** Reject new calls, drain in-flight work, settle open streams, and flush queued usage. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link close}. */

@@ -675,20 +675,25 @@ describe("ProjectBinding fencing and validation", () => {
     expect(plane.headers.at(-1)?.project).toBe(TEST_PROJECT);
   });
 
-  it("validate() raises a SolwynError, not a refusal, when Solwyn does not answer", async () => {
+  it("validate() resolves null when Solwyn does not answer, and the key details when valid", async () => {
+    let up = false;
     const binding = new ProjectBinding({
       selector: TEST_PROJECT,
       apiUrl: TEST_API_URL,
       apiKey: TEST_API_KEY,
-      fetch: async () => new Response("down", { status: 503 }),
+      fetch: async () => (up ? authKeyResponse() : new Response("down", { status: 503 })),
       timeoutMs: 1000,
     });
-    const error = await binding.validate().catch((caught: unknown) => caught);
-    expect(error).not.toBeInstanceOf(ConfigurationError);
-    expect((error as Error).message).toBe(
-      "Solwyn could not validate the API key because the control plane did not answer. Try again.",
-    );
+    await expect(binding.validate()).resolves.toBeNull();
     expect(binding.state).toBe("unvalidated");
+    up = true;
+    await expect(binding.validate()).resolves.toMatchObject({
+      project_id: TEST_PROJECT_ID,
+      scope: "full",
+    });
+    up = false;
+    // Valid already: an outage keeps the pinned answer.
+    await expect(binding.validate()).resolves.toMatchObject({ project_id: TEST_PROJECT_ID });
   });
 
   it("a weaker refusal from an older dispatch is ignored, a newer one applies", () => {

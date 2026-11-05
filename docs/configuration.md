@@ -98,8 +98,9 @@ SDK trims spaces and tabs around the project. Passing `projectId` throws
 Construction makes no network request. Before the first call that needs Solwyn, the SDK sends
 `GET /api/v1/auth/key` once and pins the project's `proj_` id from the answer; until then the
 `Solwyn-Project` header carries the configured value. `await client.validate()` (or
-`await handle.validate()` on the AI SDK middleware) runs the same check on demand and throws
-`ApiKeyRefusedError` on any refusal, or `SolwynError` when Solwyn does not answer.
+`await handle.validate()` on the AI SDK middleware) runs the same check on demand. It resolves
+with the key's details (`AuthKeyResponse`), resolves `null` when Solwyn does not answer, and throws
+`ApiKeyRefusedError` on any refusal.
 
 If Solwyn does not answer the automatic check, calls follow the usual outage posture and the SDK
 retries every 30 seconds. A refusal is stored and checked first on every call, before cached

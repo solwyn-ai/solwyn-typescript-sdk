@@ -38,8 +38,9 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
 ### Added
 
 - `validate()` on the wrapped client and on the AI SDK middleware handle checks the key and
-  project now and throws `ApiKeyRefusedError` on any refusal. Without it, the first call that needs
-  Solwyn validates lazily; construction makes no network request.
+  project now: it resolves with the key's details, resolves `null` when Solwyn cannot be reached,
+  and throws `ApiKeyRefusedError` on any refusal. Without it, the first call that needs Solwyn
+  validates lazily; construction makes no network request.
 - `ApiKeyRefusedError`, a `ConfigurationError` with `code` and `field`, for every refusal of the key
   or the project, at validation and at runtime.
 - **Refusals never fall back to `failOpen`.** Every 401 from Solwyn is a refusal, whatever its body.

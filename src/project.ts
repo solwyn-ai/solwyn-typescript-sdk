@@ -23,11 +23,12 @@ import {
   type RefusalPosture,
   refusalMessage,
 } from "./api-key-errors";
-import { ApiKeyRefusedError, SolwynError } from "./errors";
+import { ApiKeyRefusedError } from "./errors";
 import { bestEffortLogger, type Logger, noopLogger } from "./logging";
 import { runOutsideRun } from "./run-context";
 import { withoutTraceContext } from "./trace-context";
 import { type FetchLike, Transport, TransportHttpError } from "./transport";
+import type { AuthKeyResponse } from "./types";
 import { AuthKeyResponseSchema } from "./validation";
 
 export const AUTH_KEY_PATH = "/api/v1/auth/key";
@@ -93,6 +94,7 @@ export class ProjectBinding {
   readonly #loggedCodes = new Set<string>();
 
   #pinnedId: string | null = null;
+  #lastAuth: AuthKeyResponse | null = null;
   #state: BindingState = "unvalidated";
   #everValid = false;
   #refusal: StoredRefusal | null = null;
@@ -169,7 +171,6 @@ export class ProjectBinding {
       return;
     }
     const { message, field } = refusalMessage(refusal, this.selector);
-    this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
     if (
       stored !== null &&
       stored.code === refusal.code &&
@@ -179,6 +180,7 @@ export class ProjectBinding {
     ) {
       return;
     }
+    this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
     this.#refusal = Object.freeze({
       code: refusal.code,
       posture: refusal.posture,
@@ -203,9 +205,10 @@ export class ProjectBinding {
   }
 
   /** Apply a full-scope `/auth/key` 200 dispatched at `dispatched`; false when superseded. */
-  #succeed(dispatched: number, projectId: string): boolean {
+  #succeed(dispatched: number, auth: AuthKeyResponse): boolean {
     if (dispatched !== this.#generation) return false;
-    this.#pinnedId = projectId;
+    this.#pinnedId = auth.project_id;
+    this.#lastAuth = auth;
     this.#state = "valid";
     this.#everValid = true;
     this.#refusal = null;
@@ -242,7 +245,7 @@ export class ProjectBinding {
             this.refuse({ code: "read_only_key", posture: "unknown", expiredOn: null }, generation);
             return "refused";
           }
-          return this.#succeed(generation, parsed.data.project_id) ? "success" : "ignored";
+          return this.#succeed(generation, parsed.data) ? "success" : "ignored";
         } catch (error) {
           if (error instanceof TransportHttpError && error.refusal !== undefined) {
             // Transport.attempt already recorded it with this request's dispatch generation.
@@ -270,24 +273,16 @@ export class ProjectBinding {
   }
 
   /**
-   * Public validation: one `/auth/key` request. Resolves when the key is valid for the project;
-   * throws {@link ApiKeyRefusedError} on any refusal (any posture), or {@link SolwynError} when
-   * Solwyn could not be reached.
+   * Public validation: one `/auth/key` request (joining one already in flight). Resolves with the
+   * key's details when the key is valid for the project (the pinned answer, if this one was
+   * superseded), or `null` when Solwyn could not be reached: nothing changes and calls keep
+   * following `failOpen`. Throws {@link ApiKeyRefusedError} on any refusal, any posture.
    */
-  async validate(): Promise<void> {
-    const outcome = await this.#request();
-    if (outcome === "outage") {
-      throw new SolwynError(
-        "Solwyn could not validate the API key because the control plane did not answer. Try again.",
-      );
-    }
-    if (this.#state === "refused" && this.#refusal !== null)
-      throw this.#refusalError(this.#refusal);
-    if (this.#state !== "valid") {
-      throw new SolwynError(
-        "Solwyn could not validate the API key because the control plane did not answer. Try again.",
-      );
-    }
+  async validate(): Promise<AuthKeyResponse | null> {
+    await this.#request();
+    const refusal = this.#state === "refused" ? this.#refusal : null;
+    if (refusal !== null) throw this.#refusalError(refusal);
+    return this.#state === "valid" ? this.#lastAuth : null;
   }
 
   #refusalError(refusal: StoredRefusal): ApiKeyRefusedError {

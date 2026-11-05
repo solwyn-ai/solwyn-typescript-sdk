@@ -73,6 +73,9 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
 - Public exports `API_KEY_PATTERN`, `PROJECT_SELECTOR_PATTERN`, `PROJECT_HEADER`,
   `PROJECT_ECHO_HEADER`, `AuthKeyResponse`, `AuthKeyResponseSchema`, `validateApiKeyFormat` and
   `validateProjectSelector`.
+- The reviewed endpoint snapshot now comes from the current Solwyn API, with contract tables for
+  `GET /api/v1/auth/key` and its refusal codes. The API also accepts optional Anthropic compaction
+  token buckets, which this SDK does not report yet; the contract tests pin that gap.
 
 ### Removed
 

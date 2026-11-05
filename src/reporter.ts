@@ -1140,7 +1140,8 @@ export class MetadataReporter {
         };
       }
       if (apiKeyRefusalOf(sendError) !== undefined) {
-        // A refusal is terminal for this batch: no retry. The binding logged it once.
+        // A refusal is terminal for this batch: dropped, never retried, counted as refused.
+        this._countDrop("event", "api_key_refused", projected.length);
         return { outcome: "sent", rejections: MALFORMED_REJECTIONS };
       }
       if (sendError instanceof TransportHttpError && sendError.status === 429) {
@@ -1215,9 +1216,10 @@ export class MetadataReporter {
       return { outcome: "sent" };
     } catch (error) {
       if (apiKeyRefusalOf(error) !== undefined) {
-        // A refusal is terminal for this confirm: dropped, never retried, and neutral for
-        // the failure counter. The binding logged it once per code.
+        // A refusal is terminal for this confirm: dropped, never retried, counted as refused,
+        // and neutral for the failure counter. The binding logged it once per code.
         if (isCurrent()) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+        this._countDrop("confirm", "api_key_refused");
         return { outcome: "sent", counterNeutral: true };
       } else {
         if (!isCurrent()) {
@@ -1901,7 +1903,12 @@ export class MetadataReporter {
             }
           }
         }
-        if (apiKeyRefusalOf(error) !== undefined) return;
+        if (apiKeyRefusalOf(error) !== undefined) {
+          // Dropped as refused: not retried until the snapshot changes or the heartbeat is due.
+          this.breakerLastSent.set(provider, this._breakerSnapshotKey(snapshot));
+          this._countDrop("breaker", "api_key_refused");
+          continue;
+        }
         this.logger.warn(
           "reporter.breaker_send_failed: provider=%s exc_type=%s",
           provider,

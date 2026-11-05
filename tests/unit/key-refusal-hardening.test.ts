@@ -17,8 +17,11 @@ import { ApiKeyRefusedError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { run } from "../../src/node";
+import { MetadataReporter } from "../../src/reporter";
 import { FakeControlPlane } from "../../src/testing/index";
+import { zeroTokenDetails } from "../../src/token-details";
 import { type FetchLike, Transport } from "../../src/transport";
+import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
 import {
   authKeyResponse,
   expired,
@@ -910,12 +913,13 @@ describe("review 3.2: deferred and returned spend is fenced at its actual dispat
       leaseEnabled: false,
       reportUntrackedSurfaces: false,
       logger: noopLogger,
-      fetch: async (url) =>
-        new URL(url).pathname === AUTH_KEY_PATH
-          ? (auths += 1) === 1
-            ? authKeyResponse()
-            : authKeyResponse({ scope: "read_only" })
-          : Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 }),
+      fetch: async (url) => {
+        if (new URL(url).pathname !== AUTH_KEY_PATH) {
+          return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+        }
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : authKeyResponse({ scope: "read_only" });
+      },
     });
     closers.push(() => client.close());
     await client.validate();
@@ -975,5 +979,217 @@ describe("review 3.2: deferred and returned spend is fenced at its actual dispat
       await rejection(Promise.resolve().then(() => chat.sendMessage({ message: "synthetic" }))),
     ).toBeInstanceOf(ApiKeyRefusedError);
     expect(providerRequests).toEqual([]);
+  });
+});
+
+describe("while refused, only the key check goes to Solwyn", () => {
+  function refusedEnforcer() {
+    let now = 0;
+    const plane = scripted((path) => {
+      if (path === AUTH_KEY_PATH) return authKeyResponse();
+      if (path === SURRENDER_PATH) return Response.json({ released: true });
+      return allow("alert_only");
+    });
+    const budget = new BudgetEnforcer({
+      apiUrl: TEST_API_URL,
+      apiKey: TEST_API_KEY,
+      project: TEST_PROJECT,
+      fetch: plane.fetch,
+      monotonicNow: () => now,
+      cacheTtl: 0,
+      leaseEnabled: false,
+    });
+    closers.push(() => budget.close());
+    return {
+      plane,
+      budget,
+      advance(ms: number) {
+        now += ms;
+      },
+      dataPlaneSince(index: number) {
+        return plane.calls.slice(index).filter((call) => call.path !== AUTH_KEY_PATH);
+      },
+    };
+  }
+
+  it("(a) an allow_unmetered client stays unmetered; only a request sent before the refusal can blip it, and the immediate revalidation relaxes it", async () => {
+    const { plane, budget, advance, dataPlaneSince } = refusedEnforcer();
+    await budget.binding.validate();
+    // Check A is in flight while the key is still valid.
+    const lateA = deferred<Response>();
+    plane.queue(CHECK_PATH, () => lateA.promise);
+    const callA = budget.checkBudget(CHECK);
+    await vi.waitFor(() => expect(plane.count(CHECK_PATH)).toBe(1));
+
+    // Check B gets the alert_only 401: a block at its status, relaxed by the revalidation.
+    plane.queue(CHECK_PATH, () => expired("alert_only"));
+    plane.queue(AUTH_KEY_PATH, () => expired("alert_only"));
+    await rejection(budget.checkBudget(CHECK));
+    await vi.waitFor(() =>
+      expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" }),
+    );
+    const mark = plane.calls.length;
+
+    // A, sent before the refusal, answers 401 late: a one-time blip, then the revalidation it
+    // triggers (at once, not after 60 s) relaxes again.
+    const authBefore = plane.count(AUTH_KEY_PATH);
+    const relax = deferred<Response>();
+    plane.queue(AUTH_KEY_PATH, () => relax.promise);
+    lateA.resolve(new Response(stalledBody(), { status: 401 }));
+    await vi.waitFor(() => expect(budget.binding.refusal?.effect).toBe("block"));
+    relax.resolve(expired("alert_only"));
+    await vi.waitFor(() =>
+      expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" }),
+    );
+    expect(plane.count(AUTH_KEY_PATH)).toBe(authBefore + 1);
+    await rejection(callA);
+
+    // No periodic re-blocks: every 60 s revalidation keeps it unmetered; calls never block.
+    for (let round = 0; round < 3; round++) {
+      advance(60_000);
+      plane.queue(AUTH_KEY_PATH, () => expired("alert_only"));
+      for (let call = 0; call < 5; call++) {
+        await expect(budget.checkBudget(CHECK)).resolves.toMatchObject({ allowed: true });
+      }
+      expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" });
+    }
+    expect(dataPlaneSince(mark)).toEqual([]);
+  });
+
+  it("(b) a 401-triggered revalidation ignores the 60 s cadence; a revalidation answered with a refusal backs off 60 s", async () => {
+    const { plane, budget, advance } = refusedEnforcer();
+    await budget.binding.validate();
+    plane.queue(CHECK_PATH, () => expired("hard_deny"));
+    plane.queue(AUTH_KEY_PATH, () => expired("hard_deny"));
+    await rejection(budget.checkBudget(CHECK));
+    // Immediate: no time passed.
+    await vi.waitFor(() => expect(plane.count(AUTH_KEY_PATH)).toBe(2));
+    // That revalidation answered with a refusal: the gate waits the full 60 s.
+    for (let call = 0; call < 3; call++) await rejection(budget.checkBudget(CHECK));
+    advance(59_999);
+    await rejection(budget.checkBudget(CHECK));
+    expect(plane.count(AUTH_KEY_PATH)).toBe(2);
+    advance(1);
+    plane.queue(AUTH_KEY_PATH, () => expired("hard_deny"));
+    await rejection(budget.checkBudget(CHECK));
+    expect(plane.count(AUTH_KEY_PATH)).toBe(3);
+  });
+
+  it("(c) a revalidation answered 200 full-scope clears the refusal and data-plane traffic resumes", async () => {
+    const { plane, budget, advance } = refusedEnforcer();
+    await budget.binding.validate();
+    plane.queue(CHECK_PATH, () => expired("hard_deny"));
+    plane.queue(AUTH_KEY_PATH, () => expired("hard_deny"));
+    await rejection(budget.checkBudget(CHECK));
+    await vi.waitFor(() => expect(plane.count(AUTH_KEY_PATH)).toBe(2));
+    const checksWhileRefused = plane.count(CHECK_PATH);
+    await rejection(budget.checkBudget(CHECK));
+    expect(plane.count(CHECK_PATH)).toBe(checksWhileRefused);
+
+    advance(60_000);
+    await expect(budget.checkBudget(CHECK)).resolves.toMatchObject({ allowed: true });
+    expect(budget.binding.state).toBe("valid");
+    expect(plane.count(CHECK_PATH)).toBe(checksWhileRefused + 1);
+  });
+
+  it("allow_unmetered client making 100 calls with background reporters sends zero data-plane requests and never blocks", async () => {
+    let auths = 0;
+    const requests: string[] = [];
+    let dispatches = 0;
+    const raw = {
+      chat: {
+        completions: {
+          create() {
+            dispatches += 1;
+            return { usage: { prompt_tokens: 3, completion_tokens: 2 } };
+          },
+        },
+      },
+    };
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      leaseEnabled: true,
+      budgetCheckCacheTtl: 0,
+      reporterFlushInterval: 0.01,
+      breakerReportHeartbeat: 0.01,
+      reportUntrackedSurfaces: true,
+      logger: noopLogger,
+      fetch: async (url) => {
+        const path = new URL(url).pathname;
+        requests.push(path);
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          return auths === 1 ? authKeyResponse() : expired("alert_only");
+        }
+        if (path === CHECK_PATH) return allow("alert_only");
+        if (path === LEASE_PATH) return grant();
+        return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+      },
+    });
+    closers.push(() => client.close());
+    const create = (): Promise<unknown> =>
+      (
+        client as unknown as { chat: { completions: { create(b: Body): Promise<unknown> } } }
+      ).chat.completions.create({ model: "gpt-4o", messages: [] });
+
+    await client.validate();
+    await create();
+    // The key expires on an alerts-only project; the next check learns it.
+    expect(await rejection(client.validate())).toBeInstanceOf(ApiKeyRefusedError);
+    const mark = requests.length;
+
+    for (let call = 0; call < 100; call++) await expect(create()).resolves.toBeDefined();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await client.close();
+
+    expect(dispatches).toBe(101);
+    expect(requests.slice(mark).filter((path) => path !== AUTH_KEY_PATH)).toEqual([]);
+  });
+});
+
+describe("refused drops are local and counted", () => {
+  it("confirms and events queued while refused are dropped without a request and counted as api_key_refused", async () => {
+    const binding = testBinding({ fetch: async () => expired("hard_deny") });
+    await expect(binding.validate()).rejects.toBeInstanceOf(ApiKeyRefusedError);
+    const sent: string[] = [];
+    const reporter = new MetadataReporter(TEST_API_URL, TEST_API_KEY, {
+      binding,
+      fetch: async (url) => {
+        sent.push(new URL(url).pathname);
+        return new Response(null, { status: 204 });
+      },
+    });
+    closers.push(() => reporter.close(0));
+    reporter.reportConfirm(
+      BudgetConfirmRequestSchema.parse({
+        reservation_id: "r-refused",
+        model: "gpt-4o",
+        provider: "openai",
+        call_id: "00000000-0000-4000-8000-0000000000d1",
+        token_details: zeroTokenDetails(),
+      }),
+    );
+    reporter.report(
+      MetadataEventSchema.parse({
+        model: "gpt-4o",
+        provider: "openai",
+        input_tokens: 1,
+        output_tokens: 1,
+        latency_ms: 1,
+        status: "success",
+        is_model_fallback: false,
+        call_id: "00000000-0000-4000-8000-0000000000d2",
+        sdk_instance_id: "sdk-refused",
+        timestamp: "2026-11-05T00:00:00Z",
+      }),
+    );
+    await reporter._flushRemaining();
+    expect(sent).toEqual([]);
+    expect(reporter.droppedCounts).toMatchObject({
+      "confirm.api_key_refused": 1,
+      "event.api_key_refused": 1,
+    });
   });
 });

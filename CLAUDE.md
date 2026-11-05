@@ -100,7 +100,9 @@ Build before running distribution or package checks. Unit tests must remain offl
     Only an expired or revoked key on a project whose refusal posture is exactly `alert_only`, on a
     client that validated once, runs unmetered; every other refusal blocks. Responses are fenced
     by the binding generation captured in `Transport.attempt`; a 401 refuses at its status and
-    starts an immediate revalidation; only a request sent after a refusal may relax it. Every
+    starts an immediate revalidation; only a request sent after a refusal may relax it. While
+    refused (either effect) `Transport.attempt` sends nothing but `/auth/key`
+    (`TransportRefusedError`, dropped as `api_key_refused`). Every
     physical provider dispatch (hops, retries, media, unmetered spend callables) re-checks
     `blockingRefusal()`; `src/refusal-fence.ts` fences what unmetered spend returns (deferred
     promises, stream helpers, handles) and carries the refusal signal on Stainless requests. Any authority change (refusal, new pin, recovery) drops cached allows

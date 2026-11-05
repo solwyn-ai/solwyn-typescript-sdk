@@ -118,6 +118,7 @@ export class ProjectBinding {
       fetch: options.fetch,
       binding: this,
       refuseAtStatus: false,
+      suppressWhileRefused: false,
     });
   }
 
@@ -208,7 +209,9 @@ export class ProjectBinding {
    * so an alert-only project relaxes as soon as a fresh `/auth/key` answer says so.
    */
   refuseAtStatus(): void {
-    if (this.#state === "refused") return;
+    // Only a request sent before the current refusal can still answer 401 (nothing else is sent
+    // while refused); its status tightens an allow_unmetered refusal for one round trip.
+    if (this.#state === "refused" && this.#refusal?.effect === "block") return;
     const unknown: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
     this.#store(unknown, "block", false);
     this.#revalidateSoon();
@@ -280,6 +283,14 @@ export class ProjectBinding {
     const aborted = this.#blockController.signal.aborted;
     if (blocking && !aborted) this.#blockController.abort();
     else if (!blocking && aborted) this.#blockController = new AbortController();
+  }
+
+  /** The stored refusal while refused, whatever its effect: data-plane requests are not sent. */
+  suppressedBy(): Refusal | undefined {
+    const refusal = this.#state === "refused" ? this.#refusal : null;
+    return refusal === null
+      ? undefined
+      : { code: refusal.code, posture: refusal.posture, expiredOn: null };
   }
 
   /**

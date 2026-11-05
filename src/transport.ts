@@ -81,6 +81,7 @@ export function requireFetchLike(fetch: unknown): asserts fetch is FetchLike | u
 
 type TransportErrorLabel =
   | "TransportError"
+  | "TransportRefusedError"
   | "TransportHttpError"
   | "TransportTimeoutError"
   | "TransportNetworkError";
@@ -130,6 +131,21 @@ export class TransportHttpError extends TransportError {
       label: "TransportHttpError",
       retryable: status === 408 || status === 429 || status >= 500,
     });
+  }
+}
+
+/**
+ * Not sent: the API key or project is refused, and while it is, nothing but the key check goes
+ * to Solwyn. Carries the stored refusal so callers drop the item as refused, without retry.
+ */
+export class TransportRefusedError extends TransportError {
+  readonly refusal: Refusal;
+
+  constructor(refusal: Refusal) {
+    super(`not sent: ${refusal.code}`);
+    this.name = "TransportRefusedError";
+    this.refusal = refusal;
+    transportFailures.set(this, { label: "TransportRefusedError", retryable: false });
   }
 }
 
@@ -183,6 +199,8 @@ export interface TransportOptions {
   binding?: RequestBinding;
   /** Record a blocking refusal at a 401's status, before its body (default true). */
   refuseAtStatus?: boolean;
+  /** Send nothing while the binding is refused (default true; off only for `/auth/key`). */
+  suppressWhileRefused?: boolean;
   /**
    * Max RETRIES (not attempts) for a single request. Default `0` — one attempt,
    * no retry. Retries apply only to transient failures and never exceed this cap
@@ -231,7 +249,10 @@ export function isRetryableTransportError(error: unknown): boolean {
 
 /** The API-key refusal carried by a transport failure, if any. */
 export function apiKeyRefusalOf(error: unknown): Refusal | undefined {
-  return error instanceof TransportHttpError ? error.refusal : undefined;
+  if (error instanceof TransportHttpError || error instanceof TransportRefusedError) {
+    return error.refusal;
+  }
+  return undefined;
 }
 
 /**
@@ -316,6 +337,8 @@ export interface RequestBinding {
   refuse(refusal: Refusal, dispatched: number): void;
   /** Record a blocking refusal the moment a 401 status arrives (unless one is stored). */
   refuseAtStatus(): void;
+  /** The stored refusal while the key is refused (either effect); data-plane requests stop. */
+  suppressedBy(): Refusal | undefined;
 }
 
 /**
@@ -423,6 +446,7 @@ export class Transport {
   private readonly retryBaseDelayMs: number;
   private readonly binding: RequestBinding | null;
   private readonly refuseAtStatusEnabled: boolean;
+  private readonly suppressWhileRefused: boolean;
 
   constructor(baseUrl: string, apiKey: string, options: TransportOptions = {}) {
     // Strip ALL trailing slashes (Python: `api_url.rstrip("/")`).
@@ -434,6 +458,7 @@ export class Transport {
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 100;
     this.binding = options.binding ?? null;
     this.refuseAtStatusEnabled = options.refuseAtStatus ?? true;
+    this.suppressWhileRefused = options.suppressWhileRefused ?? true;
   }
 
   /**
@@ -546,6 +571,9 @@ export class Transport {
     options: RequestOptions,
     consume: ResponseConsumer<T>,
   ): Promise<T> {
+    // While the key is refused, nothing but the key check goes to Solwyn.
+    const suppressed = this.suppressWhileRefused ? this.binding?.suppressedBy() : undefined;
+    if (suppressed !== undefined) throw new TransportRefusedError(suppressed);
     const controller = new AbortController();
     const deadline = monotonicNow() + options.timeoutMs;
     const discard = (response: Response) =>

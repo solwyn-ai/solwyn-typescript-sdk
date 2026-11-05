@@ -58,7 +58,10 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   retries) and every unmetered or unrecognised spend method, including references read before the
   refusal and work those methods return: promises that send later, stream helpers, chat sessions
   and derived clients are stopped at their actual dispatch. Surface acknowledgments do not override
-  it.
+  it. While a refusal is stored (blocking or unmetered), the SDK sends nothing to Solwyn except the
+  key check: no budget checks, lease requests, confirmations, metadata, untracked-surface or
+  breaker reports. Those items are dropped locally and counted as `api_key_refused` drops, so an
+  unmetered client is never re-blocked by its own background traffic.
 - **Cached allows and held leases belong to the project they were granted for.** A refusal, a
   validation that pins a different project id, or recovery from a refusal drops them all (leases
   are surrendered), and grants or check answers already in flight are not installed.

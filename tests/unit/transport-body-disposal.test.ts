@@ -14,6 +14,7 @@ import {
 import type { BudgetConfirmRequest, LeaseGrantResponse } from "../../src/types";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
 import { BudgetConfirmRequestSchema } from "../../src/validation";
+import { pinnedBinding } from "../helpers/project-binding";
 
 // 2026-09-22 performance audit: Dispose unfinished HTTP response bodies the SDK discards.
 // Every body the SDK does not use is released off the result path: small complete
@@ -21,7 +22,7 @@ import { BudgetConfirmRequestSchema } from "../../src/validation";
 // request aborted within min(remaining attempt deadline, 1 s). Outcomes never wait.
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 const SDK_INSTANCE_ID = "00000000-0000-0000-0000-000000000001";
 /** A synthetic sentinel that must never surface in any diagnostic. */
@@ -328,7 +329,7 @@ describe("Transport body disposal — drain versus cancel", () => {
     expect(signals[0]?.aborted).toBe(false);
   });
 
-  it("still detects the read-only-key marker on a 403", async () => {
+  it("still classifies a read-only-key refusal on a 403 without retaining the body", async () => {
     const transport = transportFor(
       () =>
         new Response(JSON.stringify({ detail: { code: "read_only_key", message: "x" } }), {
@@ -340,7 +341,11 @@ describe("Transport body disposal — drain versus cancel", () => {
       .postJson(BUDGET_CONFIRM_PATH, {}, { timeoutMs: 5_000 })
       .catch((e: unknown) => e);
     expect((error as TransportHttpError).status).toBe(403);
-    expect((error as TransportHttpError).marker).toBe("read_only_key");
+    expect((error as TransportHttpError).refusal).toEqual({
+      code: "read_only_key",
+      posture: "unknown",
+      expiredOn: null,
+    });
 
     const plain = await transportFor(
       () => new Response(JSON.stringify({ detail: BODY_SENTINEL }), { status: 403 }),
@@ -348,7 +353,7 @@ describe("Transport body disposal — drain versus cancel", () => {
     )
       .postJson(BUDGET_CONFIRM_PATH, {}, { timeoutMs: 5_000 })
       .catch((e: unknown) => e);
-    expect((plain as TransportHttpError).marker).toBeUndefined();
+    expect((plain as TransportHttpError).refusal).toBeUndefined();
     expect(JSON.stringify(plain)).not.toContain(BODY_SENTINEL);
     expect((plain as Error).message).toBe("HTTP 403");
   });
@@ -516,6 +521,7 @@ describe.each([
     const probes: BodyProbe[] = [];
     const signals: AbortSignal[] = [];
     const budget = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: true,
@@ -581,6 +587,7 @@ describe.each([
     const probes: BodyProbe[] = [];
     const signals: AbortSignal[] = [];
     const reporter = new MetadataReporter(API_URL, API_KEY, {
+      binding: await pinnedBinding(PROJECT_ID),
       logger,
       flushInterval: 3_600,
       sdkInstanceId: SDK_INSTANCE_ID,
@@ -603,7 +610,6 @@ describe.each([
         return successResponse(kind, status, probes);
       },
     });
-    reporter.observeProjectId(PROJECT_ID);
 
     await reporter._startBreakerCycle(true);
     await vi.advanceTimersByTimeAsync(DRAIN_BOUND_MS);

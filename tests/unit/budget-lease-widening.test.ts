@@ -7,7 +7,7 @@ import { FakeControlPlane } from "../../src/testing/index";
 import type { LeaseGrantResponse } from "../../src/types";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const LEASE_URL = `${API_URL}/api/v1/budgets/lease`;
 const RENEW_URL = `${API_URL}/api/v1/budgets/lease/renew`;
 const SURRENDER_URL = `${API_URL}/api/v1/budgets/lease/surrender`;
@@ -126,6 +126,7 @@ function harness(handlers: Handlers = {}, overrides: Partial<BudgetEnforcerOptio
   const checks: Body[] = [];
   let mark = 0;
   const budget = new BudgetEnforcer({
+    project: "test-project",
     apiUrl: API_URL,
     apiKey: API_KEY,
     leaseEnabled: true,
@@ -762,6 +763,7 @@ describe("lease widening against FakeControlPlane", () => {
   it("surrenders the held generation after a widening to a zero-rate model, then re-grants", async () => {
     const plane = new FakeControlPlane({ grantedTokens: 15_000 });
     const budget = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,

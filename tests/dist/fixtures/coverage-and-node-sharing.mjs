@@ -47,7 +47,12 @@ const clients = [first, second].map(
           },
         },
       },
-      { apiKey: `sk_proj_${"a".repeat(64)}`, provider: "openai", reportUntrackedSurfaces: false },
+      {
+        apiKey: `solwyn_sk_${"a".repeat(64)}`,
+        project: "test-project",
+        provider: "openai",
+        reportUntrackedSurfaces: false,
+      },
     ),
 );
 assert.equal(first.coverage(clients[1]).provider, "openai");

@@ -8,7 +8,7 @@ import type { BudgetConfirmRequest } from "../../src/types";
 import { BudgetConfirmRequestSchema } from "../../src/validation";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function loggerSpies(): Logger {
   return {
@@ -79,6 +79,7 @@ function budgetWithBreaker(
   const withBreaker = {
     apiUrl: API_URL,
     apiKey: API_KEY,
+    project: "test-project",
     ...options,
     controlPlaneBreaker: breaker,
   } as BudgetEnforcerOptions & { controlPlaneBreaker: CircuitBreaker | null };

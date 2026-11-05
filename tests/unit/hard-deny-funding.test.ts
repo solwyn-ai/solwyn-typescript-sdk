@@ -20,7 +20,7 @@ import { Solwyn } from "../../src/index";
 import { run } from "../../src/node";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 
 type Body = Record<string, unknown>;

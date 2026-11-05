@@ -22,7 +22,7 @@ import type { FetchLike } from "../../src/transport";
 import type { MediaUsage, Modality } from "../../src/types";
 import { VelocityMonitor } from "../../src/velocity";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 /** Media-only adapter fixture carried by a declared OpenAI-shaped SDK client. */
 function declaredMediaClient<T>(create: T) {
@@ -272,13 +272,6 @@ describe("mediaCall lifecycle", () => {
       order.push("tuning");
       return originalReplaceTotal.call(this, total);
     });
-    const originalObserveProject = MetadataReporter.prototype.observeProjectId;
-    const observeProject = vi
-      .spyOn(MetadataReporter.prototype, "observeProjectId")
-      .mockImplementation(function (this: MetadataReporter, projectId) {
-        order.push("project");
-        return originalObserveProject.call(this, projectId);
-      });
     const client = {
       chat: {
         completions: {
@@ -316,7 +309,6 @@ describe("mediaCall lifecycle", () => {
       observe.mockRestore();
       checkBudget.mockRestore();
       replaceTotal.mockRestore();
-      observeProject.mockRestore();
       await core.close();
     }
 
@@ -326,12 +318,10 @@ describe("mediaCall lifecycle", () => {
       "velocity",
       "budget",
       "tuning",
-      "project",
       "dispatch-chat",
       "velocity",
       "budget",
       "tuning",
-      "project",
       "dispatch-media",
     ]);
   });
@@ -368,7 +358,6 @@ describe("mediaCall lifecycle", () => {
     });
     const replaceTuning = vi.spyOn(CircuitBreakerManager.prototype, "replaceTuning");
     const replaceTotal = vi.spyOn(Deadline.prototype, "replaceTotal");
-    const observeProject = vi.spyOn(MetadataReporter.prototype, "observeProjectId");
     const prepareChat = vi.spyOn(adapter, "prepareCall");
     const prepareMedia = vi.spyOn(adapter, "prepareMediaCall");
     const candidateOrder = vi.fn<SelectionPolicy["order"]>(() => {
@@ -427,7 +416,6 @@ describe("mediaCall lifecycle", () => {
     expect(phaseOrder).toEqual(["budget", "postcheck-release", "report"]);
     expect(replaceTuning).not.toHaveBeenCalled();
     expect(replaceTotal).not.toHaveBeenCalled();
-    expect(observeProject).not.toHaveBeenCalled();
     expect(candidateOrder).not.toHaveBeenCalled();
     expect(prepareChat).not.toHaveBeenCalled();
     expect(prepareMedia).not.toHaveBeenCalled();
@@ -1486,7 +1474,11 @@ describe("mediaCall lifecycle", () => {
 
 describe("media budget plumbing", () => {
   it("builds modality/media fields without changing text defaults", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: "https://api.solwyn.test", apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: "https://api.solwyn.test",
+      apiKey: API_KEY,
+    });
     const check = enforcer.buildCheckRequest({
       estimatedInputTokens: 7,
       estimatedMedia: { audio_seconds: null, is_estimated: true },

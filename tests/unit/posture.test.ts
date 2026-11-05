@@ -3,7 +3,7 @@ import { Solwyn } from "../../src/index";
 import * as proxies from "../../src/proxies";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const WARNING =
   "Provider '%s' client shape '%s' exposes untracked surface '%s' (scope: %s); no budget check and no cost event will be emitted. Tracking for this surface is coming.";
 

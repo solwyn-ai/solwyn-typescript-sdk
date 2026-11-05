@@ -166,6 +166,7 @@ for (const producer of entries) {
   };
   const client = new producer.Solwyn(primary, {
     apiKey: plane.apiKey,
+    project: plane.project,
     apiUrl: plane.apiUrl,
     fetch: plane.fetch,
     fallback: [[fallback, "claude-test"]],
@@ -214,6 +215,7 @@ for (const [index, producer] of entries.entries()) {
       },
       {
         apiKey: plane.apiKey,
+        project: plane.project,
         apiUrl: plane.apiUrl,
         fetch: plane.fetch,
         leaseEnabled: false,
@@ -256,6 +258,7 @@ for (const format of formats) {
   const plane = new FakeControlPlane();
   const handle = createSolwynMiddleware({
     apiKey: plane.apiKey,
+    project: plane.project,
     apiUrl: plane.apiUrl,
     fetch: plane.fetch,
     leaseEnabled: false,

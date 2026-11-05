@@ -15,7 +15,7 @@ import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
 import { serializeBudgetConfirmRequest } from "../../src/validation";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const LEASE_URL = `${API_URL}/api/v1/budgets/lease`;
 const RENEW_URL = `${API_URL}/api/v1/budgets/lease/renew`;
 const SURRENDER_URL = `${API_URL}/api/v1/budgets/lease/surrender`;
@@ -132,6 +132,7 @@ function enforcer(
   overrides: Partial<BudgetEnforcerOptions> = {},
 ): BudgetEnforcer {
   return new BudgetEnforcer({
+    project: "test-project",
     apiUrl: API_URL,
     apiKey: API_KEY,
     fetch,
@@ -229,6 +230,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
   it("enables leases by default at the low-level constructor", async () => {
     const urls: string[] = [];
     const budget = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       holderId: "sdk-default-holder",

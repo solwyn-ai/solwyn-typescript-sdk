@@ -9,7 +9,7 @@ import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/valid
 import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
 const API_URL = "https://api.solwyn.ai";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const INGEST_URL = `${API_URL}/api/v1/metadata/ingest`;
 const CONFIRM_URL = `${API_URL}/api/v1/budgets/confirm`;
 

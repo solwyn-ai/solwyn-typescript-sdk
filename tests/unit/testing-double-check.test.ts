@@ -69,7 +69,7 @@ describe("FakeControlPlane checks", () => {
 
   it("exposes deterministic fixed wiring and validates every constructor knob", async () => {
     const plane = await makePlane();
-    expect(plane.apiKey).toBe(`sk_proj_${"0".repeat(64)}`);
+    expect(plane.apiKey).toBe(`solwyn_sk_${"0".repeat(64)}`);
     expect(plane.apiUrl).toBe("http://control-plane.invalid");
     expect(typeof plane.fetch).toBe("function");
 

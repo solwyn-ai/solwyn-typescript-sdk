@@ -20,7 +20,7 @@ import type { ProviderAdapter } from "../../src/providers/protocol";
 import type { FetchLike } from "../../src/transport";
 import { PROVIDER_NAMES } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function fakeLogger(): Logger & { infos: string[]; warnings: string[] } {
   const infos: string[] = [];

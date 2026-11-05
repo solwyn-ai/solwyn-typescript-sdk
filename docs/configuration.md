@@ -6,7 +6,8 @@
 
 | Option | Env var | Default | Description |
 |--------|---------|---------|-------------|
-| `apiKey` | `SOLWYN_API_KEY` | *required* | Solwyn project API key (`sk_proj_` + 64 hex) |
+| `apiKey` | `SOLWYN_API_KEY` | *required* | Solwyn API key (`solwyn_sk_` + 64 lowercase hex); old `sk_proj_` keys are rejected |
+| `project` | `SOLWYN_PROJECT` | *required* | Project name or `proj_` id the key reports to; sent as `Solwyn-Project` on every request. `SOLWYN_PROJECT_ID` is not read |
 | `apiUrl` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn Cloud API endpoint |
 | `model` | — | — | Model for the primary provider (per-call `model` overrides it) |
 | `provider` | — | auto-detect | Provider pin for the primary; bypasses detection, then validates client family |
@@ -85,3 +86,23 @@ the stream finishes, so it also limits the total duration of a healthy stream. T
 stream on the other SDKs, pass an `AbortSignal` in the request options or apply your own idle
 timeout while iterating. Bedrock's `requestTimeout` is not a universal hard abort for every
 Converse stream handler; configure a finite socket timeout on the AWS request handler too.
+
+## API key and project
+
+`apiKey` and `project` are both required; each falls back to its environment variable. The key is
+checked locally for the `solwyn_sk_` format, and the project for a name (1 to 100 characters from
+letters, digits, spaces, `.`, `_` and `-`, with no leading or trailing space) or a `proj_` id. The
+SDK trims spaces and tabs around the project. Passing `projectId` throws
+`ConfigurationError(field: "project_id")`; `SOLWYN_PROJECT_ID` is not read.
+
+Construction makes no network request. Before the first call that needs Solwyn, the SDK sends
+`GET /api/v1/auth/key` once and pins the project's `proj_` id from the answer; until then the
+`Solwyn-Project` header carries the configured value. `await client.validate()` (or
+`await handle.validate()` on the AI SDK middleware) runs the same check on demand and throws
+`ApiKeyRefusedError` on any refusal, or `SolwynError` when Solwyn does not answer.
+
+If Solwyn does not answer the automatic check, calls follow the usual outage posture and the SDK
+retries every 30 seconds. A refusal is stored and checked first on every call, before cached
+allows, leases, the control-plane breaker and `failOpen`; the SDK rechecks every 60 seconds and
+clears the refusal only after a successful check. See the README section on API keys and projects
+for which refusals block and which let calls run unmetered.

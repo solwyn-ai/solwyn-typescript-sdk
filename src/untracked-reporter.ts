@@ -1,9 +1,10 @@
 import { ConfigurationError } from "./errors";
 import { bestEffortLogger, type Logger, noopLogger } from "./logging";
-import { handleReadOnlyKeyError } from "./read-only-key";
+import type { ProjectBinding } from "./project";
 import { SURFACE_CLIENT_SHAPES, type SurfaceClientShape, validateSurfacePath } from "./surfaces";
 import { withoutTraceContext } from "./trace-context";
 import {
+  apiKeyRefusalOf,
   type FetchLike,
   isRetryableTransportError,
   MAX_RATE_LIMIT_ATTEMPTS,
@@ -48,6 +49,8 @@ export interface UntrackedSurfaceObservation {
 export interface UntrackedSurfaceReporterOptions {
   readonly sdkInstanceId: string;
   readonly fetch?: FetchLike;
+  /** The client's project binding: `Solwyn-Project` header and refusal recording. */
+  readonly binding?: ProjectBinding;
   readonly wallClock?: () => number;
   readonly monotonicClock?: () => number;
   readonly randomUUID?: () => string;
@@ -335,6 +338,7 @@ export class UntrackedSurfaceReporter {
   constructor(apiUrl: string, apiKey: string, options: UntrackedSurfaceReporterOptions) {
     this.#transport = new Transport(apiUrl, apiKey, {
       fetch: options.fetch,
+      binding: options.binding,
       maxRetries: 0,
     });
     this.#sdkInstanceId = options.sdkInstanceId;
@@ -556,8 +560,11 @@ export class UntrackedSurfaceReporter {
           { timeoutMs, signal: this.#shutdownController.signal },
         );
       } catch (error) {
-        if (handleReadOnlyKeyError(error, this.#logger)) {
-          this.#disabled = true;
+        const refusal = apiKeyRefusalOf(error);
+        if (refusal !== undefined) {
+          // Terminal for this batch, never retried; the binding logged it once per code.
+          // A read-only key can never report, so advisory reporting stops for good.
+          if (refusal.code === "read_only_key") this.#disabled = true;
           this.#state.reject(batch);
           return progressed;
         }

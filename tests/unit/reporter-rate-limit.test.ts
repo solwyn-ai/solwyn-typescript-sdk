@@ -4,8 +4,9 @@ import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { pinnedBinding } from "../helpers/project-binding";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 function enqueue(
   reporter: MetadataReporter,
   kind: "confirm" | "settlement" | "event",
@@ -333,6 +334,7 @@ describe("reporter rate limiting", () => {
     let breakerAttempts = 0;
     let ingestAttempts = 0;
     const reporter = new MetadataReporter("https://api.solwyn.test", API_KEY, {
+      binding: await pinnedBinding(),
       monotonicClock: Date.now,
       sdkInstanceId: "rate-limit-test",
       breakerSnapshots: () => [["openai", breaker.getState()]],
@@ -349,7 +351,6 @@ describe("reporter rate limiting", () => {
             });
       },
     });
-    reporter.observeProjectId(`proj_${"0".repeat(24)}`);
     const active = reporter._startBreakerCycle();
     enqueue(reporter, "event");
     await reporter._flushRemaining();

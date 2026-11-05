@@ -26,7 +26,7 @@ import { Solwyn } from "../../src/index";
 import type { Logger } from "../../src/logging";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const SENTINEL = "SUPER_SECRET_PROMPT_a1b2c3";
 
 /** A minimal OpenAI-dialect client (native `openai` NAME). */

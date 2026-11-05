@@ -63,7 +63,7 @@ ${from("FakeControlPlane", "@solwyn/sdk/testing")}
 const plane=new FakeControlPlane();
 let dispatched=0;
 const provider={chat:{completions:{create(){dispatched++;return {usage:{prompt_tokens:2,completion_tokens:3}};}}}};
-const client=new Solwyn(provider,{apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:noopLogger,reportUntrackedSurfaces:false,reporterFlushInterval:60});
+const client=new Solwyn(provider,{apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:noopLogger,reportUntrackedSurfaces:false,reporterFlushInterval:60});
 globalThis.reviewClient=client;
 await ${name === "node-run-used" ? "run('bundle-review',()=>client.chat.completions.create({model:'gpt-review'}))" : "client.chat.completions.create({model:'gpt-review'})"};
 ${name === "core-explicit-close" ? "await client.close();" : ""}
@@ -154,12 +154,12 @@ globalThis.reviewDone=(async()=>{
   const warnings=[];
   const logger={debug(){},info(){},warn(message){warnings.push(message);},error(message){warnings.push(message);}};
   const provider={chat:{completions:{create(params){providerCalls++;if(params.stream)return(async function*(){yield{usage:{prompt_tokens:2,completion_tokens:3}}})();return{usage:{prompt_tokens:2,completion_tokens:3}};}}}};
-  const client=new Solwyn(provider,{apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch,leaseEnabled:false,budgetCheckCacheTtl:0,reportUntrackedSurfaces:false,logger});
+  const client=new Solwyn(provider,{apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch,leaseEnabled:false,budgetCheckCacheTtl:0,reportUntrackedSurfaces:false,logger});
   await client.chat.completions.create({model:'gpt-review'});
   for await(const part of await client.chat.completions.create({model:'gpt-review',stream:true})){void part;}
   await client.close();
   const coreClosed={checks:plane.checks.length,confirms:plane.confirms.length,ingested:plane.ingested.length};
-  const middleware=createSolwynMiddleware({apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch,leaseEnabled:false,budgetCheckCacheTtl:0,logger});
+  const middleware=createSolwynMiddleware({apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch,leaseEnabled:false,budgetCheckCacheTtl:0,logger});
   const params={prompt:[],maxOutputTokens:1};
   const model={provider:'openai',modelId:'gpt-review'};
   await middleware.middleware.wrapGenerate({params,model,doGenerate:async()=>({usage:{inputTokens:2,outputTokens:3},content:[]})});

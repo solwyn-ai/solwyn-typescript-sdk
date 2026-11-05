@@ -72,7 +72,8 @@ const fetch: FetchLike = async (url, init) => {
   throw new Error("unexpected mocked stream accounting endpoint");
 };
 const options = {
-  apiKey: `sk_proj_${"a".repeat(64)}`,
+  apiKey: `solwyn_sk_${"a".repeat(64)}`,
+  project: "test-project",
   apiUrl: "https://stream-retention.invalid",
   fetch,
   logger: noopLogger,

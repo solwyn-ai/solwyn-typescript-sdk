@@ -102,9 +102,14 @@ const noopLogger = {
   error() {},
 };
 const fetchStub = async () => new Response("[]", { status: 202 });
-const apiKey = `sk_proj_${"a".repeat(64)}`;
+const apiKey = `solwyn_sk_${"a".repeat(64)}`;
 
-const client = new Solwyn(fakeClient, { apiKey, fetch: fetchStub, logger: noopLogger });
+const client = new Solwyn(fakeClient, {
+  apiKey,
+  project: "test-project",
+  fetch: fetchStub,
+  logger: noopLogger,
+});
 
 // A FIFO barrier guarantees all earlier loader messages have been observed before snapshotting.
 await barrier("pre-call loader barrier");

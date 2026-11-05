@@ -46,6 +46,7 @@ const provider = {
 };
 const client = new Solwyn(provider, {
   apiKey: plane.apiKey,
+  project: plane.project,
   apiUrl: plane.apiUrl,
   fetch: plane.fetch,
   leaseEnabled: false,

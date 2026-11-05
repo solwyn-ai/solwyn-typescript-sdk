@@ -29,6 +29,7 @@ function makeClient() {
   };
   return new Solwyn(client, {
     apiKey: plane.apiKey,
+    project: plane.project,
     apiUrl: plane.apiUrl,
     fetch: plane.fetch,
     logger: noopLogger,

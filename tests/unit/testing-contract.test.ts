@@ -10,7 +10,7 @@ import {
 import type { FetchLike } from "../../src/transport";
 
 const JSON_HEADERS = {
-  Authorization: `Bearer ${`sk_proj_${"0".repeat(64)}`}`,
+  Authorization: `Bearer ${`solwyn_sk_${"0".repeat(64)}`}`,
   "Content-Type": "application/json",
 };
 
@@ -101,6 +101,7 @@ describe("public testing contract helpers", () => {
     await assertCheckContract(captured.fetch, {
       apiUrl: `${plane.apiUrl}/base/`,
       apiKey: plane.apiKey,
+      project: plane.project,
     });
 
     expect(captured.requests).toHaveLength(5);
@@ -136,7 +137,11 @@ describe("public testing contract helpers", () => {
 
   it("confirms a reservation, its replays, both XOR failures, and an unknown reservation", async () => {
     const plane = new FakeControlPlane();
-    await assertConfirmContract(plane.fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey });
+    await assertConfirmContract(plane.fetch, {
+      apiUrl: plane.apiUrl,
+      apiKey: plane.apiKey,
+      project: plane.project,
+    });
 
     expect(plane.checks).toHaveLength(1);
     expect(plane.confirms).toHaveLength(1);
@@ -145,7 +150,11 @@ describe("public testing contract helpers", () => {
 
   it("exercises the full lease lifecycle without asserting stale-surrender behavior", async () => {
     const plane = setupLeasePlane();
-    await assertLeaseContract(plane.fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey });
+    await assertLeaseContract(plane.fetch, {
+      apiUrl: plane.apiUrl,
+      apiKey: plane.apiKey,
+      project: plane.project,
+    });
 
     expect(plane.leaseGrants).toHaveLength(3);
     expect(plane.leaseRenewals).toHaveLength(3);
@@ -169,7 +178,11 @@ describe("public testing contract helpers", () => {
 
     let failure: unknown;
     try {
-      await assertLeaseContract(captured.fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey });
+      await assertLeaseContract(captured.fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      });
     } catch (error) {
       failure = error;
     }
@@ -198,7 +211,11 @@ describe("public testing contract helpers", () => {
     );
 
     await expect(
-      assertLeaseContract(fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey }),
+      assertLeaseContract(fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      }),
     ).rejects.toThrow("[lease.renew-wrong-generation]");
   });
 
@@ -209,6 +226,7 @@ describe("public testing contract helpers", () => {
     await assertRunControlContract(plane.fetch, {
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
+      project: plane.project,
       stoppedRunId: "contract-stopped-by-caller",
     });
 
@@ -220,7 +238,11 @@ describe("public testing contract helpers", () => {
 
   it("ingests exactly one server denial and one aggregate replay", async () => {
     const plane = new FakeControlPlane();
-    await assertReceiptIngestContract(plane.fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey });
+    await assertReceiptIngestContract(plane.fetch, {
+      apiUrl: plane.apiUrl,
+      apiKey: plane.apiKey,
+      project: plane.project,
+    });
 
     expect(plane.denialReceipts).toHaveLength(2);
     expect(plane.aggregateReplays).toHaveLength(1);
@@ -258,7 +280,11 @@ describe("public testing contract helpers", () => {
     );
 
     await expect(
-      assertCheckContract(fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey }),
+      assertCheckContract(fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      }),
     ).rejects.toThrow(/\[check\.monthly\].*price_hints/);
   });
 
@@ -277,7 +303,11 @@ describe("public testing contract helpers", () => {
     const plane = setupCheckPlane();
     const fetch = mutateResponse(plane.fetch, (_request, occurrence) => occurrence === 0, mutation);
     await expect(
-      assertCheckContract(fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey }),
+      assertCheckContract(fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      }),
     ).rejects.toThrow("[check.monthly]");
   });
 
@@ -291,6 +321,7 @@ describe("public testing contract helpers", () => {
       await assertCheckContract(fetch, {
         apiUrl: "https://control-plane.example/base",
         apiKey: "contract-key",
+        project: "contract-project",
       });
     } catch (error) {
       failure = error;
@@ -331,7 +362,11 @@ describe("public testing contract helpers", () => {
     );
 
     await expect(
-      assertLeaseContract(fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey }),
+      assertLeaseContract(fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      }),
     ).rejects.toThrow("[lease.grant]");
   });
 
@@ -350,6 +385,7 @@ describe("public testing contract helpers", () => {
       assertRunControlContract(fetch, {
         apiUrl: plane.apiUrl,
         apiKey: plane.apiKey,
+        project: plane.project,
         stoppedRunId: "contract-stopped-by-caller",
       }),
     ).rejects.toThrow("[run-control.opted-in]");
@@ -377,7 +413,11 @@ describe("public testing contract helpers", () => {
     const fetch = mutateResponse(plane.fetch, (_request, occurrence) => occurrence === 0, mutation);
 
     await expect(
-      assertReceiptIngestContract(fetch, { apiUrl: plane.apiUrl, apiKey: plane.apiKey }),
+      assertReceiptIngestContract(fetch, {
+        apiUrl: plane.apiUrl,
+        apiKey: plane.apiKey,
+        project: plane.project,
+      }),
     ).rejects.toThrow("[receipt.server-denial]");
   });
 });

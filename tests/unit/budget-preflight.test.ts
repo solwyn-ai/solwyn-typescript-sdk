@@ -13,7 +13,7 @@ import { Deadline } from "../../src/routing";
 import { createTokenDetails } from "../../src/token-details";
 import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 const CALL_ID = "00000000-0000-0000-0000-000000000001";
@@ -66,7 +66,12 @@ function options(overrides: Partial<CheckBudgetOptions> = {}): CheckBudgetOption
 }
 
 function enforcer(overrides: Partial<BudgetEnforcerOptions> = {}): BudgetEnforcer {
-  return new BudgetEnforcer({ apiKey: API_KEY, apiUrl: API_URL, ...overrides });
+  return new BudgetEnforcer({
+    project: "test-project",
+    apiKey: API_KEY,
+    apiUrl: API_URL,
+    ...overrides,
+  });
 }
 
 function ledger(budget: BudgetEnforcer): LeaseLedger {

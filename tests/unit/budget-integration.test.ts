@@ -53,7 +53,7 @@ import { createTokenDetails, type TokenDetails, zeroTokenDetails } from "../../s
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, LeaseGrantResponse, MetadataEvent } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 // ---------------------------------------------------------------------------
 // Wire-body helpers.
@@ -1248,7 +1248,7 @@ describe("client lease activation identity", () => {
       usage: { prompt_tokens: 3, completion_tokens: 2 },
     }));
     const solwyn = new Solwyn(provider, {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       fetch,
       leaseEnabled: true,
       leaseOutputBoundDefault: 512,

@@ -226,6 +226,31 @@ export class ConfigurationError extends SolwynError {
   }
 }
 
+/** Options for {@link ApiKeyRefusedError}. */
+export interface ApiKeyRefusedErrorOptions {
+  /** The refusal code, for example `"api_key_expired"` or `"project_not_found"`. */
+  code: string;
+  /** `"api_key"` or `"project"`, naming what to fix. */
+  field: "api_key" | "project";
+}
+
+/**
+ * Raised when Solwyn refused the API key or its project and the SDK must not run past the
+ * refusal: an expired, revoked, unrecognised or read-only key, or a project the key does not
+ * reach. A {@link ConfigurationError}, so one `instanceof ConfigurationError` check covers
+ * construction, `validate()` and wrapped calls.
+ */
+export class ApiKeyRefusedError extends ConfigurationError {
+  readonly code: string;
+
+  constructor(message: string, options: ApiKeyRefusedErrorOptions) {
+    super(message, { field: options.field });
+    this.name = "ApiKeyRefusedError";
+    brandError(this, "ApiKeyRefusedError");
+    this.code = options.code;
+  }
+}
+
 /** Options for {@link UnsupportedSurfaceError}. */
 export interface UnsupportedSurfaceErrorOptions {
   surface: string;
@@ -479,6 +504,7 @@ for (const [errorConstructor, family] of [
   [RunStoppedError, "RunStoppedError"],
   [ProviderUnavailableError, "ProviderUnavailableError"],
   [ConfigurationError, "ConfigurationError"],
+  [ApiKeyRefusedError, "ApiKeyRefusedError"],
   [UnsupportedSurfaceError, "UnsupportedSurfaceError"],
   [UntrackedSpendSurfaceError, "UntrackedSpendSurfaceError"],
   [CoverageMismatchError, "CoverageMismatchError"],

@@ -1002,6 +1002,7 @@ const CUSTOM_INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
 const CORE_OWNED: ReadonlySet<string | symbol> = new Set<string | symbol>([
   "close",
+  "validate",
   Symbol.asyncDispose,
   CUSTOM_INSPECT,
 ]);
@@ -1360,6 +1361,11 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
 
 /** The Solwyn-owned surface added on top of the wrapped client's own surface. */
 export interface Solwyn {
+  /**
+   * Check the API key and project with Solwyn now. Throws `ApiKeyRefusedError` (a
+   * `ConfigurationError`) on any refusal; wrapped calls otherwise validate lazily.
+   */
+  validate(): Promise<void>;
   /** Flush reporter work, close budget-enforcer resources, then forward provider shutdown. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link Solwyn.close}. */

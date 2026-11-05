@@ -89,10 +89,10 @@ ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "form
 const plane=new testing.FakeControlPlane();
 let dispatched=0;
 const provider={chat:{completions:{create(){dispatched++;return {usage:{prompt_tokens:2,completion_tokens:3}};}}}};
-const client=new sdk.Solwyn(provider,{apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:sdk.noopLogger,reportUntrackedSurfaces:false});
+const client=new sdk.Solwyn(provider,{apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:sdk.noopLogger,reportUntrackedSurfaces:false});
 await node.run('consumer-review',async()=>{await client.chat.completions.create({model:'gpt-review'});});
 await client.close();
-const middleware=ai.createSolwynMiddleware({apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:sdk.noopLogger});
+const middleware=ai.createSolwynMiddleware({apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,logger:sdk.noopLogger});
 await middleware.close();
 const health=await (await plane.fetch(plane.apiUrl+'/health')).json();
 assert.equal(dispatched,1);assert.equal(plane.checks.length,1);assert.equal(plane.confirms.length,1);assert.equal(plane.ingested.length,1);
@@ -130,7 +130,7 @@ const raw=new Anthropic({apiKey:'synthetic',maxRetries:0,fetch:async()=>{
   dispatches++;
   return new Response(JSON.stringify({id:'msg_structural',type:'message',role:'assistant',model:'claude-review',content:[],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:2,output_tokens:3}}),{headers:{'content-type':'application/json'}});
 }});
-const client=new Solwyn(raw,{apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,reportUntrackedSurfaces:false,logger:noopLogger});
+const client=new Solwyn(raw,{apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,reportUntrackedSurfaces:false,logger:noopLogger});
 const result=client.messages.create({model:'claude-review',messages:[],max_tokens:3});
 assert.equal(typeof result.then,'function');
 assert.equal('withResponse' in result,false);
@@ -179,7 +179,7 @@ for(const [family,Client] of [
   const raw=new Client({region:'us-east-1',credentials});
   try{
     assert.throws(()=>new sdk.Solwyn(raw,{
-      apiKey:'sk_proj_'+'0'.repeat(64),logger:sdk.noopLogger,reportUntrackedSurfaces:false,fetch:noNetwork,
+      apiKey:'solwyn_sk_'+'0'.repeat(64),project:'test-project',logger:sdk.noopLogger,reportUntrackedSurfaces:false,fetch:noNetwork,
     }),error=>error instanceof sdk.ConfigurationError && error instanceof opposite.ConfigurationError && error.field==='provider',format+' '+family+' must fail automatic detection synchronously');
     results.push({format,family,rejected:true});
   }finally{raw.destroy();}

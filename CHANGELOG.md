@@ -9,6 +9,58 @@ corresponding release notes before users upgrade.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-05
+
+Public-preview minor release: API keys are account keys scoped to projects, and every request
+names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no longer work.
+
+### Breaking
+
+- **New key format.** API keys are `solwyn_sk_` followed by 64 lowercase hex characters. An old
+  `sk_proj_` key fails at construction with `ConfigurationError(field: "api_key")`: "This is an old
+  Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create."
+- **A project is required.** Pass `project` (a project name or its `proj_` id) or set
+  `SOLWYN_PROJECT`, on `new Solwyn(...)`, `createSolwynMiddleware(...)` and `new BudgetEnforcer(...)`.
+  Without one, construction fails with `ConfigurationError(field: "project")`. `SOLWYN_PROJECT_ID`
+  is not read; when it is set, the error says to rename it. Passing `projectId` fails with
+  `ConfigurationError(field: "project_id")`.
+- **Every control-plane request sends `Solwyn-Project`.** The SDK sends the configured value until
+  it validates, then the pinned `proj_` id, so renaming the project does not break a running app.
+  Budget checks no longer teach the SDK its project id; only `GET /api/v1/auth/key` pins it.
+- **Read-only keys are refused.** A read-only key fails validation and blocks every wrapped call
+  with `ApiKeyRefusedError`; it no longer logs a diagnostic and carries on.
+- **Testing double.** `FakeControlPlane` requires the key and `Solwyn-Project` on every request,
+  serves `GET /api/v1/auth/key`, and its `apiKey` is now a `solwyn_sk_` key. `projectId` must be a
+  `proj_` id (default `proj_000000000000000000000000`); `projectName` (default `fake-project`) and
+  `keyScope` are new options, and `project` is a reserved `wrap()` option. Every contract probe
+  takes `project` in its options.
+
+### Added
+
+- `validate()` on the wrapped client and on the AI SDK middleware handle checks the key and
+  project now and throws `ApiKeyRefusedError` on any refusal. Without it, the first call that needs
+  Solwyn validates lazily; construction makes no network request.
+- `ApiKeyRefusedError`, a `ConfigurationError` with `code` and `field`, for every refusal of the key
+  or the project, at validation and at runtime.
+- **Refusals never fall back to `failOpen`.** Every 401 from Solwyn is a refusal, whatever its body.
+  A stored refusal is checked before cached allows, held leases, the control-plane breaker and the
+  outage posture, and a refusal recorded while a call was in flight overrides that call's result,
+  including its outage path. An expired or revoked key on a project with no hard limits lets calls
+  run unmetered (logging `solwyn.api_key_refused` at error on each call), but only after the
+  client has validated once; every other refusal blocks. The SDK rechecks a refused key every 60
+  seconds and recovers after a successful check; a delayed older response can never clear or
+  weaken a newer refusal.
+- `FakeControlPlane.expireKey`, `revokeKey`, `refuseKey`, `refuseProject` and `renameProject`, the
+  `authKeyRequests` and `projectHeaders` recordings, and the `assertAuthKeyContract` probe.
+- Public exports `API_KEY_PATTERN`, `PROJECT_SELECTOR_PATTERN`, `PROJECT_HEADER`,
+  `PROJECT_ECHO_HEADER`, `AuthKeyResponse`, `AuthKeyResponseSchema`, `validateApiKeyFormat` and
+  `validateProjectSelector`.
+
+### Removed
+
+- `validateProjectKeyFormat` (replaced by `validateApiKeyFormat`) and the read-only-key
+  log-and-continue path.
+
 ## [0.3.1] — 2026-11-02
 
 Public-preview patch release with `hard_deny` bug fixes: hard_deny now also covers failover hops
@@ -825,7 +877,8 @@ data.
 - Intercepted OpenAI and Anthropic calls return plain promises rather than `APIPromise`, so
   `.withResponse()` / `.asResponse()` are intentionally unavailable on those calls.
 
-[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/solwyn-ai/solwyn-typescript-sdk/compare/v0.1.1...v0.2.0

@@ -56,6 +56,7 @@ import {
   type FailoverTuningConfig,
   pickFailoverTuning,
   pickVelocityConfig,
+  rejectProjectIdOption,
   resolveConfig,
   type SolwynConfig,
   type SolwynConfigOptions,
@@ -93,6 +94,7 @@ import {
   estimateTokensFromLength,
   requestedAnthropicCacheTtls,
 } from "./privacy";
+import { ProjectBinding } from "./project";
 import { validatePinnedClientFamily } from "./providers/detection";
 import { resolveProviderIdentity } from "./providers/index";
 import {
@@ -543,12 +545,14 @@ export type FallbackEntry = FallbackSpec;
 /**
  * Public constructor options for {@link SolwynCore} / `Solwyn`. camelCase (the TS
  * public surface); mapped internally to the snake_case `SolwynConfig`. Every field is
- * optional except that a valid `apiKey` must resolve (from here or `SOLWYN_API_KEY`
- * on Node) or construction throws `ConfigurationError`.
+ * optional except that a valid `apiKey` and `project` must resolve (from here or
+ * `SOLWYN_API_KEY` / `SOLWYN_PROJECT` on Node) or construction throws `ConfigurationError`.
  */
 export interface SolwynOptions {
-  /** Solwyn project API key (`sk_proj_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
+  /** Solwyn API key (`solwyn_sk_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
   apiKey?: string;
+  /** Solwyn project: a project name or a `proj_` id. Falls back to `SOLWYN_PROJECT` on Node. */
+  project?: string;
   /** Solwyn Cloud API base URL. Defaults to `https://api.solwyn.ai`. */
   apiUrl?: string;
   /** Model for the primary provider link (per-call `model` overrides this). */
@@ -653,9 +657,10 @@ export interface SolwynOptions {
   velocityAccelFactor?: number;
 }
 
-/** The set of public option keys — anything else (e.g. `projectId`) is rejected. */
+/** The set of public option keys; anything else (e.g. `projectId`) is rejected. */
 const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
   "apiKey",
+  "project",
   "apiUrl",
   "model",
   "provider",
@@ -1099,6 +1104,7 @@ const PER_CALL_IDEMPOTENT_KEY = "solwynIdempotent";
 function toConfigOptions(options: SolwynOptions): SolwynConfigOptions {
   const configOptions: SolwynConfigOptions = {};
   if (options.apiKey !== undefined) configOptions.api_key = options.apiKey;
+  if (options.project !== undefined) configOptions.project = options.project;
   if (options.apiUrl !== undefined) configOptions.api_url = options.apiUrl;
   if (options.failOpen !== undefined) configOptions.fail_open = options.failOpen;
   if (options.budgetMode !== undefined) configOptions.budget_mode = options.budgetMode;
@@ -1227,6 +1233,7 @@ export class SolwynCore {
   readonly #fallbackSpecs: FallbackSpec[];
   readonly #reporter: MetadataReporter;
   readonly #budget: BudgetEnforcer;
+  readonly #binding: ProjectBinding;
   readonly #breakers: CircuitBreakerManager;
   readonly #controlPlaneBreaker: CircuitBreaker;
   readonly #sdkInstanceId: string;
@@ -1296,7 +1303,8 @@ export class SolwynCore {
     }
 
     // Reject unknown/renamed options (e.g. `projectId`) so an untyped JS caller cannot
-    // silently pass a dropped field — mirrors Python's unexpected-keyword TypeError.
+    // silently pass a dropped field; mirrors Python's unexpected-keyword TypeError.
+    rejectProjectIdOption(options);
     for (const key of Object.keys(options)) {
       if (!KNOWN_OPTION_KEYS.has(key)) {
         throw new ConfigurationError(`unexpected option '${key}'`, { field: key });
@@ -1342,8 +1350,19 @@ export class SolwynCore {
     }
     this.#surfaceContext = primarySurfaceRuntime.context;
     this.#validateSurfaceAcknowledgments();
+    // One project binding shared by the three control-plane transports. No network here:
+    // validation is lazy (the first gated call) or explicit (`validate()`).
+    this.#binding = new ProjectBinding({
+      selector: this.#config.project,
+      apiUrl: this.#config.api_url,
+      apiKey: this.#config.api_key,
+      fetch: options.fetch,
+      timeoutMs: this.#config.budget_check_timeout * 1000,
+      logger: this.#logger,
+    });
     this.#untrackedSurfaceReporter = this.#config.report_untracked_surfaces
       ? new UntrackedSurfaceReporter(this.#config.api_url, this.#config.api_key, {
+          binding: this.#binding,
           sdkInstanceId: this.#sdkInstanceId,
           shutdownDeadline: this.#config.reporter_shutdown_deadline * 1000,
           fetch: options.fetch,
@@ -1375,6 +1394,7 @@ export class SolwynCore {
     });
 
     this.#reporter = new MetadataReporter(this.#config.api_url, this.#config.api_key, {
+      binding: this.#binding,
       batchSize: this.#config.reporter_batch_size,
       flushInterval: this.#config.reporter_flush_interval * 1000,
       maxQueueSize: this.#config.reporter_max_queue_size,
@@ -1400,6 +1420,7 @@ export class SolwynCore {
     this.#budget = new BudgetEnforcer({
       apiUrl: this.#config.api_url,
       apiKey: this.#config.api_key,
+      binding: this.#binding,
       budgetMode: this.#config.budget_mode,
       failOpen: this.#config.fail_open,
       cacheTtl: this.#config.budget_check_cache_ttl,
@@ -2529,7 +2550,6 @@ export class SolwynCore {
     this.#postcheckRunControl(admission, budget, velocity);
     const tuning = this.#applyFailoverTuningDirective(budget.failoverTuningAllowed);
     deadline.replaceTotal(tuning.totalTimeout);
-    this.#reporter.observeProjectId(budget.projectId);
     const ctx: DispatchContext = {
       surface,
       responsesLeaf,
@@ -2718,7 +2738,6 @@ export class SolwynCore {
     this.#postcheckRunControl(admission, budget, velocity);
     const tuning = this.#applyFailoverTuningDirective(budget.failoverTuningAllowed);
     deadline.replaceTotal(tuning.totalTimeout);
-    this.#reporter.observeProjectId(budget.projectId);
     const deniedRegion = budget.allowed
       ? null
       : safeExtractRegion(() => primary.adapter.extractRegion(primary.sdkClient), this.#logger);
@@ -4709,6 +4728,16 @@ export class SolwynCore {
     applyEventReceiptFields(event, fields);
     this.#applyRunReceipt(event, ctx.run);
     return event;
+  }
+
+  /**
+   * Check the API key and project with Solwyn now (`GET /api/v1/auth/key`). Resolves when the
+   * key is valid for the project; throws `ApiKeyRefusedError` (a `ConfigurationError`) on any
+   * refusal, or `SolwynError` when Solwyn could not be reached. Wrapped calls validate lazily
+   * on their own; call this to fail at startup instead of on the first call.
+   */
+  validate(): Promise<void> {
+    return this.#binding.validate();
   }
 
   /**

@@ -21,7 +21,7 @@ import { currentRun, run } from "../../src/node";
 import { __resetUnmeteredSurfaceWarnings, createClientProxy } from "../../src/proxies";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 /** A capturing logger for asserting the proxy's operational warnings. */
 function fakeLogger(): Logger & { warnings: string[] } {

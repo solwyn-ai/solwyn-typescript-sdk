@@ -14,8 +14,9 @@ import {
 
 const apiUrl = process.env.SOLWYN_LIVE_API_URL;
 const apiKey = process.env.SOLWYN_LIVE_API_KEY;
+const project = process.env.SOLWYN_LIVE_PROJECT;
 const jwt = process.env.SOLWYN_LIVE_JWT;
-const configured = Boolean(apiUrl && apiKey);
+const configured = Boolean(apiUrl && apiKey && project);
 
 test("a Solwyn control plane with fake providers", {
   skip: !configured,
@@ -23,7 +24,7 @@ test("a Solwyn control plane with fake providers", {
 }, async (t) => {
   const sdk = await import("../../dist/node.js");
   const probes = await import("../../dist/testing/index.js");
-  const options = { apiUrl, apiKey };
+  const options = { apiUrl, apiKey, project };
   const probeFetch = (input, init) =>
     fetch(input, {
       ...init,
@@ -58,7 +59,11 @@ test("a Solwyn control plane with fake providers", {
   async function request(method, path, body, status = 200, token = apiKey) {
     const response = await fetch(`${apiUrl.replace(/\/$/, "")}/api/v1${path}`, {
       method,
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Solwyn-Project": project,
+      },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(15_000),
     });
@@ -142,6 +147,7 @@ test("a Solwyn control plane with fake providers", {
           ...options,
           apiUrl: plane.apiUrl,
           apiKey: plane.apiKey,
+          project: plane.project,
           fetch: wire.fetch,
           provider,
           logger,
@@ -238,7 +244,9 @@ test("a Solwyn control plane with fake providers", {
             const fixture = providerFixture(provider, { streamError: failure });
             const client = wrap(fixture, wire, provider, {
               leaseEnabled: leased,
-              ...(plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {}),
+              ...(plane
+                ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey, project: plane.project }
+                : {}),
             });
             const name = `sdk-live-stream-error-${provider}-${crypto.randomUUID()}`;
             let runId;
@@ -336,7 +344,7 @@ test("a Solwyn control plane with fake providers", {
           fixture,
           wire,
           "openai",
-          plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {},
+          plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey, project: plane.project } : {},
         );
         const name = `sdk-live-lease-${crypto.randomUUID()}`;
         let runId;
@@ -400,7 +408,7 @@ test("a Solwyn control plane with fake providers", {
         fixture,
         wire,
         "openai",
-        plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {},
+        plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey, project: plane.project } : {},
       );
       try {
         await fixture.invoke(client);
@@ -555,7 +563,7 @@ test("a Solwyn control plane with fake providers", {
               fixture,
               wire,
               "openai",
-              plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {},
+              plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey, project: plane.project } : {},
             );
             try {
               await assert.rejects(fixture.invoke(client), sdk.BudgetExceededError);
@@ -578,7 +586,9 @@ test("a Solwyn control plane with fake providers", {
           const fixture = providerFixture("openai");
           const client = wrap(fixture, wire, "openai", {
             leaseEnabled: false,
-            ...(plane ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey } : {}),
+            ...(plane
+              ? { apiUrl: plane.apiUrl, apiKey: plane.apiKey, project: plane.project }
+              : {}),
           });
           const name = `sdk-live-manual-kill-${crypto.randomUUID()}`;
           try {
@@ -610,6 +620,10 @@ test("a Solwyn control plane with fake providers", {
           assert.equal(fixture.calls, 2);
           assert.equal(fixture.ended, 1);
         }
+      });
+
+      await sub.test("assertAuthKeyContract", async () => {
+        await probes.assertAuthKeyContract(probeFetch, options);
       });
 
       await sub.test("assertCheckContract", async () => {

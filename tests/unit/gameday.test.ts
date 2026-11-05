@@ -376,6 +376,7 @@ describe("non-lease game days", () => {
     plane.denyRun("gameday-sticky-run");
     const warnings: string[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -427,6 +428,7 @@ describe("non-lease game days", () => {
     let now = 0;
     const plane = new FakeControlPlane();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -500,6 +502,7 @@ describe("non-lease game days", () => {
       random: () => 0,
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -708,6 +711,7 @@ describe("lease game days", () => {
       random: () => 0,
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch,

@@ -21,7 +21,7 @@ import type {
   MetadataEvent,
 } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 
@@ -91,6 +91,7 @@ function checkOptions(runId: string, index: number) {
 
 function enforcer(fetch: FetchLike): BudgetEnforcer {
   return new BudgetEnforcer({
+    project: "test-project",
     apiUrl: API_URL,
     apiKey: API_KEY,
     fetch,

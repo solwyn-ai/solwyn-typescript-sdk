@@ -50,7 +50,7 @@ function fixture(mode: "hard_deny" | "alert_only" = "hard_deny") {
     confirms,
     events,
     options: {
-      apiKey: `sk_proj_${"0".repeat(64)}`,
+      apiKey: `solwyn_sk_${"0".repeat(64)}`,
       fetch,
       logger: noopLogger,
       leaseEnabled: false,

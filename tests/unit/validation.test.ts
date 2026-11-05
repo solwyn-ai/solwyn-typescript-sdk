@@ -40,33 +40,92 @@ import {
   serializeLeaseRenewRequest,
   serializeLeaseSurrenderRequest,
   serializeMetadataEvent,
+  validateApiKeyFormat,
   validateProjectId,
-  validateProjectKeyFormat,
+  validateProjectSelector,
 } from "../../src/validation";
 
 // ---------------------------------------------------------------------------
 // Project key / ID validators.
 // ---------------------------------------------------------------------------
 
-describe("validateProjectKeyFormat", () => {
-  const valid = `sk_proj_${"a".repeat(64)}`;
+describe("validateApiKeyFormat", () => {
+  const valid = `solwyn_sk_${"a".repeat(64)}`;
 
-  it("accepts sk_proj_ + 64 lowercase hex and returns it unchanged", () => {
-    expect(validateProjectKeyFormat(valid)).toBe(valid);
+  it("accepts solwyn_sk_ + 64 lowercase hex and returns it unchanged", () => {
+    expect(validateApiKeyFormat(valid)).toBe(valid);
+  });
+
+  it("rejects a retired sk_proj_ key with the exact old-key message", () => {
+    expect(() => validateApiKeyFormat(`sk_proj_${"a".repeat(64)}`)).toThrow(
+      new ConfigurationError(
+        "This is an old Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create.",
+      ),
+    );
   });
 
   it.each([
-    ["wrong prefix", `sk_solwyn_${"a".repeat(64)}`],
-    ["uppercase hex", `sk_proj_${"A".repeat(64)}`],
-    ["63 chars", `sk_proj_${"a".repeat(63)}`],
-    ["65 chars", `sk_proj_${"a".repeat(65)}`],
-  ])("rejects %s with a message containing sk_proj_", (_label, input) => {
-    expect(() => validateProjectKeyFormat(input)).toThrow(ConfigurationError);
-    expect(() => validateProjectKeyFormat(input)).toThrow(/sk_proj_/);
+    ["wrong prefix", `sk_solwyn_${"a".repeat(64)}`, "sk_solwyn_aa"],
+    ["uppercase hex", `solwyn_sk_${"A".repeat(64)}`, "solwyn_sk_AA"],
+    ["63 chars", `solwyn_sk_${"a".repeat(63)}`, "solwyn_sk_aa"],
+    ["65 chars", `solwyn_sk_${"a".repeat(65)}`, "solwyn_sk_aa"],
+    ["path traversal", "solwyn_sk_/etc/passwd", "solwyn_sk_/e"],
+    ["empty", "", "<too short>"],
+    ["twelve characters", "solwyn_sk_ab", "<too short>"],
+  ])("rejects %s with the exact format message", (_label, input, shown) => {
+    let error: unknown;
+    try {
+      validateApiKeyFormat(input);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ConfigurationError);
+    expect((error as ConfigurationError).field).toBe("api_key");
+    expect((error as Error).message).toBe(
+      `Invalid API key format: expected 'solwyn_sk_' followed by 64 lowercase hex characters. Got: ${shown}`,
+    );
   });
 
-  it("there is NO validateApiKeyFormat legacy symbol", () => {
-    expect((validation as Record<string, unknown>)["validateApiKeyFormat"]).toBeUndefined();
+  it("rejects a homograph after NFC normalization", () => {
+    expect(() => validateApiKeyFormat(`solwyn_sk_${"а".repeat(64)}`)).toThrow(ConfigurationError);
+  });
+
+  it("there is NO validateProjectKeyFormat legacy symbol", () => {
+    expect((validation as Record<string, unknown>)["validateProjectKeyFormat"]).toBeUndefined();
+  });
+});
+
+describe("validateProjectSelector", () => {
+  it.each([
+    ["checkout-bot", "checkout-bot"],
+    ["  Checkout Bot\t", "Checkout Bot"],
+    [`proj_${"a".repeat(24)}`, `proj_${"a".repeat(24)}`],
+    ["a", "a"],
+    ["x".repeat(100), "x".repeat(100)],
+    ["v1.2_beta-3", "v1.2_beta-3"],
+  ])("accepts %j and returns it trimmed", (input, expected) => {
+    expect(validateProjectSelector(input)).toBe(expected);
+  });
+
+  it.each([
+    ["empty", ""],
+    ["only spaces", "   "],
+    ["101 characters", "x".repeat(101)],
+    ["slash", "a/b"],
+    ["non-ASCII", "café"],
+    ["newline inside", "a\nb"],
+  ])("rejects %s with the exact message", (_label, input) => {
+    let error: unknown;
+    try {
+      validateProjectSelector(input);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ConfigurationError);
+    expect((error as ConfigurationError).field).toBe("project");
+    expect((error as Error).message).toBe(
+      "Invalid project: use a project name (letters, digits, spaces, '.', '_' or '-', up to 100 characters) or a proj_ id.",
+    );
   });
 });
 
@@ -91,7 +150,7 @@ describe("validateProjectId", () => {
 describe("security checks (shared, in order)", () => {
   it("rejects an empty string", () => {
     expect(() => validateProjectId("")).toThrow(ConfigurationError);
-    expect(() => validateProjectKeyFormat("")).toThrow(ConfigurationError);
+    expect(() => validateApiKeyFormat("")).toThrow(ConfigurationError);
   });
 
   it("rejects non-ASCII input", () => {
@@ -100,7 +159,6 @@ describe("security checks (shared, in order)", () => {
 
   it("rejects path-traversal substrings before the regex runs", () => {
     expect(() => validateProjectId("../proj_aaaaaaaaaaaaaaaaaaaaaaaa")).toThrow(/path separators/);
-    expect(() => validateProjectKeyFormat("sk_proj_/etc/passwd")).toThrow(/path separators/);
   });
 });
 

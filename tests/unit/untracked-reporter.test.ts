@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resetReadOnlyKeyDiagnosticForTest } from "../../src/read-only-key";
+import { ProjectBinding } from "../../src/project";
 import type { FetchLike } from "../../src/transport";
 import {
   type UntrackedSurfaceObservation,
   UntrackedSurfaceReporter,
 } from "../../src/untracked-reporter";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const FIRST_SEEN = Date.UTC(2026, 7, 13, 12);
 
 function reportId(sequence: number): string {
@@ -548,17 +548,25 @@ describe("UntrackedSurfaceReporter", () => {
     await reporter.close();
   });
 
-  it("routes read-only credentials through the shared diagnostic and stops advisory delivery", async () => {
-    resetReadOnlyKeyDiagnosticForTest();
+  it("records a read-only refusal on the binding and stops advisory delivery", async () => {
     const warn = vi.fn();
     const error = vi.fn();
     const fetch = vi.fn(
       async () =>
         new Response(JSON.stringify({ detail: { code: "read_only_key" } }), { status: 403 }),
     );
+    const binding = new ProjectBinding({
+      selector: "test-project",
+      apiUrl: "https://api.solwyn.test",
+      apiKey: API_KEY,
+      fetch,
+      timeoutMs: 1000,
+      logger: { debug: vi.fn(), info: vi.fn(), warn, error },
+    });
     const reporter = new UntrackedSurfaceReporter("https://api.solwyn.test", API_KEY, {
       sdkInstanceId: "synthetic",
       fetch,
+      binding,
       logger: { debug: vi.fn(), info: vi.fn(), warn, error },
     });
     reporter.observe(observation());
@@ -567,7 +575,8 @@ describe("UntrackedSurfaceReporter", () => {
     await reporter.close();
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(error).toHaveBeenCalledTimes(1);
-    expect(error.mock.calls[0]?.[0]).toContain("read_only_key");
+    expect(error.mock.calls[0]?.[0]).toContain("solwyn.configuration_error.read_only_key");
+    expect(binding.refusal).toMatchObject({ code: "read_only_key", effect: "block" });
     expect(warn).not.toHaveBeenCalled();
   });
 

@@ -25,7 +25,7 @@ async function waitForDelivery(predicate: () => boolean, describe: () => string)
   }
 }
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT = `proj_${"0".repeat(24)}`;
 const REPORTER_HOOK = Symbol.for("@solwyn/sdk/node-reporter-registration");
 const LEASE_HOOK = Symbol.for("@solwyn/sdk/node-lease-registration");
@@ -212,6 +212,7 @@ interface ClientOptions {
 function middlewareOptions(fetch: FetchLike, extra: ClientOptions = {}) {
   return {
     apiKey: API_KEY,
+    project: "test-project",
     apiUrl: "https://retention.invalid",
     logger: noopLogger,
     leaseEnabled: extra.lease ?? false,

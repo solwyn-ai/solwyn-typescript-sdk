@@ -18,9 +18,11 @@ import { z } from "zod";
 import { ConfigurationError } from "./errors";
 import { copyTags } from "./tags";
 import { serializeTokenDetails, TokenDetailsSchema } from "./token-details";
+import type { AuthKeyResponse } from "./types";
 import {
   AGENT_RUN_ID_MAX_LENGTH,
   AGENT_RUN_NAME_MAX_LENGTH,
+  API_KEY_PATTERN,
   BUDGET_MODES,
   type BudgetConfirmRequest,
   CALL_ID_MAX_LENGTH,
@@ -39,7 +41,7 @@ import {
   MODALITIES,
   MODEL_NAME_MAX_LENGTH,
   PROJECT_ID_PATTERN,
-  PROJECT_KEY_PATTERN,
+  PROJECT_SELECTOR_PATTERN,
   PROVIDER_NAMES,
   PROVIDER_REGION_MAX_LENGTH,
   SERVICE_TIER_MAX_LENGTH,
@@ -583,23 +585,61 @@ export function validateProjectId(projectId: string): string {
   return normalized;
 }
 
+/** The retired project-key prefix; rejected locally with a message that says what to do. */
+const OLD_PROJECT_KEY_PREFIX = "sk_proj_";
+
+/** Exact message for a retired `sk_proj_` key. */
+export const OLD_PROJECT_KEY_MESSAGE =
+  "This is an old Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create.";
+
+/** Exact message for a selector that is neither a project name nor a `proj_` id. */
+export const INVALID_PROJECT_MESSAGE =
+  "Invalid project: use a project name (letters, digits, spaces, '.', '_' or '-', up to 100 characters) or a proj_ id.";
+
 /**
- * Format-only validation of a project API key (`sk_proj_` + 64 lowercase hex).
- * Does NOT authenticate against the API. Returns the normalized input on success;
- * throws {@link ConfigurationError} otherwise.
- *
- * There is intentionally NO `validateApiKeyFormat` — that legacy symbol must not exist.
+ * Format-only validation of a Solwyn API key (`solwyn_sk_` + 64 lowercase hex). Does NOT
+ * authenticate. The key is NFC-normalized first so a homograph cannot slip through; the
+ * pattern admits only ASCII lowercase hex after the prefix, which also excludes path
+ * traversal characters. Returns the normalized key; throws {@link ConfigurationError}.
  */
-export function validateProjectKeyFormat(apiKey: string): string {
-  const normalized = securityCheck(apiKey, "api_key");
-  if (!PROJECT_KEY_PATTERN.test(normalized)) {
+export function validateApiKeyFormat(apiKey: string): string {
+  if (apiKey.startsWith(OLD_PROJECT_KEY_PREFIX)) {
+    throw new ConfigurationError(OLD_PROJECT_KEY_MESSAGE, { field: "api_key" });
+  }
+  const normalized = apiKey.normalize("NFC");
+  if (!isAscii(normalized) || !API_KEY_PATTERN.test(normalized)) {
+    const display = normalized.length > 12 ? normalized.slice(0, 12) : "<too short>";
     throw new ConfigurationError(
-      "Invalid API key format: expected 'sk_proj_' followed by 64 lowercase hex characters",
+      `Invalid API key format: expected 'solwyn_sk_' followed by 64 lowercase hex characters. Got: ${display}`,
       { field: "api_key" },
     );
   }
   return normalized;
 }
+
+/** Trim spaces and tabs, then validate a project name or `proj_` id; returns the trimmed value. */
+export function validateProjectSelector(selector: string): string {
+  const trimmed = selector.replace(/^[ \t]+|[ \t]+$/g, "");
+  if (!PROJECT_SELECTOR_PATTERN.test(trimmed)) {
+    throw new ConfigurationError(INVALID_PROJECT_MESSAGE, { field: "project" });
+  }
+  return trimmed;
+}
+
+/** Strict `GET /api/v1/auth/key` response; every field is required. */
+export const AuthKeyResponseSchema: z.ZodType<AuthKeyResponse> = z.strictObject({
+  account_id: z.string(),
+  key_id: z.string(),
+  key_prefix: z.string(),
+  key_name: z.string(),
+  scope: z.enum(["full", "read_only"]),
+  created_via: z.enum(["dashboard", "cli"]),
+  expires_at: Rfc3339DateTimeSchema,
+  rotation_grace_until: Rfc3339DateTimeSchema.nullable(),
+  project_id: z.string().regex(PROJECT_ID_PATTERN),
+  project_name: z.string(),
+  budget_mode: z.enum(BUDGET_MODES),
+});
 
 // ---------------------------------------------------------------------------
 // Wire-serialization helpers (None-skipping / omit-when-false).

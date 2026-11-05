@@ -11,7 +11,7 @@ const { z } = zod;
 
 const raw = new OpenAI({ apiKey: "offline" });
 const client = new Solwyn(raw, {
-  apiKey: `sk_proj_${"a".repeat(64)}`,
+  apiKey: `solwyn_sk_${"a".repeat(64)}`, project: "test-project",
 });
 const helper = client.responses.stream({
   model: "gpt-test",

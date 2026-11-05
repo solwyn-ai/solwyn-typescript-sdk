@@ -12,6 +12,7 @@ import { createClientProxy, type InterceptedClient, type Solwyn } from "../proxi
 import { getCurrentRun } from "../run-context";
 import type { FetchLike } from "../transport";
 import type {
+  AuthKeyResponse,
   BreakerStateReport,
   BudgetCheckRequest,
   BudgetCheckResponse,
@@ -27,7 +28,9 @@ import type {
   RunControlDirective,
   UntrackedSurfaceReport,
 } from "../types";
+import { PROJECT_ECHO_HEADER, PROJECT_HEADER, PROJECT_ID_PATTERN } from "../types";
 import {
+  AuthKeyResponseSchema,
   BreakerReportAcceptedSchema,
   BreakerStateReportSchema,
   BudgetCheckRequestSchema,
@@ -61,12 +64,14 @@ type ScenarioKind =
   | "outage"
   | "slow"
   | "read_only"
+  | "refuse_key"
   | "refuse_checks"
   | "refuse_leases"
   | "misroute_stops"
   | "reject_ingest";
 type Route =
   | "health"
+  | "auth_key"
   | "check"
   | "confirm"
   | "ingest"
@@ -109,6 +114,7 @@ interface ScenarioSpec {
   readonly code?: LeaseRefusalCode;
   readonly retryAfter?: number;
   readonly rejectIngest?: RejectIngestEffect;
+  readonly keyRefusal?: PlaneResponse;
 }
 
 class ScenarioWindowState implements ScenarioWindow {
@@ -154,7 +160,12 @@ export interface FakeControlPlaneOptions {
   budgetLimit?: number;
   currentUsage?: number;
   remainingBudget?: number;
+  /** Resolved project id (`proj_` + 24 lowercase hex). */
   projectId?: string;
+  /** Project name the key reaches (default `fake-project`). */
+  projectName?: string;
+  /** Scope `GET /api/v1/auth/key` reports (default `full`). */
+  keyScope?: "full" | "read_only";
   failoverTuningAllowed?: boolean;
   /** Opted-in text hints default to { [provider]: 1 }; null returns an empty map. */
   priceHints?: Record<string, number> | null;
@@ -175,7 +186,9 @@ const FakeControlPlaneOptionsSchema = z.strictObject({
   budgetLimit: z.number().optional(),
   currentUsage: z.number().optional(),
   remainingBudget: z.number().optional(),
-  projectId: z.string().min(1).optional(),
+  projectId: z.string().regex(PROJECT_ID_PATTERN).optional(),
+  projectName: z.string().min(1).max(100).optional(),
+  keyScope: z.enum(["full", "read_only"]).optional(),
   failoverTuningAllowed: z.boolean().optional(),
   priceHints: z.record(z.string(), z.number()).nullable().optional(),
   postureMode: z.enum(["alert_only", "hard_deny"]).optional(),
@@ -188,6 +201,7 @@ const FakeControlPlaneOptionsSchema = z.strictObject({
   leaseLengthS: z.number().positive().optional(),
 });
 
+const AUTH_KEY_PATH = "/api/v1/auth/key";
 const CHECK_PATH = "/api/v1/budgets/check";
 const CONFIRM_PATH = "/api/v1/budgets/confirm";
 const LEASE_GRANT_PATH = "/api/v1/budgets/lease";
@@ -206,7 +220,7 @@ const INGEST_REJECTION_CODE_SET = new Set<IngestRejectionCode>([
   "unsupported_modality",
 ]);
 
-const RESERVED_WRAP_KEYS = ["apiKey", "apiUrl", "fetch"] as const;
+const RESERVED_WRAP_KEYS = ["apiKey", "apiUrl", "fetch", "project"] as const;
 const ENV_CONFIG_TO_OPTION: Readonly<Record<string, keyof SolwynOptions>> = Object.freeze({
   tags: "tags",
   fail_open: "failOpen",
@@ -238,12 +252,13 @@ const ENV_CONFIG_TO_OPTION: Readonly<Record<string, keyof SolwynOptions>> = Obje
   trace_correlation: "traceCorrelation",
 });
 
-type WrapOptions = Omit<SolwynOptions, "apiKey" | "apiUrl" | "fetch">;
+type WrapOptions = Omit<SolwynOptions, "apiKey" | "apiUrl" | "fetch" | "project">;
 
 interface ControlPlaneWiring {
   readonly apiKey: string;
   readonly apiUrl: string;
   readonly fetch: FetchLike;
+  readonly project: string;
 }
 
 /** Pure construction seam used to prove environment-neutral test wrappers. */
@@ -258,7 +273,7 @@ export function buildHermeticWrapOptions(
     }
   }
 
-  const defaults = SolwynConfigSchema.parse({ api_key: wiring.apiKey });
+  const defaults = SolwynConfigSchema.parse({ api_key: wiring.apiKey, project: wiring.project });
   const hermetic: Record<string, unknown> = {};
   for (const [field, envName] of Object.entries(ENV_FIELD_MAP)) {
     if (env[envName] === undefined) continue;
@@ -278,6 +293,7 @@ export function buildHermeticWrapOptions(
     apiKey: wiring.apiKey,
     apiUrl: wiring.apiUrl,
     fetch: wiring.fetch,
+    project: wiring.project,
     budgetCheckCacheTtl: 0,
   };
   for (const [key, value] of Object.entries(options)) {
@@ -373,6 +389,28 @@ function testingConfigurationError(message: string, field: string): Configuratio
   return new ConfigurationError(`solwyn.testing: ${message}`, { field });
 }
 
+function unauthorized(detail: Record<string, unknown>): PlaneResponse {
+  return {
+    status: 401,
+    body: { detail },
+    headers: { "WWW-Authenticate": 'Bearer error="invalid_token"' },
+  };
+}
+
+function projectNotFound(): PlaneResponse {
+  return {
+    status: 404,
+    body: {
+      detail: {
+        code: "project_not_found",
+        message:
+          "No project on this API key matches Solwyn-Project. Check the name or proj_ id. A renamed project's old name stops working; its proj_ id always works.",
+      },
+    },
+    headers: {},
+  };
+}
+
 function errorResponse(status: number, detail: string): PlaneResponse {
   return { status, body: { detail }, headers: {} };
 }
@@ -429,7 +467,7 @@ function abortableDelay(seconds: number, signal?: AbortSignal): Promise<void> {
 }
 
 export class FakeControlPlane {
-  readonly apiKey = `sk_proj_${"0".repeat(64)}`;
+  readonly apiKey = `solwyn_sk_${"0".repeat(64)}`;
   readonly apiUrl = "http://control-plane.invalid";
   readonly fetch: FetchLike;
 
@@ -442,6 +480,15 @@ export class FakeControlPlane {
   readonly untrackedReports: UntrackedSurfaceReport[] = [];
   readonly breakerReports: BreakerStateReport[] = [];
   readonly unmatchedRequests: Array<{ method: string; path: string }> = [];
+  /** Every `GET /api/v1/auth/key` that authenticated, by `Solwyn-Project` value. */
+  readonly authKeyRequests: string[] = [];
+  /** `Solwyn-Project` value of every request that reached the fake, in order. */
+  readonly projectHeaders: Array<string | null> = [];
+
+  /** The project selector `wrap()` configures: the project's current name. */
+  get project(): string {
+    return this.projectName;
+  }
 
   get denialReceipts(): MetadataEvent[] {
     return this.ingested.filter((event) => event.deny_source != null);
@@ -456,6 +503,8 @@ export class FakeControlPlane {
   private readonly currentUsage: number;
   private readonly remainingBudget: number;
   private readonly projectId: string;
+  private projectName: string;
+  private readonly keyScope: "full" | "read_only";
   private readonly failoverTuningAllowed: boolean;
   private readonly priceHints: Record<string, number> | null | undefined;
   private readonly postureMode: BudgetMode | undefined;
@@ -506,7 +555,9 @@ export class FakeControlPlane {
     this.budgetLimit = value.budgetLimit ?? 100;
     this.currentUsage = value.currentUsage ?? 0;
     this.remainingBudget = value.remainingBudget ?? this.budgetLimit - this.currentUsage;
-    this.projectId = value.projectId ?? "proj_fake";
+    this.projectId = value.projectId ?? `proj_${"0".repeat(24)}`;
+    this.projectName = value.projectName ?? "fake-project";
+    this.keyScope = value.keyScope ?? "full";
     this.failoverTuningAllowed = value.failoverTuningAllowed ?? true;
     this.priceHints = value.priceHints;
     this.postureMode = value.postureMode;
@@ -534,11 +585,12 @@ export class FakeControlPlane {
       }
       const method = (init?.method ?? "GET").toUpperCase();
       const path = new URL(input).pathname;
+      const headers = new Headers(init?.headers);
       const bodyBytes =
         path === UNTRACKED_PATH && typeof init?.body === "string"
           ? new TextEncoder().encode(init.body).byteLength
           : 0;
-      const prepared = this.prepareFetch(method, path, body, jsonInvalid, bodyBytes);
+      const prepared = this.prepareFetch(method, path, body, jsonInvalid, bodyBytes, headers);
       if (prepared.outage) {
         throw new TypeError("fetch failed");
       }
@@ -573,6 +625,98 @@ export class FakeControlPlane {
       remaining: scenarioCount(options.requests, null),
       seconds,
     });
+  }
+
+  /**
+   * Answer key requests with `401 api_key_expired`. `projectBudgetMode` is the refusal's
+   * posture; absent, it is derived like core does (hard_deny when the project mode or the lease
+   * posture is hard_deny, else alert_only). `null` sends a null posture.
+   */
+  expireKey(
+    options: {
+      projectBudgetMode?: BudgetMode | null;
+      expiredAt?: string;
+      requests?: number;
+      path?: string;
+    } = {},
+  ): ScenarioWindow {
+    const expiredAt = options.expiredAt ?? "2026-11-01T00:00:00Z";
+    const date = expiredAt.slice(0, 10);
+    return this.addScenario({
+      kind: "refuse_key",
+      path: options.path ?? null,
+      remaining: scenarioCount(options.requests, null),
+      keyRefusal: unauthorized({
+        code: "api_key_expired",
+        message: `This API key expired on ${date}. Rotate it in the dashboard or with solwyn keys rotate.`,
+        expired_at: expiredAt,
+        api_key_id: "00000000-0000-4000-8000-000000000000",
+        project_budget_mode: this.refusalPosture(options.projectBudgetMode),
+      }),
+    });
+  }
+
+  /** Answer key requests with `401 api_key_invalid` (a revoked key), posture as in expireKey. */
+  revokeKey(
+    options: { projectBudgetMode?: BudgetMode | null; requests?: number; path?: string } = {},
+  ): ScenarioWindow {
+    return this.addScenario({
+      kind: "refuse_key",
+      path: options.path ?? null,
+      remaining: scenarioCount(options.requests, null),
+      keyRefusal: unauthorized({
+        code: "api_key_invalid",
+        message: "Invalid or revoked API key.",
+        project_budget_mode: this.refusalPosture(options.projectBudgetMode),
+      }),
+    });
+  }
+
+  /** Answer key requests with an exact refusal response (any status and body). */
+  refuseKey(
+    response: { status: number; body: unknown; headers?: Record<string, string> },
+    options: { requests?: number; path?: string } = {},
+  ): ScenarioWindow {
+    return this.addScenario({
+      kind: "refuse_key",
+      path: options.path ?? null,
+      remaining: scenarioCount(options.requests, null),
+      keyRefusal: { status: response.status, body: response.body, headers: response.headers ?? {} },
+    });
+  }
+
+  /** Answer key requests with a project refusal (`404 project_not_found` or `403 key_not_dedicated`). */
+  refuseProject(
+    code: "project_not_found" | "key_not_dedicated",
+    options: { requests?: number; path?: string } = {},
+  ): ScenarioWindow {
+    return this.addScenario({
+      kind: "refuse_key",
+      path: options.path ?? null,
+      remaining: scenarioCount(options.requests, null),
+      keyRefusal:
+        code === "project_not_found"
+          ? projectNotFound()
+          : {
+              status: 403,
+              body: {
+                detail: {
+                  code: "key_not_dedicated",
+                  message: `Project ${this.projectName} only accepts API keys dedicated to it, and this key also reaches other projects. Use a key that holds only this project.`,
+                  project_id: this.projectId,
+                },
+              },
+              headers: {},
+            },
+    });
+  }
+
+  /** Rename the project: its old name stops matching, its `proj_` id keeps working. */
+  renameProject(name: string): void {
+    if (typeof name !== "string" || name.length === 0 || name.length > 100) {
+      throw testingConfigurationError("project name must be 1 to 100 characters", "name");
+    }
+    this.projectName = name;
   }
 
   readOnly(options: { requests?: number; path?: string } = {}): ScenarioWindow {
@@ -769,10 +913,99 @@ export class FakeControlPlane {
     this.untrackedReports.length = 0;
     this.breakerReports.length = 0;
     this.unmatchedRequests.length = 0;
+    this.authKeyRequests.length = 0;
+    this.projectHeaders.length = 0;
   }
 
+  /** Dispatch one request as already authenticated for the configured key and project. */
   handle(method: string, path: string, body: unknown): PlaneResponse {
     return this.dispatch(method.toUpperCase(), path, body);
+  }
+
+  private refusalPosture(mode: BudgetMode | null | undefined): BudgetMode | null {
+    if (mode !== undefined) return mode;
+    return this.mode === "hard_deny" || this.postureMode === "hard_deny"
+      ? "hard_deny"
+      : "alert_only";
+  }
+
+  /**
+   * Key-path authentication in core's precedence: key refusals (401), then the
+   * `Solwyn-Project` header (400 required, 404 not found), scenario project refusals, the
+   * URL-project match for URL-scoped routes, then the handler. Returns a response to send
+   * instead of dispatching, or `null` to dispatch.
+   */
+  private authenticate(path: string, headers: Headers): PlaneResponse | null {
+    const header = headers.get(PROJECT_HEADER);
+    this.projectHeaders.push(header);
+    const keyRefusal = this.matchingScenarios("refuse_key", path)[0];
+    if (keyRefusal?.spec.keyRefusal !== undefined && keyRefusal.spec.keyRefusal.status === 401) {
+      keyRefusal.consume();
+      return keyRefusal.spec.keyRefusal;
+    }
+    if (headers.get("Authorization") !== `Bearer ${this.apiKey}`) {
+      return unauthorized({
+        code: "api_key_invalid",
+        message: "Invalid or revoked API key.",
+        project_budget_mode: null,
+      });
+    }
+    const selector = (header ?? "").replace(/^[ \t]+|[ \t]+$/g, "");
+    if (selector === "") {
+      return {
+        status: 400,
+        body: {
+          detail: {
+            code: "project_selector_required",
+            message:
+              "This API key needs a project. Set SOLWYN_PROJECT, or send the Solwyn-Project header, to a project name or proj_ id.",
+          },
+        },
+        headers: {},
+      };
+    }
+    const lowered = selector.toLowerCase();
+    const matches = /^proj_[a-f0-9]{24}$/.test(lowered)
+      ? lowered === this.projectId
+      : lowered === this.projectName.toLowerCase();
+    if (selector.length > 100 || !matches) return projectNotFound();
+    if (keyRefusal?.spec.keyRefusal !== undefined) {
+      keyRefusal.consume();
+      return keyRefusal.spec.keyRefusal;
+    }
+    if (BREAKER_PATH.test(path) && path.split("/")[4] !== encodeURIComponent(this.projectId)) {
+      return {
+        status: 400,
+        body: {
+          detail: {
+            code: "project_selector_conflict",
+            message: "Solwyn-Project names a different project than the URL.",
+            reason: "url_mismatch",
+          },
+        },
+        headers: {},
+      };
+    }
+    return null;
+  }
+
+  private authKeyResponse(): PlaneResponse {
+    const readOnly = this.matchingScenarios("read_only", AUTH_KEY_PATH)[0];
+    if (readOnly !== undefined) readOnly.consume();
+    const body: AuthKeyResponse = {
+      account_id: "00000000-0000-4000-8000-000000000001",
+      key_id: "00000000-0000-4000-8000-000000000002",
+      key_prefix: this.apiKey.slice(0, 26),
+      key_name: "fake-key",
+      scope: readOnly !== undefined ? "read_only" : this.keyScope,
+      created_via: "dashboard",
+      expires_at: "2099-01-01T00:00:00Z",
+      rotation_grace_until: null,
+      project_id: this.projectId,
+      project_name: this.projectName,
+      budget_mode: this.mode,
+    };
+    return validatedResponse(200, AuthKeyResponseSchema, body, { "Cache-Control": "no-store" });
   }
 
   private dispatch(method: string, path: string, body: unknown): PlaneResponse {
@@ -781,6 +1014,7 @@ export class FakeControlPlane {
       this.unmatchedRequests.push({ method, path });
       return errorResponse(404, "not found");
     }
+    if (route === "auth_key") return this.authKeyResponse();
     const refusal = this.endpointRefusal(method, path, body);
     if (refusal !== null) return refusal;
     if (method === "POST") {
@@ -826,6 +1060,7 @@ export class FakeControlPlane {
     body: unknown,
     jsonInvalid: boolean,
     bodyBytes: number,
+    headers: Headers,
   ): PreparedRequest {
     const outages = this.matchingScenarios("outage", path);
     if (outages.length > 0) {
@@ -854,6 +1089,24 @@ export class FakeControlPlane {
       };
     }
 
+    const route = this.resolveRoute(method, path);
+    if (route !== null && route !== "health") {
+      const refused = this.authenticate(path, headers);
+      if (refused !== null) {
+        return { outage: false, delaySeconds, delayMatched: slows.length > 0, response: refused };
+      }
+      if (route === "auth_key") this.authKeyRequests.push(headers.get(PROJECT_HEADER) ?? "");
+      const response = this.dispatch(method, path, body);
+      return {
+        outage: false,
+        delaySeconds,
+        delayMatched: slows.length > 0,
+        response: {
+          ...response,
+          headers: { ...response.headers, [PROJECT_ECHO_HEADER]: this.projectId },
+        },
+      };
+    }
     return {
       outage: false,
       delaySeconds,
@@ -875,6 +1128,7 @@ export class FakeControlPlane {
 
   private resolveRoute(method: string, path: string): Route | null {
     if (method === "GET" && path === "/health") return "health";
+    if (method === "GET" && path === AUTH_KEY_PATH) return "auth_key";
     if (method !== "POST") return null;
     if (path === CHECK_PATH) return "check";
     if (path === CONFIRM_PATH) return "confirm";

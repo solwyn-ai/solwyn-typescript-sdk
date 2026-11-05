@@ -110,6 +110,7 @@ async function googleNativeCompat({ tarball, out }, report, evidence) {
     const plane = new testing.FakeControlPlane();
     const client = new sdk.Solwyn(native, {
       apiKey: plane.apiKey,
+      project: plane.project,
       apiUrl: plane.apiUrl,
       fetch: plane.fetch,
       failoverHopReadTimeout: timeoutMs / 1000,
@@ -268,6 +269,7 @@ async function googleNativeCompat({ tarball, out }, report, evidence) {
   const gcPlane = new testing.FakeControlPlane();
   const gcClient = new sdk.Solwyn(new GoogleGenAI({ apiKey: "offline-synthetic" }), {
     apiKey: gcPlane.apiKey,
+    project: gcPlane.project,
     apiUrl: gcPlane.apiUrl,
     fetch: gcPlane.fetch,
     failoverHopReadTimeout: 600,

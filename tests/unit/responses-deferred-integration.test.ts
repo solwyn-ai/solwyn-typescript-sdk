@@ -9,7 +9,7 @@ import { LatencyTracker } from "../../src/routing";
 import { markTerminated, resetRunControlForTest } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 afterEach(() => {
   resetRunControlForTest();

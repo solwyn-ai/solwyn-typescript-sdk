@@ -3,7 +3,7 @@ import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function settlement(index: number): [BudgetConfirmRequest, MetadataEvent] {
   const call_id = `00000000-0000-0000-0000-${index.toString(16).padStart(12, "0")}`;

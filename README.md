@@ -37,7 +37,8 @@ Solwyn bundles no provider clients.
 
 ## Quick start
 
-You need a **Solwyn project API key** and credentials for your LLM provider. This example uses
+You need a **Solwyn API key**, the **name or `proj_` id of the Solwyn project** it reaches, and
+credentials for your LLM provider. This example uses
 OpenAI; [other provider examples](#providers) and [Vercel AI SDK middleware](#vercel-ai-sdk) are below.
 To try budget enforcement without keys or network access, use the [offline example](#testing-budget-enforcement).
 
@@ -49,16 +50,19 @@ npm install openai
 
 ### 1. Set your keys
 
-Use the project API key from your Solwyn project. If you do not yet have project access, start at
-[Solwyn](https://solwyn.ai). The Solwyn key and the provider key are separate credentials:
+Create an API key in the Solwyn dashboard or with `solwyn keys create`. If you do not yet have
+project access, start at [Solwyn](https://solwyn.ai). The Solwyn key and the provider key are
+separate credentials. `SOLWYN_PROJECT` names the project this application reports to:
 
 ```sh
-export SOLWYN_API_KEY="<your Solwyn project API key>"
+export SOLWYN_API_KEY="<your Solwyn API key>"
+export SOLWYN_PROJECT="checkout-bot"   # a project name or its proj_ id
 export OPENAI_API_KEY="<your OpenAI API key>"
 ```
 
-Keep both in your server environment or secret manager. The Solwyn key must have the format
-`sk_proj_` followed by 64 hexadecimal characters; placeholder values will fail validation.
+Keep the keys in your server environment or secret manager. The Solwyn key must have the format
+`solwyn_sk_` followed by 64 lowercase hexadecimal characters; placeholder values and old
+`sk_proj_` keys fail validation. You can also pass `project: "checkout-bot"` to the constructor.
 
 ### 2. Wrap your client and make a call
 
@@ -108,7 +112,8 @@ Solwyn API outage.
 
 | If you see… | Check… |
 |-------------|---------|
-| `ConfigurationError` for `api_key` | Supply the full Solwyn project key, not your provider key or a placeholder. |
+| `ConfigurationError` for `api_key` | Supply the full Solwyn API key, not your provider key or a placeholder. |
+| `ConfigurationError` for `project` | Set `SOLWYN_PROJECT` (or `project`) to a project the key reaches. |
 | A provider authentication or model error | Check the provider credentials and use a model your account can access. |
 | A response but no usage in Solwyn | Await `close()`, check SDK warnings, and verify the Solwyn key and network access to the configured `apiUrl`. |
 | An unmetered-surface warning | Check [provider coverage](#strict-coverage-controls); wrapping a client does not make every method metered. |
@@ -176,6 +181,24 @@ Eligible calls can reuse cached authority or a run lease. Settlement is automati
 Close the wrapped client to flush queued confirmations and events. See
 [budget checks, settlement, and run leases](https://github.com/solwyn-ai/solwyn-typescript-sdk/blob/main/docs/budgets-and-leases.md#budget-checks-settlement-and-run-leases)
 for preflight deadlines, reporter delivery, and lease eligibility and renewal.
+
+## API keys and projects
+
+Every request to Solwyn carries the key and the project (`Solwyn-Project` header). The SDK checks
+both once, lazily, before the first call that needs Solwyn, and pins the project's `proj_` id, so
+renaming the project later does not break a running app. Call `await client.validate()` to check at
+startup instead; it throws `ApiKeyRefusedError` (a `ConfigurationError`) on any refusal.
+
+When Solwyn refuses the key or the project, the SDK does not fall back to `failOpen`:
+
+| Refusal | Wrapped calls |
+|---------|---------------|
+| Unknown project, a project that needs a dedicated key, or a read-only key | Throw `ApiKeyRefusedError` |
+| Expired or revoked key, before the client has validated once | Throw `ApiKeyRefusedError` |
+| Expired or revoked key on a project with any hard limit | Throw `ApiKeyRefusedError` |
+| Expired or revoked key on an alerts-only project, after validating once | Run unmetered, logging `solwyn.api_key_refused` at error on every call |
+
+The SDK rechecks a refused key every 60 seconds and recovers on its own after you rotate it.
 
 ## Choose your next step
 
@@ -393,7 +416,10 @@ import { generateText, wrapLanguageModel } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { createSolwynMiddleware } from "@solwyn/sdk/ai-sdk";
 
-const solwyn = createSolwynMiddleware({ apiKey: process.env.SOLWYN_API_KEY! });
+const solwyn = createSolwynMiddleware({
+  apiKey: process.env.SOLWYN_API_KEY!,
+  project: process.env.SOLWYN_PROJECT!,
+});
 
 const model = wrapLanguageModel({
   model: openai("gpt-4o"),
@@ -755,7 +781,8 @@ All SDK errors inherit from `SolwynError`:
 | `BudgetExceededError` | An ordinary budget denial blocks the call: a live Cloud hard denial, an applicable retained project/run budget denial, or a local fail-closed denial when `failOpen: false` (run-control stops use `RunStoppedError`) |
 | `RunStoppedError` | The control plane or local velocity policy has stopped the active run; direct `SolwynError`, not `BudgetExceededError` |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
-| `ConfigurationError` | Invalid API key format, invalid `provider` override, an unexpected option, or an untracked call surface (e.g. Bedrock `InvokeModel`) |
+| `ConfigurationError` | Invalid API key format, missing or invalid project, invalid `provider` override, an unexpected option, or an untracked call surface (e.g. Bedrock `InvokeModel`) |
+| `ApiKeyRefusedError` | A `ConfigurationError`: Solwyn refused the key or the project (expired, revoked, read-only, unknown project). Carries `code` and `field` |
 | `UnsupportedSurfaceError` | A known provider cannot safely dispatch a tracked surface |
 | `UntrackedSpendSurfaceError` | `onUnmetered: "raise"` blocks an unknown or explicitly unmetered spend surface |
 | `CoverageMismatchError` | A local provider graph differs from a reviewed `coverage(...).expect(...)` fingerprint |

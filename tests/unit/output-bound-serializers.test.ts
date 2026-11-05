@@ -16,7 +16,7 @@ import { GoogleAdapter } from "../../src/providers/google";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetMode } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 
 type Body = Record<string, unknown>;

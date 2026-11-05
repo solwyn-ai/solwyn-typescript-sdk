@@ -36,6 +36,7 @@
  */
 
 import type { CircuitBreaker, CircuitBreakerAdmission } from "./circuit-breaker";
+import { getEnvSnapshot, resolveProjectSelector } from "./config";
 import { safeExceptionType as exceptionName } from "./error-diagnostics";
 import {
   BudgetExceededError,
@@ -59,7 +60,7 @@ import {
 import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
 import { positiveOutputBound } from "./output-bound";
-import { handleReadOnlyKeyError, isReadOnlyKeyError } from "./read-only-key";
+import { ProjectBinding } from "./project";
 import { ORDINARY_TOKEN_COUNT_MAX } from "./receipt-fold";
 import {
   RELEASE_DROP_REASONS,
@@ -79,6 +80,7 @@ import {
 import { buildTokenDetails, type TokenDetails, totalTokens } from "./token-details";
 import { withoutTraceContext } from "./trace-context";
 import {
+  apiKeyRefusalOf,
   BUDGET_CHECK_PATH,
   type FetchLike,
   LEASE_GRANT_PATH,
@@ -491,6 +493,10 @@ export interface BuildConfirmRequestOptions {
 export interface BudgetEnforcerOptions {
   apiUrl: string;
   apiKey: string;
+  /** Solwyn project: a project name or a `proj_` id (required unless `binding` is given). */
+  project?: string;
+  /** @internal The client's shared project binding; built from `project` when absent. */
+  binding?: ProjectBinding;
   budgetMode?: BudgetMode;
   failOpen?: boolean;
   /** Cache TTL in SECONDS for allow decisions (default 5). */
@@ -537,7 +543,8 @@ type InitialGrantResult =
   | { readonly kind: "admission"; readonly admission: LeaseAdmission }
   | { readonly kind: "denied"; readonly result: MaterializedBudgetCheckResult }
   | { readonly kind: "legacy" }
-  | { readonly kind: "outage" };
+  | { readonly kind: "outage" }
+  | { readonly kind: "refused" };
 
 interface RenewalOperation {
   readonly runId: string;
@@ -638,6 +645,10 @@ function money(value: number): string {
 
 export class BudgetEnforcer {
   private readonly transport: Transport;
+  /** The client's project binding: the entry gate and exit check of every check. */
+  readonly binding: ProjectBinding;
+  /** Results that stand in for a recorded refusal; the exit check always discards them. */
+  private readonly refusedPlaceholders = new WeakSet<object>();
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly monotonicNow: () => number;
@@ -777,11 +788,25 @@ export class BudgetEnforcer {
             );
             return raw;
           };
-    // Transport normalizes the URL (strips ALL trailing slashes) and owns auth headers.
-    this.transport = new Transport(options.apiUrl, options.apiKey, { fetch });
     this.logger = bestEffortLogger(options.logger ?? noopLogger);
     this.now = options.now ?? Date.now;
     this.monotonicNow = options.monotonicNow ?? (() => performance.now());
+    this.binding =
+      options.binding ??
+      new ProjectBinding({
+        selector: resolveProjectSelector(options.project, getEnvSnapshot()),
+        apiUrl: options.apiUrl,
+        apiKey: options.apiKey,
+        fetch: options.fetch,
+        timeoutMs: DEFAULT_CHECK_TIMEOUT_MS,
+        logger: this.logger,
+        now: this.monotonicNow,
+      });
+    // Transport normalizes the URL (strips ALL trailing slashes) and owns auth headers.
+    this.transport = new Transport(options.apiUrl, options.apiKey, {
+      fetch,
+      binding: this.binding,
+    });
     this.releases = new ReleaseDispatcher({
       send: (request, timeoutMs) => this.attemptSurrender(request, timeoutMs),
       now: () => this.monotonicNow(),
@@ -802,6 +827,8 @@ export class BudgetEnforcer {
     this.budgetMode = options.budgetMode ?? "alert_only";
     this.failOpen = options.failOpen ?? true;
     this.cacheTtl = cacheTtl;
+    // A refusal surrenders every held lease locally: none may fund a call past it.
+    this.binding.onRefuse(() => this.surrenderHeldLeases());
 
     try {
       const register = Reflect.get(globalThis, NODE_LEASE_REGISTRATION);
@@ -1050,10 +1077,7 @@ export class BudgetEnforcer {
       );
     }
     try {
-      const result = await this.checkBudgetWithOwnership(
-        { ...options, callId, signal },
-        deadlineMs,
-      );
+      const result = await this.gatedCheck({ ...options, callId, signal }, deadlineMs);
       try {
         throwIfCheckAborted(signal);
       } catch (error) {
@@ -1070,6 +1094,71 @@ export class BudgetEnforcer {
         if (remaining <= 0) this.pendingUnmanagedRuns.delete(unmanagedRunId);
         else this.pendingUnmanagedRuns.set(unmanagedRunId, remaining);
       }
+    }
+  }
+
+  /**
+   * Entry gate, check, exit check. The gate runs before the result cache, the lease path and
+   * the breaker-open branch, so a stored refusal is never hidden by any of them. The exit check
+   * wraps every return of the check (live allow, cached allow, lease-funded allow, denial, and
+   * every outage exit including `handleOutage`): a refusal or generation change recorded while
+   * the check ran discards its result.
+   */
+  private async gatedCheck(
+    options: CheckBudgetOptions & { callId: string },
+    deadlineMs: number,
+  ): Promise<BudgetCheckResult> {
+    for (let pass = 0; ; pass++) {
+      const gate = await this.binding.gate();
+      if (gate.kind === "unmetered") return this.unmeteredResult();
+      const result = await this.checkBudgetWithOwnership(options, deadlineMs);
+      const exit = this.binding.exitDecision(gate.generation);
+      if (exit.kind === "keep") return result;
+      // The result is discarded: return any local lease reservation it claimed.
+      this.releaseReservation(options.callId, result.leaseClaimToken ?? null);
+      if (exit.kind === "block") throw exit.error;
+      if (exit.kind === "unmetered") {
+        // A real denial is at least as strong as running unmetered; keep it.
+        return result.allowed || this.refusedPlaceholders.has(result)
+          ? this.unmeteredResult()
+          : { ...result, leaseClaimToken: null };
+      }
+      // A successful revalidation moved the generation: re-run once from the top.
+      if (pass >= 1) return this.checkBudgetWithOwnership(options, deadlineMs);
+    }
+  }
+
+  /** The provider call runs with no check and no reservation (refused, alert_only, valid once). */
+  private unmeteredResult(): MaterializedBudgetCheckResult {
+    return budgetCheckResult({
+      allowed: true,
+      remainingBudget: 0,
+      mode: this.budgetMode,
+      warning: "solwyn.api_key_refused: running unmetered",
+    });
+  }
+
+  /** Placeholder returned after a refusal; the exit check always discards it. */
+  private refusedPlaceholder(leaseClaimToken: number | null): MaterializedBudgetCheckResult {
+    const placeholder = budgetCheckResult({
+      allowed: false,
+      remainingBudget: 0,
+      mode: "hard_deny",
+      warning: "solwyn.api_key_refused",
+      leaseClaimToken,
+    });
+    this.refusedPlaceholders.add(placeholder);
+    return placeholder;
+  }
+
+  /** Drop every held lease locally and send a best-effort surrender (ignored if refused). */
+  private surrenderHeldLeases(): void {
+    if (this.closed) return;
+    for (const runId of this.leaseLedger.activeRunIds()) {
+      if (this.retiringRuns.has(runId)) continue;
+      const request = this.leaseLedger.buildSurrenderRequest(runId);
+      this.leaseLedger.drop(runId);
+      if (request !== null) this.queueSurrender(request);
     }
   }
 
@@ -1179,6 +1268,8 @@ export class BudgetEnforcer {
               return this.withLeaseClaim(grant.result, leaseClaimToken);
             } else if (grant.kind === "outage") {
               return this.handleColdLeaseOutage(captured, leaseCallId, leaseClaimToken);
+            } else if (grant.kind === "refused") {
+              return this.refusedPlaceholder(leaseClaimToken);
             }
             // A grant loser, refused/malformed grant, or one-shot re-entry that still
             // needs authority continues to the legacy per-call endpoint exactly once.
@@ -1249,13 +1340,14 @@ export class BudgetEnforcer {
             });
           } catch (error) {
             throwIfCheckAborted(captured.signal);
-            if (isReadOnlyKeyError(error)) {
+            if (apiKeyRefusalOf(error) !== undefined) {
+              // Recorded on the binding by the transport; credit the breaker and leave
+              // through the exit check, which applies the refusal.
               this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-              handleReadOnlyKeyError(error, this.logger);
-            } else {
-              this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-              this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
+              return this.refusedPlaceholder(leaseClaimToken);
             }
+            this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
+            this.logger.warn("Cloud API budget check failed: %s", exceptionName(error));
             return this.withLeaseClaim(
               this.handleOutage(captured.estimatedInputTokens, captured.agentRunId),
               leaseClaimToken,
@@ -1550,16 +1642,14 @@ export class BudgetEnforcer {
         });
       } catch (error) {
         const status = error instanceof TransportHttpError ? error.status : null;
+        const refused = apiKeyRefusalOf(error) !== undefined;
         const responded =
-          isReadOnlyKeyError(error) ||
-          status === 503 ||
-          (status !== null && status >= 400 && status < 500);
+          refused || status === 503 || (status !== null && status >= 400 && status < 500);
         if (responded) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         else this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-        if (isReadOnlyKeyError(error)) handleReadOnlyKeyError(error, this.logger);
 
         if (operation.closeEpoch === this.closeEpoch) {
-          if (status === 404 || status === 409) {
+          if (refused || status === 404 || status === 409) {
             this.leaseLedger.dropIfCurrent(operation.runId, {
               leaseId: operation.originLeaseId,
               generation: operation.originGeneration,
@@ -1760,13 +1850,15 @@ export class BudgetEnforcer {
       } catch (error) {
         throwIfCheckAborted(captured.signal);
         const status = error instanceof TransportHttpError ? error.status : null;
-        const responded =
-          isReadOnlyKeyError(error) ||
-          status === 503 ||
-          (status !== null && status >= 400 && status < 500);
+        if (apiKeyRefusalOf(error) !== undefined) {
+          // Recorded on the binding; drop the lease and let the exit check apply it.
+          this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+          if (closeDispatchEpoch === this.closeEpoch) this.leaseLedger.drop(runId);
+          return { kind: "refused" };
+        }
+        const responded = status === 503 || (status !== null && status >= 400 && status < 500);
         if (responded) {
           this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-          if (isReadOnlyKeyError(error)) handleReadOnlyKeyError(error, this.logger);
           if (closeDispatchEpoch === this.closeEpoch) {
             this.leaseLedger.markIneligible(runId, {
               now: this.monotonicNow() / 1000,
@@ -3097,12 +3189,11 @@ export class BudgetEnforcer {
         }
         const status = error instanceof TransportHttpError ? error.status : null;
         const responded =
-          isReadOnlyKeyError(error) ||
+          apiKeyRefusalOf(error) !== undefined ||
           status === 503 ||
           (status !== null && status >= 400 && status < 500);
         if (responded) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         else this.controlPlaneBreaker?.recordFailure(admission ?? undefined);
-        if (isReadOnlyKeyError(error)) handleReadOnlyKeyError(error, this.logger);
         this.logger.debug("lease.surrender_failed: status=%s", status);
         if (status !== null) return { result: "refused", settled };
         if (error instanceof TransportTimeoutError) return { result: "timeout", settled };

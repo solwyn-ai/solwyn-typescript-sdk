@@ -5,11 +5,15 @@ import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 describe("settlement architecture parity", () => {
   it("keeps confirm construction sans-I/O and removes the blocking public send method", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: "https://api.solwyn.test", apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: "https://api.solwyn.test",
+      apiKey: API_KEY,
+    });
     const confirm = enforcer.buildConfirmRequest({
       reservationId: "reservation-1",
       model: "gpt-4o",

@@ -210,7 +210,7 @@ const openaiAgents = await load('@solwyn/sdk/openai-agents');
 let artifactIdentity;
 ${installedArtifactIdentitySource(allInstalledEntries, "artifactIdentity", "format")}
 const plane = new testing.FakeControlPlane();
-const options = {apiKey:plane.apiKey, apiUrl:plane.apiUrl, fetch:plane.fetch, leaseEnabled:false, budgetCheckCacheTtl:0, logger:sdk.noopLogger, reportUntrackedSurfaces:false};
+const options = {apiKey:plane.apiKey, project:plane.project, apiUrl:plane.apiUrl, fetch:plane.fetch, leaseEnabled:false, budgetCheckCacheTtl:0, logger:sdk.noopLogger, reportUntrackedSurfaces:false};
 let dispatches = 0;
 const provider = {chat:{completions:{create(){dispatches++; return {id:'packed-response',usage:{prompt_tokens:2,completion_tokens:3}};}}}};
 const client = new sdk.Solwyn(provider, options);
@@ -224,7 +224,7 @@ assert.equal(plane.confirms.length,1);
 assert.equal(plane.ingested.length,1);
 assert.equal(typeof plane.checks[0].agent_run_id,'string');
 assert.equal(plane.ingested[0].agent_run_name,'consumer-review');
-const handle = ai.createSolwynMiddleware({apiKey:plane.apiKey,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,budgetCheckCacheTtl:0,logger:sdk.noopLogger});
+const handle = ai.createSolwynMiddleware({apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl,fetch:plane.fetch,leaseEnabled:false,budgetCheckCacheTtl:0,logger:sdk.noopLogger});
 assert.equal(typeof handle.middleware.wrapGenerate,'function');
 assert.equal(typeof handle.middleware.wrapStream,'function');
 assert.equal(typeof handle[Symbol.asyncDispose],'function');
@@ -264,12 +264,12 @@ import {SolwynRunScopeHandler} from '@solwyn/sdk/langchain';
 const plane=new FakeControlPlane();
 const handler=new SolwynRunScopeHandler();
 const seam:FetchLike=plane.fetch;
-const client=new Solwyn({chat:{completions:{create(_params:{model:string}){return {usage:{prompt_tokens:1,completion_tokens:1}};}}}},{fetch:seam,apiKey:plane.apiKey});
+const client=new Solwyn({chat:{completions:{create(_params:{model:string}){return {usage:{prompt_tokens:1,completion_tokens:1}};}}}},{fetch:seam,apiKey:plane.apiKey,project:plane.project});
 const usage:Promise<{usage:{prompt_tokens:number;completion_tokens:number}}>=client.chat.completions.create({model:'gpt-review'});
 const identity:string|undefined=run('review',()=>currentRun()?.agentRunId);
 const handle=createRun('review');
 const scope:ScenarioWindow=plane.outage({requests:1});
-const options:ContractOptions={apiKey:plane.apiKey,apiUrl:plane.apiUrl};
+const options:ContractOptions={apiKey:plane.apiKey,project:plane.project,apiUrl:plane.apiUrl};
 const legacy:BudgetCheckResult={allowed:true,remainingBudget:5,projectId:'legacy',reservationId:'legacy',mode:'alert_only',warning:null,budgetLimit:10,currentUsage:5,priceHints:null,failoverTuningAllowed:null,deniedByPeriod:null};
 const budget=budgetCheckResult({allowed:true,remainingBudget:1});
 const leaseId:string|null=budget.leaseId;
@@ -642,7 +642,7 @@ process.stdout.write(JSON.stringify({resolved,openaiCannotResolve:true,artifactI
       "AI peer consumer installed a different SDK version",
     );
     report.versions.providers.ai = aiRequire("ai/package.json").version;
-    const aiTypes = `${types}\nimport {createSolwynMiddleware} from '@solwyn/sdk/ai-sdk';\nconst middleware=createSolwynMiddleware({apiKey:plane.apiKey,fetch:seam});\nvoid middleware;\n`;
+    const aiTypes = `${types}\nimport {createSolwynMiddleware} from '@solwyn/sdk/ai-sdk';\nconst middleware=createSolwynMiddleware({apiKey:plane.apiKey,project:plane.project,fetch:seam});\nvoid middleware;\n`;
     for (const ext of ["mts", "cts"])
       fs.writeFileSync(path.join(aiApp, `consumer.${ext}`), aiTypes);
     const aiConfig = JSON.parse(fs.readFileSync(path.join(app, "tsconfig.json"), "utf8"));

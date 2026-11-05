@@ -27,6 +27,7 @@ const raw = {
 };
 const options = {
   apiKey: plane.apiKey,
+  project: plane.project,
   apiUrl: plane.apiUrl,
   fetch: plane.fetch,
   leaseEnabled: false,

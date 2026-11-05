@@ -267,6 +267,7 @@ describe("FakeControlPlane run control", () => {
     plane.stopRun("b3-misroute-run");
     plane.misrouteStops({ requests: 1 });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -301,6 +302,7 @@ describe("FakeControlPlane run control", () => {
     setRunControlClockForTest(() => now);
     const plane = new FakeControlPlane({ refreshIntervalS: 1, leaseLengthS: 3 });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,

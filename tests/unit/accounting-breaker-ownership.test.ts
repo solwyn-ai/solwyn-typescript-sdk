@@ -24,7 +24,7 @@ for (const operation of ["check", "confirm"] as const) {
     });
     let requests = 0;
     const options = {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       apiUrl: "https://accounting-breaker.invalid",
       controlPlaneBreaker: breaker,
       fetch: async () => {
@@ -47,7 +47,12 @@ for (const operation of ["check", "confirm"] as const) {
             });
       },
     };
-    const budget = new BudgetEnforcer({ ...options, cacheTtl: 0, leaseEnabled: false });
+    const budget = new BudgetEnforcer({
+      project: "test-project",
+      ...options,
+      cacheTtl: 0,
+      leaseEnabled: false,
+    });
     const reporter = new MetadataReporter(options.apiUrl, options.apiKey, options);
     const send = () =>
       operation === "check"

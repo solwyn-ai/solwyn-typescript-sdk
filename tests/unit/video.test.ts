@@ -6,7 +6,7 @@ import { measureOpenAIVideoMedia, measureVideoMedia } from "../../src/privacy";
 import { __resetAdapterRegistry } from "../../src/providers/index";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const UNTRACKED_WARNING =
   "Provider '%s' client shape '%s' exposes untracked surface '%s' (scope: %s); no budget check and no cost event will be emitted. Tracking for this surface is coming.";
 

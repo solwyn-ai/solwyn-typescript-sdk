@@ -30,7 +30,7 @@ import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetCheckRequest, BudgetCheckResponse } from "../../src/types";
 
 const API_URL = "https://api.solwyn.ai";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const CHECK_URL = `${API_URL}/api/v1/budgets/check`;
 
 afterEach(() => resetRunControlForTest());
@@ -273,6 +273,7 @@ function stoppedResult(deniedByPeriod: string | null): ReturnType<typeof budgetC
 
 function stoppedBuilderEnforcer(terminationFor: (runId: string) => unknown | null): BudgetEnforcer {
   return new BudgetEnforcer({
+    project: "test-project",
     apiUrl: API_URL,
     apiKey: API_KEY,
     leaseEnabled: false,
@@ -436,7 +437,11 @@ describe("buildCheckRequest", () => {
   });
 
   it("emits only the check fields, passes tokens/model/provider through, never leaks other shapes", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     const req = enforcer.buildCheckRequest({
       estimatedInputTokens: 42,
       model: "gpt-4o",
@@ -468,7 +473,11 @@ describe("buildCheckRequest", () => {
   });
 
   it("defaults fallback arrays to [] and never mutates the caller's arrays", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     const fallbackProviders: ("openai" | "anthropic")[] = ["anthropic"];
     const fallbackModels = ["claude-3"];
     const req = enforcer.buildCheckRequest({
@@ -492,6 +501,7 @@ describe("buildCheckRequest", () => {
   it("sends fallback arrays over the wire on the actual check POST", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -505,7 +515,11 @@ describe("buildCheckRequest", () => {
   });
 
   it("always opts into failover directives and omits an absent run id", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     expect(enforcer.buildCheckRequest(baseCheck())).toMatchObject({
       failover_directive_version: "1",
     });
@@ -515,7 +529,11 @@ describe("buildCheckRequest", () => {
   it("copies supplied tags onto the check request while omitting absent tags", () => {
     // Mutation caught: dropping tags or retaining the caller's mutable record causes
     // control-plane attribution to be missing or change after capture.
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     const tags = { customer: "acme", environment: "test" };
     const request = enforcer.buildCheckRequest({
       ...baseCheck(),
@@ -539,6 +557,7 @@ describe("buildCheckRequest", () => {
     const protoDescriptor = Object.getOwnPropertyDescriptor(tags, "__proto__");
     const constructorDescriptor = Object.getOwnPropertyDescriptor(tags, "constructor");
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: true,
@@ -571,6 +590,7 @@ describe("buildCheckRequest", () => {
   it("serializes a supplied run id on the outbound check", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -594,6 +614,7 @@ describe("checkBudget provider requirement", () => {
   it("throws ConfigurationError when provider is missing, even from untyped JS", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -608,7 +629,11 @@ describe("checkBudget provider requirement", () => {
   });
 
   it("throws ConfigurationError on an empty-string provider", async () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     const opts = { estimatedInputTokens: 1, model: "m", provider: "" } as unknown as Parameters<
       BudgetEnforcer["checkBudget"]
     >[0];
@@ -626,6 +651,7 @@ describe("checkBudget outbound request validation", () => {
     vi.useFakeTimers();
     let signal: AbortSignal | undefined;
     const budget = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: async (_url, init) => {
@@ -655,6 +681,7 @@ describe("checkBudget outbound request validation", () => {
   it("does not let a hot chain cache bypass validation for an invalid estimate", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -670,6 +697,7 @@ describe("checkBudget outbound request validation", () => {
   it("throws (no fetch, no fail-open) on misaligned fallback arrays", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -692,6 +720,7 @@ describe("checkBudget outbound request validation", () => {
   it("throws (no fetch) on an invalid provider string from an untyped caller", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -709,6 +738,7 @@ describe("checkBudget outbound request validation", () => {
   it("throws (no fetch) when more than 8 fallback models are supplied", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -735,6 +765,7 @@ describe("cloud reachable + allow", () => {
   it("returns allowed with fields flowing through untouched and no warning", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () =>
@@ -760,6 +791,7 @@ describe("cloud reachable + allow", () => {
   it("propagates non-null price hints string-keyed and unmodified", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse({ price_hints: { openai: 1.0, anthropic: 1.5 } })),
@@ -771,6 +803,7 @@ describe("cloud reachable + allow", () => {
   it("records the last-known budget limit/usage on an allow (behavior 6)", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse({ budget_limit: 100, current_usage: 30 })),
@@ -811,6 +844,7 @@ describe("cloud reachable + allow", () => {
   ])("propagates failover entitlement from a cloud $name", async ({ response, expected }) => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => response),
@@ -833,6 +867,7 @@ describe("cloud reachable + deny (alert_only)", () => {
     const log = capturingLogger();
     const clock = fakeMonotonicClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -873,6 +908,7 @@ describe("cloud reachable + deny (alert_only)", () => {
   it("warns for an allowed alert-only overrun while preserving its reservation", async () => {
     const log = capturingLogger();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       logger: log.logger,
@@ -900,6 +936,7 @@ describe("cloud reachable + deny (alert_only)", () => {
   it("still allows with a 'limit' warning and 2-decimal dollar amounts", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       budgetMode: "alert_only",
@@ -923,6 +960,7 @@ describe("cloud reachable + deny (alert_only)", () => {
     const records: FetchRecord[] = [];
     const log = capturingLogger();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       budgetMode: "alert_only",
@@ -952,6 +990,7 @@ describe("cloud reachable + deny (hard_deny)", () => {
   it("blocks the call with an 'exceeded' warning", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       budgetMode: "hard_deny",
@@ -978,6 +1017,7 @@ describe("cloud reachable + deny (hard_deny)", () => {
 
   it("attributes a live directive denial to its directive reason", async () => {
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       budgetMode: "hard_deny",
@@ -1008,6 +1048,7 @@ describe("cloud reachable + deny (hard_deny)", () => {
   it("copies budgetLimit/currentUsage VERBATIM from the response, never remaining/0 (Bug 1.1)", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () =>
@@ -1030,6 +1071,7 @@ describe("cloud reachable + deny (hard_deny)", () => {
   it("records the last-known limit/usage on a deny response too (behavior 6)", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () =>
@@ -1044,6 +1086,7 @@ describe("cloud reachable + deny (hard_deny)", () => {
   it("omits reservationId AND priceHints on a hard deny (Python None defaults — finding 5)", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () =>
@@ -1113,6 +1156,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1128,6 +1172,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1148,6 +1193,7 @@ describe("cache behavior", () => {
   ])("isolates public $name from its cache entry while replaying it exactly", async ({ hints }) => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () =>
@@ -1182,6 +1228,7 @@ describe("cache behavior", () => {
   it("excludes estimates from the cache key", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -1196,6 +1243,7 @@ describe("cache behavior", () => {
   it("normalizes omitted modality and explicit text to the same key", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -1238,6 +1286,7 @@ describe("cache behavior", () => {
   ])("does not collide when $name changes", async ({ baseline = {}, changed }) => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -1252,6 +1301,7 @@ describe("cache behavior", () => {
   it("is a bounded 16-entry LRU whose touches preserve the touched chain", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -1274,6 +1324,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1306,6 +1357,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1342,6 +1394,7 @@ describe("cache behavior", () => {
     })();
     let calls = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1377,6 +1430,7 @@ describe("cache behavior", () => {
   it("keeps null and absent tags on the existing untagged cache path", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: okFetch(records, () => makeResponse()),
@@ -1397,6 +1451,7 @@ describe("cache behavior", () => {
       const records: FetchRecord[] = [];
       let next = makeResponse();
       const enforcer = new BudgetEnforcer({
+        project: "test-project",
         apiUrl: API_URL,
         apiKey: API_KEY,
         fetch: okFetch(records, () => next),
@@ -1417,6 +1472,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     let next = makeResponse({ price_hints: { openai: 1.2 } });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1440,6 +1496,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     let next = makeResponse({ price_hints: { openai: 1.2 } });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1463,6 +1520,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1479,6 +1537,7 @@ describe("cache behavior", () => {
     const clock = fakeClock();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1518,6 +1577,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 0,
@@ -1533,6 +1593,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1552,6 +1613,7 @@ describe("cache behavior", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       cacheTtl: 5,
@@ -1572,6 +1634,7 @@ describe("outage + fail_open", () => {
   it("allows with a 'fail-open' warning, mode=configured, remainingBudget 0", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -1590,6 +1653,7 @@ describe("outage + fail_open", () => {
   it("still accrues local spend while failing open (DEFAULT_COST_PER_TOKEN * tokens)", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -1604,6 +1668,7 @@ describe("outage + fail_open", () => {
     const warn = vi.fn<Logger["warn"]>();
     const logger: Logger = { debug: vi.fn(), info: vi.fn(), warn, error: vi.fn() };
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -1633,6 +1698,7 @@ describe("hard-deny stickiness (invariant 9)", () => {
       denied_by_period: "monthly",
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: options.failOpen,
@@ -1680,6 +1746,7 @@ describe("hard-deny stickiness (invariant 9)", () => {
   it("uses a sticky directive reason only for the directive's active run", async () => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -1720,6 +1787,7 @@ describe("hard-deny stickiness (invariant 9)", () => {
     const monotonic = fakeMonotonicClock(10);
     let calls = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1794,6 +1862,7 @@ describe("hard-deny stickiness (invariant 9)", () => {
     const records: FetchRecord[] = [];
     let reachable = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -1876,6 +1945,7 @@ describe("run-scoped sticky denials", () => {
     const records: FetchRecord[] = [];
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1907,6 +1977,7 @@ describe("run-scoped sticky denials", () => {
     let online = true;
     let next = runDeny();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -1952,6 +2023,7 @@ describe("run-scoped sticky denials", () => {
     const olderTaggedResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2020,6 +2092,7 @@ describe("run-scoped sticky denials", () => {
     const olderTaggedResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2075,6 +2148,7 @@ describe("run-scoped sticky denials", () => {
     const laterTaggedAllowResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2129,6 +2203,7 @@ describe("run-scoped sticky denials", () => {
     const olderTaggedAllowResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2177,6 +2252,7 @@ describe("run-scoped sticky denials", () => {
     const monotonic = fakeMonotonicClock(10);
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2237,6 +2313,7 @@ describe("run-scoped sticky denials", () => {
     const olderProjectResponse = deferredResponse();
     let checkCalls = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2310,6 +2387,7 @@ describe("run-scoped sticky denials", () => {
     const olderProjectResponse = deferredResponse();
     let checkCalls = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2367,6 +2445,7 @@ describe("run-scoped sticky denials", () => {
     const taggedResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2437,6 +2516,7 @@ describe("run-scoped sticky denials", () => {
     const delayedResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2496,6 +2576,7 @@ describe("run-scoped sticky denials", () => {
     const delayedRunResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2574,6 +2655,7 @@ describe("run-scoped sticky denials", () => {
     const delayedAlertResponse = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2645,6 +2727,7 @@ describe("run-scoped sticky denials", () => {
     let online = true;
     let next = makeResponse({ price_hints: { openai: 1 } });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2687,6 +2770,7 @@ describe("run-scoped sticky denials", () => {
     const checkTaggedPeriod = async (deniedByPeriod: "monthly" | "agent_run") => {
       let online = true;
       const enforcer = new BudgetEnforcer({
+        project: "test-project",
         apiUrl: API_URL,
         apiKey: API_KEY,
         leaseEnabled: false,
@@ -2735,6 +2819,7 @@ describe("run-scoped sticky denials", () => {
     let online = true;
     let next = makeResponse({ price_hints: { openai: 1 } });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2768,6 +2853,7 @@ describe("run-scoped sticky denials", () => {
   it("replays a run denial only for the same run during an outage", async () => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -2798,6 +2884,7 @@ describe("run-scoped sticky denials", () => {
       denied_by_period: "daily",
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -2823,6 +2910,7 @@ describe("run-scoped sticky denials", () => {
   it("a project-period denial received inside a run remains globally sticky", async () => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -2854,6 +2942,7 @@ describe("run-scoped sticky denials", () => {
     let online = true;
     let next = runDeny();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -2887,6 +2976,7 @@ describe("run-scoped sticky denials", () => {
     const delayedAllow = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -2928,6 +3018,7 @@ describe("run-scoped sticky denials", () => {
     const monotonic = fakeMonotonicClock(10);
     let next = runDeny();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       monotonicNow: monotonic.now,
@@ -2944,6 +3035,7 @@ describe("run-scoped sticky denials", () => {
   it("bounds run stickies at 128 and a replay touch preserves the touched key", async () => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -2979,6 +3071,7 @@ describe("run-scoped sticky denials", () => {
     const delayedAllow = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3007,6 +3100,7 @@ describe("run-scoped sticky denials", () => {
     const delayedAllow = deferredResponse();
     let call = 0;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: false,
@@ -3031,6 +3125,7 @@ describe("run-scoped sticky denials", () => {
     let online = true;
     let next = runDeny();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3058,6 +3153,7 @@ describe("run-scoped sticky denials", () => {
     const log = capturingLogger();
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       logger: log.logger,
@@ -3083,6 +3179,7 @@ describe("run-scoped sticky denials", () => {
   ] as const)("replays a %s denial only for its matching run during an outage", async (deniedByPeriod) => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3119,6 +3216,7 @@ describe("run-scoped sticky denials", () => {
       denied_by_period: "daily",
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3156,6 +3254,7 @@ describe("run-scoped sticky denials", () => {
       denied_by_period: "daily",
     });
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3186,6 +3285,7 @@ describe("run-scoped sticky denials", () => {
   it("retains a no-run stopped denial globally when no stronger global sticky exists", async () => {
     let online = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3216,6 +3316,7 @@ describe("outage + fail_closed local enforcement", () => {
   it("denies (fail-closed) when the cloud was never reached", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: false,
@@ -3239,6 +3340,7 @@ describe("outage + fail_closed local enforcement", () => {
     const records: FetchRecord[] = [];
     let reachable = true;
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: false,
@@ -3274,6 +3376,7 @@ describe("outage + fail_closed local enforcement", () => {
     let reachable = true;
     // A tiny limit that even one estimate exceeds.
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: false,
@@ -3316,6 +3419,7 @@ describe("local cost tracking", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock();
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3331,6 +3435,7 @@ describe("local cost tracking", () => {
     const records: FetchRecord[] = [];
     const clock = fakeClock(Date.UTC(2026, 6, 3, 23, 59, 0));
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,
@@ -3346,7 +3451,11 @@ describe("local cost tracking", () => {
 
 describe("buildConfirmRequest", () => {
   it("carries provider_region and a recognized service_tier through", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     const req = enforcer.buildConfirmRequest({
       reservationId: "res-1",
       model: "m",
@@ -3362,7 +3471,12 @@ describe("buildConfirmRequest", () => {
 
   it("downgrades an unrecognized service_tier to absent and logs at DEBUG (behavior 20)", () => {
     const log = capturingLogger();
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY, logger: log.logger });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      logger: log.logger,
+    });
     const req = enforcer.buildConfirmRequest({
       reservationId: "res-1",
       model: "m",
@@ -3376,7 +3490,11 @@ describe("buildConfirmRequest", () => {
   });
 
   it("throws from buildConfirmRequest on a missing callId, before any wire work", () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     expect(() =>
       enforcer.buildConfirmRequest({
         reservationId: "res-1",
@@ -3395,7 +3513,11 @@ describe("buildConfirmRequest", () => {
 
 describe("lifecycle", () => {
   it("close() is idempotent and no-op-safe", async () => {
-    const enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+    const enforcer = new BudgetEnforcer({
+      project: "test-project",
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+    });
     await enforcer.close();
     await enforcer.close();
     expect(enforcer.isClosed).toBe(true);
@@ -3404,7 +3526,11 @@ describe("lifecycle", () => {
   it("supports Symbol.asyncDispose (await using)", async () => {
     let closedRef: BudgetEnforcer | null = null;
     {
-      await using enforcer = new BudgetEnforcer({ apiUrl: API_URL, apiKey: API_KEY });
+      await using enforcer = new BudgetEnforcer({
+        project: "test-project",
+        apiUrl: API_URL,
+        apiKey: API_KEY,
+      });
       closedRef = enforcer;
       expect(enforcer.isClosed).toBe(false);
     }
@@ -3420,6 +3546,7 @@ describe("concurrent async calls (single-threaded atomicity)", () => {
   it("sums fail-open local spend exactly across many concurrent checkBudget calls", async () => {
     const records: FetchRecord[] = [];
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiUrl: API_URL,
       apiKey: API_KEY,
       failOpen: true,

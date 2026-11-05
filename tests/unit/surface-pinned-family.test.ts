@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConfigurationError, coverage, Solwyn } from "../../src/index";
 import { buildRuntimes } from "../../src/registry";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const clientsToClose: Array<{ close(): Promise<void> }> = [];
 let ioCalls = 0;
 let providerCalls = 0;

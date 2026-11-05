@@ -6,7 +6,7 @@ import { ConfigurationError, coverage, Solwyn, UntrackedSpendSurfaceError } from
 import { noopLogger } from "../../src/logging";
 
 const clients: Array<{ close(): Promise<void> }> = [];
-const apiKey = `sk_proj_${"a".repeat(64)}`;
+const apiKey = `solwyn_sk_${"a".repeat(64)}`;
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
   __resetUnmeteredSurfaceWarnings();

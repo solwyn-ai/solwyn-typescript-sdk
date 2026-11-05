@@ -15,7 +15,7 @@ import type { FetchLike } from "../../src/transport";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
 import { installIngestContractGuard } from "../helpers/ingest-contract";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const MODEL = "gpt-4o-mini";
 const UNTRACKED_REPORT_PATH = "/api/v1/untracked-surfaces";
 

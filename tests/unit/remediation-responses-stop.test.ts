@@ -89,7 +89,7 @@ describe("remediation 10: native Responses subscription stop boundaries", () => 
       return native;
     });
     const sdk = new Solwyn(raw, {
-      apiKey: `sk_proj_${"0".repeat(64)}`,
+      apiKey: `solwyn_sk_${"0".repeat(64)}`,
       fetch,
       leaseEnabled: false,
       velocityMode: "off",

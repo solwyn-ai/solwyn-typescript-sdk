@@ -5,7 +5,7 @@ import { getCurrentRun } from "../../src/run-context";
 import { gcProbeTimeout, runGcProbe } from "../helpers/gc-probe";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 // Each scenario runs in its own `node --expose-gc` subprocess so forced collection is real
 // and no Vitest state keeps a dropped client reachable. Assertions are structural counts.

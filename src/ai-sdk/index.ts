@@ -37,7 +37,7 @@ import {
   floorTokenDetails,
 } from "../budget";
 import { CircuitBreaker } from "../circuit-breaker";
-import { resolveConfig, type SolwynConfigOptions } from "../config";
+import { rejectProjectIdOption, resolveConfig, type SolwynConfigOptions } from "../config";
 import { safeErrorClassName } from "../error-class";
 import {
   ConfigurationError,
@@ -56,6 +56,7 @@ import {
   resolveAiSdkOutputBound,
 } from "../output-bound";
 import { estimateContentLength, estimateTokensFromLength } from "../privacy";
+import { ProjectBinding } from "../project";
 import { ORDINARY_TOKEN_COUNT_MAX } from "../receipt-fold";
 import { MetadataReporter } from "../reporter";
 import { attemptMaybeBilled } from "../routing";
@@ -426,8 +427,10 @@ function deltaChars(part: unknown): number {
  * defaults) reuses {@link resolveConfig} verbatim.
  */
 export interface SolwynMiddlewareOptions {
-  /** Solwyn project API key (`sk_proj_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
+  /** Solwyn API key (`solwyn_sk_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
   apiKey?: string;
+  /** Solwyn project: a project name or a `proj_` id. Falls back to `SOLWYN_PROJECT` on Node. */
+  project?: string;
   /** Solwyn Cloud API base URL. Defaults to `https://api.solwyn.ai`. */
   apiUrl?: string;
   /** Budget fail-open policy (default true). */
@@ -482,6 +485,7 @@ export interface SolwynMiddlewareOptions {
 
 const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
   "apiKey",
+  "project",
   "apiUrl",
   "failOpen",
   "budgetMode",
@@ -515,6 +519,11 @@ const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
 export interface SolwynMiddlewareHandle {
   /** Pass to `wrapLanguageModel({ model, middleware })`. */
   readonly middleware: LanguageModelMiddleware;
+  /**
+   * Check the API key and project with Solwyn now. Throws `ApiKeyRefusedError` (a
+   * `ConfigurationError`) on any refusal; calls otherwise validate lazily.
+   */
+  validate(): Promise<void>;
   /** Reject new calls, drain in-flight work, settle open streams, and flush queued usage. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link close}. */
@@ -525,6 +534,7 @@ export interface SolwynMiddlewareHandle {
 function toConfigOptions(options: SolwynMiddlewareOptions): SolwynConfigOptions {
   const config: SolwynConfigOptions = {};
   if (options.apiKey !== undefined) config.api_key = options.apiKey;
+  if (options.project !== undefined) config.project = options.project;
   if (options.apiUrl !== undefined) config.api_url = options.apiUrl;
   if (options.failOpen !== undefined) config.fail_open = options.failOpen;
   if (options.budgetMode !== undefined) config.budget_mode = options.budgetMode;
@@ -883,7 +893,10 @@ const collectedStreamSettlements = new FinalizationRegistry<MiddlewareStreamSett
  * import { openai } from "@ai-sdk/openai";
  * import { createSolwynMiddleware } from "@solwyn/sdk/ai-sdk";
  *
- * const solwyn = createSolwynMiddleware({ apiKey: process.env.SOLWYN_API_KEY! });
+ * const solwyn = createSolwynMiddleware({
+ *   apiKey: process.env.SOLWYN_API_KEY!,
+ *   project: "checkout-bot",
+ * });
  * const model = wrapLanguageModel({ model: openai("gpt-4o"), middleware: solwyn.middleware });
  * const { text } = await generateText({ model, prompt: "Hello" });
  * await solwyn.close();
@@ -892,6 +905,7 @@ const collectedStreamSettlements = new FinalizationRegistry<MiddlewareStreamSett
 export function createSolwynMiddleware(
   options: SolwynMiddlewareOptions = {},
 ): SolwynMiddlewareHandle {
+  rejectProjectIdOption(options);
   for (const key of Object.keys(options)) {
     if (!KNOWN_OPTION_KEYS.has(key)) {
       throw new ConfigurationError(`unexpected option '${key}'`, { field: key });
@@ -908,9 +922,20 @@ export function createSolwynMiddleware(
     logger,
   });
 
+  // One project binding shared by the budget and reporter transports; no network here.
+  const binding = new ProjectBinding({
+    selector: config.project,
+    apiUrl: config.api_url,
+    apiKey: config.api_key,
+    fetch: options.fetch,
+    timeoutMs: config.budget_check_timeout * 1000,
+    logger,
+  });
+
   const budget = new BudgetEnforcer({
     apiUrl: config.api_url,
     apiKey: config.api_key,
+    binding,
     budgetMode: config.budget_mode,
     failOpen: config.fail_open,
     cacheTtl: config.budget_check_cache_ttl,
@@ -923,6 +948,7 @@ export function createSolwynMiddleware(
   });
 
   const reporter = new MetadataReporter(config.api_url, config.api_key, {
+    binding,
     batchSize: config.reporter_batch_size,
     flushInterval: config.reporter_flush_interval * 1000,
     maxQueueSize: config.reporter_max_queue_size,
@@ -1032,7 +1058,6 @@ export function createSolwynMiddleware(
         signal: params.abortSignal,
       }),
     );
-    reporter.observeProjectId(decision.projectId);
 
     if (!decision.allowed) {
       try {
@@ -1607,6 +1632,7 @@ export function createSolwynMiddleware(
       wrapGenerate: (args) => trackCall(() => meteredMiddleware.wrapGenerate(args)),
       wrapStream: (args) => trackCall(() => meteredMiddleware.wrapStream(args)),
     },
+    validate: () => binding.validate(),
     close,
     [Symbol.asyncDispose](): Promise<void> {
       return close();

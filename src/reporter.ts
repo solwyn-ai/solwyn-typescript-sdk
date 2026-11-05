@@ -31,7 +31,7 @@ import { ConfigurationError, SolwynError } from "./errors";
 import { createEventTimestampAllocator } from "./event-timestamp";
 import type { Logger } from "./logging";
 import { bestEffortLogger, escapeControlChars, noopLogger } from "./logging";
-import { handleReadOnlyKeyError, isReadOnlyKeyError } from "./read-only-key";
+import type { ProjectBinding } from "./project";
 import {
   buildReceiptReplayEvents,
   ORDINARY_TOKEN_COUNT_MAX,
@@ -40,6 +40,7 @@ import {
 import { runOutsideRun } from "./run-context";
 import { withoutTraceContext } from "./trace-context";
 import {
+  apiKeyRefusalOf,
   BUDGET_CONFIRM_PATH,
   type FetchLike,
   isRetryableTransportError,
@@ -347,6 +348,8 @@ export interface MetadataReporterOptions {
   breakerReportHeartbeat?: number;
   /** Injectable `fetch` (tests). */
   fetch?: FetchLike;
+  /** The client's project binding: `Solwyn-Project` header, refusals, pinned breaker URL. */
+  binding?: ProjectBinding;
   /** Injectable logger (default no-op). */
   logger?: Logger;
   /** Shared check/confirm control-plane breaker; null/absent disables admission. */
@@ -448,7 +451,7 @@ export class MetadataReporter {
   private activeRound: Promise<void> | null = null;
   /** A quota-exhausted round armed a zero-delay continuation tick that has not run yet. */
   private continuationPending = false;
-  private breakerProjectId: string | null = null;
+  private readonly binding: ProjectBinding | null;
   private activeBreakerCycle: Promise<void> | null = null;
   private activeBreakerAbortController: AbortController | null = null;
   private readonly breakerLastSent = new Map<string, string>();
@@ -472,7 +475,11 @@ export class MetadataReporter {
   constructor(apiUrl: string, apiKey: string, options: MetadataReporterOptions = {}) {
     requireFetchLike(options.fetch);
     // Transport normalizes the URL (strips ALL trailing slashes) and owns auth.
-    this.transport = new Transport(apiUrl, apiKey, { fetch: options.fetch });
+    this.binding = options.binding ?? null;
+    this.transport = new Transport(apiUrl, apiKey, {
+      fetch: options.fetch,
+      binding: this.binding ?? undefined,
+    });
     this.logger = bestEffortLogger(options.logger ?? noopLogger);
     this.controlPlaneBreaker = options.controlPlaneBreaker ?? null;
     this.breakerSnapshots = options.breakerSnapshots ?? null;
@@ -578,11 +585,9 @@ export class MetadataReporter {
     return Object.fromEntries(this.dropCounts);
   }
 
-  /** Learn the project id returned by a budget check; falsy values never erase authority. */
-  observeProjectId(projectId: string | null | undefined): void {
-    if (projectId) {
-      this.breakerProjectId = projectId;
-    }
+  /** Breaker reports address the project pinned from `/auth/key`; none until pinned. */
+  private get breakerProjectId(): string | null {
+    return this.binding?.pinnedId ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -1134,7 +1139,8 @@ export class MetadataReporter {
           rejections: MALFORMED_REJECTIONS,
         };
       }
-      if (handleReadOnlyKeyError(sendError, this.logger)) {
+      if (apiKeyRefusalOf(sendError) !== undefined) {
+        // A refusal is terminal for this batch: no retry. The binding logged it once.
         return { outcome: "sent", rejections: MALFORMED_REJECTIONS };
       }
       if (sendError instanceof TransportHttpError && sendError.status === 429) {
@@ -1208,11 +1214,10 @@ export class MetadataReporter {
       if (isCurrent()) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
       return { outcome: "sent" };
     } catch (error) {
-      if (isReadOnlyKeyError(error)) {
-        if (isCurrent()) {
-          this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
-          handleReadOnlyKeyError(error, this.logger);
-        }
+      if (apiKeyRefusalOf(error) !== undefined) {
+        // A refusal is terminal for this confirm: dropped, never retried, and neutral for
+        // the failure counter. The binding logged it once per code.
+        if (isCurrent()) this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
         return { outcome: "sent", counterNeutral: true };
       } else {
         if (!isCurrent()) {
@@ -1896,10 +1901,7 @@ export class MetadataReporter {
             }
           }
         }
-        if (isReadOnlyKeyError(error)) {
-          handleReadOnlyKeyError(error, this.logger);
-          return;
-        }
+        if (apiKeyRefusalOf(error) !== undefined) return;
         this.logger.warn(
           "reporter.breaker_send_failed: provider=%s exc_type=%s",
           provider,

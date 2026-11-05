@@ -74,7 +74,8 @@ const fetch: FetchLike = async (url, init) => {
   return new Response(null, { status: 204 });
 };
 const options = {
-  apiKey: `sk_proj_${"0".repeat(64)}`,
+  apiKey: `solwyn_sk_${"0".repeat(64)}`,
+  project: "test-project",
   fetch,
   logger: noopLogger,
   velocityMode: "off" as const,

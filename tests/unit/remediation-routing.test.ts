@@ -43,7 +43,7 @@ function options(extra: SolwynOptions = {}): SolwynOptions {
     throw new Error("unexpected offline control route");
   };
   return {
-    apiKey: `sk_proj_${"0".repeat(64)}`,
+    apiKey: `solwyn_sk_${"0".repeat(64)}`,
     apiUrl: "https://control.invalid",
     fetch,
     logger: noopLogger,

@@ -1,0 +1,331 @@
+/**
+ * One `ProjectBinding` per client: the configured project selector, the project id pinned
+ * from `GET /api/v1/auth/key`, and every definitive refusal of the key or its project.
+ *
+ * Every request to the Solwyn API carries `Solwyn-Project` (the pinned id once known, else the
+ * selector) and captures the binding's `generation` at dispatch (inside `Transport.attempt`).
+ * Mutations are fenced by that dispatch generation, so a delayed response can never clear or
+ * weaken a refusal recorded after it was sent:
+ *
+ * - a validation success applies only when nothing changed since its dispatch;
+ * - a refusal may always tighten (`block` replaces `allow_unmetered`), but may relax a stored
+ *   `block` only when it was dispatched at or after the stored refusal.
+ *
+ * The budget layer calls {@link ProjectBinding.gate} first on every path that can let a
+ * provider call proceed, and {@link ProjectBinding.exitDecision} on every return of that path,
+ * so neither a cached allow, a held lease, an open breaker nor the outage posture can run a
+ * call past a refusal.
+ */
+
+import {
+  type Refusal,
+  type RefusalCode,
+  type RefusalPosture,
+  refusalMessage,
+} from "./api-key-errors";
+import { ApiKeyRefusedError, SolwynError } from "./errors";
+import { bestEffortLogger, type Logger, noopLogger } from "./logging";
+import { type FetchLike, Transport, TransportHttpError } from "./transport";
+import { AuthKeyResponseSchema } from "./validation";
+
+export const AUTH_KEY_PATH = "/api/v1/auth/key";
+
+/** Retry interval for automatic validation while no `/auth/key` 200 has been seen. */
+export const UNVALIDATED_RETRY_MS = 30_000;
+/** Retry interval for automatic validation while a refusal is stored. */
+export const REFUSED_RETRY_MS = 60_000;
+
+export type BindingState = "unvalidated" | "valid" | "refused";
+export type RefusalEffect = "block" | "allow_unmetered";
+
+/** A stored refusal, with its effect decided once, at the moment it was recorded. */
+export interface StoredRefusal {
+  readonly code: RefusalCode;
+  readonly posture: RefusalPosture;
+  readonly effect: RefusalEffect;
+  readonly message: string;
+  readonly field: "api_key" | "project";
+}
+
+/** What the gate decided for one call. */
+export type GateDecision =
+  | { readonly kind: "proceed"; readonly generation: number }
+  | { readonly kind: "unmetered" };
+
+/** What the exit check decided for one result. */
+export type ExitDecision =
+  | { readonly kind: "keep" }
+  | { readonly kind: "rerun" }
+  | { readonly kind: "unmetered" }
+  | { readonly kind: "block"; readonly error: ApiKeyRefusedError };
+
+/** The outcome of one `/auth/key` request. */
+export type ValidationOutcome = "success" | "ignored" | "refused" | "outage";
+
+export interface ProjectBindingOptions {
+  /** The validated, trimmed project selector (a name or a `proj_` id). */
+  selector: string;
+  apiUrl: string;
+  apiKey: string;
+  fetch?: FetchLike;
+  /** `/auth/key` timeout in milliseconds (the budget check timeout). */
+  timeoutMs: number;
+  logger?: Logger;
+  /** Monotonic clock in milliseconds; injectable for tests. */
+  now?: () => number;
+}
+
+const BLOCK_RANK: Readonly<Record<RefusalEffect, number>> = { allow_unmetered: 1, block: 2 };
+
+function monotonicNow(): number {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+export class ProjectBinding {
+  readonly selector: string;
+  readonly #transport: Transport;
+  readonly #timeoutMs: number;
+  readonly #logger: Logger;
+  readonly #now: () => number;
+  readonly #listeners = new Set<() => void>();
+  readonly #loggedCodes = new Set<string>();
+
+  #pinnedId: string | null = null;
+  #state: BindingState = "unvalidated";
+  #everValid = false;
+  #refusal: StoredRefusal | null = null;
+  #generation = 0;
+  #refusalGen = 0;
+  #nextValidateAt = 0;
+  #inflight: Promise<ValidationOutcome> | null = null;
+
+  constructor(options: ProjectBindingOptions) {
+    this.selector = options.selector;
+    this.#timeoutMs = options.timeoutMs;
+    this.#logger = bestEffortLogger(options.logger ?? noopLogger);
+    this.#now = options.now ?? monotonicNow;
+    this.#transport = new Transport(options.apiUrl, options.apiKey, {
+      fetch: options.fetch,
+      binding: this,
+    });
+  }
+
+  get state(): BindingState {
+    return this.#state;
+  }
+
+  get pinnedId(): string | null {
+    return this.#pinnedId;
+  }
+
+  get everValid(): boolean {
+    return this.#everValid;
+  }
+
+  get refusal(): StoredRefusal | null {
+    return this.#refusal;
+  }
+
+  get generation(): number {
+    return this.#generation;
+  }
+
+  /** The `Solwyn-Project` header value: the pinned id once known, else the selector. */
+  get headerValue(): string {
+    return this.#pinnedId ?? this.selector;
+  }
+
+  /** Capture the header value and the dispatch generation in one step. */
+  dispatch(): { readonly header: string; readonly generation: number } {
+    return { header: this.headerValue, generation: this.#generation };
+  }
+
+  /** Run `listener` synchronously whenever a refusal changes the stored state. */
+  onRefuse(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  /**
+   * Record a classified refusal from a request dispatched at generation `dispatched`.
+   * Tightening always applies; a weaker refusal applies only when dispatched at or after the
+   * stored one. Never throws.
+   */
+  refuse(refusal: Refusal, dispatched: number): void {
+    const effect: RefusalEffect =
+      (refusal.code === "api_key_expired" || refusal.code === "api_key_invalid") &&
+      refusal.posture === "alert_only" &&
+      this.#everValid
+        ? "allow_unmetered"
+        : "block";
+    const stored = this.#refusal;
+    if (
+      stored !== null &&
+      BLOCK_RANK[effect] < BLOCK_RANK[stored.effect] &&
+      dispatched < this.#refusalGen
+    ) {
+      return;
+    }
+    const { message, field } = refusalMessage(refusal, this.selector);
+    this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
+    if (
+      stored !== null &&
+      stored.code === refusal.code &&
+      stored.posture === refusal.posture &&
+      stored.effect === effect &&
+      stored.message === message
+    ) {
+      return;
+    }
+    this.#refusal = Object.freeze({
+      code: refusal.code,
+      posture: refusal.posture,
+      effect,
+      message,
+      field,
+    });
+    this.#state = "refused";
+    this.#generation += 1;
+    this.#refusalGen = this.#generation;
+    if (!this.#loggedCodes.has(refusal.code)) {
+      this.#loggedCodes.add(refusal.code);
+      this.#logger.error(`solwyn.configuration_error.${refusal.code}: ${message}`);
+    }
+    for (const listener of [...this.#listeners]) {
+      try {
+        listener();
+      } catch {
+        // Listeners are best-effort local cleanup; a refusal is recorded regardless.
+      }
+    }
+  }
+
+  /** Apply a full-scope `/auth/key` 200 dispatched at `dispatched`; false when superseded. */
+  #succeed(dispatched: number, projectId: string): boolean {
+    if (dispatched !== this.#generation) return false;
+    this.#pinnedId = projectId;
+    this.#state = "valid";
+    this.#everValid = true;
+    this.#refusal = null;
+    this.#generation += 1;
+    return true;
+  }
+
+  #outage(): ValidationOutcome {
+    if (this.#state !== "valid") {
+      this.#nextValidateAt =
+        this.#now() + (this.#state === "refused" ? REFUSED_RETRY_MS : UNVALIDATED_RETRY_MS);
+    }
+    return "outage";
+  }
+
+  /** One single-flight `GET /api/v1/auth/key`. Never throws. */
+  #request(): Promise<ValidationOutcome> {
+    if (this.#inflight !== null) return this.#inflight;
+    const pending = (async (): Promise<ValidationOutcome> => {
+      try {
+        const { read, generation } = await this.#transport.getJson(AUTH_KEY_PATH, {
+          timeoutMs: this.#timeoutMs,
+        });
+        if (!read.parsed) return this.#outage();
+        const parsed = AuthKeyResponseSchema.safeParse(read.value);
+        if (!parsed.success) {
+          this.#logger.warn("solwyn.auth_key_response_unreadable");
+          return this.#outage();
+        }
+        if (parsed.data.scope !== "full") {
+          this.refuse({ code: "read_only_key", posture: "unknown", expiredOn: null }, generation);
+          return "refused";
+        }
+        return this.#succeed(generation, parsed.data.project_id) ? "success" : "ignored";
+      } catch (error) {
+        if (error instanceof TransportHttpError && error.refusal !== undefined) {
+          // Transport.attempt already recorded it with this request's dispatch generation.
+          this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
+          return "refused";
+        }
+        return this.#outage();
+      }
+    })();
+    const tracked = pending.finally(() => {
+      if (this.#inflight === tracked) this.#inflight = null;
+    });
+    this.#inflight = tracked;
+    return tracked;
+  }
+
+  /** Automatic validation from the gate: records the outcome, never throws. */
+  async revalidate(): Promise<ValidationOutcome> {
+    try {
+      return await this.#request();
+    } catch {
+      return this.#outage();
+    }
+  }
+
+  /**
+   * Public validation: one `/auth/key` request. Resolves when the key is valid for the project;
+   * throws {@link ApiKeyRefusedError} on any refusal (any posture), or {@link SolwynError} when
+   * Solwyn could not be reached.
+   */
+  async validate(): Promise<void> {
+    const outcome = await this.#request();
+    if (outcome === "outage") {
+      throw new SolwynError(
+        "Solwyn could not validate the API key because the control plane did not answer. Try again.",
+      );
+    }
+    if (this.#state === "refused" && this.#refusal !== null)
+      throw this.#refusalError(this.#refusal);
+    if (this.#state !== "valid") {
+      throw new SolwynError(
+        "Solwyn could not validate the API key because the control plane did not answer. Try again.",
+      );
+    }
+  }
+
+  #refusalError(refusal: StoredRefusal): ApiKeyRefusedError {
+    return new ApiKeyRefusedError(refusal.message, { code: refusal.code, field: refusal.field });
+  }
+
+  #apply(refusal: StoredRefusal): { kind: "unmetered" } {
+    if (refusal.effect === "block") throw this.#refusalError(refusal);
+    this.#logger.error(
+      `solwyn.api_key_refused: ${refusal.code}; the call runs unmetered because the project is alert_only. ${refusal.message}`,
+    );
+    return { kind: "unmetered" };
+  }
+
+  /**
+   * Entry gate, first on every path that can let a provider call proceed. Revalidates when due
+   * (never throws for that), then applies a stored refusal: `block` throws
+   * {@link ApiKeyRefusedError}, `allow_unmetered` returns `unmetered`. Otherwise returns the
+   * generation the exit check compares against.
+   */
+  async gate(): Promise<GateDecision> {
+    if (this.#state !== "valid" && this.#now() >= this.#nextValidateAt) {
+      await this.revalidate();
+    }
+    const refusal = this.#state === "refused" ? this.#refusal : null;
+    if (refusal !== null) return this.#apply(refusal);
+    return { kind: "proceed", generation: this.#generation };
+  }
+
+  /**
+   * Exit check for a result produced after the gate returned `generation`. A refusal or a
+   * generation change discards the result: `block` and `unmetered` apply the stored refusal,
+   * `rerun` (a successful revalidation moved the generation) re-runs the check once.
+   */
+  exitDecision(generation: number): ExitDecision {
+    const refusal = this.#state === "refused" ? this.#refusal : null;
+    if (refusal !== null) {
+      if (refusal.effect === "block") return { kind: "block", error: this.#refusalError(refusal) };
+      this.#logger.error(
+        `solwyn.api_key_refused: ${refusal.code}; the call runs unmetered because the project is alert_only. ${refusal.message}`,
+      );
+      return { kind: "unmetered" };
+    }
+    if (this.#generation !== generation) return { kind: "rerun" };
+    return { kind: "keep" };
+  }
+}

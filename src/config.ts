@@ -32,7 +32,12 @@ import {
 } from "./surfaces";
 import { copyTags, type Tags } from "./tags";
 import type { BudgetMode, ProviderName } from "./types";
-import { BudgetModeSchema, ProviderEntrySchema, validateProjectKeyFormat } from "./validation";
+import {
+  BudgetModeSchema,
+  ProviderEntrySchema,
+  validateApiKeyFormat,
+  validateProjectSelector,
+} from "./validation";
 import { VELOCITY_HISTORY_LIMIT, type VelocityConfig } from "./velocity";
 
 // ---------------------------------------------------------------------------
@@ -274,14 +279,15 @@ export const FAILOVER_TUNING_DEFAULTS: FailoverTuningConfig = Object.freeze({
  *
  * Numeric fields accept env-sourced raw strings (e.g. `"5"`) while rejecting booleans,
  * empty strings, and unsafe values. Real numeric options pass through unchanged.
- * `api_key` is a plain string here — its FORMAT is validated separately
- * (via {@link validateProjectKeyFormat}) so a bad key surfaces as `field="api_key"`
- * rather than a generic string issue. The non-empty `providers` invariant is NOT
+ * `api_key` and `project` are plain strings here; their formats are validated separately
+ * (via {@link validateApiKeyFormat} and {@link validateProjectSelector}) so a bad value
+ * surfaces with its exact message and field rather than a generic string issue. The non-empty `providers` invariant is NOT
  * enforced here (the field defaults to `[]` and validates "after construction" — see
  * {@link validateProviderChain}), so `SolwynConfig` builds from `api_key` alone.
  */
 export const SolwynConfigSchema = z.strictObject({
   api_key: z.string(),
+  project: z.string(),
   api_url: z.string().default(DEFAULT_API_URL),
   fail_open: z.boolean().default(true),
   budget_mode: BudgetModeSchema.default("alert_only"),
@@ -411,10 +417,12 @@ export interface ProviderEntryInput {
 /**
  * Constructor options for building a {@link SolwynConfig}. Every field is optional
  * here — any absent field falls back to its env var (where mapped) then its default.
- * There is deliberately NO `project_id` field (removed from the tier-zero API).
+ * `project` names the Solwyn project (a project name or a `proj_` id); there is no
+ * `project_id` field.
  */
 export interface SolwynConfigOptions {
   api_key?: string;
+  project?: string;
   api_url?: string;
   fail_open?: boolean;
   budget_mode?: BudgetMode;
@@ -466,10 +474,11 @@ export interface SolwynConfigOptions {
  * The EXACT `SOLWYN_*` field map. Only these fields are auto-loaded from the
  * environment; notably `providers`, `default_params`, the failover knobs, and
  * `circuit_breaker_recovery_timeout_jitter` are constructor-only. `SOLWYN_PROJECT_ID`
- * is intentionally absent — it is read by nothing.
+ * is intentionally absent: it is read by nothing except the missing-project hint.
  */
 export const ENV_FIELD_MAP: Readonly<Record<string, string>> = {
   api_key: "SOLWYN_API_KEY",
+  project: "SOLWYN_PROJECT",
   api_url: "SOLWYN_API_URL",
   tags: "SOLWYN_TAGS",
   fail_open: "SOLWYN_FAIL_OPEN",
@@ -609,7 +618,9 @@ export function loadConfigFromEnv(
  * Validation order (mirrors the Python "first error wins" surfacing):
  *   1. `api_key` presence, then FORMAT — a missing or malformed key throws
  *      `ConfigurationError(field="api_key")`.
- *   2. Schema parse — applies defaults, coerces env strings, and validates numeric /
+ *   2. `project` presence (option, then `SOLWYN_PROJECT`), then the selector format,
+ *      throwing `ConfigurationError(field="project")`.
+ *   3. Schema parse — applies defaults, coerces env strings, and validates numeric /
  *      enum constraints (e.g. `same_provider_retries >= 0`). A schema failure is
  *      wrapped into `ConfigurationError` whose `field` is the last path segment of the
  *      first zod issue (unknown/extra keys → `extra="forbid"` rejection).
@@ -645,11 +656,14 @@ export function resolveConfigFromEnvSnapshot(
   if (typeof apiKey !== "string") {
     throw new ConfigurationError("api_key must be a string", { field: "api_key" });
   }
-  // Throws ConfigurationError(field="api_key") on empty/non-ASCII/traversal/bad-format.
+  // Throws ConfigurationError(field="api_key") on an old sk_proj_ key or a bad format.
   // Returns the NFC-normalized key (identity for valid ASCII hex keys).
-  raw["api_key"] = validateProjectKeyFormat(apiKey);
+  raw["api_key"] = validateApiKeyFormat(apiKey);
 
-  // 2. Schema parse — wrap any zod failure into a ConfigurationError naming the field.
+  // 2. project: presence, then the selector format (trimmed).
+  raw["project"] = resolveProjectSelector(raw["project"], env);
+
+  // 3. Schema parse — wrap any zod failure into a ConfigurationError naming the field.
   const result = SolwynConfigSchema.safeParse(raw);
   if (!result.success) {
     const issue = result.error.issues[0];
@@ -661,6 +675,42 @@ export function resolveConfigFromEnvSnapshot(
     throw new ConfigurationError(issue.message, { field });
   }
   return result.data;
+}
+
+/** `projectId` (and `project_id`) are not options; say what to use instead. */
+export function rejectProjectIdOption(options: object): void {
+  for (const key of ["projectId", "project_id"]) {
+    if (Object.hasOwn(options, key)) {
+      throw new ConfigurationError(
+        "project_id is not an option. Use the project option with a project name or proj_ id.",
+        { field: "project_id" },
+      );
+    }
+  }
+}
+
+/** Exact message when no project is configured (`subject` names the option form). */
+export function missingProjectMessage(env: EnvSnapshot, subject: string): string {
+  const base = `No Solwyn project configured. Set SOLWYN_PROJECT or pass ${subject} with a project name or proj_ id.`;
+  return env["SOLWYN_PROJECT_ID"] === undefined
+    ? base
+    : `${base} SOLWYN_PROJECT_ID is no longer read; rename it to SOLWYN_PROJECT.`;
+}
+
+/**
+ * Validate the configured project selector (option, then `SOLWYN_PROJECT`) and return it
+ * trimmed. Throws {@link ConfigurationError} with `field: "project"`.
+ */
+export function resolveProjectSelector(value: unknown, env: EnvSnapshot): string {
+  if (value === undefined || value === null) {
+    throw new ConfigurationError(missingProjectMessage(env, "the project option"), {
+      field: "project",
+    });
+  }
+  if (typeof value !== "string") {
+    throw new ConfigurationError("project must be a string", { field: "project" });
+  }
+  return validateProjectSelector(value);
 }
 
 /** Resolve configuration through the ambient environment snapshot. */
@@ -693,4 +743,4 @@ export {
   PROVIDER_REGION_MAX_LENGTH,
   SERVICE_TIER_MAX_LENGTH,
 } from "./types";
-export { ProviderEntrySchema, validateProjectKeyFormat } from "./validation";
+export { ProviderEntrySchema, validateApiKeyFormat, validateProjectSelector } from "./validation";

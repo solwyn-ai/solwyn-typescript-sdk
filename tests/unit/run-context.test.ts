@@ -15,7 +15,7 @@ import { currentRun, currentRunContext, newRunId, run } from "../../src/node";
 import { getCurrentRun } from "../../src/run-context";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

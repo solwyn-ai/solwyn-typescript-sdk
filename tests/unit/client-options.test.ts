@@ -32,7 +32,7 @@ describe("constructor shape validation", () => {
     const options =
       field === "options"
         ? value
-        : { apiKey: `sk_proj_${"0".repeat(64)}`, [field as string]: value };
+        : { apiKey: `solwyn_sk_${"0".repeat(64)}`, [field as string]: value };
     let caught: unknown;
     try {
       new Solwyn(raw, options as SolwynOptions);

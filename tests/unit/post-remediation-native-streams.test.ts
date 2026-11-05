@@ -101,7 +101,7 @@ function fixture(provider: "openai" | "anthropic", open = false, crossDialect = 
     return new Response(null, { status: 204 });
   };
   const options = {
-    apiKey: `sk_proj_${"a".repeat(64)}`,
+    apiKey: `solwyn_sk_${"a".repeat(64)}`,
     fetch: controlFetch,
     leaseEnabled: false,
     breakerReportingEnabled: false,

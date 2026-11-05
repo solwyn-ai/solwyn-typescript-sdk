@@ -40,8 +40,8 @@ it("compiles and executes the published OpenAI Agents recipe with offline transp
     );
     source = replaceOnce(
       source,
-      '{ apiKey: process.env["SOLWYN_API_KEY"]! }',
-      '{ apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, onUnmetered: "raise" }',
+      '{\n  apiKey: process.env["SOLWYN_API_KEY"]!,\n  project: process.env["SOLWYN_PROJECT"]!,\n}',
+      '{ apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, onUnmetered: "raise" }',
     );
     source = `import { FakeControlPlane } from "../../../src/testing/index";
 import { createAgentsTransport } from "../../helpers/openai-agents-transport";

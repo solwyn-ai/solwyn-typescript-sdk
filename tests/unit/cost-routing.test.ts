@@ -4,7 +4,7 @@ import { CostPolicy, type ProviderCandidate, type SelectionPolicy, Solwyn } from
 import type { FetchLike } from "../../src/transport";
 import type { CircuitState } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function captureFetch(priceHints: Record<string, number> | null): {
   fetch: ReturnType<typeof vi.fn<FetchLike>>;

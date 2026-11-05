@@ -22,6 +22,7 @@ interface WrappedOpenAI extends OpenAIShape {
 
 interface WrappablePlane {
   readonly apiKey: string;
+  readonly project: string;
   readonly apiUrl: string;
   readonly fetch: FetchLike;
   readonly checks: readonly { model?: string }[];
@@ -187,9 +188,9 @@ describe("FakeControlPlane.wrap wiring", () => {
   });
 
   it("keeps direct config resolution environment-aware through an injected snapshot", () => {
-    const apiKey = `sk_proj_${"a".repeat(64)}`;
+    const apiKey = `solwyn_sk_${"a".repeat(64)}`;
     const direct = configModule.resolveConfigFromEnvSnapshot(
-      { api_key: apiKey },
+      { api_key: apiKey, project: "test-project" },
       {
         SOLWYN_API_URL: "https://ambient.invalid",
         SOLWYN_FAIL_OPEN: "false",

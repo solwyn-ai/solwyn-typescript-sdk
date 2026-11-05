@@ -45,7 +45,7 @@ import type {
   LeaseGrantResponse,
 } from "../../src/types";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 afterEach(() => {
   vi.restoreAllMocks();

@@ -19,8 +19,21 @@ async function releasesIdle(budget: BudgetEnforcer): Promise<void> {
   await releasesOf(budget).whenIdle();
   await setImmediate();
 }
-const apiKey = `sk_proj_${"a".repeat(64)}`;
+const apiKey = `solwyn_sk_${"a".repeat(64)}`;
 const projectId = `proj_${"0".repeat(24)}`;
+const authKey = {
+  account_id: "00000000-0000-4000-8000-000000000001",
+  key_id: "00000000-0000-4000-8000-000000000002",
+  key_prefix: apiKey.slice(0, 26),
+  key_name: "retention-key",
+  scope: "full",
+  created_via: "dashboard",
+  expires_at: "2099-01-01T00:00:00Z",
+  rotation_grace_until: null,
+  project_id: projectId,
+  project_name: "test-project",
+  budget_mode: "hard_deny",
+};
 const results: Record<string, unknown> = {};
 const scenarios: Record<string, () => Promise<void>> = {};
 
@@ -66,6 +79,7 @@ function fixture(ineligible = false, tokens = 0) {
   });
   const fetch: FetchLike = async (url, init) => {
     const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/auth/key")) return Response.json(authKey);
     if (pathname.endsWith("/budgets/lease")) {
       counters.grants++;
       return Response.json(grant());
@@ -118,6 +132,7 @@ function fixture(ineligible = false, tokens = 0) {
     },
     {
       apiKey,
+      project: "test-project",
       apiUrl: "https://accounting-retention.invalid",
       fetch,
       logger: noopLogger,
@@ -209,6 +224,7 @@ scenarios["ai-histories"] = async () => {
   const f = fixture();
   const middleware = createSolwynMiddleware({
     apiKey,
+    project: "test-project",
     apiUrl: "https://accounting-retention.invalid",
     fetch: f.fetch,
     logger: noopLogger,
@@ -524,6 +540,7 @@ scenarios["identity-only-reuse"] = async () => {
 scenarios["unmanaged-before-owned"] = async () => {
   const f = fixture(true);
   const enforcer = new BudgetEnforcer({
+    project: "test-project",
     apiKey,
     apiUrl: "https://accounting-retention.invalid",
     fetch: f.fetch,
@@ -657,6 +674,7 @@ scenarios["idle-release-dispatcher"] = async () => {
   // keep an unclosed enforcer reachable.
   async function exercise(): Promise<WeakRef<BudgetEnforcer>> {
     const enforcer = new BudgetEnforcer({
+      project: "test-project",
       apiKey,
       apiUrl: "https://accounting-retention.invalid",
       fetch: async () => new Response(null, { status: 204 }),
@@ -769,6 +787,7 @@ scenarios["flush-soon-run-isolation"] = async () => {
   });
   const client = new Solwyn(native, {
     apiKey,
+    project: "test-project",
     fetch,
     logger: noopLogger,
     reporterFlushInterval: 0.02,

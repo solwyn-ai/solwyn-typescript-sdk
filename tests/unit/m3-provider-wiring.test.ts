@@ -16,7 +16,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Solwyn } from "../../src/index";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 /** AWS SDK v3-shaped `ConverseCommand` (plain, AWS-import-free) — dispatched via `send`. */
 class ConverseCommand {

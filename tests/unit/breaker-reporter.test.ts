@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CircuitBreakerState } from "../../src/circuit-breaker";
 import type { Logger } from "../../src/logging";
-import { resetReadOnlyKeyDiagnosticForTest } from "../../src/read-only-key";
+import type { ProjectBinding } from "../../src/project";
 import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 const SDK_INSTANCE_ID = "00000000-0000-0000-0000-000000000001";
 const BREAKER_URL = `${API_URL}/api/v1/projects/${PROJECT_ID}/providers/breaker-reports`;
@@ -46,10 +47,20 @@ function warningThrowingLogger(): Logger {
   };
 }
 
+const bindings = new WeakMap<MetadataReporter, ProjectBinding>();
+
 function reporter(
   options: ConstructorParameters<typeof MetadataReporter>[2] = {},
 ): MetadataReporter {
-  return new MetadataReporter(API_URL, API_KEY, { random: () => 1, ...options });
+  const binding = options.binding ?? testBinding({ projectId: PROJECT_ID });
+  const instance = new MetadataReporter(API_URL, API_KEY, { random: () => 1, ...options, binding });
+  bindings.set(instance, binding);
+  return instance;
+}
+
+/** Breaker reports address the project pinned from `/auth/key`; pin it. */
+async function pin(instance: MetadataReporter): Promise<void> {
+  await bindings.get(instance)?.validate();
 }
 
 function metadataEvent(): MetadataEvent {
@@ -110,7 +121,7 @@ describe("provider breaker report cycles", () => {
       ],
       wallClock,
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
     const timeoutCalls = setTimeoutSpy.mock.calls.filter((call) => call[1] === 10_000).length;
@@ -143,7 +154,7 @@ describe("provider breaker report cycles", () => {
       fetch,
       ...(includeSupplier ? { breakerSnapshots: snapshots } : {}),
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
 
@@ -151,7 +162,7 @@ describe("provider breaker report cycles", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("gates before snapshot collection until a truthy project id is learned", async () => {
+  it("gates before snapshot collection until /auth/key pins the project id", async () => {
     const snapshots = vi.fn(() => [["openai", state()] as const]);
     const fetch = vi.fn<FetchLike>();
     const instance = reporter({
@@ -159,8 +170,6 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: snapshots,
     });
-    instance.observeProjectId(null);
-    instance.observeProjectId("");
 
     await instance._startBreakerCycle();
 
@@ -183,7 +192,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: snapshots,
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     const first = instance._startBreakerCycle();
     const second = instance._startBreakerCycle();
@@ -206,7 +215,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: () => snapshots,
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
     await instance._startBreakerCycle();
@@ -230,7 +239,7 @@ describe("provider breaker report cycles", () => {
         return new Response(null, { status: 204 });
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
     now = 59_999;
@@ -249,7 +258,7 @@ describe("provider breaker report cycles", () => {
       breakerSnapshots: () => [["openai", state()]],
       fetch: async () => new Response(null, { status: statuses.shift() }),
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
     expect(instance._breakerReportsDue()).toBe(true);
@@ -270,7 +279,7 @@ describe("provider breaker report cycles", () => {
         return new Response(null, { status: statuses.shift() });
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     await instance._startBreakerCycle();
     now = 60_000;
     await instance._startBreakerCycle();
@@ -293,7 +302,7 @@ describe("provider breaker report cycles", () => {
         return new Response(null, { status: 204 });
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     await instance._startBreakerCycle(true);
     await instance._startBreakerCycle(true);
     wallNow -= 10_000;
@@ -314,7 +323,7 @@ describe("provider breaker report cycles", () => {
         return new Response(null, { status: 429, headers: { "Retry-After": "60" } });
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     await instance._startBreakerCycle();
     now = 59_999;
     expect(instance._breakerReportsDue()).toBe(false);
@@ -345,7 +354,7 @@ describe("provider breaker report cycles", () => {
         });
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     await instance._startBreakerCycle();
     now = 60_000;
     await instance._startBreakerCycle();
@@ -375,7 +384,7 @@ describe("provider breaker report cycles", () => {
         ["anthropic", state()],
       ],
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
 
@@ -404,7 +413,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: brokenSupplier,
     });
-    second.observeProjectId(PROJECT_ID);
+    await pin(second);
     await second._startBreakerCycle();
     expect(logger.warn).toHaveBeenCalledWith(
       "reporter.breaker_snapshot_failed: exc_type=%s",
@@ -417,7 +426,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: "x".repeat(101),
       breakerSnapshots: () => [["openai", state()]],
     });
-    longSdkId.observeProjectId(PROJECT_ID);
+    await pin(longSdkId);
     await longSdkId._startBreakerCycle();
     expect(fetch).toHaveBeenCalledTimes(2);
   });
@@ -432,7 +441,7 @@ describe("provider breaker report cycles", () => {
         throw new TypeError("private supplier detail");
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await expect(instance._startBreakerCycle()).resolves.toBeUndefined();
     expect(fetch).not.toHaveBeenCalled();
@@ -457,7 +466,7 @@ describe("provider breaker report cycles", () => {
         ["anthropic", state()],
       ],
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await expect(instance._startBreakerCycle()).resolves.toBeUndefined();
     expect(sentProviders).toEqual(["openai", "anthropic"]);
@@ -472,7 +481,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: snapshots,
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     instance.start();
 
     try {
@@ -485,8 +494,7 @@ describe("provider breaker report cycles", () => {
     }
   });
 
-  it("ends the cycle after an exact read-only response", async () => {
-    resetReadOnlyKeyDiagnosticForTest();
+  it("ends the cycle after a read-only refusal and records it on the binding", async () => {
     const logger = loggerSpies();
     const fetch = vi.fn<FetchLike>(
       async () =>
@@ -501,12 +509,15 @@ describe("provider breaker report cycles", () => {
         ["anthropic", state()],
       ],
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
 
     await instance._startBreakerCycle();
 
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(bindings.get(instance)?.refusal).toMatchObject({
+      code: "read_only_key",
+      effect: "block",
+    });
     expect(logger.warn).not.toHaveBeenCalledWith(
       "reporter.breaker_send_failed: provider=%s exc_type=%s",
       expect.anything(),
@@ -534,7 +545,7 @@ describe("provider breaker report cycles", () => {
       return new Response("", { status: 204 });
     });
     const active = reporter({ fetch, sdkInstanceId: SDK_INSTANCE_ID, breakerSnapshots: snapshots });
-    active.observeProjectId(PROJECT_ID);
+    await pin(active);
     const cycle = active._startBreakerCycle();
     const closing = active.close();
     await Promise.resolve();
@@ -557,7 +568,7 @@ describe("provider breaker report cycles", () => {
         return new Promise<Response>(() => {});
       },
     });
-    active.observeProjectId(PROJECT_ID);
+    await pin(active);
     active._startBreakerCycle();
     const activeClose = active.close();
     await vi.advanceTimersByTimeAsync(10);
@@ -574,7 +585,7 @@ describe("provider breaker report cycles", () => {
         return new Promise<Response>(() => {});
       },
     });
-    forced.observeProjectId(PROJECT_ID);
+    await pin(forced);
     const forcedClose = forced.close();
     await vi.advanceTimersByTimeAsync(10);
     await forcedClose;
@@ -591,7 +602,7 @@ describe("provider breaker report cycles", () => {
       breakerSnapshots: snapshots,
       fetch: async () => new Response(null, { status: 204 }),
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     await instance._startBreakerCycle();
     const start = vi.spyOn(instance, "_startBreakerCycle");
     instance.start();
@@ -639,7 +650,7 @@ describe("provider breaker report cycles", () => {
       sdkInstanceId: SDK_INSTANCE_ID,
       breakerSnapshots: () => [["openai", state()]],
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     instance.report(metadataEvent());
     instance.start();
 
@@ -701,7 +712,7 @@ describe("provider breaker report cycles", () => {
         );
       },
     });
-    instance.observeProjectId(PROJECT_ID);
+    await pin(instance);
     const flush = instance._flushRemaining.bind(instance);
     vi.spyOn(instance, "_flushRemaining").mockImplementation(async (...args) => {
       const clean = await flush(...args);

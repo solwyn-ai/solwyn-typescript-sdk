@@ -8,7 +8,7 @@ import {
 } from "../../src/surface-guard";
 import { createSurfaceRules } from "../../src/surfaces";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const clients: Array<{ close(): Promise<void> }> = [];
 
 function fixture(posture: "warn" | "raise" | "allow", nested: boolean) {

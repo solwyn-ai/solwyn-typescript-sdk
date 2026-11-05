@@ -8,6 +8,7 @@ import {
   setRunControlClockForTest,
 } from "../../src/run-control";
 import { FakeControlPlane } from "../../src/testing/index";
+import { testBinding } from "../helpers/project-binding";
 
 const CHECK_PATH = "/api/v1/budgets/check";
 const GRANT_PATH = "/api/v1/budgets/lease";
@@ -267,6 +268,7 @@ describe("FakeControlPlane run control", () => {
     plane.stopRun("b3-misroute-run");
     plane.misrouteStops({ requests: 1 });
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -301,6 +303,7 @@ describe("FakeControlPlane run control", () => {
     setRunControlClockForTest(() => now);
     const plane = new FakeControlPlane({ refreshIntervalS: 1, leaseLengthS: 3 });
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,

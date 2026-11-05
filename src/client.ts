@@ -56,6 +56,7 @@ import {
   type FailoverTuningConfig,
   pickFailoverTuning,
   pickVelocityConfig,
+  rejectProjectIdOption,
   resolveConfig,
   type SolwynConfig,
   type SolwynConfigOptions,
@@ -93,6 +94,7 @@ import {
   estimateTokensFromLength,
   requestedAnthropicCacheTtls,
 } from "./privacy";
+import { ProjectBinding } from "./project";
 import { validatePinnedClientFamily } from "./providers/detection";
 import { resolveProviderIdentity } from "./providers/index";
 import {
@@ -109,6 +111,7 @@ import {
 // dispatch loop must call THROUGH the namespace object for that spy to be observed.
 import * as translation from "./providers/translation/index";
 import { ORDINARY_TOKEN_COUNT_MAX } from "./receipt-fold";
+import { RefusalFence } from "./refusal-fence";
 import {
   assertRawProviderClient,
   buildRuntimes,
@@ -202,6 +205,7 @@ import {
 } from "./trace-context";
 import { type FetchLike, globalFetch, requireFetchLike } from "./transport";
 import type {
+  AuthKeyResponse,
   BudgetMode,
   DenySource,
   FailoverReason,
@@ -543,12 +547,14 @@ export type FallbackEntry = FallbackSpec;
 /**
  * Public constructor options for {@link SolwynCore} / `Solwyn`. camelCase (the TS
  * public surface); mapped internally to the snake_case `SolwynConfig`. Every field is
- * optional except that a valid `apiKey` must resolve (from here or `SOLWYN_API_KEY`
- * on Node) or construction throws `ConfigurationError`.
+ * optional except that a valid `apiKey` and `project` must resolve (from here or
+ * `SOLWYN_API_KEY` / `SOLWYN_PROJECT` on Node) or construction throws `ConfigurationError`.
  */
 export interface SolwynOptions {
-  /** Solwyn project API key (`sk_proj_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
+  /** Solwyn API key (`solwyn_sk_` + 64 hex). Falls back to `SOLWYN_API_KEY` on Node. */
   apiKey?: string;
+  /** Solwyn project: a project name or a `proj_` id. Falls back to `SOLWYN_PROJECT` on Node. */
+  project?: string;
   /** Solwyn Cloud API base URL. Defaults to `https://api.solwyn.ai`. */
   apiUrl?: string;
   /** Model for the primary provider link (per-call `model` overrides this). */
@@ -653,9 +659,10 @@ export interface SolwynOptions {
   velocityAccelFactor?: number;
 }
 
-/** The set of public option keys — anything else (e.g. `projectId`) is rejected. */
+/** The set of public option keys; anything else (e.g. `projectId`) is rejected. */
 const KNOWN_OPTION_KEYS: ReadonlySet<string> = new Set([
   "apiKey",
+  "project",
   "apiUrl",
   "model",
   "provider",
@@ -1099,6 +1106,7 @@ const PER_CALL_IDEMPOTENT_KEY = "solwynIdempotent";
 function toConfigOptions(options: SolwynOptions): SolwynConfigOptions {
   const configOptions: SolwynConfigOptions = {};
   if (options.apiKey !== undefined) configOptions.api_key = options.apiKey;
+  if (options.project !== undefined) configOptions.project = options.project;
   if (options.apiUrl !== undefined) configOptions.api_url = options.apiUrl;
   if (options.failOpen !== undefined) configOptions.fail_open = options.failOpen;
   if (options.budgetMode !== undefined) configOptions.budget_mode = options.budgetMode;
@@ -1227,6 +1235,9 @@ export class SolwynCore {
   readonly #fallbackSpecs: FallbackSpec[];
   readonly #reporter: MetadataReporter;
   readonly #budget: BudgetEnforcer;
+  readonly #binding: ProjectBinding;
+  /** Fences unmetered and unknown spend, and what it returns, against stored key refusals. */
+  readonly #refusalFence: RefusalFence;
   readonly #breakers: CircuitBreakerManager;
   readonly #controlPlaneBreaker: CircuitBreaker;
   readonly #sdkInstanceId: string;
@@ -1296,7 +1307,8 @@ export class SolwynCore {
     }
 
     // Reject unknown/renamed options (e.g. `projectId`) so an untyped JS caller cannot
-    // silently pass a dropped field — mirrors Python's unexpected-keyword TypeError.
+    // silently pass a dropped field; mirrors Python's unexpected-keyword TypeError.
+    rejectProjectIdOption(options);
     for (const key of Object.keys(options)) {
       if (!KNOWN_OPTION_KEYS.has(key)) {
         throw new ConfigurationError(`unexpected option '${key}'`, { field: key });
@@ -1330,6 +1342,17 @@ export class SolwynCore {
     // D6: resolve one logger for every core and advisory subsystem.
     this.#logger = options.logger ?? consoleLogger;
     this.#tagLogger = tagCaptureLogger(this.#logger);
+    // One project binding shared by the three control-plane transports. No network here:
+    // validation is lazy (the first gated call) or explicit (`validate()`).
+    this.#binding = new ProjectBinding({
+      selector: this.#config.project,
+      apiUrl: this.#config.api_url,
+      apiKey: this.#config.api_key,
+      fetch: options.fetch,
+      timeoutMs: this.#config.budget_check_timeout * 1000,
+      logger: this.#logger,
+    });
+    this.#refusalFence = new RefusalFence(this.#binding);
     this.#surfaceRuntimes = buildSurfaceRuntimeDescriptors(
       this.#client,
       this.#primaryModel,
@@ -1344,6 +1367,7 @@ export class SolwynCore {
     this.#validateSurfaceAcknowledgments();
     this.#untrackedSurfaceReporter = this.#config.report_untracked_surfaces
       ? new UntrackedSurfaceReporter(this.#config.api_url, this.#config.api_key, {
+          binding: this.#binding,
           sdkInstanceId: this.#sdkInstanceId,
           shutdownDeadline: this.#config.reporter_shutdown_deadline * 1000,
           fetch: options.fetch,
@@ -1375,6 +1399,7 @@ export class SolwynCore {
     });
 
     this.#reporter = new MetadataReporter(this.#config.api_url, this.#config.api_key, {
+      binding: this.#binding,
       batchSize: this.#config.reporter_batch_size,
       flushInterval: this.#config.reporter_flush_interval * 1000,
       maxQueueSize: this.#config.reporter_max_queue_size,
@@ -1400,6 +1425,7 @@ export class SolwynCore {
     this.#budget = new BudgetEnforcer({
       apiUrl: this.#config.api_url,
       apiKey: this.#config.api_key,
+      binding: this.#binding,
       budgetMode: this.#config.budget_mode,
       failOpen: this.#config.fail_open,
       cacheTtl: this.#config.budget_check_cache_ttl,
@@ -1488,13 +1514,17 @@ export class SolwynCore {
     }
   }
 
-  #applySurfacePosture<T>(decision: EffectiveSurfaceDecision, execute: () => T): T {
+  #applySurfacePosture<T>(decision: EffectiveSurfaceDecision, execute: () => T, owner?: object): T {
     const provider = this.#surfaceContext.provider;
     if (provider === null) {
       throw new SolwynError("surface provider attribution is unavailable");
     }
+    // A stored blocking key refusal outranks every surface posture and acknowledgment; it is
+    // enforced when a governed callable executes (reads also run inside background observation
+    // callbacks, where a throw would escape to the application).
+    const governed = decision.kind === "unknown" || decision.kind === "unmetered_spend";
     const shared = surfacePostureState();
-    return applySurfacePosture({
+    const value = applySurfacePosture({
       posture: this.#config.on_unmetered,
       decision,
       provider,
@@ -1507,6 +1537,7 @@ export class SolwynCore {
       guardAcknowledgedDescendant: (value) => this.#guardSurfaceValue(value, decision.surface),
       execute,
     });
+    return governed ? this.#refusalFence.callable(value, owner) : value;
   }
 
   #guardSurfaceValue<T>(value: T, path: string): T {
@@ -1596,7 +1627,7 @@ export class SolwynCore {
       ) {
         // An absent descriptor cannot distinguish a missing field from a dynamic
         // Proxy capability. Even a reviewed namespace must refuse before lookup.
-        return this.#applySurfacePosture(dynamicDecision, execute);
+        return this.#applySurfacePosture(dynamicDecision, execute, target);
       }
 
       const value = execute();
@@ -1607,7 +1638,11 @@ export class SolwynCore {
           ? this.#guardSurfaceValue(value, surface)
           : namespaceTransform(value);
       }
-      const resolved = this.#applySurfacePosture(effectiveSurfaceDecision(actual), () => value);
+      const resolved = this.#applySurfacePosture(
+        effectiveSurfaceDecision(actual),
+        () => value,
+        target,
+      );
       return resolved;
     }
     const observation = staticObservation;
@@ -1618,7 +1653,7 @@ export class SolwynCore {
       const value = execute();
       const actual = observeEvaluatedProperty(surface, observation.descriptorCategory, value);
       if (rule?.acceptsShape(actual)) return interceptedMethod();
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
     if (
       rule === undefined &&
@@ -1635,12 +1670,12 @@ export class SolwynCore {
         const guarded = this.#guardSurfaceValue(value, surface);
         if (this.#config.on_unmetered !== "raise") {
           this.#surfaceGuards.observeTerminal(guarded, () => {
-            this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+            this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
           });
         }
         return guarded;
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
     this.#throwSurfaceDecision(decision);
     if (
@@ -1648,7 +1683,7 @@ export class SolwynCore {
       this.#config.on_unmetered === "raise" &&
       !this.#acknowledgmentApplies(surface, decision.rule ?? undefined)
     ) {
-      return this.#applySurfacePosture(decision, execute);
+      return this.#applySurfacePosture(decision, execute, target);
     }
 
     let evaluated = false;
@@ -1677,7 +1712,7 @@ export class SolwynCore {
           ? this.#guardSurfaceValue(value, surface)
           : namespaceTransform(value);
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
 
     if (decision.kind === "metadata" || decision.kind === "infrastructure") {
@@ -1695,18 +1730,24 @@ export class SolwynCore {
       ) {
         return value;
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
 
-    const value = this.#applySurfacePosture(decision, readOnce);
+    const value = this.#applySurfacePosture(decision, readOnce, target);
     // Static drift already entered unknown posture before evaluation. Finish by
     // guarding the evaluated value, not by recording the same drift a second time.
-    if (decision.kind === "unknown") return guardEvaluatedValue(rawValue);
+    if (decision.kind === "unknown") {
+      return this.#refusalFence.callable(guardEvaluatedValue(rawValue), target);
+    }
     // Even data descriptors can differ from Proxy.get results. Every evaluated
     // value must satisfy the reviewed shape before an acknowledgment can allow it.
     const actual = evaluatedObservation();
     if (rule !== undefined && !rule.acceptsShape(actual)) {
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => rawValue);
+      return this.#applySurfacePosture(
+        effectiveSurfaceDecision(actual, rule),
+        () => rawValue,
+        target,
+      );
     }
     const exactRawResponse =
       decision.kind === "unmetered_spend" &&
@@ -1716,7 +1757,10 @@ export class SolwynCore {
       const method = rawValue as (...args: unknown[]) => unknown;
       return (...args: unknown[]) => this.#noOutputCapCall(surface, target, method, args);
     }
-    return exactRawResponse ? value : guardEvaluatedValue(rawValue);
+    const resolved = exactRawResponse ? value : guardEvaluatedValue(rawValue);
+    return decision.kind === "unmetered_spend"
+      ? this.#refusalFence.callable(resolved, target)
+      : resolved;
   }
 
   /**
@@ -1778,7 +1822,12 @@ export class SolwynCore {
     if (result.hardDenyAdmitted) {
       throw new OutputBoundUnenforceableError({ provider, reason: "no_output_cap" });
     }
-    return Reflect.apply(method, target, args);
+    // A refusal recorded after the check (a concurrent validation or call) still stops the
+    // native dispatch; nothing awaits between this check and the call.
+    const refused = this.#binding.blockingRefusal();
+    if (refused !== null) throw refused;
+    // Fenced: the native request carries the refusal signal, and its result re-checks on use.
+    return Reflect.apply(this.#refusalFence.callable(method, target), target, args);
   }
 
   /** Resolve one wrapper-owned operation before the interception pipeline starts. */
@@ -2529,7 +2578,6 @@ export class SolwynCore {
     this.#postcheckRunControl(admission, budget, velocity);
     const tuning = this.#applyFailoverTuningDirective(budget.failoverTuningAllowed);
     deadline.replaceTotal(tuning.totalTimeout);
-    this.#reporter.observeProjectId(budget.projectId);
     const ctx: DispatchContext = {
       surface,
       responsesLeaf,
@@ -2718,7 +2766,6 @@ export class SolwynCore {
     this.#postcheckRunControl(admission, budget, velocity);
     const tuning = this.#applyFailoverTuningDirective(budget.failoverTuningAllowed);
     deadline.replaceTotal(tuning.totalTimeout);
-    this.#reporter.observeProjectId(budget.projectId);
     const deniedRegion = budget.allowed
       ? null
       : safeExtractRegion(() => primary.adapter.extractRegion(primary.sdkClient), this.#logger);
@@ -2759,6 +2806,13 @@ export class SolwynCore {
       throw new ProviderUnavailableError("failover deadline expired", {
         attempted: [provider],
       });
+    }
+    // A refusal recorded after the budget check (by a concurrent call or a background write)
+    // still stops this dispatch, and the call's funding is returned.
+    const refusedBeforeDispatch = this.#binding.blockingRefusal();
+    if (refusedBeforeDispatch !== null) {
+      this.#releaseFunding(callId, funding);
+      throw refusedBeforeDispatch;
     }
     const started = nowMs();
     let region: string | null = null;
@@ -3029,6 +3083,14 @@ export class SolwynCore {
         // The provider read bound is immutable for the whole logical call. The total deadline
         // gates sleeps and BETWEEN-hop advancement but never shrinks an already-dispatched read.
         const hopReadTimeoutSeconds = ctx.tuning.hopReadTimeout;
+        // Before EVERY physical dispatch (first hop, failover hop, same-provider retry): a stored
+        // blocking refusal stops the call whatever funding admitted it, and the funding is closed.
+        const refusedBeforeDispatch = this.#binding.blockingRefusal();
+        if (refusedBeforeDispatch !== null) {
+          breaker.releaseProbe(admission);
+          this.#closeFunding(ctx);
+          throw refusedBeforeDispatch;
+        }
         const hopStarted = nowMs();
         try {
           const attempt = ctx.isStreaming
@@ -4709,6 +4771,23 @@ export class SolwynCore {
     applyEventReceiptFields(event, fields);
     this.#applyRunReceipt(event, ctx.run);
     return event;
+  }
+
+  /** @internal Throw the stored blocking key refusal, if any, before a raw native dispatch. */
+  assertNotRefused(): void {
+    const refused = this.#binding.blockingRefusal();
+    if (refused !== null) throw refused;
+  }
+
+  /**
+   * Check the API key and project with Solwyn now (`GET /api/v1/auth/key`). Resolves with the
+   * key's details and pins the project id when the key is valid for the project, or `null` when
+   * Solwyn could not be reached (calls keep following `failOpen`). Throws `ApiKeyRefusedError`
+   * (a `ConfigurationError`) on any refusal. Wrapped calls validate lazily on their own; call
+   * this to fail at startup instead of on the first call.
+   */
+  validate(): Promise<AuthKeyResponse | null> {
+    return this.#binding.validate();
   }
 
   /**

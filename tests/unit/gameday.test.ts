@@ -16,6 +16,7 @@ import { FakeControlPlane } from "../../src/testing/index";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const callId = (index: number): string =>
   `00000000-0000-0000-0000-${index.toString(16).padStart(12, "0")}`;
@@ -376,6 +377,7 @@ describe("non-lease game days", () => {
     plane.denyRun("gameday-sticky-run");
     const warnings: string[] = [];
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -427,6 +429,7 @@ describe("non-lease game days", () => {
     let now = 0;
     const plane = new FakeControlPlane();
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -443,6 +446,7 @@ describe("non-lease game days", () => {
       tokenDetails: zeroTokenDetails(),
     });
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: enforcer.binding,
       fetch: plane.fetch,
       flushInterval: 1_000_000,
       shutdownDeadline: 10,
@@ -500,6 +504,7 @@ describe("non-lease game days", () => {
       random: () => 0,
     });
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch: plane.fetch,
@@ -516,6 +521,7 @@ describe("non-lease game days", () => {
     expect(breaker.getState().state).toBe("open");
 
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: enforcer.binding,
       fetch: plane.fetch,
       flushInterval: 1_000_000,
       retryBackoffBase: 1,
@@ -708,6 +714,7 @@ describe("lease game days", () => {
       random: () => 0,
     });
     const enforcer = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch,

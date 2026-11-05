@@ -707,7 +707,7 @@ describe("committed provider surface interval evidence", () => {
     );
     const expected = documentedOpenAIStrictFingerprint(guide);
     const client = new Solwyn(new OpenAI({ apiKey: "sk-offline" }), {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       acknowledgeUntracked: [],
       onUnmetered: "raise",
       reportUntrackedSurfaces: false,

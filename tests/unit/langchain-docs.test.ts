@@ -37,6 +37,11 @@ it("strict-compiles and executes the complete documented LangChain recipe offlin
       "apiKey: process.env.SOLWYN_API_KEY!,",
       "apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, budgetCheckCacheTtl: 0,",
     );
+    source = exactlyOnce(
+      source,
+      "project: process.env.SOLWYN_PROJECT!,",
+      "project: plane.project,",
+    );
     source = `import { FakeControlPlane } from "${local("src/testing/index.ts")}";\nimport { createFakeOpenAITransport } from "${local("tests/helpers/fake-openai-transport.ts")}";\nexport const plane = new FakeControlPlane();\nexport const transport = createFakeOpenAITransport();\n${source}`;
     const fixture = join(directory, "recipe.ts");
     writeFileSync(fixture, source);

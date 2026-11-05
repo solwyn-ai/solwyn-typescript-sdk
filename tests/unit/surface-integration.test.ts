@@ -15,7 +15,7 @@ import type { FetchLike } from "../../src/transport";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
 import { installIngestContractGuard } from "../helpers/ingest-contract";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const MODEL = "gpt-4o-mini";
 const UNTRACKED_REPORT_PATH = "/api/v1/untracked-surfaces";
 
@@ -202,7 +202,8 @@ describe("public surface controls", () => {
     expect(await create({ model: "claude-3-5-sonnet", messages: [] })).toBe(result);
     await wrapped.close();
 
-    expect(order.slice(0, 2)).toEqual(["/api/v1/budgets/check", "provider"]);
+    // The first call validates the key and project before its budget check.
+    expect(order.slice(0, 3)).toEqual(["/api/v1/auth/key", "/api/v1/budgets/check", "provider"]);
     expect(providerCalls).toHaveLength(1);
     expect(providerCalls[0]).toMatchObject({ model: "claude-3-5-sonnet", messages: [] });
     expect(calls.find((call) => call.path === "/api/v1/budgets/check")?.body).toMatchObject({

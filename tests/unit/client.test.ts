@@ -40,7 +40,7 @@ import type { FetchLike } from "../../src/transport";
 import type { BudgetConfirmRequest, VelocityFlag } from "../../src/types";
 import { VelocityMonitor } from "../../src/velocity";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 // ---------------------------------------------------------------------------
 // Fetch capture + fake-client helpers.

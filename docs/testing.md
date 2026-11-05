@@ -107,6 +107,33 @@ a price-hint map (by default `{ [provider]: 1 }`; non-text or unpriceable checks
 Set `priceHints: null` to return an empty map on opted-in text checks; this does not omit the
 `price_hints` field.
 
+### API keys and projects
+
+The fake authenticates every control-plane request the way Solwyn does. It requires
+`Authorization: Bearer <plane.apiKey>` and a `Solwyn-Project` header naming `plane.project` (the
+project name, `test-project` by default) or its `proj_` id (`projectId`, default
+`proj_000000000000000000000000`). A missing header returns `400 project_selector_required`; a
+header that matches neither returns `404 project_not_found`. `GET /api/v1/auth/key` returns the
+key and the resolved project, and every authenticated response carries `Solwyn-Project-Id`.
+`plane.wrap(...)` configures `project` for you; `project` is a reserved wrap option.
+
+| Method or option | Effect |
+|------------------|--------|
+| `keyScope: "read_only"` | `/auth/key` reports a read-only key, so `validate()` and the first call refuse |
+| `expireKey({ projectBudgetMode?, requests?, path? })` | `401 api_key_expired`; the posture defaults to `hard_deny` when `mode` or `postureMode` is `hard_deny`, else `alert_only` (`null` sends a null posture) |
+| `revokeKey({ projectBudgetMode?, requests?, path? })` | `401 api_key_invalid` with the same posture rule |
+| `refuseKey({ status, body }, { requests?, path? })` | Any exact refusal response, for malformed 401 bodies and similar cases |
+| `refuseProject("project_not_found" \| "key_not_dedicated", { requests?, path? })` | A project refusal after the key is accepted |
+| `renameProject(name)` | The old name stops matching; the `proj_` id keeps working |
+| `readOnly()` | Writes return `403 read_only_key`, and `/auth/key` reports a read-only key |
+
+`plane.authKeyRequests` and `plane.projectHeaders` record the `Solwyn-Project` value of each
+`/auth/key` request and of every request. `plane.handle(...)` dispatches as an already
+authenticated request. `assertAuthKeyContract(fetch, { apiUrl, apiKey, project })` checks the
+`/auth/key` shape, the id echo, pinning by name and by id, and the `project_selector_required`,
+`project_not_found` and `api_key_invalid` refusals against the fake or a live plane; every other
+contract probe now also takes `project`.
+
 The fake stores only accepted ingest events and returns indexed `rejected` and `duplicates`
 arrays. It enforces the server's 1,000-event metadata batch limit, 100-report untracked batch
 limit, 256 KiB untracked body limit, unique untracked keys within a batch, and project matching

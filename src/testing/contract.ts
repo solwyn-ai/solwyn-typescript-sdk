@@ -10,7 +10,9 @@ import type {
   LeaseSurrenderRequest,
   MetadataEvent,
 } from "../types";
+import { PROJECT_ECHO_HEADER, PROJECT_HEADER } from "../types";
 import {
+  AuthKeyResponseSchema,
   BudgetCheckRequestSchema,
   BudgetCheckResponseSchema,
   BudgetConfirmRequestSchema,
@@ -28,6 +30,7 @@ import {
   serializeMetadataEvent,
 } from "../validation";
 
+const AUTH_KEY_PATH = "/api/v1/auth/key";
 const CHECK_PATH = "/api/v1/budgets/check";
 const CONFIRM_PATH = "/api/v1/budgets/confirm";
 const LEASE_PATH = "/api/v1/budgets/lease";
@@ -48,6 +51,8 @@ const LEASE_AUTHORITY_KEYS = [
 export interface ContractOptions {
   apiUrl: string;
   apiKey: string;
+  /** The project selector sent as `Solwyn-Project`: a project name or a `proj_` id. */
+  project: string;
 }
 
 export interface RunControlContractOptions extends ContractOptions {
@@ -84,9 +89,30 @@ async function postJson(
       headers: {
         Authorization: `Bearer ${options.apiKey}`,
         "Content-Type": "application/json",
+        [PROJECT_HEADER]: options.project,
       },
       body: JSON.stringify(body),
     });
+  } catch (error) {
+    throw new Error(`[${phase}] request failed (${safeExceptionType(error)})`);
+  }
+  try {
+    return { response, text: await response.text() };
+  } catch (error) {
+    throw new Error(`[${phase}] response body read failed (${safeExceptionType(error)})`);
+  }
+}
+
+async function getJson(
+  fetch: FetchLike,
+  options: ContractOptions,
+  path: string,
+  headers: Record<string, string>,
+  phase: string,
+): Promise<Exchange> {
+  let response: Response;
+  try {
+    response = await fetch(joinApiUrl(options.apiUrl, path), { method: "GET", headers });
   } catch (error) {
     throw new Error(`[${phase}] request failed (${safeExceptionType(error)})`);
   }
@@ -869,4 +895,97 @@ export async function assertReceiptIngestContract(
     receiptEvent("aggregate_replay", 3000),
     "receipt.aggregate-replay",
   );
+}
+
+function requireErrorDetail(
+  exchange: Exchange,
+  status: number,
+  code: string,
+  phase: string,
+): JsonRecord {
+  requireStatus(exchange, status, phase);
+  const body = requireRecord(parseJson(exchange, phase), phase, exchange.text);
+  const detail = requireRecord(body["detail"], phase, exchange.text, "detail");
+  if (detail["code"] !== code) fail(phase, `detail.code must be ${code}`, exchange.text);
+  requireString(detail["message"], phase, exchange.text, "detail.message");
+  return detail;
+}
+
+/**
+ * `GET /api/v1/auth/key` and the key-path refusals the SDK classifies: the strict 200 shape
+ * with `Solwyn-Project-Id` echo, pinning by name and by id, `project_selector_required`,
+ * `project_not_found`, and `api_key_invalid` with a null `project_budget_mode`.
+ */
+export async function assertAuthKeyContract(
+  fetch: FetchLike,
+  options: ContractOptions,
+): Promise<void> {
+  const auth = { Authorization: `Bearer ${options.apiKey}` };
+  const byName = await getJson(
+    fetch,
+    options,
+    AUTH_KEY_PATH,
+    { ...auth, [PROJECT_HEADER]: options.project },
+    "auth-key.selector",
+  );
+  requireStatus(byName, 200, "auth-key.selector");
+  const body = requireRecord(
+    parseJson(byName, "auth-key.selector"),
+    "auth-key.selector",
+    byName.text,
+  );
+  requireSchema(AuthKeyResponseSchema, body, "auth-key.selector", byName.text);
+  if (body["scope"] !== "full") fail("auth-key.selector", "scope must be full", byName.text);
+  const projectId = body["project_id"] as string;
+  if (byName.response.headers.get(PROJECT_ECHO_HEADER) !== projectId) {
+    fail("auth-key.selector", `${PROJECT_ECHO_HEADER} must echo project_id`, byName.text);
+  }
+
+  const byId = await getJson(
+    fetch,
+    options,
+    AUTH_KEY_PATH,
+    { ...auth, [PROJECT_HEADER]: projectId },
+    "auth-key.pinned-id",
+  );
+  requireStatus(byId, 200, "auth-key.pinned-id");
+  const pinned = requireRecord(
+    parseJson(byId, "auth-key.pinned-id"),
+    "auth-key.pinned-id",
+    byId.text,
+  );
+  if (pinned["project_id"] !== projectId) {
+    fail("auth-key.pinned-id", "the pinned id must resolve to the same project", byId.text);
+  }
+
+  requireErrorDetail(
+    await getJson(fetch, options, AUTH_KEY_PATH, auth, "auth-key.selector-required"),
+    400,
+    "project_selector_required",
+    "auth-key.selector-required",
+  );
+  requireErrorDetail(
+    await getJson(
+      fetch,
+      options,
+      AUTH_KEY_PATH,
+      { ...auth, [PROJECT_HEADER]: "solwyn-contract-no-such-project" },
+      "auth-key.project-not-found",
+    ),
+    404,
+    "project_not_found",
+    "auth-key.project-not-found",
+  );
+  const unknownKey = `solwyn_sk_${"f".repeat(64)}`;
+  const invalid = await getJson(
+    fetch,
+    options,
+    AUTH_KEY_PATH,
+    { Authorization: `Bearer ${unknownKey}`, [PROJECT_HEADER]: options.project },
+    "auth-key.invalid",
+  );
+  const detail = requireErrorDetail(invalid, 401, "api_key_invalid", "auth-key.invalid");
+  if (detail["project_budget_mode"] !== null) {
+    fail("auth-key.invalid", "an unknown key has a null project_budget_mode", invalid.text);
+  }
 }

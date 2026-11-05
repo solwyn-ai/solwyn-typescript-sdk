@@ -48,7 +48,7 @@ function controlPlane(extra: SolwynOptions = {}, mode: "hard_deny" | "alert_only
     return new Response(null, { status: 204 });
   };
   const options: SolwynOptions = {
-    apiKey: `sk_proj_${"0".repeat(64)}`,
+    apiKey: `solwyn_sk_${"0".repeat(64)}`,
     fetch,
     logger: noopLogger,
     leaseEnabled: false,

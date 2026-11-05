@@ -8,6 +8,7 @@ import { createSolwynMiddleware } from "../../src/ai-sdk/index";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import type { FetchLike } from "../../src/transport";
+import { authKeyResponse } from "../helpers/project-binding";
 import { alive, collectUntil } from "./gc.mjs";
 
 const forceGc = (globalThis as { gc?: () => void }).gc;
@@ -25,7 +26,7 @@ async function waitForDelivery(predicate: () => boolean, describe: () => string)
   }
 }
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const PROJECT = `proj_${"0".repeat(24)}`;
 const REPORTER_HOOK = Symbol.for("@solwyn/sdk/node-reporter-registration");
 const LEASE_HOOK = Symbol.for("@solwyn/sdk/node-lease-registration");
@@ -111,6 +112,7 @@ function controlPlane(count: Counters, options: PlaneOptions = {}): FetchLike {
   let ingestFailed = false;
   const confirmFailed = new Set<string>();
   return async (url, init) => {
+    if (url.endsWith("/api/v1/auth/key")) return authKeyResponse();
     if (url.endsWith("/budgets/check")) {
       count.checks++;
       if (options.reservations) count.reservations++;
@@ -212,6 +214,7 @@ interface ClientOptions {
 function middlewareOptions(fetch: FetchLike, extra: ClientOptions = {}) {
   return {
     apiKey: API_KEY,
+    project: "test-project",
     apiUrl: "https://retention.invalid",
     logger: noopLogger,
     leaseEnabled: extra.lease ?? false,

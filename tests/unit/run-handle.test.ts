@@ -10,7 +10,7 @@ import {
 } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 interface WireCapture {
   readonly fetch: ReturnType<typeof vi.fn<FetchLike>>;

@@ -79,7 +79,7 @@ function names(cands: readonly ProviderCandidate[]): string[] {
   return cands.map(providerNameOf);
 }
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 function capturingLogger(): { logger: Logger; warnings: string[] } {
   const warnings: string[] = [];

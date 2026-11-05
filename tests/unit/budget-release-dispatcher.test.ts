@@ -6,9 +6,10 @@ import type { Logger } from "../../src/logging";
 import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import { createTokenDetails } from "../../src/token-details";
 import type { LeaseGrantResponse, LeaseSurrenderRequest } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const LEASE_URL = `${API_URL}/api/v1/budgets/lease`;
 const SURRENDER_URL = `${API_URL}/api/v1/budgets/lease/surrender`;
 const CHECK_URL = `${API_URL}/api/v1/budgets/check`;
@@ -118,6 +119,7 @@ function harness(
     warnings,
   };
   state.budget = new BudgetEnforcer({
+    binding: testBinding(),
     apiUrl: API_URL,
     apiKey: API_KEY,
     leaseEnabled: true,
@@ -395,6 +397,7 @@ describe("bounded lease release dispatcher", () => {
     const grantGate = deferred<Response>();
     const surrenders: Array<Record<string, unknown>> = [];
     const budget = new BudgetEnforcer({
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       holderId: "sdk-instance-1",
@@ -408,6 +411,7 @@ describe("bounded lease release dispatcher", () => {
         throw new Error("unexpected test URL");
       },
     });
+    await budget.binding.validate();
     const checking = budget.checkBudget({
       callId: callId(1),
       estimatedInputTokens: 1,

@@ -29,7 +29,7 @@ try {
   const plane = new FakeControlPlane();
   let dispatched = 0;
   const raw = { chat: { completions: { create() { dispatched++; return { usage: { prompt_tokens: 2, completion_tokens: 3 } }; } } } };
-  const client = new Solwyn(raw, { apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, reportUntrackedSurfaces: false, reporterFlushInterval: 60, logger: noopLogger });
+  const client = new Solwyn(raw, { apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, reportUntrackedSurfaces: false, reporterFlushInterval: 60, logger: noopLogger });
   globalThis.retainedClient = client;
   await ${named ? 'run("bundle", () => client.chat.completions.create({ model: "gpt-review", messages: [] }))' : 'client.chat.completions.create({ model: "gpt-review", messages: [] })'};
   ${mode === "close" ? "await client.close();" : ""}

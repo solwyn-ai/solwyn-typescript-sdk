@@ -5,14 +5,18 @@
  * Drift between validation.ts and the snapshot fails a test here, not production.
  * Every required field in the spec's component schemas is required in the zod
  * schema; optionality and string/number constraints match. Enumerated contract values are
- * asserted explicitly. The deliberate allowance for unrestricted `price_hints` keys is pinned.
+ * asserted explicitly. The deliberate allowance for unrestricted `price_hints` keys and the
+ * unsent Anthropic compaction buckets are pinned.
  */
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import type { z } from "zod";
+import { REFUSAL_CODES } from "../../src/api-key-errors";
 import { TOKEN_DETAILS_COUNTERS, TokenDetailsSchema } from "../../src/token-details";
 import {
+  AuthKeyResponseSchema,
   BreakerReportAcceptedSchema,
   BreakerStateReportSchema,
   BudgetCheckRequestObjectSchema,
@@ -59,7 +63,12 @@ interface JsonSchema {
 }
 
 const snapshotPath = fileURLToPath(new URL("../fixtures/openapi.snapshot.json", import.meta.url));
+interface SnapshotResponse {
+  headers?: Record<string, { schema?: { const?: string } }>;
+  content?: Record<string, { schema?: { $ref?: string } }>;
+}
 const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as {
+  paths: Record<string, Record<string, { responses?: Record<string, SnapshotResponse> }>>;
   components: { schemas: Record<string, JsonSchema> };
 };
 const schemas = snapshot.components.schemas;
@@ -88,6 +97,18 @@ function findConstraint(prop: JsonSchema | undefined, key: keyof JsonSchema): un
   }
   return undefined;
 }
+
+/**
+ * Optional `TokenDetails` buckets the server accepts (default 0) and this SDK does not send yet.
+ * Pinned exactly in D9 so a new server field cannot hide behind this allowance.
+ */
+const COMPACTION_BUCKETS: readonly string[] = [
+  "compaction_input_tokens",
+  "compaction_cached_input_tokens",
+  "compaction_cache_creation_5m_tokens",
+  "compaction_cache_creation_1h_tokens",
+  "compaction_output_tokens",
+];
 
 // Non-refined object schemas, so `.shape` is introspectable.
 const wireSchemas = [
@@ -126,6 +147,8 @@ describe("field-set parity with the OpenAPI snapshot", () => {
           (key) =>
             name !== "BudgetCheckRequest" || !["uncounted_calls", "uncounted_tokens"].includes(key),
         )
+        // D9: the SDK does not report Anthropic compaction buckets yet (see below).
+        .filter((key) => name !== "TokenDetails" || !COMPACTION_BUCKETS.includes(key))
         .sort();
       expect(zodKeys).toEqual(specKeys);
     });
@@ -607,5 +630,94 @@ describe("D8: trace context is strict in the SDK, lenient at ingest (deliberate 
     expect(spanId.length).toBeLessThanOrEqual(
       findConstraint(props["span_id"], "maxLength") as number,
     );
+  });
+});
+
+describe("D9: Anthropic compaction buckets are server-optional and not sent (deliberate gap)", () => {
+  it("the spec declares exactly these five optional, zero-default buckets", () => {
+    const props = specSchema("TokenDetails").properties ?? {};
+    const required = specSchema("TokenDetails").required ?? [];
+    expect(Object.keys(props).filter((key) => key.startsWith("compaction_"))).toEqual([
+      ...COMPACTION_BUCKETS,
+    ]);
+    for (const key of COMPACTION_BUCKETS) {
+      expect(required).not.toContain(key);
+      expect((props[key] as { default?: unknown }).default).toBe(0);
+    }
+  });
+
+  it("the SDK schema does not carry them, so payloads stay unchanged", () => {
+    for (const key of COMPACTION_BUCKETS) {
+      expect(Object.keys(TokenDetailsSchema.shape)).not.toContain(key);
+    }
+  });
+});
+
+describe("GET /api/v1/auth/key matches the snapshot", () => {
+  const authKeyShape = (AuthKeyResponseSchema as unknown as z.ZodObject<Record<string, z.ZodType>>)
+    .shape;
+  const spec = specSchema("AuthKeyResponse");
+
+  it("the snapshot carries exactly the nine endpoint shapes the SDK calls", () => {
+    expect(
+      Object.entries(snapshot.paths)
+        .flatMap(([path, methods]) => Object.keys(methods).map((method) => `${method} ${path}`))
+        .sort(),
+    ).toEqual(
+      [
+        "get /api/v1/auth/key",
+        "post /api/v1/budgets/check",
+        "post /api/v1/budgets/confirm",
+        "post /api/v1/budgets/lease",
+        "post /api/v1/budgets/lease/renew",
+        "post /api/v1/budgets/lease/surrender",
+        "post /api/v1/metadata/ingest",
+        "post /api/v1/projects/{project_id}/providers/breaker-reports",
+        "post /api/v1/untracked-surfaces",
+      ].sort(),
+    );
+  });
+
+  it("200 is AuthKeyResponse with no-store; 400, 401, 403 and 404 are ApiKeyErrorResponse", () => {
+    const responses = snapshot.paths["/api/v1/auth/key"]?.["get"]?.responses ?? {};
+    const ref = (status: string) => responses[status]?.content?.["application/json"]?.schema?.$ref;
+    expect(ref("200")).toBe("#/components/schemas/AuthKeyResponse");
+    expect(responses["200"]?.headers?.["Cache-Control"]?.schema?.const).toBe("no-store");
+    for (const status of ["400", "401", "403", "404"]) {
+      expect(ref(status)).toBe("#/components/schemas/ApiKeyErrorResponse");
+    }
+  });
+
+  it("AuthKeyResponse: key set, required set and closed shape match", () => {
+    expect(Object.keys(authKeyShape).sort()).toEqual(Object.keys(spec.properties ?? {}).sort());
+    const zodRequired = Object.entries(authKeyShape)
+      .filter(([, field]) => !field.safeParse(undefined).success)
+      .map(([key]) => key)
+      .sort();
+    expect(zodRequired).toEqual([...(spec.required ?? [])].sort());
+    expect((spec as { additionalProperties?: unknown }).additionalProperties).toBe(false);
+  });
+
+  it("AuthKeyResponse: scope, created_via and budget_mode vocabularies match", () => {
+    for (const field of ["scope", "created_via", "budget_mode"]) {
+      const specEnum = [...((spec.properties?.[field]?.enum as string[] | undefined) ?? [])];
+      const zodField = authKeyShape[field] as unknown as { options: readonly string[] };
+      expect([...zodField.options].sort()).toEqual(specEnum.sort());
+    }
+  });
+
+  it("ApiKeyErrorDetail: the SDK acts on every code but api_key_not_allowed", () => {
+    const detail = specSchema("ApiKeyErrorDetail").properties ?? {};
+    const codes = (detail["code"]?.enum ?? []) as string[];
+    expect([...REFUSAL_CODES].sort()).toEqual(
+      codes.filter((code) => code !== "api_key_not_allowed").sort(),
+    );
+    // api_key_not_allowed is a per-route refusal (a project key on an account route), not a
+    // refusal of the key or its project; tests/unit/api-key-errors.test.ts pins that.
+    expect(codes).toContain("api_key_not_allowed");
+    expect(findConstraint(detail["project_budget_mode"], "enum")).toEqual([
+      "hard_deny",
+      "alert_only",
+    ]);
   });
 });

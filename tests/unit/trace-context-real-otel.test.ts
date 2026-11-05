@@ -562,7 +562,15 @@ describe("background control-plane I/O with a real context manager", () => {
         (entry.phase === "call" || entry.path === "/api/v1/budgets/lease/surrender"),
     );
     expect(new Set(background.map(({ path }) => tail(path)))).toEqual(
-      new Set(["confirm", "ingest", "renew", "surrender", "untracked-surfaces", "breaker-reports"]),
+      new Set([
+        "key",
+        "confirm",
+        "ingest",
+        "renew",
+        "surrender",
+        "untracked-surfaces",
+        "breaker-reports",
+      ]),
     );
     for (const { path, spanId, baggage, custom } of background) {
       // Only the span and baggage are removed; other application context survives.

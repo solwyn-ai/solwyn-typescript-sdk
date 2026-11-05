@@ -3,6 +3,7 @@ import { BudgetEnforcer } from "../../src/budget";
 import { CircuitBreaker } from "../../src/circuit-breaker";
 import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
+import { testBinding } from "../helpers/project-binding";
 
 for (const operation of ["check", "confirm"] as const) {
   it(`fences a stale ${operation} success away from a live control-plane recovery probe`, async () => {
@@ -24,7 +25,7 @@ for (const operation of ["check", "confirm"] as const) {
     });
     let requests = 0;
     const options = {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       apiUrl: "https://accounting-breaker.invalid",
       controlPlaneBreaker: breaker,
       fetch: async () => {
@@ -47,7 +48,12 @@ for (const operation of ["check", "confirm"] as const) {
             });
       },
     };
-    const budget = new BudgetEnforcer({ ...options, cacheTtl: 0, leaseEnabled: false });
+    const budget = new BudgetEnforcer({
+      binding: testBinding(),
+      ...options,
+      cacheTtl: 0,
+      leaseEnabled: false,
+    });
     const reporter = new MetadataReporter(options.apiUrl, options.apiKey, options);
     const send = () =>
       operation === "check"

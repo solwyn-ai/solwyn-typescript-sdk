@@ -32,6 +32,7 @@ function fixture() {
   const plane = new FakeControlPlane({ mode: "alert_only" });
   const handle = createSolwynMiddleware({
     apiKey: plane.apiKey,
+    project: plane.project,
     apiUrl: plane.apiUrl,
     fetch: plane.fetch,
     logger: noopLogger,

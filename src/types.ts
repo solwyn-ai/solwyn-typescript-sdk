@@ -163,8 +163,18 @@ export const TRACE_ID_PATTERN = /^[0-9a-f]{32}$/;
 /** Lowercase-hex W3C span id; the all-zero invalid id is rejected separately. */
 export const SPAN_ID_PATTERN = /^[0-9a-f]{16}$/;
 export const PROJECT_ID_PATTERN = /^proj_[a-f0-9]{24}$/;
-/** Project API-key format: `sk_proj_` + 64 lowercase hex. */
-export const PROJECT_KEY_PATTERN = /^sk_proj_[a-f0-9]{64}$/;
+/** Solwyn API-key format: `solwyn_sk_` + 64 lowercase hex. */
+export const API_KEY_PATTERN = /^solwyn_sk_[a-f0-9]{64}$/;
+/**
+ * A project selector: a `proj_` id, or a project name of 1 to 100 ASCII characters from
+ * `A-Z a-z 0-9 space . _ -` with no leading or trailing space. Lock-step with core.
+ */
+export const PROJECT_SELECTOR_PATTERN =
+  /^(?:proj_[a-f0-9]{24}|[A-Za-z0-9._-](?:[A-Za-z0-9 ._-]{0,98}[A-Za-z0-9._-])?)$/;
+/** Request header naming the project on every request made with an API key. */
+export const PROJECT_HEADER = "Solwyn-Project";
+/** Diagnostic echo of the resolved project id; the SDK never pins from it. */
+export const PROJECT_ECHO_HEADER = "Solwyn-Project-Id";
 
 // ---------------------------------------------------------------------------
 // Wire-model interfaces (snake_case fields; parsed/post-default shape).
@@ -436,4 +446,22 @@ export interface BreakerStateReport {
 /** OpenAPI-named response for an accepted breaker snapshot. */
 export interface BreakerReportAccepted {
   accepted?: boolean;
+}
+
+/** Key scope reported by `GET /api/v1/auth/key`. */
+export type ApiKeyScope = "full" | "read_only";
+
+/** `GET /api/v1/auth/key`: the key and the project its `Solwyn-Project` header resolved to. */
+export interface AuthKeyResponse {
+  account_id: string;
+  key_id: string;
+  key_prefix: string;
+  key_name: string;
+  scope: ApiKeyScope;
+  created_via: "dashboard" | "cli";
+  expires_at: string;
+  rotation_grace_until: string | null;
+  project_id: string;
+  project_name: string;
+  budget_mode: BudgetMode;
 }

@@ -12,8 +12,9 @@ import { noopLogger } from "../../src/logging";
 import { Deadline } from "../../src/routing";
 import { createTokenDetails } from "../../src/token-details";
 import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
 const PROJECT_ID = `proj_${"0".repeat(24)}`;
 const CALL_ID = "00000000-0000-0000-0000-000000000001";
@@ -66,7 +67,12 @@ function options(overrides: Partial<CheckBudgetOptions> = {}): CheckBudgetOption
 }
 
 function enforcer(overrides: Partial<BudgetEnforcerOptions> = {}): BudgetEnforcer {
-  return new BudgetEnforcer({ apiKey: API_KEY, apiUrl: API_URL, ...overrides });
+  return new BudgetEnforcer({
+    binding: testBinding(),
+    apiKey: API_KEY,
+    apiUrl: API_URL,
+    ...overrides,
+  });
 }
 
 function ledger(budget: BudgetEnforcer): LeaseLedger {
@@ -336,6 +342,8 @@ describe("budget preflight deadline and cancellation", () => {
     const breaker = new CircuitBreaker();
     const failure = vi.spyOn(breaker, "recordFailure");
     const budget = enforcer({ fetch, leaseEnabled, controlPlaneBreaker: breaker });
+    await budget.binding.validate();
+    vi.useFakeTimers();
     const outcome = budget
       .checkBudget(options({ signal: controller.signal }))
       .catch((error: unknown) => error);
@@ -357,6 +365,7 @@ describe("budget preflight deadline and cancellation", () => {
     const fetch = vi.fn(async () => new Promise<Response>(() => {}));
     const breaker = new CircuitBreaker();
     const budget = enforcer({ fetch, leaseEnabled, controlPlaneBreaker: breaker });
+    await budget.binding.validate();
     if (timing === "before") controller.abort("cancelled");
     const outcome = budget
       .checkBudget(options({ signal: controller.signal }))

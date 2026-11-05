@@ -6,7 +6,8 @@
 
 | Option | Env var | Default | Description |
 |--------|---------|---------|-------------|
-| `apiKey` | `SOLWYN_API_KEY` | *required* | Solwyn project API key (`sk_proj_` + 64 hex) |
+| `apiKey` | `SOLWYN_API_KEY` | *required* | Solwyn API key (`solwyn_sk_` + 64 lowercase hex); old `sk_proj_` keys are rejected |
+| `project` | `SOLWYN_PROJECT` | *required* | Project name or `proj_` id the key reports to; sent as `Solwyn-Project` on every request. `SOLWYN_PROJECT_ID` is not read |
 | `apiUrl` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn Cloud API endpoint |
 | `model` | — | — | Model for the primary provider (per-call `model` overrides it) |
 | `provider` | — | auto-detect | Provider pin for the primary; bypasses detection, then validates client family |
@@ -85,3 +86,35 @@ the stream finishes, so it also limits the total duration of a healthy stream. T
 stream on the other SDKs, pass an `AbortSignal` in the request options or apply your own idle
 timeout while iterating. Bedrock's `requestTimeout` is not a universal hard abort for every
 Converse stream handler; configure a finite socket timeout on the AWS request handler too.
+
+## API key and project
+
+`apiKey` and `project` are both required; each falls back to its environment variable. The key is
+checked locally for the `solwyn_sk_` format, and the project for a name (1 to 100 characters from
+letters, digits, spaces, `.`, `_` and `-`, with no leading or trailing space) or a `proj_` id. The
+SDK trims spaces and tabs around the project. Passing `projectId` throws
+`ConfigurationError(field: "project_id")`; `SOLWYN_PROJECT_ID` is not read.
+
+Construction makes no network request. Before the first call that needs Solwyn, the SDK sends
+`GET /api/v1/auth/key` once and pins the project's `proj_` id from the answer; until then the
+`Solwyn-Project` header carries the configured value. `await client.validate()` (or
+`await handle.validate()` on the AI SDK middleware) runs the same check on demand. It resolves
+with the key's details (`AuthKeyResponse`), resolves `null` when Solwyn does not answer, and throws
+`ApiKeyRefusedError` on any refusal.
+
+If Solwyn does not answer the automatic check, calls follow the usual outage posture and the SDK
+retries every 30 seconds. Cached allows and leases taken before a check pins the project id, or
+before a refusal or a recovery, are dropped at that moment, because they may belong to another
+project or key state. A refusal is stored and checked first on every call, before cached
+allows, leases, the control-plane breaker and `failOpen`. A refusal only tightens: a 401 blocks
+at its status, and only a key check sent after the refusal can relax or clear it. The SDK sends one
+immediately after a 401, then every 60 seconds after an answer that refuses (a 401, or a 200 for a
+read-only key), or every 5 seconds when the check gets no answer at all. Unmetered calls drive the same schedule as
+budget checks, so a client that only uses unmetered methods still recovers. A refusal stops every call
+admitted after it is recorded; a call already admitted may complete (for example a request the
+provider SDK is still preparing, or a chat message already queued behind another one). Any
+refusal from another response, even an identical one and from the moment its 401 status arrives,
+is newer than a key check already in flight, so that check cannot relax or clear it. While a refusal is stored, that key check is the
+only request the SDK sends to Solwyn; queued usage, metadata and reports are dropped locally and
+counted as `api_key_refused`. A successful key check clears the refusal and traffic resumes. See the README section on API keys and projects
+for which refusals block and which let calls run unmetered.

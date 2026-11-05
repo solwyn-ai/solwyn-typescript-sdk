@@ -137,8 +137,8 @@ try {
         'new OpenAI({ apiKey: "synthetic-unused", maxRetries: 0, fetch: transport.fetch })',
       );
       replace(
-        '{ apiKey: process.env["SOLWYN_API_KEY"]! }',
-        '{ apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, onUnmetered: "raise" }',
+        '{\n  apiKey: process.env["SOLWYN_API_KEY"]!,\n  project: process.env["SOLWYN_PROJECT"]!,\n}',
+        '{ apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, onUnmetered: "raise" }',
       );
       runtimeSource = `import { FakeControlPlane } from "@solwyn/sdk/testing";\nimport { createAgentsTransport } from "./openai-agents-transport.mjs";\nexport const plane = new FakeControlPlane();\nexport const transport = createAgentsTransport([{kind:"tool",name:"transfer_to_Specialist"},{kind:"tool",name:"lookup"},{kind:"text"}]);\n${runtimeSource}`;
       fs.writeFileSync(path.join(consumerRoot, "recipe-runtime.mjs"), emit(runtimeSource));

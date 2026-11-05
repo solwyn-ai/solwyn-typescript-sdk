@@ -18,9 +18,10 @@ import {
   setRunControlClockForTest,
 } from "../../src/run-control";
 import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const CHECK_URL = `${API_URL}/api/v1/budgets/check`;
 const LEASE_URL = `${API_URL}/api/v1/budgets/lease`;
 const RENEW_URL = `${API_URL}/api/v1/budgets/lease/renew`;
@@ -137,6 +138,7 @@ function enforcer(
   overrides: Partial<BudgetEnforcerOptions> = {},
 ): BudgetEnforcer {
   return new BudgetEnforcer({
+    binding: testBinding(),
     apiUrl: API_URL,
     apiKey: API_KEY,
     fetch,
@@ -1336,6 +1338,8 @@ describe("BudgetEnforcer lease directive fences", () => {
       },
       { leaseEnabled: true },
     );
+    // Validate first: the first pin drops any authority installed before it.
+    await budget.binding.validate();
     expect(
       internal(budget).leaseLedger.applyGrantResponse(
         "run-b",

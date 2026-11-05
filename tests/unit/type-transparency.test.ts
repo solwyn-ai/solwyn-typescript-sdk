@@ -5,7 +5,7 @@ import { __resetAdapterRegistry, __setAdapterLoadersForTesting } from "../../src
 import { buildRuntimes } from "../../src/registry";
 import type { FetchLike } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const CUSTOM_INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
 class FakeOpenAI {

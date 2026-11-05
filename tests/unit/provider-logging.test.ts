@@ -90,7 +90,7 @@ it("passes the Solwyn logger to adapters on lazy initialization", async () => {
       chat: { completions: { create: async (_params: unknown) => ({}) } },
     },
     {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       provider: "openai_compatible",
       fetch,
       leaseEnabled: false,

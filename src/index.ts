@@ -7,7 +7,7 @@
  * here — importing this entry must never pull in `node:*`.
  */
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 // Budget enforcement surface (pre-flight check + sans-I/O settlement builder).
 export {
@@ -38,6 +38,8 @@ export {
   resolveConfig,
   type SolwynConfig,
   type SolwynConfigOptions,
+  validateApiKeyFormat,
+  validateProjectSelector,
   validateProviderChain,
 } from "./config";
 export type {
@@ -52,6 +54,8 @@ export type {
 export { coverage } from "./coverage";
 // Typed error hierarchy.
 export {
+  ApiKeyRefusedError,
+  type ApiKeyRefusedErrorOptions,
   BudgetExceededError,
   ConfigurationError,
   CoverageMismatchError,
@@ -116,6 +120,8 @@ export type { FetchLike } from "./transport";
 export { LEASE_GRANT_PATH, LEASE_RENEW_PATH, LEASE_SURRENDER_PATH } from "./transport";
 // Wire-model interfaces + enums (snake_case fields).
 export type {
+  ApiKeyScope,
+  AuthKeyResponse,
   BudgetCheckRequest,
   BudgetCheckResponse,
   BudgetConfirmRequest,
@@ -140,8 +146,19 @@ export type {
   ServiceTier,
   VelocityFlag,
 } from "./types";
-export { BUDGET_MODES, CALL_STATUSES, CIRCUIT_STATES, MODALITIES, PROVIDER_NAMES } from "./types";
 export {
+  API_KEY_PATTERN,
+  BUDGET_MODES,
+  CALL_STATUSES,
+  CIRCUIT_STATES,
+  MODALITIES,
+  PROJECT_ECHO_HEADER,
+  PROJECT_HEADER,
+  PROJECT_SELECTOR_PATTERN,
+  PROVIDER_NAMES,
+} from "./types";
+export {
+  AuthKeyResponseSchema,
   LeaseGrantRequestObjectSchema,
   LeaseGrantRequestSchema,
   LeaseGrantResponseSchema,

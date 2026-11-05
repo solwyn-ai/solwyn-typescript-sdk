@@ -30,7 +30,8 @@ const rawClients = [0, 1].map(() => ({
 const clients = [esm, cjs].map(
   (sdk, index) =>
     new sdk.Solwyn(rawClients[index], {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
+      project: "test-project",
       provider: "openai",
       model: "gpt-4o-mini",
       onUnmetered: "warn",

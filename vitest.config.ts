@@ -7,6 +7,6 @@ export default defineConfig({
     // they run separately via `pnpm test:dist` (see `vitest.dist.config.ts`).
     exclude: ["tests/dist/**", "node_modules/**"],
     environment: "node",
-    setupFiles: ["tests/helpers/ingest-contract.ts"],
+    setupFiles: ["tests/helpers/project-env.ts", "tests/helpers/ingest-contract.ts"],
   },
 });

@@ -3,8 +3,11 @@
  *
  * Responsibilities (and nothing more):
  * - Normalize the base URL (strip trailing `/`), append the endpoint path.
- * - Attach the two required auth headers (`Authorization: Bearer <key>` +
- *   `Content-Type: application/json`) to every request (wire-contract.md).
+ * - Attach the auth headers (`Authorization: Bearer <key>`, `Solwyn-Project`, and
+ *   `Content-Type: application/json` on bodies) to every request, capturing the project
+ *   binding's generation at dispatch so a delayed answer cannot weaken a newer refusal.
+ * - Classify every 400/401/403/404 body for an API-key or project refusal and record it on
+ *   the binding before the error leaves this module.
  * - Serialize the request body to JSON.
  * - Enforce a per-request timeout via `AbortController` (web-standard; no
  *   `node:*` — edge-safe core).
@@ -28,7 +31,9 @@
  * The `fetch` implementation is injectable so unit tests stay fully offline.
  */
 
+import { classify, isClassifiedStatus, type Refusal } from "./api-key-errors";
 import { ConfigurationError } from "./errors";
+import { PROJECT_HEADER } from "./types";
 
 /** The exact endpoint paths, relative to the (trailing-slash-stripped) base URL. */
 export const BUDGET_CHECK_PATH = "/api/v1/budgets/check";
@@ -76,6 +81,7 @@ export function requireFetchLike(fetch: unknown): asserts fetch is FetchLike | u
 
 type TransportErrorLabel =
   | "TransportError"
+  | "TransportRefusedError"
   | "TransportHttpError"
   | "TransportTimeoutError"
   | "TransportNetworkError";
@@ -111,19 +117,35 @@ export class TransportError extends Error {
  */
 export class TransportHttpError extends TransportError {
   readonly status: number;
-  readonly marker: "read_only_key" | undefined;
+  /** A classified refusal of the API key or its project; allowlisted facts only. */
+  readonly refusal: Refusal | undefined;
   readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, marker?: "read_only_key", retryAfterMs?: number) {
+  constructor(status: number, refusal?: Refusal, retryAfterMs?: number) {
     super(`HTTP ${status}`);
     this.name = "TransportHttpError";
     this.status = status;
-    this.marker = marker;
+    this.refusal = refusal;
     this.retryAfterMs = retryAfterMs;
     transportFailures.set(this, {
       label: "TransportHttpError",
       retryable: status === 408 || status === 429 || status >= 500,
     });
+  }
+}
+
+/**
+ * Not sent: the API key or project is refused, and while it is, nothing but the key check goes
+ * to Solwyn. Carries the stored refusal so callers drop the item as refused, without retry.
+ */
+export class TransportRefusedError extends TransportError {
+  readonly refusal: Refusal;
+
+  constructor(refusal: Refusal) {
+    super(`not sent: ${refusal.code}`);
+    this.name = "TransportRefusedError";
+    this.refusal = refusal;
+    transportFailures.set(this, { label: "TransportRefusedError", retryable: false });
   }
 }
 
@@ -173,6 +195,12 @@ export class TransportNetworkError extends TransportError {
 export interface TransportOptions {
   /** Injectable `fetch` (defaults to `globalThis.fetch`). */
   fetch?: FetchLike;
+  /** Project binding: supplies `Solwyn-Project` and receives classified refusals. */
+  binding?: RequestBinding;
+  /** Record a blocking refusal at a 401's status, before its body (default true). */
+  refuseAtStatus?: boolean;
+  /** Send nothing while the binding is refused (default true; off only for `/auth/key`). */
+  suppressWhileRefused?: boolean;
   /**
    * Max RETRIES (not attempts) for a single request. Default `0` — one attempt,
    * no retry. Retries apply only to transient failures and never exceed this cap
@@ -199,7 +227,11 @@ type JsonBodyReadResult =
  * Reads a successful response. `discard` hands the body to the detached drain;
  * a consumer that does not call it owns the body and must read it fully.
  */
-type ResponseConsumer<T> = (response: Response, discard: () => void) => T | Promise<T>;
+type ResponseConsumer<T> = (
+  response: Response,
+  discard: () => void,
+  generation: number,
+) => T | Promise<T>;
 
 /** Bytes an unused body may deliver before it is cancelled instead of drained. */
 const DISCARD_DRAIN_MAX_BYTES = 16 * 1024;
@@ -215,26 +247,102 @@ export function isRetryableTransportError(error: unknown): boolean {
   return transportFailure(error)?.retryable ?? false;
 }
 
-/** Inspect and discard a non-2xx body, retaining only the one allowlisted marker. */
-async function sanitizedHttpMarker(response: Response): Promise<"read_only_key" | undefined> {
-  if (response.status !== 403) {
-    return undefined;
+/** The API-key refusal carried by a transport failure, if any. */
+export function apiKeyRefusalOf(error: unknown): Refusal | undefined {
+  if (error instanceof TransportHttpError || error instanceof TransportRefusedError) {
+    return error.refusal;
+  }
+  return undefined;
+}
+
+/**
+ * Read a 400/401/403/404 body, bounded like the discard drain (16 KiB and `boundMs`), and keep
+ * only the classified refusal. A body that is too large, stalls past the bound, or fails to read
+ * is cancelled (the request is aborted) and classifies as unreadable: every 401 is still a
+ * refusal. The text itself is never retained.
+ */
+async function classifyHttpFailure(
+  response: Response,
+  controller: AbortController,
+  boundMs: number,
+): Promise<Refusal | undefined> {
+  return classify(response.status, await readBoundedText(response, controller, boundMs));
+}
+
+async function readBoundedText(
+  response: Response,
+  controller: AbortController,
+  boundMs: number,
+): Promise<string | null> {
+  let body: ReadableStream<Uint8Array> | null | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    body = response.body;
+    if (body === null || body === undefined) return "";
+    reader = body.getReader();
+  } catch {
+    controller.abort();
+    return null;
+  }
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.min(Math.max(0, boundMs), DISCARD_DRAIN_MAX_MS));
+    (timer as { unref?: () => void })?.unref?.();
+  });
+  const complete = (async (): Promise<boolean> => {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) return true;
+      const value: unknown = result.value;
+      if (!(value instanceof Uint8Array)) return false;
+      bytes += value.byteLength;
+      if (bytes > DISCARD_DRAIN_MAX_BYTES) return false;
+      chunks.push(value);
+    }
+  })().catch(() => false);
+  try {
+    if (!(await Promise.race([complete, expired]))) {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {
+        // A synchronously throwing cancel still ends in the abort below.
+      }
+      controller.abort();
+      return null;
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
   }
   try {
-    const payload: unknown = await response.json();
-    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-      return undefined;
-    }
-    const detail = (payload as Record<string, unknown>)["detail"];
-    if (typeof detail !== "object" || detail === null || Array.isArray(detail)) {
-      return undefined;
-    }
-    return (detail as Record<string, unknown>)["code"] === "read_only_key"
-      ? "read_only_key"
-      : undefined;
+    return new TextDecoder("utf-8", { fatal: true }).decode(joined);
   } catch {
-    return undefined;
+    return null;
   }
+}
+
+/**
+ * The project binding a transport reports to. `dispatch` captures the header value and the
+ * generation in one step; `refuse` records a classified refusal against that generation.
+ */
+export interface RequestBinding {
+  dispatch(): { readonly header: string; readonly generation: number };
+  /**
+   * Record a classified refusal. `ownStatus` is what `refuseAtStatus` returned for this same
+   * request; `keyCheck` marks the binding's own `/auth/key` answer.
+   */
+  refuse(refusal: Refusal, dispatched: number, ownStatus?: number, keyCheck?: boolean): void;
+  /** Record a blocking refusal the moment a 401 status arrives (unless one is stored). */
+  refuseAtStatus(): number;
+  /** The stored refusal while the key is refused (either effect); data-plane requests stop. */
+  suppressedBy(): Refusal | undefined;
 }
 
 /**
@@ -340,6 +448,9 @@ export class Transport {
   private readonly fetchImpl: FetchLike;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
+  private readonly binding: RequestBinding | null;
+  private readonly refuseAtStatusEnabled: boolean;
+  private readonly suppressWhileRefused: boolean;
 
   constructor(baseUrl: string, apiKey: string, options: TransportOptions = {}) {
     // Strip ALL trailing slashes (Python: `api_url.rstrip("/")`).
@@ -349,14 +460,45 @@ export class Transport {
     this.fetchImpl = injected ?? globalFetch;
     this.maxRetries = Math.max(0, options.maxRetries ?? 0);
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 100;
+    this.binding = options.binding ?? null;
+    this.refuseAtStatusEnabled = options.refuseAtStatus ?? true;
+    this.suppressWhileRefused = options.suppressWhileRefused ?? true;
   }
 
-  /** The two required headers, identical on every request. */
+  /**
+   * The request headers and the binding generation they were captured at. Called once per
+   * attempt, immediately before the fetch.
+   */
+  requestHeaders(withBody = true): { headers: Record<string, string>; generation: number } {
+    const headers: Record<string, string> = { Authorization: `Bearer ${this.apiKey}` };
+    if (withBody) headers["Content-Type"] = "application/json";
+    if (this.binding === null) return { headers, generation: 0 };
+    const { header, generation } = this.binding.dispatch();
+    headers[PROJECT_HEADER] = header;
+    return { headers, generation };
+  }
+
+  /** The current request headers (diagnostic and test seam; requests capture their own). */
   authHeaders(): Record<string, string> {
-    return {
-      Authorization: `Bearer ${this.apiKey}`,
-      "Content-Type": "application/json",
-    };
+    return this.requestHeaders().headers;
+  }
+
+  /**
+   * GET `path` and read its JSON body, returning the dispatch generation with it. Non-2xx,
+   * timeout and network failures throw the same typed errors as POSTs.
+   */
+  async getJson(
+    path: string,
+    options: RequestOptions,
+  ): Promise<{ read: JsonBodyReadResult; generation: number }> {
+    return this.requestWith("GET", path, undefined, options, async (response, _d, generation) => {
+      const text = await response.text();
+      try {
+        return { read: { parsed: true, value: JSON.parse(text) }, generation };
+      } catch (error) {
+        return { read: { parsed: false, error }, generation };
+      }
+    });
   }
 
   /**
@@ -366,7 +508,7 @@ export class Transport {
    * always privacy-safe (class name + status only).
    */
   async postJson(path: string, body: unknown, options: RequestOptions): Promise<void> {
-    return this.postJsonWith(path, body, options, (_response, discard) => {
+    return this.requestWith("POST", path, JSON.stringify(body), options, (_response, discard) => {
       discard();
     });
   }
@@ -382,7 +524,7 @@ export class Transport {
     body: unknown,
     options: RequestOptions,
   ): Promise<JsonBodyReadResult> {
-    return this.postJsonWith(path, body, options, async (response) => {
+    return this.requestWith("POST", path, JSON.stringify(body), options, async (response) => {
       // Read completion is the boundary between transport I/O and JSON contract drift.
       const text = await response.text();
       try {
@@ -393,20 +535,20 @@ export class Transport {
     });
   }
 
-  private async postJsonWith<T>(
+  private async requestWith<T>(
+    method: "GET" | "POST",
     path: string,
-    body: unknown,
+    payload: string | undefined,
     options: RequestOptions,
     consume: ResponseConsumer<T>,
   ): Promise<T> {
     const url = joinApiUrl(this.baseUrl, path);
-    const payload = JSON.stringify(body);
     const attempts = this.maxRetries + 1;
 
     let lastError: unknown;
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
-        return await this.attempt(url, payload, options, consume);
+        return await this.attempt(method, url, payload, options, consume);
       } catch (error) {
         lastError = error;
         const isLast = attempt === attempts - 1;
@@ -427,11 +569,15 @@ export class Transport {
   }
 
   private async attempt<T>(
+    method: "GET" | "POST",
     url: string,
-    payload: string,
+    payload: string | undefined,
     options: RequestOptions,
     consume: ResponseConsumer<T>,
   ): Promise<T> {
+    // While the key is refused, nothing but the key check goes to Solwyn.
+    const suppressed = this.suppressWhileRefused ? this.binding?.suppressedBy() : undefined;
+    if (suppressed !== undefined) throw new TransportRefusedError(suppressed);
     const controller = new AbortController();
     const deadline = monotonicNow() + options.timeoutMs;
     const discard = (response: Response) =>
@@ -476,12 +622,11 @@ export class Transport {
 
     try {
       const operation = (async () => {
-        const response = await this.fetchImpl(url, {
-          method: "POST",
-          headers: this.authHeaders(),
-          body: payload,
-          signal: controller.signal,
-        });
+        // Headers and the dispatch generation are captured together, right before the fetch.
+        const { headers, generation } = this.requestHeaders(payload !== undefined);
+        const init: RequestInit = { method, headers, signal: controller.signal };
+        if (payload !== undefined) init.body = payload;
+        const response = await this.fetchImpl(url, init);
         if (abandoned) {
           // An abort-ignoring fetch resolved after the attempt already failed.
           discardResponseBody(response, controller, 0);
@@ -494,18 +639,28 @@ export class Transport {
           } catch {
             // Custom fetch responses may lack a usable headers interface.
           }
-          const failure = new TransportHttpError(
-            response.status,
-            await sanitizedHttpMarker(response),
-            retryAfterMs,
-          );
+          const classified = isClassifiedStatus(response.status);
+          // Every 401 refuses, whatever its body: block now, synchronously at the status, so a
+          // timeout or cancellation that beats a stalled body can never reach the outage posture.
+          const ownStatus =
+            response.status === 401 && this.refuseAtStatusEnabled
+              ? this.binding?.refuseAtStatus()
+              : undefined;
+          const refusal = classified
+            ? await classifyHttpFailure(response, controller, deadline - monotonicNow())
+            : undefined;
+          // The classified refusal may only tighten what the status recorded (generation fencing).
+          if (refusal !== undefined) {
+            this.binding?.refuse(refusal, generation, ownStatus, !this.refuseAtStatusEnabled);
+          }
+          const failure = new TransportHttpError(response.status, refusal, retryAfterMs);
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.
-          // A 403 body was consumed by the marker read; anything else is drained.
-          if (response.status !== 403) discard(response);
+          // A classified body was consumed by the refusal read; anything else is drained.
+          if (!classified) discard(response);
           throw failure;
         }
-        return consume(response, () => discard(response));
+        return consume(response, () => discard(response), generation);
       })();
       return await Promise.race([operation, timeout, externalAbort]);
     } catch (error) {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FakeControlPlane } from "../../src/testing/index";
+import { planeHeaders } from "../helpers/project-binding";
 
 const INGEST_PATH = "/api/v1/metadata/ingest";
 
@@ -22,6 +23,7 @@ function event(index: number, overrides: Record<string, unknown> = {}): Record<s
 
 async function post(plane: FakeControlPlane, body: unknown): Promise<Response> {
   return plane.fetch(`${plane.apiUrl}${INGEST_PATH}`, {
+    headers: planeHeaders(plane),
     method: "POST",
     body: JSON.stringify(body),
   });

@@ -1,4 +1,5 @@
 export {
+  assertAuthKeyContract,
   assertCheckContract,
   assertConfirmContract,
   assertLeaseContract,

@@ -6,6 +6,7 @@ import { noopLogger, Solwyn } from "../../src/index";
 import { MetadataReporter } from "../../src/reporter";
 import { FakeControlPlane } from "../../src/testing";
 import type { MetadataEvent } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 afterEach(() => vi.useRealTimers());
 
@@ -145,6 +146,7 @@ describe("remediation: timestamps survive legacy ingest identity", () => {
     freezeClock();
     const plane = new FakeControlPlane();
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: testBinding(),
       fetch: plane.fetch,
       maxQueueSize: 1,
       sdkInstanceId: "timestamp-replay",
@@ -181,6 +183,7 @@ describe("remediation: timestamps survive legacy ingest identity", () => {
     const attempts: MetadataEvent[][] = [];
     let now = 0;
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: testBinding(),
       logger: noopLogger,
       retryBackoffBase: 1,
       retryBackoffCap: 1,

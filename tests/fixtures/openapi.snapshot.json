@@ -39,7 +39,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -112,7 +112,7 @@
       "post": {
         "tags": ["budgets"],
         "summary": "Budget Confirm",
-        "description": "Confirm actual cost for the authority that funded one served call.\n\nThe body names EXACTLY ONE funding source (wire-enforced): a\n``reservation_id`` from the legacy per-call check, or the ``lease_id`` the\ncall drew its tokens from. A lease-funded confirm has no reservation to look\nup — the lease itself is the ownership proof, bound to the caller's project\ninside the settlement — so it skips the reservation choreography entirely.\n\n``body.provider`` and ``body.is_provider_fallback`` are the *served*\nfailover attribution. They are accepted but **not persisted here** — the\ndurable served attribution is written via the metadata-ingest path onto\n``cost_events`` (see ``metadata_ingest._store_cost_event``). Confirm only\nsettles the Redis budget counter, so it has nothing to attribute them to.",
+        "description": "Confirm actual cost for the authority that funded one served call.\n\nThe body names EXACTLY ONE funding source (wire-enforced): a\n``reservation_id`` from the legacy per-call check, or the ``lease_id`` the\ncall drew its tokens from. A lease-funded confirm has no reservation to look\nup — the lease itself is the ownership proof, bound to the caller's project\ninside the settlement — so it skips the reservation choreography entirely.\n\n``body.provider`` and ``body.is_provider_fallback`` are the *served*\nfailover attribution. The durable served attribution is written via the\nmetadata-ingest path onto ``cost_events`` (see\n``metadata_ingest._store_cost_event``). An ordinary per-call confirm only\nsettles the Redis budget counter. Two per-call confirms also write a\ndurable receipt (migration 0036), which nets against the call's events as\nmax(receipt, events): one whose ``token_details.is_estimated`` is set (an\nSDK hard-deny floor for a call it could not measure), and one arriving\nafter its reservation's 300 s hold, which is charged instead of 404ing for\nup to ``LATE_CONFIRM_WINDOW_SECONDS`` after the check. A reservation id\nnever issued to this project is still 404.",
         "operationId": "budget_confirm_api_v1_budgets_confirm_post",
         "requestBody": {
           "content": {
@@ -135,7 +135,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -287,7 +287,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -350,7 +350,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -470,7 +470,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -571,7 +571,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -679,7 +679,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -777,7 +777,7 @@
                 "schema": {
                   "anyOf": [
                     {
-                      "$ref": "#/components/schemas/ReadOnlyKeyErrorResponse"
+                      "$ref": "#/components/schemas/ApiKeyErrorResponse"
                     },
                     {
                       "$ref": "#/components/schemas/StringDetailErrorResponse"
@@ -800,10 +800,259 @@
           }
         }
       }
+    },
+    "/api/v1/auth/key": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Get Authenticated Key",
+        "description": "Read the supplied key and the project named in Solwyn-Project.\n\nAPI keys only (sessions and CLI logins get 403 ``api_key_required``), and,\nlike every key request, the ``Solwyn-Project`` header is required. SDKs pin\nthe returned ``project_id``. Authentication may perform its normal\nlast-used bookkeeping. Scope is not a promise that a later write will pass\nits own authorization, entitlement or budget checks.",
+        "operationId": "get_authenticated_key_api_v1_auth_key_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthKeyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
     "schemas": {
+      "ApiKeyErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "api_key_invalid",
+              "api_key_expired",
+              "api_key_not_allowed",
+              "project_selector_required",
+              "project_not_found",
+              "project_selector_conflict",
+              "key_not_dedicated",
+              "read_only_key"
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "project_budget_mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["hard_deny", "alert_only"]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Budget Mode",
+            "description": "401 only: whether the named project promises to block anything (hard_deny when its mode, or any unpaused hard rule on it, is hard_deny). null when there is no key, no selector, or no matching project."
+          },
+          "expired_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expired At"
+          },
+          "api_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key Id"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["url_mismatch", "multiple_headers"]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          }
+        },
+        "type": "object",
+        "required": ["code", "message"],
+        "title": "ApiKeyErrorDetail",
+        "description": "Every refusal on the API-key path (``detail`` of the error body)."
+      },
+      "ApiKeyErrorResponse": {
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ApiKeyErrorDetail"
+          }
+        },
+        "type": "object",
+        "required": ["detail"],
+        "title": "ApiKeyErrorResponse"
+      },
+      "AuthKeyResponse": {
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "title": "Account Id",
+            "description": "Account that owns the key."
+          },
+          "key_id": {
+            "type": "string",
+            "title": "Key Id"
+          },
+          "key_prefix": {
+            "type": "string",
+            "title": "Key Prefix",
+            "description": "First 26 characters of the key, for display."
+          },
+          "key_name": {
+            "type": "string",
+            "title": "Key Name"
+          },
+          "scope": {
+            "type": "string",
+            "enum": ["full", "read_only"],
+            "title": "Scope",
+            "description": "Scope of the supplied key, not of its replacement."
+          },
+          "created_via": {
+            "type": "string",
+            "enum": ["dashboard", "cli"],
+            "title": "Created Via"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          },
+          "rotation_grace_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rotation Grace Until"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id",
+            "description": "Project resolved from Solwyn-Project."
+          },
+          "project_name": {
+            "type": "string",
+            "title": "Project Name"
+          },
+          "budget_mode": {
+            "type": "string",
+            "enum": ["alert_only", "hard_deny"],
+            "title": "Budget Mode"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "account_id",
+          "key_id",
+          "key_prefix",
+          "key_name",
+          "scope",
+          "created_via",
+          "expires_at",
+          "rotation_grace_until",
+          "project_id",
+          "project_name",
+          "budget_mode"
+        ],
+        "title": "AuthKeyResponse",
+        "description": "``GET /api/v1/auth/key``: the supplied API key and the project it resolved.\n\nThe project is the one the request named in ``Solwyn-Project``; an SDK pins\n``project_id`` from this response and sends it on every later request, so a\nproject rename never breaks a running client."
+      },
       "BreakerReportAccepted": {
         "properties": {
           "accepted": {
@@ -902,8 +1151,14 @@
           },
           "estimated_output_bound": {
             "anyOf": [
-              { "type": "integer", "maximum": 100000000, "minimum": 0.0 },
-              { "type": "null" }
+              {
+                "type": "integer",
+                "maximum": 100000000,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
             ],
             "title": "Estimated Output Bound",
             "description": "Maximum number of output tokens the pending call can produce. When present, the server reserves input cost plus this bound at the model's output rate. When omitted, the reservation keeps the legacy estimate, which prices output as equal to input."
@@ -1048,7 +1303,7 @@
           },
           "mode": {
             "$ref": "#/components/schemas/BudgetMode",
-            "description": "Current budget enforcement mode"
+            "description": "Effective enforcement mode for this call: hard_deny when any counter that applies to it enforces (a hard_deny project, or an applicable scoped hard_deny rule or hard run cap on an alert_only project), alert_only otherwise. SDKs cap an uncapped call's output only under hard_deny."
           },
           "budget_limit": {
             "type": "number",
@@ -1075,7 +1330,7 @@
           "project_id": {
             "type": "string",
             "title": "Project Id",
-            "description": "Project identifier resolved from the API key"
+            "description": "Project identifier resolved from Solwyn-Project"
           },
           "price_hints": {
             "anyOf": [
@@ -2424,32 +2679,6 @@
         "title": "RateLimitErrorResponse",
         "description": "429 body shared by ingest and budget-plane admission; the SDK parses it."
       },
-      "ReadOnlyKeyErrorDetail": {
-        "properties": {
-          "code": {
-            "type": "string",
-            "const": "read_only_key",
-            "title": "Code"
-          },
-          "message": {
-            "type": "string",
-            "title": "Message"
-          }
-        },
-        "type": "object",
-        "required": ["code", "message"],
-        "title": "ReadOnlyKeyErrorDetail"
-      },
-      "ReadOnlyKeyErrorResponse": {
-        "properties": {
-          "detail": {
-            "$ref": "#/components/schemas/ReadOnlyKeyErrorDetail"
-          }
-        },
-        "type": "object",
-        "required": ["detail"],
-        "title": "ReadOnlyKeyErrorResponse"
-      },
       "RunControlDirective": {
         "properties": {
           "version": {
@@ -2596,6 +2825,46 @@
             "description": "Tokens used for tool/function definitions (Google)",
             "default": 0
           },
+          "compaction_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Compaction Input Tokens",
+            "description": "Anthropic compaction iteration input — a SUBSET of input_tokens, normalized like it (uncached input + cache reads + cache writes of every compaction iteration). The provider bills compaction but excludes it from top-level usage; the SDK folds it into input_tokens (which prices it) and reports the share here for attribution.",
+            "default": 0
+          },
+          "compaction_cached_input_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Compaction Cached Input Tokens",
+            "description": "Compaction cache reads — a SUBSET of cached_input_tokens and of compaction_input_tokens.",
+            "default": 0
+          },
+          "compaction_cache_creation_5m_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Compaction Cache Creation 5M Tokens",
+            "description": "Compaction 5-minute cache writes — a SUBSET of cache_creation_5m_tokens and of compaction_input_tokens.",
+            "default": 0
+          },
+          "compaction_cache_creation_1h_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Compaction Cache Creation 1H Tokens",
+            "description": "Compaction 1-hour cache writes — a SUBSET of cache_creation_1h_tokens and of compaction_input_tokens.",
+            "default": 0
+          },
+          "compaction_output_tokens": {
+            "type": "integer",
+            "maximum": 100000000,
+            "minimum": 0.0,
+            "title": "Compaction Output Tokens",
+            "description": "Compaction iteration output — a SUBSET of output_tokens.",
+            "default": 0
+          },
           "is_estimated": {
             "type": "boolean",
             "title": "Is Estimated",
@@ -2606,7 +2875,7 @@
         "additionalProperties": false,
         "type": "object",
         "title": "TokenDetails",
-        "description": "Normalized token usage breakdown for one LLM call.\n\nProvider adapters populate whichever fields their API exposes; the rest\nstay at 0.  The API uses this struct to compute exact costs rather than\ntrusting SDK-side estimates.\n\nNormalization contract: ``input_tokens`` includes uncached input, cached\ninput reads, and cache-creation writes.  PricingService subtracts cached\nbuckets from ``input_tokens`` to derive uncached input, so provider adapters\nmust not send \"uncached only\" input totals.\n\nNesting contract: ``image_input_tokens`` and ``audio_input_tokens`` are\nSUBSETS of ``input_tokens``; ``image_output_tokens`` and\n``audio_output_tokens`` are SUBSETS of ``output_tokens`` (probed live\n2026-07-10: an images.edit response reported input_tokens=222 with\nimage_tokens=194 in ``input_tokens_details``; the audio buckets come from\nthe same per-modality sub-objects — OpenAI's\n``prompt_tokens_details.audio_tokens`` / ``completion_tokens_details.audio_tokens``\nand Google's AUDIO ``ModalityTokenCount`` entries). These mirror the existing\n``reasoning_tokens`` ⊂ ``output_tokens`` relationship — DOCUMENTED semantics,\nNOT validator-enforced (reasoning is likewise unenforced). The only enforced\nsubset invariant is the cache-bucket one below; image and audio tokens\ndeliberately do not participate in it.\n\nPricingService derives every text remainder from these subsets\n(``input_tokens − image_input_tokens − audio_input_tokens`` on the uncached\nslice, and the output mirror), so an adapter MUST report the inclusive\nchannel total. Sending an audio count beside a zeroed ``input_tokens`` /\n``output_tokens`` under-bills the call; sending it on top of a text-only\ntotal double-bills it."
+        "description": "Normalized token usage breakdown for one LLM call.\n\nProvider adapters populate whichever fields their API exposes; the rest\nstay at 0.  The API uses this struct to compute exact costs rather than\ntrusting SDK-side estimates.\n\nNormalization contract: ``input_tokens`` includes uncached input, cached\ninput reads, and cache-creation writes.  PricingService subtracts cached\nbuckets from ``input_tokens`` to derive uncached input, so provider adapters\nmust not send \"uncached only\" input totals.\n\nNesting contract: ``image_input_tokens`` and ``audio_input_tokens`` are\nSUBSETS of ``input_tokens``; ``image_output_tokens`` and\n``audio_output_tokens`` are SUBSETS of ``output_tokens`` (probed live\n2026-07-10: an images.edit response reported input_tokens=222 with\nimage_tokens=194 in ``input_tokens_details``; the audio buckets come from\nthe same per-modality sub-objects — OpenAI's\n``prompt_tokens_details.audio_tokens`` / ``completion_tokens_details.audio_tokens``\nand Google's AUDIO ``ModalityTokenCount`` entries). These mirror the existing\n``reasoning_tokens`` ⊂ ``output_tokens`` relationship — DOCUMENTED semantics,\nNOT validator-enforced (reasoning is likewise unenforced). The only enforced\nsubset invariant is the cache-bucket one below; image and audio tokens\ndeliberately do not participate in it.\n\nPricingService derives every text remainder from these subsets\n(``input_tokens − image_input_tokens − audio_input_tokens`` on the uncached\nslice, and the output mirror), so an adapter MUST report the inclusive\nchannel total. Sending an audio count beside a zeroed ``input_tokens`` /\n``output_tokens`` under-bills the call; sending it on top of a text-only\ntotal double-bills it.\n\nCompaction contract: the five ``compaction_*`` buckets are SUBSETS of\ntheir parent buckets (``compaction_input_tokens`` ⊂ ``input_tokens``,\neach compaction cache bucket ⊂ both its parent cache bucket and\n``compaction_input_tokens``, ``compaction_output_tokens`` ⊂\n``output_tokens``). They carry Anthropic's server-side compaction\niterations (beta ``usage.iterations`` entries of type ``compaction``),\nwhich the provider bills but leaves OUT of its top-level usage, so the\nadapter adds them into the parent buckets and reports the share here.\nPricingService prices the INCLUSIVE parents: the compaction share bills at\nthe request model's rates and the context card is selected on the whole\nrequest's input (Anthropic: \"A request's prompt length counts all of its\ninput tokens\"). Whole-request tiering is Core's CONSERVATIVE policy, not a\nverified Anthropic rule: per-iteration tiering is unspecified, and on a\nprompt-length-tiered card (Haiku 5.5) whole-request tiering can overstate a\nrequest whose iterations each sit below the bound — it never understates.\nThe subsets are attribution; because several compactions in one request\ncollapse into one share, they allow re-pricing the compaction/remainder\nsplit but cannot reconstruct each iteration for exact historical re-tiering.\nThey are validator-enforced so stored rows always partition cleanly."
       },
       "UnknownModelError422Response": {
         "properties": {

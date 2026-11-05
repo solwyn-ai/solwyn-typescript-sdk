@@ -1116,7 +1116,7 @@ describe("coverage", () => {
     },
   ])("reports constructor-accepted partial $provider graphs", async ({ rawClient, surface }) => {
     const wrapper = new Solwyn(rawClient, {
-      apiKey: `sk_proj_${"a".repeat(64)}`,
+      apiKey: `solwyn_sk_${"a".repeat(64)}`,
       model: "test-model",
       fetch: operationMustNotRun,
     });

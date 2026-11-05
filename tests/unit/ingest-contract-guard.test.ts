@@ -8,7 +8,7 @@ import {
 } from "../helpers/ingest-contract";
 
 const reporter = () =>
-  new MetadataReporter("https://api.solwyn.test", `sk_proj_${"0".repeat(64)}`, {
+  new MetadataReporter("https://api.solwyn.test", `solwyn_sk_${"0".repeat(64)}`, {
     logger: noopLogger,
   });
 
@@ -39,7 +39,7 @@ it("detects ingest drift after the reporter module is reloaded", async () => {
   const { MetadataReporter: ReloadedReporter } = await import("../../src/reporter");
   expect(ReloadedReporter).not.toBe(MetadataReporter);
   installIngestContractGuard(ReloadedReporter);
-  const reloaded = new ReloadedReporter("https://api.solwyn.test", `sk_proj_${"0".repeat(64)}`, {
+  const reloaded = new ReloadedReporter("https://api.solwyn.test", `solwyn_sk_${"0".repeat(64)}`, {
     logger: noopLogger,
   });
   reloaded._parseIngestRejections({ ingested: 1, rejected: [] }, 1);

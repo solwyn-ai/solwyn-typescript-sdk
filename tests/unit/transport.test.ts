@@ -11,7 +11,7 @@ import {
   TransportTimeoutError,
 } from "../../src/transport";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 interface RecordedCall {
   url: string;

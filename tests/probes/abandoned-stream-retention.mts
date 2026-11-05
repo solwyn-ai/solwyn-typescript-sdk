@@ -5,6 +5,7 @@ import { MetadataReporter } from "../../src/reporter";
 import { LatencyTracker } from "../../src/routing";
 import { getCurrentRun } from "../../src/run-context";
 import type { FetchLike } from "../../src/transport";
+import { authKeyResponse } from "../helpers/project-binding";
 import { alive, collectUntil } from "./gc.mjs";
 
 const lifetimes: WeakRef<object>[] = [];
@@ -37,6 +38,7 @@ let grants = 0;
 // Alert-only: on hard_deny an abandoned stream keeps its claim at the floor
 // (tests/unit/hard-deny-funding.test.ts); this probe pins finalization at observed usage.
 const fetch: FetchLike = async (url, init) => {
+  if (url.endsWith("/api/v1/auth/key")) return authKeyResponse();
   const body = JSON.parse(String(init?.body ?? "null"));
   if (url.endsWith("/budgets/lease"))
     return Response.json({
@@ -74,7 +76,8 @@ const fetch: FetchLike = async (url, init) => {
   return new Response(null, { status: 204 });
 };
 const options = {
-  apiKey: `sk_proj_${"0".repeat(64)}`,
+  apiKey: `solwyn_sk_${"0".repeat(64)}`,
+  project: "test-project",
   fetch,
   logger: noopLogger,
   velocityMode: "off" as const,

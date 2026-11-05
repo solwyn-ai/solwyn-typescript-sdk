@@ -41,7 +41,10 @@ import {
 import { Solwyn } from "@solwyn/sdk/node";
 import { SolwynAgents, solwynToolErrorFunction } from "@solwyn/sdk/openai-agents";
 
-const client = new Solwyn(new OpenAI({ maxRetries: 0 }), { apiKey: process.env["SOLWYN_API_KEY"]! });
+const client = new Solwyn(new OpenAI({ maxRetries: 0 }), {
+  apiKey: process.env["SOLWYN_API_KEY"]!,
+  project: process.env["SOLWYN_PROJECT"]!,
+});
 // The proxy preserves OpenAI at runtime; this cast accommodates OpenAI's private-field types.
 setDefaultOpenAIClient(client as unknown as OpenAI);
 setOpenAIAPI("chat_completions");
@@ -82,7 +85,8 @@ try {
 }
 ```
 
-Your OpenAI client reads `OPENAI_API_KEY`; Solwyn uses `SOLWYN_API_KEY` for the control plane.
+Your OpenAI client reads `OPENAI_API_KEY`; Solwyn uses `SOLWYN_API_KEY` and `SOLWYN_PROJECT` (a project
+name or `proj_` id) for the control plane.
 Provider traffic goes directly to OpenAI. Setting the
 framework's default client also keeps separately configured side runs on a wrapped client;
 it does not admit those runs for this integration's attribution.

@@ -9,7 +9,7 @@ import {
 import { IngestResponseSchema, LeaseRenewRequestSchema } from "../../src/validation";
 import { allowIngestContractDrift } from "../helpers/ingest-contract";
 
-const API_KEY = `sk_proj_${"a".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 describe("settlement wire contract", () => {
   it("requires duplicates and validates every duplicate as a strict disposition", () => {

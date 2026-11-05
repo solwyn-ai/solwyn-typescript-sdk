@@ -10,8 +10,9 @@ import {
   type SolwynConfigOptions,
 } from "../../src/index";
 import { MetadataReporter } from "../../src/reporter";
+import { testBinding } from "../helpers/project-binding";
 
-const API_KEY = `sk_proj_${"0".repeat(64)}`;
+const API_KEY = `solwyn_sk_${"0".repeat(64)}`;
 
 function expectInvalidFetch(construct: () => unknown): void {
   let thrown: unknown;
@@ -63,6 +64,7 @@ describe("fetch construction seam", () => {
     expectInvalidFetch(
       () =>
         new BudgetEnforcer({
+          binding: testBinding(),
           apiKey: API_KEY,
           apiUrl: "http://control-plane.invalid",
           fetch: 42 as unknown as FetchLike,
@@ -92,6 +94,7 @@ describe("fetch construction seam", () => {
       expectInvalidFetch(
         () =>
           new BudgetEnforcer({
+            binding: testBinding(),
             apiKey: API_KEY,
             apiUrl: "http://control-plane.invalid",
             fetch: value as unknown as FetchLike,
@@ -115,6 +118,7 @@ describe("fetch construction seam", () => {
 
   it("accepts explicit undefined at all three constructors", async () => {
     const budget = new BudgetEnforcer({
+      binding: testBinding(),
       apiKey: API_KEY,
       apiUrl: "http://control-plane.invalid",
       fetch: undefined,

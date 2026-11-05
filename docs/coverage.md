@@ -69,6 +69,7 @@ import { coverage, type CoverageFingerprint, Solwyn } from "@solwyn/sdk";
 
 const client = new Solwyn(new OpenAI(), {
   apiKey: process.env.SOLWYN_API_KEY!,
+  project: process.env.SOLWYN_PROJECT!,
   acknowledgeUntracked: [],
   onUnmetered: "raise",
 });

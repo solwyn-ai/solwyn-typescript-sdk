@@ -33,9 +33,14 @@ const noopLogger = {
   error() {},
 };
 const fetchStub = async () => new Response("[]", { status: 202 });
-const apiKey = `sk_proj_${"a".repeat(64)}`;
+const apiKey = `solwyn_sk_${"a".repeat(64)}`;
 
-const handle = createSolwynMiddleware({ apiKey, fetch: fetchStub, logger: noopLogger });
+const handle = createSolwynMiddleware({
+  apiKey,
+  project: "test-project",
+  fetch: fetchStub,
+  logger: noopLogger,
+});
 
 const hasWrapGenerate = typeof handle?.middleware?.wrapGenerate === "function";
 const hasWrapStream = typeof handle?.middleware?.wrapStream === "function";

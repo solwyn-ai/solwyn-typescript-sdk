@@ -70,7 +70,7 @@ import { observeEvaluatedProperty } from "./surface-graph";
 import { guardedSurfaceDescriptor } from "./surface-guard";
 import type { SurfaceDialect } from "./surfaces";
 import { buildReportedTokenDetails, buildTokenDetails, isUsageCount } from "./token-details";
-import type { MediaUsage } from "./types";
+import type { AuthKeyResponse, MediaUsage } from "./types";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -1002,6 +1002,7 @@ const CUSTOM_INSPECT = Symbol.for("nodejs.util.inspect.custom");
 
 const CORE_OWNED: ReadonlySet<string | symbol> = new Set<string | symbol>([
   "close",
+  "validate",
   Symbol.asyncDispose,
   CUSTOM_INSPECT,
 ]);
@@ -1092,6 +1093,8 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
     // still carries `input.modelId`, it is an unrecognized inference-shaped command escaping
     // budget/metering — warn (never silent) that it passes through untracked.
     if (hasModelId) {
+      // Inference-shaped spend that escapes metering still stops on a stored key refusal.
+      core.assertNotRefused();
       core.logger.warn(
         "Solwyn is passing an unrecognized Bedrock command that carries input.modelId through " +
           "UNTRACKED (no budget check, no usage metering). If this is a Converse call, send a " +
@@ -1360,6 +1363,12 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
 
 /** The Solwyn-owned surface added on top of the wrapped client's own surface. */
 export interface Solwyn {
+  /**
+   * Check the API key and project with Solwyn now. Resolves with the key's details, or `null`
+   * when Solwyn could not be reached; throws `ApiKeyRefusedError` (a `ConfigurationError`) on
+   * any refusal. Wrapped calls otherwise validate lazily.
+   */
+  validate(): Promise<AuthKeyResponse | null>;
   /** Flush reporter work, close budget-enforcer resources, then forward provider shutdown. */
   close(): Promise<void>;
   /** `await using` lifecycle — delegates to {@link Solwyn.close}. */

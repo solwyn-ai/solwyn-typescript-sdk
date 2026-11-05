@@ -37,6 +37,8 @@ const makers = {
   ProviderUnavailableError: (api) =>
     new api.ProviderUnavailableError("unavailable", { attempted: ["openai"] }),
   ConfigurationError: (api) => new api.ConfigurationError("invalid", { field: "client" }),
+  ApiKeyRefusedError: (api) =>
+    new api.ApiKeyRefusedError("refused", { code: "api_key_invalid", field: "api_key" }),
   UnsupportedSurfaceError: (api) =>
     new api.UnsupportedSurfaceError({ surface: "embeddings", provider: "openai" }),
   UntrackedSpendSurfaceError: (api) =>
@@ -87,8 +89,10 @@ for (const producer of entries) {
         false,
       );
       for (const other of Object.keys(makers)) {
+        // ApiKeyRefusedError is deliberately a ConfigurationError.
+        const parent = family === "ApiKeyRefusedError" && other === "ConfigurationError";
         if (other !== family && other !== "SolwynError")
-          assert.equal(error instanceof consumer[other], false);
+          assert.equal(error instanceof consumer[other], parent);
       }
     }
     class CustomError extends producer[family] {}

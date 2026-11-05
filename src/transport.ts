@@ -334,9 +334,13 @@ async function readBoundedText(
  */
 export interface RequestBinding {
   dispatch(): { readonly header: string; readonly generation: number };
-  refuse(refusal: Refusal, dispatched: number): void;
+  /**
+   * Record a classified refusal. `ownStatus` is what `refuseAtStatus` returned for this same
+   * request; `keyCheck` marks the binding's own `/auth/key` answer.
+   */
+  refuse(refusal: Refusal, dispatched: number, ownStatus?: number, keyCheck?: boolean): void;
   /** Record a blocking refusal the moment a 401 status arrives (unless one is stored). */
-  refuseAtStatus(): void;
+  refuseAtStatus(): number | undefined;
   /** The stored refusal while the key is refused (either effect); data-plane requests stop. */
   suppressedBy(): Refusal | undefined;
 }
@@ -638,14 +642,17 @@ export class Transport {
           const classified = isClassifiedStatus(response.status);
           // Every 401 refuses, whatever its body: block now, synchronously at the status, so a
           // timeout or cancellation that beats a stalled body can never reach the outage posture.
-          if (response.status === 401 && this.refuseAtStatusEnabled) {
-            this.binding?.refuseAtStatus();
-          }
+          const ownStatus =
+            response.status === 401 && this.refuseAtStatusEnabled
+              ? this.binding?.refuseAtStatus()
+              : undefined;
           const refusal = classified
             ? await classifyHttpFailure(response, controller, deadline - monotonicNow())
             : undefined;
           // The classified refusal may only tighten what the status recorded (generation fencing).
-          if (refusal !== undefined) this.binding?.refuse(refusal, generation);
+          if (refusal !== undefined) {
+            this.binding?.refuse(refusal, generation, ownStatus, !this.refuseAtStatusEnabled);
+          }
           const failure = new TransportHttpError(response.status, refusal, retryAfterMs);
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.

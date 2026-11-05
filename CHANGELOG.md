@@ -53,11 +53,14 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   as soon as its status arrives, and nothing that was already in flight (including that 401's own
   body) can relax it. Only a key check sent after the refusal can: the SDK starts one right away
   after a 401 (so an alerts-only project returns to unmetered calls within a round trip), then
-  every 60 seconds, and recovers after a successful check. A stored blocking refusal also stops
+  every 60 seconds after a refusing answer (every 5 seconds when Solwyn does not answer), and
+  recovers after a successful check. A refusal stops every call admitted after it is recorded; a
+  call already admitted may complete. A stored blocking refusal also stops
   every later provider dispatch of a call already in flight (failover hops and same-provider
   retries) and every unmetered or unrecognised spend method, including references read before the
   refusal and work those methods return: promises that send later, stream helpers, chat sessions
-  and derived clients are stopped at their actual dispatch. Surface acknowledgments do not override
+  and derived clients (including their nested namespaces, and values those promises resolve to)
+  are stopped at their actual dispatch. Surface acknowledgments do not override
   it. While a refusal is stored (blocking or unmetered), the SDK sends nothing to Solwyn except the
   key check: no budget checks, lease requests, confirmations, metadata, untracked-surface or
   breaker reports. Those items are dropped locally and counted as `api_key_refused` drops, so an

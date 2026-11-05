@@ -734,22 +734,33 @@ describe("ProjectBinding fencing and validation", () => {
     await expect(binding.validate()).resolves.toMatchObject({ project_id: TEST_PROJECT_ID });
   });
 
-  it("a same-effect refusal only rewords the stored one; a weaker one from an older dispatch is ignored", async () => {
+  it("a request's own body only rewords its status record; an independent same-effect refusal advances ordering; a weaker older one is ignored", async () => {
+    let auths = 0;
     const binding = new ProjectBinding({
       selector: TEST_PROJECT,
       apiUrl: TEST_API_URL,
       apiKey: TEST_API_KEY,
-      fetch: async () => authKeyResponse(),
-      timeoutMs: 1000,
+      fetch: async () => {
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : new Promise<Response>(() => {});
+      },
+      timeoutMs: 60_000,
     });
     await binding.validate();
-    const old = binding.generation;
-    binding.refuse({ code: "api_key_expired", posture: "hard_deny", expiredOn: null }, old);
-    const stored = binding.generation;
-    binding.refuse({ code: "api_key_invalid", posture: "unknown", expiredOn: null }, old);
+    const dispatched = binding.generation;
+    const own = binding.refuseAtStatus();
+    const afterStatus = binding.generation;
+    binding.refuse(
+      { code: "api_key_expired", posture: "hard_deny", expiredOn: null },
+      dispatched,
+      own,
+    );
+    expect(binding.refusal?.code).toBe("api_key_expired");
+    expect(binding.generation).toBe(afterStatus);
+    binding.refuse({ code: "api_key_invalid", posture: "unknown", expiredOn: null }, dispatched);
     expect(binding.refusal?.code).toBe("api_key_invalid");
-    expect(binding.generation).toBe(stored);
-    binding.refuse({ code: "api_key_expired", posture: "alert_only", expiredOn: null }, old);
+    expect(binding.generation).toBe(afterStatus + 1);
+    binding.refuse({ code: "api_key_expired", posture: "alert_only", expiredOn: null }, dispatched);
     expect(binding.refusal).toMatchObject({ code: "api_key_invalid", effect: "block" });
   });
 

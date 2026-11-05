@@ -37,6 +37,8 @@ export const AUTH_KEY_PATH = "/api/v1/auth/key";
 export const UNVALIDATED_RETRY_MS = 30_000;
 /** Retry interval for automatic validation while a refusal is stored. */
 export const REFUSED_RETRY_MS = 60_000;
+/** Retry interval while refused when the key check could not reach Solwyn (no answer at all). */
+export const REFUSED_UNREACHABLE_RETRY_MS = 5_000;
 
 export type BindingState = "unvalidated" | "valid" | "refused";
 /** Why retained authority (cached allows, held leases) must be dropped. */
@@ -189,7 +191,7 @@ export class ProjectBinding {
    * recorded, which in practice is the revalidation started when that refusal was recorded. A
    * 401's own body can therefore never relax the block its status recorded. Never throws.
    */
-  refuse(refusal: Refusal, dispatched: number): void {
+  refuse(refusal: Refusal, dispatched: number, ownStatus?: number, keyCheck = false): void {
     const effect = this.#effectFor(refusal);
     const stored = this.#refusal;
     if (
@@ -199,7 +201,10 @@ export class ProjectBinding {
     ) {
       return;
     }
-    this.#store(refusal, effect, true);
+    // A 401's body after its own status (nothing recorded in between) only rewords that record;
+    // any other refusal is independent news and advances the ordering.
+    const coalesce = keyCheck || (ownStatus !== undefined && ownStatus === this.#refusalGen);
+    this.#store(refusal, effect, true, !coalesce);
   }
 
   /**
@@ -208,13 +213,15 @@ export class ProjectBinding {
    * cancellation racing a slow body can then reach the outage posture), and revalidate promptly
    * so an alert-only project relaxes as soon as a fresh `/auth/key` answer says so.
    */
-  refuseAtStatus(): void {
+  refuseAtStatus(): number | undefined {
     // Only a request sent before the current refusal can still answer 401 (nothing else is sent
     // while refused); its status tightens an allow_unmetered refusal for one round trip.
-    if (this.#state === "refused" && this.#refusal?.effect === "block") return;
+    if (this.#state === "refused" && this.#refusal?.effect === "block") return undefined;
     const unknown: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
-    this.#store(unknown, "block", false);
+    this.#store(unknown, "block", false, false);
     this.#revalidateSoon();
+    // The request's own body may later reword this record without advancing the ordering.
+    return this.#refusalGen;
   }
 
   /**
@@ -230,20 +237,30 @@ export class ProjectBinding {
     else pending.then(start, start);
   }
 
-  #store(refusal: Refusal, effect: RefusalEffect, log: boolean): void {
+  #store(refusal: Refusal, effect: RefusalEffect, log: boolean, independent: boolean): void {
     const stored = this.#refusal;
     const { message, field } = refusalMessage(refusal, this.selector);
     if (log && !this.#loggedCodes.has(refusal.code)) {
       this.#loggedCodes.add(refusal.code);
       this.#logger.error(`solwyn.configuration_error.${refusal.code}: ${message}`);
     }
-    if (
-      stored !== null &&
-      stored.code === refusal.code &&
-      stored.posture === refusal.posture &&
-      stored.effect === effect &&
-      stored.message === message
-    ) {
+    if (stored !== null && stored.effect === effect) {
+      // Same effect. A request's own body only rewords its status record. An independent
+      // response (another request's 401, even an identical one) is newer news: the ordering
+      // advances, so a key check sent before it can neither relax nor clear it, and a fresh key
+      // check follows the one in flight.
+      this.#refusal = Object.freeze({
+        code: refusal.code,
+        posture: refusal.posture,
+        effect,
+        message,
+        field,
+      });
+      if (independent && this.#state === "refused") {
+        this.#generation += 1;
+        this.#refusalGen = this.#generation;
+        this.#revalidateSoon();
+      }
       return;
     }
     const next: StoredRefusal = Object.freeze({
@@ -253,12 +270,6 @@ export class ProjectBinding {
       message,
       field,
     });
-    if (stored !== null && stored.effect === effect) {
-      // Same effect, newer wording (for example the body of a 401 whose status already blocked):
-      // nothing a caller can observe changes, so the generation and fencing stay where they are.
-      this.#refusal = next;
-      return;
-    }
     this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
     this.#refusal = next;
     this.#state = "refused";
@@ -320,9 +331,12 @@ export class ProjectBinding {
   }
 
   #outage(): ValidationOutcome {
+    // No answer at all: retry soon while refused (a refusal backs off only when Solwyn says so),
+    // and on the usual 30 s cadence while unvalidated. The gate keeps it single-flight.
     if (this.#state !== "valid") {
       this.#nextValidateAt =
-        this.#now() + (this.#state === "refused" ? REFUSED_RETRY_MS : UNVALIDATED_RETRY_MS);
+        this.#now() +
+        (this.#state === "refused" ? REFUSED_UNREACHABLE_RETRY_MS : UNVALIDATED_RETRY_MS);
     }
     return "outage";
   }
@@ -345,7 +359,14 @@ export class ProjectBinding {
             return this.#outage();
           }
           if (parsed.data.scope !== "full") {
-            this.refuse({ code: "read_only_key", posture: "unknown", expiredOn: null }, generation);
+            this.refuse(
+              { code: "read_only_key", posture: "unknown", expiredOn: null },
+              generation,
+              undefined,
+              true,
+            );
+            // A refusing answer backs off the full interval, even when nothing changed.
+            this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
             return "refused";
           }
           return this.#succeed(generation, parsed.data) ? "success" : "ignored";

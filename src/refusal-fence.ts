@@ -77,6 +77,55 @@ function hasMethods(value: object): boolean {
   return false;
 }
 
+const BUILTIN_CONSTRUCTORS = [
+  "Response",
+  "Request",
+  "Headers",
+  "Blob",
+  "File",
+  "FormData",
+  "ReadableStream",
+  "WritableStream",
+  "TransformStream",
+  "URL",
+  "URLSearchParams",
+  "AbortSignal",
+  "AbortController",
+  "Date",
+  "RegExp",
+  "Map",
+  "Set",
+  "WeakMap",
+  "WeakSet",
+  "ArrayBuffer",
+  "Error",
+] as const;
+
+/** Web and language built-ins are data or transport plumbing, never provider dispatch. */
+function isBuiltinValue(value: object): boolean {
+  if (ArrayBuffer.isView(value)) return true;
+  for (const name of BUILTIN_CONSTRUCTORS) {
+    const constructor: unknown = Reflect.get(globalThis, name);
+    try {
+      if (typeof constructor === "function" && value instanceof constructor) return true;
+    } catch {
+      // A hostile Symbol.hasInstance cannot exempt or break fencing.
+    }
+  }
+  return false;
+}
+
+/** An instance of a class (a provider resource or namespace), not a plain record or array. */
+function isClassInstance(value: object): boolean {
+  try {
+    if (Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype !== null && prototype !== Object.prototype;
+  } catch {
+    return true;
+  }
+}
+
 /** Duck-typed Stainless request pipeline: the owner, or its `_client`, builds requests. */
 function isStainlessOwner(owner: object | undefined): boolean {
   if (owner === undefined) return false;
@@ -160,13 +209,10 @@ export class RefusalFence {
     const fence = this;
     const guarded: object = new Proxy(target, {
       apply(fn, thisArg, args): unknown {
-        fence.#assertNotRefused();
-        const sent = stainless ? fence.#withRefusalSignal(fn, args) : args;
-        const value: unknown = Reflect.apply(fn, thisArg, sent);
+        const value = fence.#invoke(fn, thisArg, args, stainless);
         // A method that returns its own receiver or owner (fluent APIs, `this`) hands back the
         // provider object the wrapper already exposes; it stays itself.
         if (value === thisArg || (owner !== undefined && value === owner)) return value;
-        if (sent !== args) observeRefusalAbort(value);
         return fence.result(value);
       },
       construct(fn, args, newTarget): object {
@@ -176,6 +222,23 @@ export class RefusalFence {
     });
     this.#callables.set(target, guarded);
     return guarded as T;
+  }
+
+  /**
+   * One fenced invocation: refusal check, refusal signal on Stainless requests, then the call.
+   * Shared by fenced callables and every method of a fenced handle.
+   */
+  #invoke(
+    fn: (...args: unknown[]) => unknown,
+    thisArg: unknown,
+    args: unknown[],
+    stainless: boolean,
+  ): unknown {
+    this.#assertNotRefused();
+    const sent = stainless ? this.#withRefusalSignal(fn, args) : args;
+    const value: unknown = Reflect.apply(fn, thisArg, sent);
+    if (sent !== args) observeRefusalAbort(value);
+    return value;
   }
 
   /**
@@ -204,7 +267,10 @@ export class RefusalFence {
     if (typeof value === "function") return this.callable(value);
     const existing = this.#results.get(value);
     if (existing !== undefined) return existing as T;
-    if (!isThenable(value) && !hasMethods(value)) return value;
+    if (isBuiltinValue(value)) return value;
+    // Provider objects that can dispatch, directly or through what they hold: promises, objects
+    // with methods, and class instances (a derived client's method-less namespaces included).
+    if (!isThenable(value) && !hasMethods(value) && !isClassInstance(value)) return value;
     const fenced = isThenable(value) ? this.#thenable(value) : this.#handle(value);
     this.#results.set(value, fenced);
     return fenced as T;
@@ -221,9 +287,13 @@ export class RefusalFence {
         Promise.resolve(target).catch(() => {});
         return Promise.reject(refusal);
       }
-      return Promise.resolve(target).catch((error: unknown) => {
-        throw fence.#mapError(error);
-      });
+      // The fulfilled value (a live session, a stream, a pager, a derived client) stays fenced.
+      return Promise.resolve(target).then(
+        (value: unknown) => fence.result(value),
+        (error: unknown) => {
+          throw fence.#mapError(error);
+        },
+      );
     };
     return new Proxy(target, {
       get(raw, key): unknown {
@@ -239,9 +309,15 @@ export class RefusalFence {
               Promise.resolve(target).catch(() => {});
               return Promise.reject(refusal);
             }
-            return Promise.resolve(Reflect.apply(value, raw, args)).catch((error: unknown) => {
-              throw fence.#mapError(error);
-            });
+            return Promise.resolve(Reflect.apply(value, raw, args)).then(
+              (resolved: unknown) =>
+                isPlainRecord(resolved) && "data" in resolved
+                  ? { ...resolved, data: fence.result(resolved["data"]) }
+                  : fence.result(resolved),
+              (error: unknown) => {
+                throw fence.#mapError(error);
+              },
+            );
           };
         }
         return value;
@@ -253,6 +329,7 @@ export class RefusalFence {
   #handle(target: object): object {
     const fence = this;
     const methods = new Map<PropertyKey, { raw: unknown; fenced: unknown }>();
+    const stainless = isStainlessOwner(target);
     return new Proxy(target, {
       get(raw, key): unknown {
         const value: unknown = Reflect.get(raw, key, raw);
@@ -265,8 +342,7 @@ export class RefusalFence {
         if (cached !== undefined && cached.raw === value) return cached.fenced;
         const fenced = new Proxy(value as (...args: unknown[]) => unknown, {
           apply(fn, _thisArg, args): unknown {
-            fence.#assertNotRefused();
-            return fence.result(Reflect.apply(fn, raw, args));
+            return fence.result(fence.#invoke(fn, raw, args, stainless));
           },
         });
         methods.set(key, { raw: value, fenced });

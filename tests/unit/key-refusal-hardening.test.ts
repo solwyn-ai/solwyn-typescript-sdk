@@ -17,6 +17,7 @@ import { ApiKeyRefusedError } from "../../src/errors";
 import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { run } from "../../src/node";
+import { ProjectBinding } from "../../src/project";
 import { MetadataReporter } from "../../src/reporter";
 import { FakeControlPlane } from "../../src/testing/index";
 import { zeroTokenDetails } from "../../src/token-details";
@@ -1191,5 +1192,315 @@ describe("refused drops are local and counted", () => {
       "confirm.api_key_refused": 1,
       "event.api_key_refused": 1,
     });
+  });
+});
+
+describe("review 4.1: an independent same-strength refusal advances ordering", () => {
+  it.each([
+    "alert_only",
+    "full_scope",
+  ] as const)("a key check sent before a newer independent block cannot relax or clear it (answer %s)", async (answer) => {
+    const revalidate = deferred<Response>();
+    const started = deferred<void>();
+    const aHeaders = deferred<Response>();
+    const bHeaders = deferred<Response>();
+    let auths = 0;
+    const binding = new ProjectBinding({
+      apiUrl: TEST_API_URL,
+      apiKey: TEST_API_KEY,
+      selector: TEST_PROJECT,
+      timeoutMs: 2000,
+      fetch: async () => {
+        auths += 1;
+        if (auths === 1) return authKeyResponse();
+        started.resolve();
+        return revalidate.promise;
+      },
+    });
+    await binding.validate();
+    let calls = 0;
+    const transport = new Transport(TEST_API_URL, TEST_API_KEY, {
+      binding,
+      fetch: async () => {
+        calls += 1;
+        return calls === 1 ? aHeaders.promise : bHeaders.promise;
+      },
+    });
+    const a = rejection(transport.postJson(CHECK_PATH, {}, { timeoutMs: 2000 }));
+    const b = rejection(transport.postJson(CHECK_PATH, {}, { timeoutMs: 2000 }));
+    aHeaders.resolve(new Response("invalid JSON", { status: 401 }));
+    await started.promise;
+    await a;
+    bHeaders.resolve(expired("hard_deny"));
+    await b;
+    revalidate.resolve(answer === "alert_only" ? expired("alert_only") : authKeyResponse());
+    await binding.revalidate();
+    expect(await rejection(binding.gate())).toBeInstanceOf(ApiKeyRefusedError);
+  });
+});
+
+describe("review 4.2: derived clients keep the fence through nested namespaces", () => {
+  it.each([
+    "derived-namespace-after-refusal",
+    "derived-deferred-before-refusal",
+    "raw-post-deferred-control",
+  ] as const)("%s never dispatches after a refusal", async (mode) => {
+    let refused = false;
+    let auths = 0;
+    const requests: Array<{ afterRefusal: boolean }> = [];
+    const prepared = deferred<void>();
+    const release = deferred<void>();
+    const raw = new OpenAI({
+      apiKey: "offline-synthetic",
+      maxRetries: 0,
+      fetch: (async () => {
+        requests.push({ afterRefusal: refused });
+        return Response.json({
+          id: "synthetic",
+          object: "chat.completion",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        });
+      }) as unknown as typeof fetch,
+    });
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      logger: noopLogger,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      fetch: async (url) => {
+        if (new URL(url).pathname !== AUTH_KEY_PATH) {
+          return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+        }
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : authKeyResponse({ scope: "read_only" });
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    // biome-ignore lint/suspicious/noExplicitAny: the probe drives native client shapes.
+    const derived: any =
+      mode === "raw-post-deferred-control" ? client : client.withOptions({ timeout: 1000 });
+    // biome-ignore lint/suspicious/noExplicitAny: native APIPromise.
+    let handle: any;
+    if (mode !== "derived-namespace-after-refusal") {
+      derived.prepareOptions = async () => {
+        prepared.resolve();
+        await release.promise;
+      };
+      handle =
+        mode === "raw-post-deferred-control"
+          ? derived.post("/chat/completions", { body: { model: "synthetic", messages: [] } })
+          : derived.batches.create({
+              input_file_id: "file-synthetic",
+              endpoint: "/v1/chat/completions",
+              completion_window: "24h",
+            });
+      await prepared.promise;
+    }
+    expect(await rejection(client.validate())).toBeInstanceOf(ApiKeyRefusedError);
+    refused = true;
+    release.resolve();
+    const outcome = await rejection(
+      Promise.resolve().then(() =>
+        mode === "derived-namespace-after-refusal"
+          ? derived.chat.completions.create({ model: "synthetic", messages: [] })
+          : handle.withResponse(),
+      ),
+    );
+    expect(outcome).toBeDefined();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(requests.filter((request) => request.afterRefusal)).toEqual([]);
+  });
+});
+
+describe("review 4.3: fulfilled values stay fenced", () => {
+  it.each([
+    "await",
+    "then-chain",
+  ] as const)("a Google Live session obtained by %s never sends after a refusal", async (consumption) => {
+    let auths = 0;
+    let refused = false;
+    const sends: Array<{ afterRefusal: boolean }> = [];
+    const raw = new GoogleGenAI({ apiKey: "offline-synthetic" });
+    (raw.live as unknown as { webSocketFactory: unknown }).webSocketFactory = {
+      create(
+        _url: unknown,
+        _headers: unknown,
+        callbacks: Record<string, (event?: unknown) => void>,
+      ) {
+        let first = true;
+        return {
+          connect() {
+            queueMicrotask(() => callbacks["onopen"]?.());
+          },
+          send(_data: string) {
+            sends.push({ afterRefusal: refused });
+            if (first) {
+              first = false;
+              queueMicrotask(() =>
+                callbacks["onmessage"]?.({ data: JSON.stringify({ setupComplete: {} }) }),
+              );
+            }
+          },
+          close() {},
+        };
+      },
+    };
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      logger: noopLogger,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      fetch: async (url) => {
+        if (new URL(url).pathname !== AUTH_KEY_PATH) {
+          return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+        }
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : authKeyResponse({ scope: "read_only" });
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    const pending = client.live.connect({
+      model: "gemini-live-synthetic",
+      callbacks: { onmessage() {} },
+    });
+    const handle =
+      consumption === "await"
+        ? await pending
+        : await pending.then((value) => value).then((value) => value);
+    expect(await rejection(client.validate())).toBeInstanceOf(ApiKeyRefusedError);
+    refused = true;
+    expect(() => handle.sendClientContent({ turns: "synthetic", turnComplete: true })).toThrow(
+      ApiKeyRefusedError,
+    );
+    expect(sends.filter((send) => send.afterRefusal)).toEqual([]);
+  });
+
+  it("a promised continuation iterator never opens another request after a refusal", async () => {
+    let auths = 0;
+    let refused = false;
+    const requests: Array<{ afterRefusal: boolean }> = [];
+    const raw = new GoogleGenAI({
+      apiKey: "offline-synthetic",
+      httpOptions: {
+        fetch: async () => {
+          requests.push({ afterRefusal: refused });
+          const candidate: Record<string, unknown> = {
+            content: { role: "model", parts: [{ text: "synthetic" }] },
+            finishReason: requests.length === 1 ? "CONTINUATION" : "STOP",
+          };
+          if (requests.length === 1) candidate["continuationToken"] = "synthetic-checkpoint";
+          const chunk = {
+            candidates: [candidate],
+            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+          };
+          return new Response(`data: ${JSON.stringify(chunk)}\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      } as never,
+    });
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      logger: noopLogger,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      fetch: async (url) => {
+        if (new URL(url).pathname !== AUTH_KEY_PATH) {
+          return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+        }
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : authKeyResponse({ scope: "read_only" });
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    const models = client.models as unknown as {
+      generateContentStreamWithContinuation(params: unknown): Promise<AsyncIterable<unknown>>;
+    };
+    const stream = await models.generateContentStreamWithContinuation({
+      model: "gemini-synthetic",
+      contents: "synthetic",
+    });
+    expect(await rejection(client.validate())).toBeInstanceOf(ApiKeyRefusedError);
+    refused = true;
+    const outcome = await rejection(
+      (async () => {
+        let chunks = 0;
+        for await (const _chunk of stream) {
+          chunks += 1;
+          if (chunks > 2) throw new Error("unexpected extra continuation");
+        }
+      })(),
+    );
+    expect(outcome).toBeInstanceOf(ApiKeyRefusedError);
+    expect(requests.filter((request) => request.afterRefusal)).toEqual([]);
+  });
+});
+
+describe("review 4.6 and retry cadence while refused", () => {
+  it.each([
+    "read_only_200",
+    "expired_401",
+  ] as const)("a revalidation answered with a refusal (%s) backs off 60 s", async (refusal) => {
+    let now = 0;
+    let auths = 0;
+    const binding = testBinding({
+      now: () => now,
+      fetch: async () => {
+        auths += 1;
+        return refusal === "read_only_200"
+          ? authKeyResponse({ scope: "read_only" })
+          : expired("hard_deny");
+      },
+    });
+    await rejection(binding.validate());
+    now = 60_000;
+    for (let call = 0; call < 5; call++) await rejection(binding.gate());
+    expect(auths).toBe(2);
+  });
+
+  it("while refused, an unreachable key check retries after 5 s (single-flight), not 60 s", async () => {
+    let now = 0;
+    let auths = 0;
+    let reachable = true;
+    const binding = testBinding({
+      now: () => now,
+      fetch: async () => {
+        auths += 1;
+        if (!reachable) throw new TypeError("fetch failed");
+        return expired("hard_deny");
+      },
+    });
+    await rejection(binding.validate());
+    expect(binding.state).toBe("refused");
+    reachable = false;
+    now = 60_000;
+    await rejection(binding.gate());
+    expect(auths).toBe(2);
+    // Unreachable: 5 s, not 60 s, and at most one key check per window however many calls.
+    for (let call = 0; call < 5; call++) await rejection(binding.gate());
+    now += 4_999;
+    await Promise.all([rejection(binding.gate()), rejection(binding.gate())]);
+    expect(auths).toBe(2);
+    now += 1;
+    await Promise.all([rejection(binding.gate()), rejection(binding.gate())]);
+    expect(auths).toBe(3);
+    // Solwyn answers again with a refusal: back to the 60 s back-off.
+    reachable = true;
+    now += 5_000;
+    await rejection(binding.gate());
+    expect(auths).toBe(4);
+    now += 59_999;
+    await rejection(binding.gate());
+    expect(auths).toBe(4);
   });
 });

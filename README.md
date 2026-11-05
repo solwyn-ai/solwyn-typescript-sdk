@@ -202,8 +202,9 @@ When Solwyn refuses the key or the project, the SDK does not fall back to `failO
 | Expired or revoked key on an alerts-only project, after validating once | Run unmetered, logging `solwyn.api_key_refused` at error on every call |
 
 A 401 blocks at once; the SDK then rechecks the key immediately (an alerts-only project goes back
-to unmetered calls within a round trip) and every 60 seconds after, and recovers on its own after
-you rotate the key.
+to unmetered calls within a round trip) and every 60 seconds after, or every 5 seconds while
+Solwyn is unreachable, and recovers on its own after you rotate the key. A refusal stops every
+call admitted after it is recorded; a call already admitted may complete.
 
 ## Choose your next step
 

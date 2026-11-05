@@ -91,21 +91,31 @@ function checkOptions(overrides: Record<string, unknown> = {}) {
   };
 }
 
-/** A fetch whose answers are queued per path; an empty queue falls back to `fallback`. */
+/**
+ * A fetch whose answers are queued per path; an empty queue falls back to `fallback`. `setKey`
+ * models the key's server-side state: once set, `/auth/key` answers with it (as a real server
+ * would after refusing the key on the data plane), unless an answer is queued.
+ */
 function scripted(fallback: (path: string) => Response | Promise<Response>) {
   const queues = new Map<string, Array<() => Response | Promise<Response>>>();
   const headers: Array<{ path: string; project: string | null }> = [];
+  let key: (() => Response | Promise<Response>) | null = null;
   const fetch = vi.fn<FetchLike>(async (url, init) => {
     const path = pathOf(url);
     headers.push({ path, project: new Headers(init?.headers).get("Solwyn-Project") });
     const next = queues.get(path)?.shift();
-    return next === undefined ? fallback(path) : next();
+    if (next !== undefined) return next();
+    if (path === AUTH_KEY_PATH && key !== null) return key();
+    return fallback(path);
   });
   return {
     fetch,
     headers,
     queue(path: string, ...answers: Array<() => Response | Promise<Response>>) {
       queues.set(path, [...(queues.get(path) ?? []), ...answers]);
+    },
+    setKey(answer: (() => Response | Promise<Response>) | null) {
+      key = answer;
     },
   };
 }
@@ -267,6 +277,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch, { now: () => now });
     await budget.checkBudget(checkOptions());
+    plane.setKey(() => expired("hard_deny"));
     plane.queue(CHECK_PATH, () => expired("hard_deny"));
     await refusalOf(budget.checkBudget(checkOptions()));
 
@@ -281,23 +292,38 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     expect(plane.headers.filter((entry) => entry.path === CHECK_PATH)).toHaveLength(2);
   });
 
-  it("F7b: refused allow_unmetered after validating; revalidation every 60 s keeps returning the 401; calls keep running, nothing throws", async () => {
+  it("F7b: refused allow_unmetered after validating: a brief block until the prompt revalidation relaxes it, then every 60 s revalidation keeps returning the 401; nothing throws", async () => {
     let now = 0;
     const logger = capture();
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch, { now: () => now, logger });
     await budget.checkBudget(checkOptions());
+    plane.setKey(() => expired("alert_only"));
+    const prompt = deferred<Response>();
+    plane.queue(AUTH_KEY_PATH, () => prompt.promise);
     plane.queue(CHECK_PATH, () => expired("alert_only"));
+
+    // The 401's status blocks at once; its own alert_only body cannot relax that block.
+    await refusalOf(budget.checkBudget(checkOptions()));
+    expect(budget.binding.refusal).toMatchObject({ effect: "block" });
+    await refusalOf(budget.checkBudget(checkOptions()));
+
+    // The revalidation started at the 401 (dispatched after the block) relaxes it promptly.
+    prompt.resolve(expired("alert_only"));
+    await vi.waitFor(() =>
+      expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" }),
+    );
+    expect(now).toBe(0);
     await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({
       allowed: true,
       reservationId: null,
     });
     for (let round = 0; round < 3; round++) {
       now += 60_000;
-      plane.queue(AUTH_KEY_PATH, () => expired("alert_only"));
       await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({ allowed: true });
     }
-    expect(plane.headers.filter((entry) => entry.path === AUTH_KEY_PATH)).toHaveLength(4);
+    expect(plane.headers.filter((entry) => entry.path === AUTH_KEY_PATH)).toHaveLength(5);
+    expect(plane.headers.filter((entry) => entry.path === CHECK_PATH)).toHaveLength(2);
     expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" });
   });
 
@@ -382,6 +408,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
       leaseEnabled: false,
     });
     await budget.checkBudget(checkOptions());
+    plane.setKey(() => expired("hard_deny"));
     plane.queue(CHECK_PATH, () => expired("hard_deny"));
     await refusalOf(budget.checkBudget(checkOptions()));
     breaker.recordFailure();
@@ -394,9 +421,12 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch, { now: () => now });
     await budget.checkBudget(checkOptions());
+    plane.setKey(() => expired("hard_deny"));
     plane.queue(CHECK_PATH, () => expired("hard_deny"));
     await refusalOf(budget.checkBudget(checkOptions()));
     await refusalOf(budget.checkBudget(checkOptions()));
+    // The key is rotated server-side; the next revalidation succeeds.
+    plane.setKey(null);
     now += 60_000;
     await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({ allowed: true });
     expect(budget.binding.state).toBe("valid");
@@ -480,6 +510,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch, { failOpen: true });
     await budget.binding.validate();
+    plane.setKey(() => expired("hard_deny"));
     const a = deferred<Response>();
     const b = deferred<Response>();
     plane.queue(
@@ -568,6 +599,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch);
     await budget.binding.validate();
+    plane.setKey(() => expired("hard_deny"));
     const a = deferred<Response>();
     const b = deferred<Response>();
     plane.queue(
@@ -582,7 +614,9 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     await refusalOf(callB);
     a.resolve(expired("alert_only"));
     await refusalOf(callA);
-    expect(budget.binding.refusal).toMatchObject({ effect: "block", posture: "hard_deny" });
+    await vi.waitFor(() =>
+      expect(budget.binding.refusal).toMatchObject({ effect: "block", posture: "hard_deny" }),
+    );
     await refusalOf(budget.checkBudget(checkOptions()));
   });
 
@@ -590,6 +624,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch);
     await budget.binding.validate();
+    plane.setKey(() => expired("hard_deny"));
     const auth = deferred<Response>();
     const c = deferred<Response>();
     plane.queue(AUTH_KEY_PATH, () => auth.promise);
@@ -610,10 +645,13 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
     const budget = enforcer(plane.fetch, { now: () => now });
     await budget.checkBudget(checkOptions());
+    plane.setKey(() => expired("hard_deny"));
     plane.queue(CHECK_PATH, () => expired("hard_deny"));
     await refusalOf(budget.checkBudget(checkOptions()));
+    await vi.waitFor(() => expect(budget.binding.refusal?.posture).toBe("hard_deny"));
+    // The owner pauses the hard rule; the next 60 s revalidation sees alert_only.
+    plane.setKey(() => expired("alert_only"));
     now += 60_000;
-    plane.queue(AUTH_KEY_PATH, () => expired("alert_only"));
     await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({
       allowed: true,
       reservationId: null,
@@ -696,7 +734,7 @@ describe("ProjectBinding fencing and validation", () => {
     await expect(binding.validate()).resolves.toMatchObject({ project_id: TEST_PROJECT_ID });
   });
 
-  it("a weaker refusal from an older dispatch is ignored, a newer one applies", () => {
+  it("a same-effect refusal only rewords the stored one; a weaker one from an older dispatch is ignored", async () => {
     const binding = new ProjectBinding({
       selector: TEST_PROJECT,
       apiUrl: TEST_API_URL,
@@ -704,12 +742,15 @@ describe("ProjectBinding fencing and validation", () => {
       fetch: async () => authKeyResponse(),
       timeoutMs: 1000,
     });
+    await binding.validate();
     const old = binding.generation;
     binding.refuse({ code: "api_key_expired", posture: "hard_deny", expiredOn: null }, old);
     const stored = binding.generation;
     binding.refuse({ code: "api_key_invalid", posture: "unknown", expiredOn: null }, old);
     expect(binding.refusal?.code).toBe("api_key_invalid");
-    expect(binding.generation).toBe(stored + 1);
+    expect(binding.generation).toBe(stored);
+    binding.refuse({ code: "api_key_expired", posture: "alert_only", expiredOn: null }, old);
+    expect(binding.refusal).toMatchObject({ code: "api_key_invalid", effect: "block" });
   });
 
   it("logs a refusal once per code", async () => {

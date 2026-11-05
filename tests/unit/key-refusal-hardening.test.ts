@@ -9,6 +9,7 @@
  * 5. a lease-funded rerun reused its own released call id;
  * 6. a directly constructed BudgetEnforcer ignored SOLWYN_PROJECT.
  */
+import { GoogleGenAI } from "@google/genai";
 import OpenAI from "openai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer } from "../../src/budget";
@@ -17,7 +18,7 @@ import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { run } from "../../src/node";
 import { FakeControlPlane } from "../../src/testing/index";
-import type { FetchLike } from "../../src/transport";
+import { type FetchLike, Transport } from "../../src/transport";
 import {
   authKeyResponse,
   expired,
@@ -25,6 +26,7 @@ import {
   TEST_API_URL,
   TEST_PROJECT,
   TEST_PROJECT_ID,
+  testBinding,
 } from "../helpers/project-binding";
 
 const AUTH_KEY_PATH = "/api/v1/auth/key";
@@ -139,14 +141,17 @@ describe("1. a 401 refuses at its status, before a stalled body can lose the rac
     closers.push(() => budget.close());
     await budget.binding.validate();
     plane.queue(CHECK_PATH, () => new Response(stalledBody(), { status: 401 }));
+    // The revalidation started at the 401 sees the same refused key.
+    plane.queue(AUTH_KEY_PATH, () => expired("hard_deny"));
 
     const error = await rejection(budget.checkBudget({ ...CHECK, timeout: 0.1 }));
 
     expect(error).toBeInstanceOf(ApiKeyRefusedError);
-    expect(budget.binding.refusal).toMatchObject({ code: "api_key_invalid", effect: "block" });
+    // Blocking from the status on; the revalidation it started may reword it (here: expired).
+    expect(budget.binding.refusal).toMatchObject({ effect: "block" });
   });
 
-  it("refines the provisional refusal once a slow 401 body arrives inside the deadline", async () => {
+  it("a slow alert_only 401 body never relaxes its own block; the revalidation started at the 401 does", async () => {
     const plane = scripted((path) =>
       path === AUTH_KEY_PATH ? authKeyResponse() : allow("alert_only"),
     );
@@ -160,8 +165,9 @@ describe("1. a 401 refuses at its status, before a stalled body can lose the rac
     });
     closers.push(() => budget.close());
     await budget.binding.validate();
-    const body = expired("alert_only");
-    const text = await body.text();
+    const text = await expired("alert_only").text();
+    const revalidation = deferred<Response>();
+    plane.queue(AUTH_KEY_PATH, () => revalidation.promise);
     plane.queue(
       CHECK_PATH,
       () =>
@@ -176,14 +182,24 @@ describe("1. a 401 refuses at its status, before a stalled body can lose the rac
           { status: 401 },
         ),
     );
-    await expect(budget.checkBudget({ ...CHECK, timeout: 2 })).resolves.toMatchObject({
+    // The status blocked; the body (alert_only) arrived inside the deadline but cannot relax it.
+    expect(await rejection(budget.checkBudget({ ...CHECK, timeout: 2 }))).toBeInstanceOf(
+      ApiKeyRefusedError,
+    );
+    expect(budget.binding.refusal).toMatchObject({ effect: "block" });
+    expect(plane.count(AUTH_KEY_PATH)).toBe(2);
+
+    revalidation.resolve(expired("alert_only"));
+    await vi.waitFor(() =>
+      expect(budget.binding.refusal).toMatchObject({
+        code: "api_key_expired",
+        posture: "alert_only",
+        effect: "allow_unmetered",
+      }),
+    );
+    await expect(budget.checkBudget(CHECK)).resolves.toMatchObject({
       allowed: true,
       reservationId: null,
-    });
-    expect(budget.binding.refusal).toMatchObject({
-      code: "api_key_expired",
-      posture: "alert_only",
-      effect: "allow_unmetered",
     });
   });
 });
@@ -489,6 +505,7 @@ describe("review 2.1: a provisional 401 loses ownership to any newer definitive 
     const bothChecks = deferred<void>();
     const firstBodyRead = deferred<void>();
     let checks = 0;
+    let auths = 0;
     let dispatches = 0;
     let bodyController!: ReadableStreamDefaultController<Uint8Array>;
     const provider = {
@@ -511,7 +528,10 @@ describe("review 2.1: a provisional 401 loses ownership to any newer definitive 
       logger: noopLogger,
       fetch: async (url) => {
         const path = new URL(url).pathname;
-        if (path === AUTH_KEY_PATH) return authKeyResponse();
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          return auths === 1 ? authKeyResponse() : new Response("malformed JSON", { status: 401 });
+        }
         if (path === CHECK_PATH) {
           checks += 1;
           if (checks === 1) return firstHeaders.promise;
@@ -651,5 +671,309 @@ describe("review 2.2: raw native dispatches re-check the binding immediately bef
       ),
     ).toBeInstanceOf(ApiKeyRefusedError);
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+/** A 401 whose body is held until the test finishes it; `reading` resolves when it is read. */
+function slow401() {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const reading = deferred<void>();
+  const stream = new ReadableStream<Uint8Array>({
+    start(value) {
+      controller = value;
+    },
+  });
+  const response = new Response(stream, { status: 401 });
+  Object.defineProperty(response, "body", {
+    get() {
+      reading.resolve();
+      return stream;
+    },
+  });
+  return {
+    response,
+    reading,
+    finish(text: string) {
+      controller.enqueue(new TextEncoder().encode(text));
+      controller.close();
+    },
+  };
+}
+
+describe("review 3.1: a 401 only tightens; only a revalidation sent after it relaxes", () => {
+  it("two overlapping 401s: the older alert_only body cannot relax while the newer one is unread", async () => {
+    const headersA = deferred<Response>();
+    const headersB = deferred<Response>();
+    const both = deferred<void>();
+    const revalidation = deferred<Response>();
+    const a401 = slow401();
+    const b401 = slow401();
+    let checks = 0;
+    let auths = 0;
+    let dispatches = 0;
+    const raw = {
+      chat: {
+        completions: {
+          create() {
+            dispatches += 1;
+            return { usage: { prompt_tokens: 1, completion_tokens: 1 } };
+          },
+        },
+      },
+    };
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      leaseEnabled: false,
+      budgetCheckCacheTtl: 0,
+      logger: noopLogger,
+      reportUntrackedSurfaces: false,
+      fetch: async (url) => {
+        const path = new URL(url).pathname;
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          return auths === 1 ? authKeyResponse() : revalidation.promise;
+        }
+        if (path === CHECK_PATH) {
+          checks += 1;
+          if (checks === 1) return headersA.promise;
+          if (checks === 2) {
+            both.resolve();
+            return headersB.promise;
+          }
+          throw new Error("unexpected fresh budget check");
+        }
+        return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+      },
+    });
+    closers.push(() => client.close());
+    const create = (): Promise<unknown> =>
+      rejection(
+        (
+          client as unknown as { chat: { completions: { create(b: Body): Promise<unknown> } } }
+        ).chat.completions.create({ model: "synthetic" }),
+      );
+    await client.validate();
+    const a = create();
+    const b = create();
+    await both.promise;
+    headersA.resolve(a401.response);
+    await a401.reading.promise;
+    headersB.resolve(b401.response);
+    await b401.reading.promise;
+    expect(await create()).toBeInstanceOf(ApiKeyRefusedError);
+
+    a401.finish(await expired("alert_only").text());
+    expect(await a).toBeInstanceOf(ApiKeyRefusedError);
+    expect(await create()).toBeInstanceOf(ApiKeyRefusedError);
+    expect(dispatches).toBe(0);
+
+    b401.finish(await expired("hard_deny").text());
+    expect(await b).toBeInstanceOf(ApiKeyRefusedError);
+    revalidation.resolve(expired("hard_deny"));
+    await vi.waitFor(() => expect(auths).toBe(2));
+    expect(await create()).toBeInstanceOf(ApiKeyRefusedError);
+    expect(dispatches).toBe(0);
+  });
+
+  it("a cancelled overlapping 401 stays blocking after the other 401's alert_only body arrives", async () => {
+    const revalidation = deferred<Response>();
+    let auths = 0;
+    const binding = testBinding({
+      fetch: async () => {
+        auths += 1;
+        return auths === 1 ? authKeyResponse() : revalidation.promise;
+      },
+    });
+    await binding.validate();
+    const a = slow401();
+    const b = slow401();
+    const headersA = deferred<Response>();
+    const headersB = deferred<Response>();
+    const transportA = new Transport(TEST_API_URL, TEST_API_KEY, {
+      binding,
+      fetch: () => headersA.promise,
+    });
+    const transportB = new Transport(TEST_API_URL, TEST_API_KEY, {
+      binding,
+      fetch: () => headersB.promise,
+    });
+    const cancel = new AbortController();
+    const pendingA = rejection(transportA.postJson(CHECK_PATH, {}, { timeoutMs: 2000 }));
+    const pendingB = rejection(
+      transportB.postJson(CHECK_PATH, {}, { timeoutMs: 2000, signal: cancel.signal }),
+    );
+    headersA.resolve(a.response);
+    await a.reading.promise;
+    headersB.resolve(b.response);
+    await b.reading.promise;
+    cancel.abort();
+    await pendingB;
+    a.finish(await expired("alert_only").text());
+    await pendingA;
+    expect(binding.blockingRefusal()).toBeInstanceOf(ApiKeyRefusedError);
+
+    const budget = new BudgetEnforcer({
+      apiUrl: TEST_API_URL,
+      apiKey: TEST_API_KEY,
+      binding,
+      leaseEnabled: false,
+      fetch: async () => {
+        throw new Error("no fresh network expected");
+      },
+    });
+    closers.push(() => budget.close());
+    expect(await rejection(budget.checkBudget(CHECK))).toBeInstanceOf(ApiKeyRefusedError);
+    b.finish(await expired("hard_deny").text());
+    revalidation.resolve(expired("hard_deny"));
+  });
+
+  it("an alert_only project relaxes promptly through the revalidation started at the 401", async () => {
+    const plane = new FakeControlPlane({ mode: "alert_only" });
+    const upstream = pendingProvider();
+    upstream.first.resolve({ usage: { prompt_tokens: 1, completion_tokens: 1 } });
+    const wrapped = plane.wrap(upstream.client, {
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      logger: noopLogger,
+    });
+    closers.push(() => wrapped.close());
+    const create = (): Promise<unknown> =>
+      (
+        wrapped as unknown as { chat: { completions: { create(b: Body): Promise<unknown> } } }
+      ).chat.completions.create({ model: "gpt-4o", messages: [] });
+    await create();
+    plane.expireKey({ projectBudgetMode: "alert_only" });
+    // This call's check gets the 401; it is blocked unless the prompt revalidation has already
+    // relaxed the refusal by its exit check (the deterministic window is covered by F7b).
+    await rejection(create());
+    // No 60 s wait (real clock, well under a second): calls run unmetered again.
+    const before = upstream.create.mock.calls.length;
+    await vi.waitFor(async () => {
+      await create();
+    });
+    expect(upstream.create.mock.calls.length).toBeGreaterThan(before);
+    expect(plane.checks.length).toBe(1);
+  });
+});
+
+describe("review 3.2: deferred and returned spend is fenced at its actual dispatch", () => {
+  const chunk = {
+    id: "chatcmpl-synthetic",
+    object: "chat.completion.chunk",
+    created: 0,
+    model: "synthetic",
+    choices: [
+      { index: 0, delta: { role: "assistant", content: "synthetic" }, finish_reason: null },
+    ],
+  };
+  const end = {
+    ...chunk,
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  };
+  const sse = `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(end)}\n\ndata: [DONE]\n\n`;
+
+  it.each([
+    "chat.completions.stream",
+    "responses.stream",
+    "batches.await",
+    "batches.withResponse",
+    "batches.asResponse",
+  ] as const)("%s created before a refusal never dispatches after it", async (kind) => {
+    let refused = false;
+    let auths = 0;
+    const requests: Array<{ afterRefusal: boolean; url: string }> = [];
+    const prepared = deferred<void>();
+    const release = deferred<void>();
+    const raw = new OpenAI({
+      apiKey: "offline-synthetic",
+      maxRetries: 0,
+      fetch: (async (url: string) => {
+        requests.push({ afterRefusal: refused, url: String(url) });
+        return kind === "chat.completions.stream"
+          ? new Response(sse, { headers: { "content-type": "text/event-stream" } })
+          : Response.json({ id: "batch_synthetic", object: "batch" });
+      }) as unknown as typeof fetch,
+    });
+    if (kind.startsWith("batches")) {
+      (raw as unknown as { prepareOptions: () => Promise<void> }).prepareOptions = async () => {
+        prepared.resolve();
+        await release.promise;
+      };
+    }
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      logger: noopLogger,
+      fetch: async (url) =>
+        new URL(url).pathname === AUTH_KEY_PATH
+          ? (auths += 1) === 1
+            ? authKeyResponse()
+            : authKeyResponse({ scope: "read_only" })
+          : Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 }),
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    // biome-ignore lint/suspicious/noExplicitAny: the probe drives several native helper shapes.
+    let handle: any;
+    if (kind === "chat.completions.stream") {
+      handle = client.chat.completions.stream({ model: "synthetic", messages: [] });
+    } else if (kind === "responses.stream") {
+      handle = client.responses.stream({ model: "synthetic", input: "synthetic" });
+    } else {
+      handle = client.batches.create({
+        input_file_id: "file-synthetic",
+        endpoint: "/v1/chat/completions",
+        completion_window: "24h",
+      });
+      await prepared.promise;
+    }
+    expect(await rejection(client.validate())).toBeInstanceOf(ApiKeyRefusedError);
+    refused = true;
+    release.resolve();
+    const consumed = rejection(
+      Promise.resolve().then(() => {
+        if (kind === "chat.completions.stream") return handle.finalChatCompletion();
+        if (kind === "responses.stream") return handle.finalResponse();
+        if (kind === "batches.withResponse") return handle.withResponse();
+        if (kind === "batches.asResponse") return handle.asResponse();
+        return handle;
+      }),
+    );
+    expect(await consumed).toBeDefined();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requests.filter((request) => request.afterRefusal)).toEqual([]);
+  });
+
+  it("a Google chat handle created before a refusal never sends after it", async () => {
+    const providerRequests: string[] = [];
+    const raw = new GoogleGenAI({
+      apiKey: "offline-synthetic",
+      httpOptions: {
+        fetch: async (url: string) => {
+          providerRequests.push(String(url));
+          return Response.json({
+            candidates: [
+              { content: { role: "model", parts: [{ text: "synthetic" }] }, finishReason: "STOP" },
+            ],
+            usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+          });
+        },
+      } as never,
+    });
+    const plane = new FakeControlPlane({ keyScope: "read_only" });
+    const wrapped = plane.wrap(raw, { reportUntrackedSurfaces: false });
+    closers.push(() => wrapped.close());
+    const chat = wrapped.chats.create({ model: "gemini-synthetic" });
+    await expect(wrapped.validate()).rejects.toBeInstanceOf(ApiKeyRefusedError);
+    expect(
+      await rejection(Promise.resolve().then(() => chat.sendMessage({ message: "synthetic" }))),
+    ).toBeInstanceOf(ApiKeyRefusedError);
+    expect(providerRequests).toEqual([]);
   });
 });

@@ -129,8 +129,14 @@ describe("classify", () => {
 /** An enforcer that validated once, then sees `answer` on its next check. */
 async function validatedThen(answer: () => Response | Promise<Response>) {
   let checks = 0;
+  let auths = 0;
   const fetch = vi.fn(async (url: string) => {
-    if (new URL(url).pathname === AUTH_KEY_PATH) return authKeyResponse();
+    // The first validation succeeds; afterwards /auth/key reflects the refused key, as a real
+    // server would, so the revalidation started at the 401 confirms the refusal.
+    if (new URL(url).pathname === AUTH_KEY_PATH) {
+      auths += 1;
+      return auths === 1 ? authKeyResponse() : answer();
+    }
     checks += 1;
     return checks === 1 ? answer() : new Response("unexpected", { status: 500 });
   });
@@ -200,7 +206,9 @@ describe("F6 and F6b: a 401 without an exact alert_only posture blocks", () => {
 describe("background writes treat a refusal as terminal", () => {
   it("drops a refused confirm without retry and without advancing the failure counter", async () => {
     let sends = 0;
-    const binding = testBinding();
+    const binding = testBinding({
+      fetch: async () => unauthorized({ code: "api_key_invalid", project_budget_mode: null }),
+    });
     const reporter = new MetadataReporter(TEST_API_URL, TEST_API_KEY, {
       binding,
       fetch: async () => {

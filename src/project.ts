@@ -97,11 +97,11 @@ export class ProjectBinding {
 
   #pinnedId: string | null = null;
   #lastAuth: AuthKeyResponse | null = null;
+  /** Aborted the moment a blocking refusal is stored; replaced once calls may run again. */
+  #blockController = new AbortController();
   #state: BindingState = "unvalidated";
   #everValid = false;
   #refusal: StoredRefusal | null = null;
-  /** Owner token of a provisional 401 refusal whose body is still being read. */
-  #provisional: object | null = null;
   #generation = 0;
   #refusalGen = 0;
   #nextValidateAt = 0;
@@ -112,9 +112,12 @@ export class ProjectBinding {
     this.#timeoutMs = options.timeoutMs;
     this.#logger = bestEffortLogger(options.logger ?? noopLogger);
     this.#now = options.now ?? monotonicNow;
+    // The /auth/key transport does not refuse at a 401's status: its classified body is the
+    // answer that may relax a refusal, so it must not first tighten past its own generation.
     this.#transport = new Transport(options.apiUrl, options.apiKey, {
       fetch: options.fetch,
       binding: this,
+      refuseAtStatus: false,
     });
   }
 
@@ -178,14 +181,14 @@ export class ProjectBinding {
 
   /**
    * Record a classified refusal from a request dispatched at generation `dispatched`.
-   * Tightening always applies; a weaker refusal applies only when dispatched at or after the
-   * stored one. Returns the stored refusal when this call stored it. Never throws.
+   *
+   * A refusal may always tighten (no refusal, or `allow_unmetered`, becomes `block`; a block's
+   * code and message are replaced by a newer one). It may relax a stored `block` to
+   * `allow_unmetered` only when the request was dispatched at or after the stored refusal was
+   * recorded, which in practice is the revalidation started when that refusal was recorded. A
+   * 401's own body can therefore never relax the block its status recorded. Never throws.
    */
-  refuse(refusal: Refusal, dispatched: number): StoredRefusal | undefined {
-    // A definitive answer from another response ends any provisional ownership, even when it is
-    // identical to the provisional refusal or too weak to apply: the slow body that created the
-    // provisional refusal must then pass the ordinary fencing rules like any other answer.
-    this.#provisional = null;
+  refuse(refusal: Refusal, dispatched: number): void {
     const effect = this.#effectFor(refusal);
     const stored = this.#refusal;
     if (
@@ -193,41 +196,38 @@ export class ProjectBinding {
       BLOCK_RANK[effect] < BLOCK_RANK[stored.effect] &&
       dispatched < this.#refusalGen
     ) {
-      return undefined;
-    }
-    return this.#store(refusal, effect, true);
-  }
-
-  /**
-   * A 401 arrived and its body is still being read: record a blocking `api_key_invalid` now, so
-   * no timeout or cancellation that wins the race against the body can reach the outage posture.
-   * The token lets {@link refine} replace it once the body is classified.
-   */
-  refuseProvisionally(): object | undefined {
-    const provisional: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
-    const stored = this.#refusal;
-    if (stored !== null && stored.effect === "block") return undefined;
-    this.#store(provisional, "block", false);
-    const token = {};
-    this.#provisional = token;
-    return token;
-  }
-
-  /**
-   * Replace a provisional 401 refusal with the classified one. If anything else was recorded in
-   * between, the classified refusal goes through the ordinary {@link refuse} rules instead.
-   */
-  refine(token: unknown, refusal: Refusal, dispatched: number): void {
-    if (token !== undefined && token === this.#provisional) {
-      // Nothing else answered since this 401's status: its own body may set the final posture.
-      this.#provisional = null;
-      this.#store(refusal, this.#effectFor(refusal), true);
       return;
     }
-    this.refuse(refusal, dispatched);
+    this.#store(refusal, effect, true);
   }
 
-  #store(refusal: Refusal, effect: RefusalEffect, log: boolean): StoredRefusal | undefined {
+  /**
+   * A 401 status from a data-plane request, before its body is read: unless a refusal is already
+   * stored, record a blocking `api_key_invalid` with posture unknown at once (no timeout or
+   * cancellation racing a slow body can then reach the outage posture), and revalidate promptly
+   * so an alert-only project relaxes as soon as a fresh `/auth/key` answer says so.
+   */
+  refuseAtStatus(): void {
+    if (this.#state === "refused") return;
+    const unknown: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
+    this.#store(unknown, "block", false);
+    this.#revalidateSoon();
+  }
+
+  /**
+   * Start a single-flight revalidation now, or right after the one in flight (which was
+   * dispatched before the refusal, so it cannot relax it). Never throws.
+   */
+  #revalidateSoon(): void {
+    const start = (): void => {
+      if (this.#state === "refused") void this.revalidate();
+    };
+    const pending = this.#inflight;
+    if (pending === null) start();
+    else pending.then(start, start);
+  }
+
+  #store(refusal: Refusal, effect: RefusalEffect, log: boolean): void {
     const stored = this.#refusal;
     const { message, field } = refusalMessage(refusal, this.selector);
     if (log && !this.#loggedCodes.has(refusal.code)) {
@@ -241,9 +241,8 @@ export class ProjectBinding {
       stored.effect === effect &&
       stored.message === message
     ) {
-      return stored;
+      return;
     }
-    this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
     const next: StoredRefusal = Object.freeze({
       code: refusal.code,
       posture: refusal.posture,
@@ -251,12 +250,36 @@ export class ProjectBinding {
       message,
       field,
     });
+    if (stored !== null && stored.effect === effect) {
+      // Same effect, newer wording (for example the body of a 401 whose status already blocked):
+      // nothing a caller can observe changes, so the generation and fencing stay where they are.
+      this.#refusal = next;
+      return;
+    }
+    this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
     this.#refusal = next;
     this.#state = "refused";
+    this.#syncBlockSignal();
     this.#generation += 1;
     this.#refusalGen = this.#generation;
     this.#notify("refused");
-    return next;
+  }
+
+  /**
+   * An `AbortSignal` that aborts as soon as a blocking refusal is stored. Native requests that are
+   * dispatched later than the call that started them (async request hooks, stream helpers) carry
+   * it, so they never reach the network after a refusal. Calls made after the block lifts get a
+   * fresh signal.
+   */
+  refusalSignal(): AbortSignal {
+    return this.#blockController.signal;
+  }
+
+  #syncBlockSignal(): void {
+    const blocking = this.#state === "refused" && this.#refusal?.effect === "block";
+    const aborted = this.#blockController.signal.aborted;
+    if (blocking && !aborted) this.#blockController.abort();
+    else if (!blocking && aborted) this.#blockController = new AbortController();
   }
 
   /**
@@ -271,7 +294,6 @@ export class ProjectBinding {
   /** Apply a full-scope `/auth/key` 200 dispatched at `dispatched`; false when superseded. */
   #succeed(dispatched: number, auth: AuthKeyResponse): boolean {
     if (dispatched !== this.#generation) return false;
-    this.#provisional = null;
     const pinChanged = this.#pinnedId !== auth.project_id;
     const recovered = this.#state === "refused";
     this.#pinnedId = auth.project_id;
@@ -280,6 +302,7 @@ export class ProjectBinding {
     this.#everValid = true;
     this.#refusal = null;
     this.#generation += 1;
+    this.#syncBlockSignal();
     if (pinChanged) this.#notify("pinned");
     else if (recovered) this.#notify("recovered");
     return true;

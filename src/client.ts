@@ -111,6 +111,7 @@ import {
 // dispatch loop must call THROUGH the namespace object for that spy to be observed.
 import * as translation from "./providers/translation/index";
 import { ORDINARY_TOKEN_COUNT_MAX } from "./receipt-fold";
+import { RefusalFence } from "./refusal-fence";
 import {
   assertRawProviderClient,
   buildRuntimes,
@@ -1101,15 +1102,6 @@ function hasOwnEnumerableKey(record: object): boolean {
  */
 const PER_CALL_IDEMPOTENT_KEY = "solwynIdempotent";
 
-/** A class (constructing one is not a provider dispatch); unreadable sources count as callables. */
-function isClassValue(value: unknown): boolean {
-  try {
-    return /^class[\s{]/.test(Function.prototype.toString.call(value));
-  } catch {
-    return false;
-  }
-}
-
 /** Translate the camelCase public options to the snake_case `SolwynConfig` input. */
 function toConfigOptions(options: SolwynOptions): SolwynConfigOptions {
   const configOptions: SolwynConfigOptions = {};
@@ -1244,7 +1236,8 @@ export class SolwynCore {
   readonly #reporter: MetadataReporter;
   readonly #budget: BudgetEnforcer;
   readonly #binding: ProjectBinding;
-  readonly #refusalGuards = new WeakMap<object, object>();
+  /** Fences unmetered and unknown spend, and what it returns, against stored key refusals. */
+  readonly #refusalFence: RefusalFence;
   readonly #breakers: CircuitBreakerManager;
   readonly #controlPlaneBreaker: CircuitBreaker;
   readonly #sdkInstanceId: string;
@@ -1349,6 +1342,17 @@ export class SolwynCore {
     // D6: resolve one logger for every core and advisory subsystem.
     this.#logger = options.logger ?? consoleLogger;
     this.#tagLogger = tagCaptureLogger(this.#logger);
+    // One project binding shared by the three control-plane transports. No network here:
+    // validation is lazy (the first gated call) or explicit (`validate()`).
+    this.#binding = new ProjectBinding({
+      selector: this.#config.project,
+      apiUrl: this.#config.api_url,
+      apiKey: this.#config.api_key,
+      fetch: options.fetch,
+      timeoutMs: this.#config.budget_check_timeout * 1000,
+      logger: this.#logger,
+    });
+    this.#refusalFence = new RefusalFence(this.#binding);
     this.#surfaceRuntimes = buildSurfaceRuntimeDescriptors(
       this.#client,
       this.#primaryModel,
@@ -1361,16 +1365,6 @@ export class SolwynCore {
     }
     this.#surfaceContext = primarySurfaceRuntime.context;
     this.#validateSurfaceAcknowledgments();
-    // One project binding shared by the three control-plane transports. No network here:
-    // validation is lazy (the first gated call) or explicit (`validate()`).
-    this.#binding = new ProjectBinding({
-      selector: this.#config.project,
-      apiUrl: this.#config.api_url,
-      apiKey: this.#config.api_key,
-      fetch: options.fetch,
-      timeoutMs: this.#config.budget_check_timeout * 1000,
-      logger: this.#logger,
-    });
     this.#untrackedSurfaceReporter = this.#config.report_untracked_surfaces
       ? new UntrackedSurfaceReporter(this.#config.api_url, this.#config.api_key, {
           binding: this.#binding,
@@ -1520,7 +1514,7 @@ export class SolwynCore {
     }
   }
 
-  #applySurfacePosture<T>(decision: EffectiveSurfaceDecision, execute: () => T): T {
+  #applySurfacePosture<T>(decision: EffectiveSurfaceDecision, execute: () => T, owner?: object): T {
     const provider = this.#surfaceContext.provider;
     if (provider === null) {
       throw new SolwynError("surface provider attribution is unavailable");
@@ -1543,35 +1537,7 @@ export class SolwynCore {
       guardAcknowledgedDescendant: (value) => this.#guardSurfaceValue(value, decision.surface),
       execute,
     });
-    return governed ? this.#refusalGuarded(value) : value;
-  }
-
-  /**
-   * Unmetered and unknown spend callables run outside the budget check, so each invocation
-   * re-checks the stored key refusal, including through a reference read before the refusal.
-   * Non-callables pass through; one guard per callable keeps reads identity-stable.
-   */
-  #refusalGuarded<T>(value: T): T {
-    if (typeof value !== "function" || isClassValue(value)) return value;
-    const target = value as unknown as (...args: unknown[]) => unknown;
-    const existing = this.#refusalGuards.get(target);
-    if (existing !== undefined) return existing as T;
-    const assertNotRefused = (): void => {
-      const refusal = this.#binding.blockingRefusal();
-      if (refusal !== null) throw refusal;
-    };
-    const guarded: object = new Proxy(target, {
-      apply(fn, thisArg, args): unknown {
-        assertNotRefused();
-        return Reflect.apply(fn, thisArg, args);
-      },
-      construct(fn, args, newTarget): object {
-        assertNotRefused();
-        return Reflect.construct(fn, args, newTarget);
-      },
-    });
-    this.#refusalGuards.set(target, guarded);
-    return guarded as T;
+    return governed ? this.#refusalFence.callable(value, owner) : value;
   }
 
   #guardSurfaceValue<T>(value: T, path: string): T {
@@ -1661,7 +1627,7 @@ export class SolwynCore {
       ) {
         // An absent descriptor cannot distinguish a missing field from a dynamic
         // Proxy capability. Even a reviewed namespace must refuse before lookup.
-        return this.#applySurfacePosture(dynamicDecision, execute);
+        return this.#applySurfacePosture(dynamicDecision, execute, target);
       }
 
       const value = execute();
@@ -1672,7 +1638,11 @@ export class SolwynCore {
           ? this.#guardSurfaceValue(value, surface)
           : namespaceTransform(value);
       }
-      const resolved = this.#applySurfacePosture(effectiveSurfaceDecision(actual), () => value);
+      const resolved = this.#applySurfacePosture(
+        effectiveSurfaceDecision(actual),
+        () => value,
+        target,
+      );
       return resolved;
     }
     const observation = staticObservation;
@@ -1683,7 +1653,7 @@ export class SolwynCore {
       const value = execute();
       const actual = observeEvaluatedProperty(surface, observation.descriptorCategory, value);
       if (rule?.acceptsShape(actual)) return interceptedMethod();
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
     if (
       rule === undefined &&
@@ -1700,12 +1670,12 @@ export class SolwynCore {
         const guarded = this.#guardSurfaceValue(value, surface);
         if (this.#config.on_unmetered !== "raise") {
           this.#surfaceGuards.observeTerminal(guarded, () => {
-            this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+            this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
           });
         }
         return guarded;
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
     this.#throwSurfaceDecision(decision);
     if (
@@ -1713,7 +1683,7 @@ export class SolwynCore {
       this.#config.on_unmetered === "raise" &&
       !this.#acknowledgmentApplies(surface, decision.rule ?? undefined)
     ) {
-      return this.#applySurfacePosture(decision, execute);
+      return this.#applySurfacePosture(decision, execute, target);
     }
 
     let evaluated = false;
@@ -1742,7 +1712,7 @@ export class SolwynCore {
           ? this.#guardSurfaceValue(value, surface)
           : namespaceTransform(value);
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
 
     if (decision.kind === "metadata" || decision.kind === "infrastructure") {
@@ -1760,18 +1730,24 @@ export class SolwynCore {
       ) {
         return value;
       }
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value);
+      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => value, target);
     }
 
-    const value = this.#applySurfacePosture(decision, readOnce);
+    const value = this.#applySurfacePosture(decision, readOnce, target);
     // Static drift already entered unknown posture before evaluation. Finish by
     // guarding the evaluated value, not by recording the same drift a second time.
-    if (decision.kind === "unknown") return this.#refusalGuarded(guardEvaluatedValue(rawValue));
+    if (decision.kind === "unknown") {
+      return this.#refusalFence.callable(guardEvaluatedValue(rawValue), target);
+    }
     // Even data descriptors can differ from Proxy.get results. Every evaluated
     // value must satisfy the reviewed shape before an acknowledgment can allow it.
     const actual = evaluatedObservation();
     if (rule !== undefined && !rule.acceptsShape(actual)) {
-      return this.#applySurfacePosture(effectiveSurfaceDecision(actual, rule), () => rawValue);
+      return this.#applySurfacePosture(
+        effectiveSurfaceDecision(actual, rule),
+        () => rawValue,
+        target,
+      );
     }
     const exactRawResponse =
       decision.kind === "unmetered_spend" &&
@@ -1782,7 +1758,9 @@ export class SolwynCore {
       return (...args: unknown[]) => this.#noOutputCapCall(surface, target, method, args);
     }
     const resolved = exactRawResponse ? value : guardEvaluatedValue(rawValue);
-    return decision.kind === "unmetered_spend" ? this.#refusalGuarded(resolved) : resolved;
+    return decision.kind === "unmetered_spend"
+      ? this.#refusalFence.callable(resolved, target)
+      : resolved;
   }
 
   /**
@@ -1848,7 +1826,8 @@ export class SolwynCore {
     // native dispatch; nothing awaits between this check and the call.
     const refused = this.#binding.blockingRefusal();
     if (refused !== null) throw refused;
-    return Reflect.apply(method, target, args);
+    // Fenced: the native request carries the refusal signal, and its result re-checks on use.
+    return Reflect.apply(this.#refusalFence.callable(method, target), target, args);
   }
 
   /** Resolve one wrapper-owned operation before the interception pipeline starts. */

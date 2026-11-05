@@ -106,6 +106,7 @@ If Solwyn does not answer the automatic check, calls follow the usual outage pos
 retries every 30 seconds. Cached allows and leases taken before a check pins the project id, or
 before a refusal or a recovery, are dropped at that moment, because they may belong to another
 project or key state. A refusal is stored and checked first on every call, before cached
-allows, leases, the control-plane breaker and `failOpen`; the SDK rechecks every 60 seconds and
-clears the refusal only after a successful check. See the README section on API keys and projects
+allows, leases, the control-plane breaker and `failOpen`. A refusal only tightens: a 401 blocks
+at its status, and only a key check sent after the refusal can relax or clear it. The SDK sends one
+immediately after a 401, then every 60 seconds. See the README section on API keys and projects
 for which refusals block and which let calls run unmetered.

@@ -99,9 +99,11 @@ Build before running distribution or package checks. Unit tests must remain offl
     allow cache, leases, the breaker and the outage posture, and `exitDecision()` on every return.
     Only an expired or revoked key on a project whose refusal posture is exactly `alert_only`, on a
     client that validated once, runs unmetered; every other refusal blocks. Responses are fenced
-    by the binding generation captured in `Transport.attempt`; a 401 refuses at its status. Every
+    by the binding generation captured in `Transport.attempt`; a 401 refuses at its status and
+    starts an immediate revalidation; only a request sent after a refusal may relax it. Every
     physical provider dispatch (hops, retries, media, unmetered spend callables) re-checks
-    `blockingRefusal()`. Any authority change (refusal, new pin, recovery) drops cached allows
+    `blockingRefusal()`; `src/refusal-fence.ts` fences what unmetered spend returns (deferred
+    promises, stream helpers, handles) and carries the refusal signal on Stainless requests. Any authority change (refusal, new pin, recovery) drops cached allows
     and leases, and the authority epoch keeps late grants and answers from being installed.
 
 ## Architecture
@@ -170,6 +172,7 @@ src/
   privacy.ts            # content-privileged estimation helpers
   token-details.ts  tags.ts
   project.ts            # ProjectBinding: Solwyn-Project header, /auth/key pinning, refusal gate
+  refusal-fence.ts      # stops unmetered spend and its returned handles after a key refusal
   api-key-errors.ts     # classifies key and project refusals (every 401 refuses)
   budget.ts  lease.ts  circuit-breaker.ts  reporter.ts  receipt-fold.ts
   run-control.ts  velocity.ts

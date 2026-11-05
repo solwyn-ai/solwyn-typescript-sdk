@@ -181,6 +181,8 @@ export interface TransportOptions {
   fetch?: FetchLike;
   /** Project binding: supplies `Solwyn-Project` and receives classified refusals. */
   binding?: RequestBinding;
+  /** Record a blocking refusal at a 401's status, before its body (default true). */
+  refuseAtStatus?: boolean;
   /**
    * Max RETRIES (not attempts) for a single request. Default `0` — one attempt,
    * no retry. Retries apply only to transient failures and never exceed this cap
@@ -311,11 +313,9 @@ async function readBoundedText(
  */
 export interface RequestBinding {
   dispatch(): { readonly header: string; readonly generation: number };
-  refuse(refusal: Refusal, dispatched: number): unknown;
-  /** Record a blocking refusal the moment a 401 status arrives; returns a refine token. */
-  refuseProvisionally(): unknown;
-  /** Replace the provisional refusal with the classified one. */
-  refine(token: unknown, refusal: Refusal, dispatched: number): void;
+  refuse(refusal: Refusal, dispatched: number): void;
+  /** Record a blocking refusal the moment a 401 status arrives (unless one is stored). */
+  refuseAtStatus(): void;
 }
 
 /**
@@ -422,6 +422,7 @@ export class Transport {
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly binding: RequestBinding | null;
+  private readonly refuseAtStatusEnabled: boolean;
 
   constructor(baseUrl: string, apiKey: string, options: TransportOptions = {}) {
     // Strip ALL trailing slashes (Python: `api_url.rstrip("/")`).
@@ -432,6 +433,7 @@ export class Transport {
     this.maxRetries = Math.max(0, options.maxRetries ?? 0);
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 100;
     this.binding = options.binding ?? null;
+    this.refuseAtStatusEnabled = options.refuseAtStatus ?? true;
   }
 
   /**
@@ -608,16 +610,14 @@ export class Transport {
           const classified = isClassifiedStatus(response.status);
           // Every 401 refuses, whatever its body: block now, synchronously at the status, so a
           // timeout or cancellation that beats a stalled body can never reach the outage posture.
-          const provisional =
-            response.status === 401 ? this.binding?.refuseProvisionally() : undefined;
+          if (response.status === 401 && this.refuseAtStatusEnabled) {
+            this.binding?.refuseAtStatus();
+          }
           const refusal = classified
             ? await classifyHttpFailure(response, controller, deadline - monotonicNow())
             : undefined;
-          // A classified refusal is recorded before anything else on this request's path.
-          if (refusal !== undefined) {
-            if (response.status === 401) this.binding?.refine(provisional, refusal, generation);
-            else this.binding?.refuse(refusal, generation);
-          }
+          // The classified refusal may only tighten what the status recorded (generation fencing).
+          if (refusal !== undefined) this.binding?.refuse(refusal, generation);
           const failure = new TransportHttpError(response.status, refusal, retryAfterMs);
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.

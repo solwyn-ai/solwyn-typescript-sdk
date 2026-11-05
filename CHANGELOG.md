@@ -49,12 +49,15 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   outage posture, and a refusal recorded while a call was in flight overrides that call's result,
   including its outage path. An expired or revoked key on a project with no hard limits lets calls
   run unmetered (logging `solwyn.api_key_refused` at error on each call), but only after the
-  client has validated once; every other refusal blocks. The SDK rechecks a refused key every 60
-  seconds and recovers after a successful check; a delayed older response can never clear or
-  weaken a newer refusal. A 401 blocks as soon as its status arrives, even if its body never
-  does. A stored blocking refusal also stops every later provider dispatch of a call already in
-  flight (failover hops and same-provider retries) and every unmetered or unrecognised spend
-  method, including references read before the refusal; surface acknowledgments do not override
+  client has validated once; every other refusal blocks. A refusal only ever tightens: a 401 blocks
+  as soon as its status arrives, and nothing that was already in flight (including that 401's own
+  body) can relax it. Only a key check sent after the refusal can: the SDK starts one right away
+  after a 401 (so an alerts-only project returns to unmetered calls within a round trip), then
+  every 60 seconds, and recovers after a successful check. A stored blocking refusal also stops
+  every later provider dispatch of a call already in flight (failover hops and same-provider
+  retries) and every unmetered or unrecognised spend method, including references read before the
+  refusal and work those methods return: promises that send later, stream helpers, chat sessions
+  and derived clients are stopped at their actual dispatch. Surface acknowledgments do not override
   it.
 - **Cached allows and held leases belong to the project they were granted for.** A refusal, a
   validation that pins a different project id, or recovery from a refusal drops them all (leases

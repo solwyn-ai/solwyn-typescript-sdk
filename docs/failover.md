@@ -10,6 +10,7 @@ Provide an ordered `fallback` chain of alternate clients. Each entry is a positi
 // [client, model, defaultParams, providerOverride]
 const client = new Solwyn(new OpenAI(), {
   apiKey: process.env.SOLWYN_API_KEY,
+  project: process.env.SOLWYN_PROJECT,
   fallback: [
     [new OpenAI({ baseURL: "https://api.groq.com/openai/v1", apiKey: process.env.GROQ_API_KEY }), "llama-3.3-70b-versatile"],
     [new Anthropic(), "claude-sonnet-4-20250514"],
@@ -74,6 +75,7 @@ import { LatencyPolicy } from "@solwyn/sdk";
 
 const client = new Solwyn(new OpenAI(), {
   apiKey: process.env.SOLWYN_API_KEY,
+  project: process.env.SOLWYN_PROJECT,
   fallback: [/* ... */],
   selectionPolicy: new LatencyPolicy(),
 });

@@ -1093,6 +1093,8 @@ export function createClientProxy(core: SolwynCore, wrappedClient: unknown): obj
     // still carries `input.modelId`, it is an unrecognized inference-shaped command escaping
     // budget/metering — warn (never silent) that it passes through untracked.
     if (hasModelId) {
+      // Inference-shaped spend that escapes metering still stops on a stored key refusal.
+      core.assertNotRefused();
       core.logger.warn(
         "Solwyn is passing an unrecognized Bedrock command that carries input.modelId through " +
           "UNTRACKED (no budget check, no usage metering). If this is a Converse call, send a " +

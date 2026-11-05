@@ -122,6 +122,7 @@ const client = new Solwyn(
   new OpenAI({ baseURL: "http://gpu-box:8080/v1", apiKey: "-" }),
   {
     apiKey: process.env.SOLWYN_API_KEY,
+    project: process.env.SOLWYN_PROJECT,
     provider: "vllm",
     fallback: [
       [new OpenAI({ baseURL: "https://openrouter.ai/api/v1", apiKey: process.env.OPENROUTER_API_KEY }), "openrouter/auto"],

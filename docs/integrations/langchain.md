@@ -35,6 +35,7 @@ import { SolwynRunScopeHandler } from "@solwyn/sdk/langchain";
 const handler = new SolwynRunScopeHandler();
 const solwyn = new Solwyn(new OpenAI({ maxRetries: 0 }), {
   apiKey: process.env.SOLWYN_API_KEY!,
+  project: process.env.SOLWYN_PROJECT!,
 });
 const leaf = handler.chatCompletionsLeaf(solwyn);
 

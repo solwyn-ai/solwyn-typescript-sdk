@@ -134,8 +134,9 @@ try {
       );
       replace(
         "apiKey: process.env.SOLWYN_API_KEY!,",
-        "apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, budgetCheckCacheTtl: 0,",
+        "apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, budgetCheckCacheTtl: 0,",
       );
+      replace("project: process.env.SOLWYN_PROJECT!,", "project: plane.project,");
       runtimeSource = `import { FakeControlPlane } from "@solwyn/sdk/testing";\nimport { createFakeOpenAITransport } from "./fake-openai-transport.mjs";\nexport const plane = new FakeControlPlane();\nexport const transport = createFakeOpenAITransport();\n${runtimeSource}`;
       fs.writeFileSync(path.join(consumerRoot, "recipe-runtime.mjs"), emit(runtimeSource));
       fs.writeFileSync(

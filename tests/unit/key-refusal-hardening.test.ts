@@ -13,6 +13,8 @@ import OpenAI from "openai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer } from "../../src/budget";
 import { ApiKeyRefusedError } from "../../src/errors";
+import { Solwyn } from "../../src/index";
+import { noopLogger } from "../../src/logging";
 import { run } from "../../src/node";
 import { FakeControlPlane } from "../../src/testing/index";
 import type { FetchLike } from "../../src/transport";
@@ -477,5 +479,177 @@ describe("6. a directly constructed BudgetEnforcer reads SOLWYN_PROJECT", () => 
     expect(() => new BudgetEnforcer({ apiUrl: TEST_API_URL, apiKey: TEST_API_KEY })).toThrow(
       "No Solwyn project configured.",
     );
+  });
+});
+
+describe("review 2.1: a provisional 401 loses ownership to any newer definitive refusal", () => {
+  it("an older slow alert_only 401 body cannot relax a newer malformed 401's refusal", async () => {
+    const firstHeaders = deferred<Response>();
+    const secondHeaders = deferred<Response>();
+    const bothChecks = deferred<void>();
+    const firstBodyRead = deferred<void>();
+    let checks = 0;
+    let dispatches = 0;
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    const provider = {
+      chat: {
+        completions: {
+          create() {
+            dispatches += 1;
+            return { usage: { prompt_tokens: 1, completion_tokens: 1 } };
+          },
+        },
+      },
+    };
+    const wrapped = new Solwyn(provider, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      leaseEnabled: false,
+      budgetCheckCacheTtl: 0,
+      reportUntrackedSurfaces: false,
+      logger: noopLogger,
+      fetch: async (url) => {
+        const path = new URL(url).pathname;
+        if (path === AUTH_KEY_PATH) return authKeyResponse();
+        if (path === CHECK_PATH) {
+          checks += 1;
+          if (checks === 1) return firstHeaders.promise;
+          if (checks === 2) {
+            bothChecks.resolve();
+            return secondHeaders.promise;
+          }
+          throw new Error("unexpected fresh check");
+        }
+        return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+      },
+    });
+    closers.push(() => wrapped.close());
+    await wrapped.validate();
+    const create = (): Promise<unknown> =>
+      (
+        wrapped as unknown as { chat: { completions: { create(body: Body): Promise<unknown> } } }
+      ).chat.completions.create({ model: "synthetic" });
+
+    const a = rejection(create());
+    const b = rejection(create());
+    await bothChecks.promise;
+    firstHeaders.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            bodyController = controller;
+          },
+          pull() {
+            firstBodyRead.resolve();
+          },
+        }),
+        { status: 401 },
+      ),
+    );
+    await firstBodyRead.promise;
+    secondHeaders.resolve(new Response("malformed JSON", { status: 401 }));
+    expect(await b).toBeInstanceOf(ApiKeyRefusedError);
+    bodyController.enqueue(new TextEncoder().encode(await expired("alert_only").text()));
+    bodyController.close();
+
+    expect(await a).toBeInstanceOf(ApiKeyRefusedError);
+    expect(await rejection(create())).toBeInstanceOf(ApiKeyRefusedError);
+    expect(dispatches).toBe(0);
+  });
+});
+
+describe("review 2.2: raw native dispatches re-check the binding immediately before the call", () => {
+  it.each([
+    0, 2, 3, 8,
+  ])("decisions.create never runs after a read_only_key recorded after its budget check (gap %i)", async (gap) => {
+    let refused = false;
+    let calledAfterRefusal = false;
+    let auths = 0;
+    const auth = deferred<Response>();
+    const check = deferred<Response>();
+    const checkStarted = deferred<void>();
+    const raw = new OpenAI({
+      apiKey: "offline-synthetic",
+      maxRetries: 0,
+      fetch: (async () => Response.json({ id: "dec_synthetic" })) as unknown as typeof fetch,
+    });
+    const nativeCreate = raw.decisions.create;
+    raw.decisions.create = function (this: unknown, ...args: unknown[]) {
+      calledAfterRefusal ||= refused;
+      return Reflect.apply(nativeCreate, this, args);
+    } as typeof raw.decisions.create;
+    const plane = new FakeControlPlane();
+    const client = new Solwyn(raw, {
+      apiKey: plane.apiKey,
+      project: plane.project,
+      apiUrl: plane.apiUrl,
+      leaseEnabled: false,
+      reportUntrackedSurfaces: false,
+      logger: {
+        ...noopLogger,
+        error: (line: string) => {
+          if (line.startsWith("solwyn.configuration_error.read_only_key:")) refused = true;
+        },
+      },
+      fetch: async (url, init) => {
+        const path = new URL(url).pathname;
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          return auths === 1 ? authKeyResponse() : auth.promise;
+        }
+        if (path === CHECK_PATH) {
+          checkStarted.resolve();
+          return check.promise;
+        }
+        return plane.fetch(url, init);
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    const validating = rejection(client.validate());
+    const decision = rejection(
+      Promise.resolve().then(() =>
+        client.decisions.create({ model: "synthetic", input: "synthetic" } as never),
+      ),
+    );
+    await checkStarted.promise;
+    check.resolve(allow("alert_only"));
+    for (let turn = 0; turn < gap; turn++) await Promise.resolve();
+    auth.resolve(authKeyResponse({ scope: "read_only" }));
+
+    await decision;
+    expect(await validating).toBeInstanceOf(ApiKeyRefusedError);
+    expect(calledAfterRefusal).toBe(false);
+  });
+
+  it("an unrecognised Bedrock command carrying input.modelId stops on a stored refusal", async () => {
+    class BedrockRuntimeClient {
+      readonly meta = {
+        service_model: { service_name: "bedrock-runtime" },
+        region_name: "us-east-1",
+      };
+      constructor(readonly send: (command: unknown) => unknown) {}
+    }
+    class CountTokensCommand {
+      constructor(readonly input: Record<string, unknown>) {}
+    }
+    const send = vi.fn((_command: unknown) => ({ ok: true }));
+    const plane = new FakeControlPlane({ keyScope: "read_only" });
+    const client = plane.wrap(new BedrockRuntimeClient(send), {
+      reportUntrackedSurfaces: false,
+      logger: noopLogger,
+    });
+    closers.push(() => client.close());
+    await expect(client.validate()).rejects.toBeInstanceOf(ApiKeyRefusedError);
+    const sendThrough = (client as unknown as { send(command: unknown): Promise<unknown> }).send;
+    expect(
+      await rejection(
+        Promise.resolve().then(() =>
+          sendThrough(new CountTokensCommand({ modelId: "anthropic.synthetic" })),
+        ),
+      ),
+    ).toBeInstanceOf(ApiKeyRefusedError);
+    expect(send).not.toHaveBeenCalled();
   });
 });

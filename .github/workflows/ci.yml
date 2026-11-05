@@ -240,7 +240,7 @@ jobs:
           const plane = new FakeControlPlane();
           let dispatches = 0;
           const raw = { chat: { completions: { create() { dispatches += 1; return { usage: { prompt_tokens: 2, completion_tokens: 3 } }; } } } };
-          const client = new Solwyn(raw, { apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, logger: noopLogger, reportUntrackedSurfaces: false });
+          const client = new Solwyn(raw, { apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, logger: noopLogger, reportUntrackedSurfaces: false });
           await client.chat.completions.create({ model: "synthetic" });
           await client.close();
           assert.equal(dispatches, 1);
@@ -263,7 +263,7 @@ jobs:
             const plane = new FakeControlPlane();
             let dispatches = 0;
             const raw = { chat: { completions: { create() { dispatches += 1; return { usage: { prompt_tokens: 2, completion_tokens: 3 } }; } } } };
-            const client = new Solwyn(raw, { apiKey: plane.apiKey, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, logger: noopLogger, reportUntrackedSurfaces: false });
+            const client = new Solwyn(raw, { apiKey: plane.apiKey, project: plane.project, apiUrl: plane.apiUrl, fetch: plane.fetch, leaseEnabled: false, logger: noopLogger, reportUntrackedSurfaces: false });
             await client.chat.completions.create({ model: "synthetic" });
             await client.close();
             assert.equal(dispatches, 1);

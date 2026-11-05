@@ -1844,6 +1844,10 @@ export class SolwynCore {
     if (result.hardDenyAdmitted) {
       throw new OutputBoundUnenforceableError({ provider, reason: "no_output_cap" });
     }
+    // A refusal recorded after the check (a concurrent validation or call) still stops the
+    // native dispatch; nothing awaits between this check and the call.
+    const refused = this.#binding.blockingRefusal();
+    if (refused !== null) throw refused;
     return Reflect.apply(method, target, args);
   }
 
@@ -4788,6 +4792,12 @@ export class SolwynCore {
     applyEventReceiptFields(event, fields);
     this.#applyRunReceipt(event, ctx.run);
     return event;
+  }
+
+  /** @internal Throw the stored blocking key refusal, if any, before a raw native dispatch. */
+  assertNotRefused(): void {
+    const refused = this.#binding.blockingRefusal();
+    if (refused !== null) throw refused;
   }
 
   /**

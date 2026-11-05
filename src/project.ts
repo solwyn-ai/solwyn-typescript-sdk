@@ -100,6 +100,8 @@ export class ProjectBinding {
   #state: BindingState = "unvalidated";
   #everValid = false;
   #refusal: StoredRefusal | null = null;
+  /** Owner token of a provisional 401 refusal whose body is still being read. */
+  #provisional: object | null = null;
   #generation = 0;
   #refusalGen = 0;
   #nextValidateAt = 0;
@@ -180,6 +182,10 @@ export class ProjectBinding {
    * stored one. Returns the stored refusal when this call stored it. Never throws.
    */
   refuse(refusal: Refusal, dispatched: number): StoredRefusal | undefined {
+    // A definitive answer from another response ends any provisional ownership, even when it is
+    // identical to the provisional refusal or too weak to apply: the slow body that created the
+    // provisional refusal must then pass the ordinary fencing rules like any other answer.
+    this.#provisional = null;
     const effect = this.#effectFor(refusal);
     const stored = this.#refusal;
     if (
@@ -197,19 +203,24 @@ export class ProjectBinding {
    * no timeout or cancellation that wins the race against the body can reach the outage posture.
    * The token lets {@link refine} replace it once the body is classified.
    */
-  refuseProvisionally(): StoredRefusal | undefined {
+  refuseProvisionally(): object | undefined {
     const provisional: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
     const stored = this.#refusal;
     if (stored !== null && stored.effect === "block") return undefined;
-    return this.#store(provisional, "block", false);
+    this.#store(provisional, "block", false);
+    const token = {};
+    this.#provisional = token;
+    return token;
   }
 
   /**
    * Replace a provisional 401 refusal with the classified one. If anything else was recorded in
    * between, the classified refusal goes through the ordinary {@link refuse} rules instead.
    */
-  refine(token: StoredRefusal | undefined, refusal: Refusal, dispatched: number): void {
-    if (token !== undefined && this.#refusal === token) {
+  refine(token: unknown, refusal: Refusal, dispatched: number): void {
+    if (token !== undefined && token === this.#provisional) {
+      // Nothing else answered since this 401's status: its own body may set the final posture.
+      this.#provisional = null;
       this.#store(refusal, this.#effectFor(refusal), true);
       return;
     }
@@ -260,6 +271,7 @@ export class ProjectBinding {
   /** Apply a full-scope `/auth/key` 200 dispatched at `dispatched`; false when superseded. */
   #succeed(dispatched: number, auth: AuthKeyResponse): boolean {
     if (dispatched !== this.#generation) return false;
+    this.#provisional = null;
     const pinChanged = this.#pinnedId !== auth.project_id;
     const recovered = this.#state === "refused";
     this.#pinnedId = auth.project_id;

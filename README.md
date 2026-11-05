@@ -62,7 +62,8 @@ export OPENAI_API_KEY="<your OpenAI API key>"
 
 Keep the keys in your server environment or secret manager. The Solwyn key must have the format
 `solwyn_sk_` followed by 64 lowercase hexadecimal characters; placeholder values and old
-`sk_proj_` keys fail validation. You can also pass `project: "checkout-bot"` to the constructor.
+`sk_proj_` keys fail validation. Both values fall back to their environment variables, so the shorter
+examples below that pass only `apiKey` still read `SOLWYN_PROJECT`.
 
 ### 2. Wrap your client and make a call
 
@@ -75,6 +76,7 @@ import OpenAI from "openai";
 
 const client = new Solwyn(new OpenAI(), {
   apiKey: process.env.SOLWYN_API_KEY,
+  project: process.env.SOLWYN_PROJECT,
 });
 
 try {

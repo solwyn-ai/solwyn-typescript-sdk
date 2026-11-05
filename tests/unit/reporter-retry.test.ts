@@ -351,7 +351,7 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
     );
   });
 
-  it("treats an exact read-only response as sent plus malformed without disposition", async () => {
+  it("treats an exact read-only response as sent plus malformed, counted as a refused drop", async () => {
     const reporter = new MetadataReporter(API_URL, API_KEY, {
       fetch: async () =>
         new Response(JSON.stringify({ detail: { code: "read_only_key" } }), { status: 403 }),
@@ -361,7 +361,8 @@ describe("MetadataReporter retry outcomes and ingest parser", () => {
       outcome: "sent",
       rejections: { kind: "malformed", indexes: [], count: 0 },
     });
-    expect(reporter.droppedCounts).toEqual({});
+    // Terminal, never retried, and visible in the drop accounting.
+    expect(reporter.droppedCounts).toEqual({ "event.api_key_refused": 1 });
   });
 
   it("classifies reporter-boundary 408/body I/O as retry but completed invalid JSON as malformed sent", async () => {

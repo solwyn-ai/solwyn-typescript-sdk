@@ -317,6 +317,13 @@ export class ProjectBinding {
    * otherwise (no refusal, or one that lets calls run unmetered). Synchronous, no network.
    */
   blockingRefusal(): ApiKeyRefusedError | null {
+    // Every path that consults the stored refusal (unmetered and deferred spend, dispatch
+    // guards) also drives the shared key check, so a client that never runs a budget check still
+    // rechecks on schedule: 5 s after no answer, 60 s after a refusing answer. Single-flight and
+    // never awaited here.
+    if (this.#state === "refused" && this.#inflight === null && this.#revalidationDue()) {
+      void this.revalidate();
+    }
     const refusal = this.#state === "refused" ? this.#refusal : null;
     return refusal !== null && refusal.effect === "block" ? this.#refusalError(refusal) : null;
   }

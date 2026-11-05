@@ -109,7 +109,8 @@ project or key state. A refusal is stored and checked first on every call, befor
 allows, leases, the control-plane breaker and `failOpen`. A refusal only tightens: a 401 blocks
 at its status, and only a key check sent after the refusal can relax or clear it. The SDK sends one
 immediately after a 401, then every 60 seconds after an answer that refuses (a 401, or a 200 for a
-read-only key), or every 5 seconds when the check gets no answer at all. A refusal stops every call
+read-only key), or every 5 seconds when the check gets no answer at all. Unmetered calls drive the same schedule as
+budget checks, so a client that only uses unmetered methods still recovers. A refusal stops every call
 admitted after it is recorded; a call already admitted may complete (for example a request the
 provider SDK is still preparing, or a chat message already queued behind another one). Any
 refusal from another response, even an identical one and from the moment its 401 status arrives,

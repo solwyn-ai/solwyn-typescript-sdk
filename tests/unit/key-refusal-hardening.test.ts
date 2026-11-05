@@ -18,6 +18,7 @@ import { Solwyn } from "../../src/index";
 import { noopLogger } from "../../src/logging";
 import { run } from "../../src/node";
 import { ProjectBinding } from "../../src/project";
+import { RefusalFence } from "../../src/refusal-fence";
 import { MetadataReporter } from "../../src/reporter";
 import { FakeControlPlane } from "../../src/testing/index";
 import { zeroTokenDetails } from "../../src/token-details";
@@ -37,6 +38,7 @@ const AUTH_KEY_PATH = "/api/v1/auth/key";
 const CHECK_PATH = "/api/v1/budgets/check";
 const LEASE_PATH = "/api/v1/budgets/lease";
 const SURRENDER_PATH = "/api/v1/budgets/lease/surrender";
+const INGEST_PATH = "/api/v1/metadata/ingest";
 const PROJECT_B = `proj_${"b".repeat(24)}`;
 
 type Body = Record<string, unknown>;
@@ -1606,5 +1608,124 @@ describe("review 5: every independent 401 status advances ordering, even while b
     );
     body.close();
     await b;
+  });
+});
+
+describe("unmetered spend drives the shared key check", () => {
+  it("alert_only project, reporter 401, then 100 batches.create calls: exactly one prompt /auth/key re-check, then the calls proceed", async () => {
+    let auths = 0;
+    let ingests = 0;
+    const batchRequests: string[] = [];
+    const raw = new OpenAI({
+      apiKey: "offline-synthetic",
+      maxRetries: 0,
+      fetch: (async (url: string) => {
+        const path = new URL(url).pathname;
+        if (path.endsWith("/batches")) {
+          batchRequests.push(path);
+          return Response.json({ id: "batch_synthetic", object: "batch" });
+        }
+        return Response.json({
+          id: "synthetic",
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4o",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }) as unknown as typeof fetch,
+    });
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      logger: noopLogger,
+      leaseEnabled: false,
+      budgetCheckCacheTtl: 0,
+      reportUntrackedSurfaces: false,
+      reporterFlushInterval: 0.01,
+      fetch: async (url) => {
+        const path = new URL(url).pathname;
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          return auths === 1 ? authKeyResponse() : expired("alert_only");
+        }
+        if (path === CHECK_PATH) return allow("alert_only");
+        if (path === INGEST_PATH) {
+          ingests += 1;
+          return expired("alert_only");
+        }
+        return new Response(null, { status: 204 });
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    await client.chat.completions.create({
+      model: "gpt-4o",
+      messages: [],
+      max_completion_tokens: 16,
+    });
+    // The reporter's ingest gets the 401: a block at its status and one prompt key check, which
+    // answers alert_only and relaxes the block.
+    await vi.waitFor(() => expect(ingests).toBe(1));
+    await vi.waitFor(() => expect(auths).toBe(2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    for (let call = 0; call < 100; call++) {
+      await expect(
+        client.batches.create({
+          input_file_id: "file-synthetic",
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+        }),
+      ).resolves.toBeDefined();
+    }
+    expect(batchRequests).toHaveLength(100);
+    expect(auths).toBe(2);
+    expect(ingests).toBe(1);
+  });
+
+  it("fenced unmetered calls alone drive the 60 s re-check after a refusing answer and the 5 s re-check when unanswered", async () => {
+    let now = 0;
+    let auths = 0;
+    let reachable = true;
+    const binding = testBinding({
+      now: () => now,
+      fetch: async () => {
+        auths += 1;
+        if (!reachable) throw new TypeError("fetch failed");
+        return expired("hard_deny");
+      },
+    });
+    await rejection(binding.validate());
+    const spend = vi.fn(() => "sent");
+    const fenced = new RefusalFence(binding).callable(spend);
+    const call = (): unknown => {
+      try {
+        return fenced();
+      } catch (error) {
+        return error;
+      }
+    };
+    for (let attempt = 0; attempt < 10; attempt++) {
+      expect(call()).toBeInstanceOf(ApiKeyRefusedError);
+    }
+    expect(auths).toBe(1);
+
+    now += 60_000;
+    reachable = false;
+    for (let attempt = 0; attempt < 10; attempt++) call();
+    await vi.waitFor(() => expect(auths).toBe(2));
+    // Let the unanswered re-check settle (its 5 s window starts when it ends).
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Unanswered: the next re-check is 5 s later, single-flight however many calls arrive.
+    now += 4_999;
+    for (let attempt = 0; attempt < 10; attempt++) call();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(auths).toBe(2);
+    now += 1;
+    for (let attempt = 0; attempt < 10; attempt++) call();
+    await vi.waitFor(() => expect(auths).toBe(3));
+    expect(spend).not.toHaveBeenCalled();
   });
 });

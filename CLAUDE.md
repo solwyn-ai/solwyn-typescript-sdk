@@ -102,7 +102,7 @@ Build before running distribution or package checks. Unit tests must remain offl
     by the binding generation captured in `Transport.attempt`; a 401 refuses at its status and
     starts an immediate revalidation; only a request sent after a refusal may relax it, and any
     independent refusal (even identical, and already at a 401's status) advances the ordering. Refusing key-check answers back
-    off 60 s, unanswered ones 5 s. A refusal stops calls admitted after it; admitted calls may
+    off 60 s, unanswered ones 5 s; `blockingRefusal()` drives that schedule for unmetered paths. A refusal stops calls admitted after it; admitted calls may
     complete. While
     refused (either effect) `Transport.attempt` sends nothing but `/auth/key`
     (`TransportRefusedError`, dropped as `api_key_refused`). Every

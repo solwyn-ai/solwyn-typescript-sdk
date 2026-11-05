@@ -105,9 +105,9 @@ const BUILTIN_CONSTRUCTORS = [
 function isBuiltinValue(value: object): boolean {
   if (ArrayBuffer.isView(value)) return true;
   for (const name of BUILTIN_CONSTRUCTORS) {
-    const constructor: unknown = Reflect.get(globalThis, name);
+    const builtin: unknown = Reflect.get(globalThis, name);
     try {
-      if (typeof constructor === "function" && value instanceof constructor) return true;
+      if (typeof builtin === "function" && value instanceof builtin) return true;
     } catch {
       // A hostile Symbol.hasInstance cannot exempt or break fencing.
     }

@@ -1504,3 +1504,107 @@ describe("review 4.6 and retry cadence while refused", () => {
     expect(auths).toBe(4);
   });
 });
+
+describe("review 5: every independent 401 status advances ordering, even while blocked", () => {
+  it.each([
+    "alert_only",
+    "full_scope",
+  ] as const)("a key check sent before a second 401's status cannot let a new call reach the provider (answer %s)", async (answer) => {
+    const auth = deferred<Response>();
+    const authStarted = deferred<void>();
+    const aHeaders = deferred<Response>();
+    const bHeaders = deferred<Response>();
+    const bothChecks = deferred<void>();
+    let auths = 0;
+    let checks = 0;
+    let newerStatusObserved = false;
+    const providerDispatches: Array<{ newerStatusObserved: boolean }> = [];
+    const raw = new OpenAI({
+      apiKey: "offline-synthetic",
+      maxRetries: 0,
+      fetch: (async () => {
+        providerDispatches.push({ newerStatusObserved });
+        return Response.json({
+          id: "synthetic",
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4o",
+          choices: [],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }) as unknown as typeof fetch,
+    });
+    const client = new Solwyn(raw, {
+      apiKey: TEST_API_KEY,
+      apiUrl: TEST_API_URL,
+      project: TEST_PROJECT,
+      logger: noopLogger,
+      leaseEnabled: false,
+      budgetCheckCacheTtl: 0,
+      reportUntrackedSurfaces: false,
+      fetch: async (url) => {
+        const path = new URL(url).pathname;
+        if (path === AUTH_KEY_PATH) {
+          auths += 1;
+          if (auths === 1) return authKeyResponse();
+          if (auths === 2) {
+            authStarted.resolve();
+            return auth.promise;
+          }
+          return expired("hard_deny");
+        }
+        if (path === CHECK_PATH) {
+          checks += 1;
+          if (checks === 1) return aHeaders.promise;
+          if (checks === 2) {
+            bothChecks.resolve();
+            return bHeaders.promise;
+          }
+          return allow("alert_only");
+        }
+        return Response.json({ ingested: 0, rejected: [], duplicates: [] }, { status: 202 });
+      },
+    });
+    closers.push(() => client.close());
+    await client.validate();
+    const call = (): Promise<unknown> =>
+      rejection(
+        client.chat.completions.create({
+          model: "gpt-4o",
+          messages: [],
+          max_completion_tokens: 16,
+        }),
+      );
+    const a = call();
+    const b = call();
+    await bothChecks.promise;
+    aHeaders.resolve(new Response("invalid JSON", { status: 401 }));
+    await authStarted.promise;
+    await a;
+    let body!: ReadableStreamDefaultController<Uint8Array>;
+    bHeaders.resolve(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            body = controller;
+          },
+        }),
+        { status: 401 },
+      ),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    newerStatusObserved = true;
+    const pendingValidation = rejection(client.validate());
+    auth.resolve(answer === "full_scope" ? authKeyResponse() : expired("alert_only"));
+    await pendingValidation;
+    expect(await call()).toBeInstanceOf(ApiKeyRefusedError);
+    expect(providerDispatches).toEqual([]);
+    body.enqueue(
+      new TextEncoder().encode(
+        JSON.stringify({ detail: { code: "api_key_expired", project_budget_mode: "hard_deny" } }),
+      ),
+    );
+    body.close();
+    await b;
+  });
+});

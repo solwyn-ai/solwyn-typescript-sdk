@@ -340,7 +340,7 @@ export interface RequestBinding {
    */
   refuse(refusal: Refusal, dispatched: number, ownStatus?: number, keyCheck?: boolean): void;
   /** Record a blocking refusal the moment a 401 status arrives (unless one is stored). */
-  refuseAtStatus(): number | undefined;
+  refuseAtStatus(): number;
   /** The stored refusal while the key is refused (either effect); data-plane requests stop. */
   suppressedBy(): Refusal | undefined;
 }

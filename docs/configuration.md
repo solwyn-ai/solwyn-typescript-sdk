@@ -112,8 +112,8 @@ immediately after a 401, then every 60 seconds after an answer that refuses (a 4
 read-only key), or every 5 seconds when the check gets no answer at all. A refusal stops every call
 admitted after it is recorded; a call already admitted may complete (for example a request the
 provider SDK is still preparing, or a chat message already queued behind another one). Any
-refusal from another response, even an identical one, is newer than a key check already in
-flight, so that check cannot relax or clear it. While a refusal is stored, that key check is the
+refusal from another response, even an identical one and from the moment its 401 status arrives,
+is newer than a key check already in flight, so that check cannot relax or clear it. While a refusal is stored, that key check is the
 only request the SDK sends to Solwyn; queued usage, metadata and reports are dropped locally and
 counted as `api_key_refused`. A successful key check clears the refusal and traffic resumes. See the README section on API keys and projects
 for which refusals block and which let calls run unmetered.

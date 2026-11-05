@@ -213,10 +213,18 @@ export class ProjectBinding {
    * cancellation racing a slow body can then reach the outage posture), and revalidate promptly
    * so an alert-only project relaxes as soon as a fresh `/auth/key` answer says so.
    */
-  refuseAtStatus(): number | undefined {
+  refuseAtStatus(): number {
     // Only a request sent before the current refusal can still answer 401 (nothing else is sent
     // while refused); its status tightens an allow_unmetered refusal for one round trip.
-    if (this.#state === "refused" && this.#refusal?.effect === "block") return undefined;
+    if (this.#state === "refused" && this.#refusal?.effect === "block") {
+      // Already blocked: this independent 401 is still newer news. Advance the ordering at the
+      // status (before its body), so a key check already in flight can neither relax nor clear
+      // the block, and queue a fresh key check after that one.
+      this.#generation += 1;
+      this.#refusalGen = this.#generation;
+      this.#revalidateSoon();
+      return this.#refusalGen;
+    }
     const unknown: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
     this.#store(unknown, "block", false, false);
     this.#revalidateSoon();

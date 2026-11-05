@@ -39,6 +39,8 @@ export const UNVALIDATED_RETRY_MS = 30_000;
 export const REFUSED_RETRY_MS = 60_000;
 
 export type BindingState = "unvalidated" | "valid" | "refused";
+/** Why retained authority (cached allows, held leases) must be dropped. */
+export type AuthorityChange = "refused" | "pinned" | "recovered";
 export type RefusalEffect = "block" | "allow_unmetered";
 
 /** A stored refusal, with its effect decided once, at the moment it was recorded. */
@@ -90,7 +92,7 @@ export class ProjectBinding {
   readonly #timeoutMs: number;
   readonly #logger: Logger;
   readonly #now: () => number;
-  readonly #listeners = new Set<() => void>();
+  readonly #listeners = new Set<(reason: AuthorityChange) => void>();
   readonly #loggedCodes = new Set<string>();
 
   #pinnedId: string | null = null;
@@ -144,33 +146,83 @@ export class ProjectBinding {
     return { header: this.headerValue, generation: this.#generation };
   }
 
-  /** Run `listener` synchronously whenever a refusal changes the stored state. */
-  onRefuse(listener: () => void): () => void {
+  /**
+   * Run `listener` synchronously whenever retained authority must be dropped: a refusal changed
+   * the stored state (`refused`), a validation pinned a different project id (`pinned`), or a
+   * validation cleared a refusal (`recovered`).
+   */
+  onAuthorityChange(listener: (reason: AuthorityChange) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
+  }
+
+  #notify(reason: AuthorityChange): void {
+    for (const listener of [...this.#listeners]) {
+      try {
+        listener(reason);
+      } catch {
+        // Listeners are best-effort local cleanup; the state change is recorded regardless.
+      }
+    }
+  }
+
+  #effectFor(refusal: Refusal): RefusalEffect {
+    return (refusal.code === "api_key_expired" || refusal.code === "api_key_invalid") &&
+      refusal.posture === "alert_only" &&
+      this.#everValid
+      ? "allow_unmetered"
+      : "block";
   }
 
   /**
    * Record a classified refusal from a request dispatched at generation `dispatched`.
    * Tightening always applies; a weaker refusal applies only when dispatched at or after the
-   * stored one. Never throws.
+   * stored one. Returns the stored refusal when this call stored it. Never throws.
    */
-  refuse(refusal: Refusal, dispatched: number): void {
-    const effect: RefusalEffect =
-      (refusal.code === "api_key_expired" || refusal.code === "api_key_invalid") &&
-      refusal.posture === "alert_only" &&
-      this.#everValid
-        ? "allow_unmetered"
-        : "block";
+  refuse(refusal: Refusal, dispatched: number): StoredRefusal | undefined {
+    const effect = this.#effectFor(refusal);
     const stored = this.#refusal;
     if (
       stored !== null &&
       BLOCK_RANK[effect] < BLOCK_RANK[stored.effect] &&
       dispatched < this.#refusalGen
     ) {
+      return undefined;
+    }
+    return this.#store(refusal, effect, true);
+  }
+
+  /**
+   * A 401 arrived and its body is still being read: record a blocking `api_key_invalid` now, so
+   * no timeout or cancellation that wins the race against the body can reach the outage posture.
+   * The token lets {@link refine} replace it once the body is classified.
+   */
+  refuseProvisionally(): StoredRefusal | undefined {
+    const provisional: Refusal = { code: "api_key_invalid", posture: "unknown", expiredOn: null };
+    const stored = this.#refusal;
+    if (stored !== null && stored.effect === "block") return undefined;
+    return this.#store(provisional, "block", false);
+  }
+
+  /**
+   * Replace a provisional 401 refusal with the classified one. If anything else was recorded in
+   * between, the classified refusal goes through the ordinary {@link refuse} rules instead.
+   */
+  refine(token: StoredRefusal | undefined, refusal: Refusal, dispatched: number): void {
+    if (token !== undefined && this.#refusal === token) {
+      this.#store(refusal, this.#effectFor(refusal), true);
       return;
     }
+    this.refuse(refusal, dispatched);
+  }
+
+  #store(refusal: Refusal, effect: RefusalEffect, log: boolean): StoredRefusal | undefined {
+    const stored = this.#refusal;
     const { message, field } = refusalMessage(refusal, this.selector);
+    if (log && !this.#loggedCodes.has(refusal.code)) {
+      this.#loggedCodes.add(refusal.code);
+      this.#logger.error(`solwyn.configuration_error.${refusal.code}: ${message}`);
+    }
     if (
       stored !== null &&
       stored.code === refusal.code &&
@@ -178,41 +230,46 @@ export class ProjectBinding {
       stored.effect === effect &&
       stored.message === message
     ) {
-      return;
+      return stored;
     }
     this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
-    this.#refusal = Object.freeze({
+    const next: StoredRefusal = Object.freeze({
       code: refusal.code,
       posture: refusal.posture,
       effect,
       message,
       field,
     });
+    this.#refusal = next;
     this.#state = "refused";
     this.#generation += 1;
     this.#refusalGen = this.#generation;
-    if (!this.#loggedCodes.has(refusal.code)) {
-      this.#loggedCodes.add(refusal.code);
-      this.#logger.error(`solwyn.configuration_error.${refusal.code}: ${message}`);
-    }
-    for (const listener of [...this.#listeners]) {
-      try {
-        listener();
-      } catch {
-        // Listeners are best-effort local cleanup; a refusal is recorded regardless.
-      }
-    }
+    this.#notify("refused");
+    return next;
+  }
+
+  /**
+   * The error to raise before a provider dispatch, when a stored refusal blocks calls; `null`
+   * otherwise (no refusal, or one that lets calls run unmetered). Synchronous, no network.
+   */
+  blockingRefusal(): ApiKeyRefusedError | null {
+    const refusal = this.#state === "refused" ? this.#refusal : null;
+    return refusal !== null && refusal.effect === "block" ? this.#refusalError(refusal) : null;
   }
 
   /** Apply a full-scope `/auth/key` 200 dispatched at `dispatched`; false when superseded. */
   #succeed(dispatched: number, auth: AuthKeyResponse): boolean {
     if (dispatched !== this.#generation) return false;
+    const pinChanged = this.#pinnedId !== auth.project_id;
+    const recovered = this.#state === "refused";
     this.#pinnedId = auth.project_id;
     this.#lastAuth = auth;
     this.#state = "valid";
     this.#everValid = true;
     this.#refusal = null;
     this.#generation += 1;
+    if (pinChanged) this.#notify("pinned");
+    else if (recovered) this.#notify("recovered");
     return true;
   }
 

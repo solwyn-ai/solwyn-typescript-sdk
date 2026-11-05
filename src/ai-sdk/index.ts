@@ -1229,6 +1229,12 @@ export function createSolwynMiddleware(
       releaseFunding(ctx);
       throw callerAbortError(ctx.abortSignal);
     }
+    // A blocking key refusal recorded after this call's budget check still stops the dispatch.
+    const refused = binding.blockingRefusal();
+    if (refused !== null) {
+      releaseFunding(ctx);
+      throw refused;
+    }
     const error = stoppedError(ctx, handle);
     if (error === undefined) return;
     try {

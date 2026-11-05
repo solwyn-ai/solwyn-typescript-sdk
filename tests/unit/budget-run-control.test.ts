@@ -1338,6 +1338,8 @@ describe("BudgetEnforcer lease directive fences", () => {
       },
       { leaseEnabled: true },
     );
+    // Validate first: the first pin drops any authority installed before it.
+    await budget.binding.validate();
     expect(
       internal(budget).leaseLedger.applyGrantResponse(
         "run-b",

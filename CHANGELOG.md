@@ -20,7 +20,8 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   `sk_proj_` key fails at construction with `ConfigurationError(field: "api_key")`: "This is an old
   Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create."
 - **A project is required.** Pass `project` (a project name or its `proj_` id) or set
-  `SOLWYN_PROJECT`, on `new Solwyn(...)`, `createSolwynMiddleware(...)` and `new BudgetEnforcer(...)`.
+  `SOLWYN_PROJECT`, on `new Solwyn(...)`, `createSolwynMiddleware(...)` and `new BudgetEnforcer(...)`
+  (the option wins over the environment).
   Without one, construction fails with `ConfigurationError(field: "project")`. `SOLWYN_PROJECT_ID`
   is not read; when it is set, the error says to rename it. Passing `projectId` fails with
   `ConfigurationError(field: "project_id")`.
@@ -50,7 +51,14 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   run unmetered (logging `solwyn.api_key_refused` at error on each call), but only after the
   client has validated once; every other refusal blocks. The SDK rechecks a refused key every 60
   seconds and recovers after a successful check; a delayed older response can never clear or
-  weaken a newer refusal.
+  weaken a newer refusal. A 401 blocks as soon as its status arrives, even if its body never
+  does. A stored blocking refusal also stops every later provider dispatch of a call already in
+  flight (failover hops and same-provider retries) and every unmetered or unrecognised spend
+  method, including references read before the refusal; surface acknowledgments do not override
+  it.
+- **Cached allows and held leases belong to the project they were granted for.** A refusal, a
+  validation that pins a different project id, or recovery from a refusal drops them all (leases
+  are surrendered), and grants or check answers already in flight are not installed.
 - `FakeControlPlane.expireKey`, `revokeKey`, `refuseKey`, `refuseProject` and `renameProject`, the
   `authKeyRequests` and `projectHeaders` recordings, and the `assertAuthKeyContract` probe.
 - Public exports `API_KEY_PATTERN`, `PROJECT_SELECTOR_PATTERN`, `PROJECT_HEADER`,

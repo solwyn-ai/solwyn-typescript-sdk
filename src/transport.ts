@@ -311,7 +311,11 @@ async function readBoundedText(
  */
 export interface RequestBinding {
   dispatch(): { readonly header: string; readonly generation: number };
-  refuse(refusal: Refusal, dispatched: number): void;
+  refuse(refusal: Refusal, dispatched: number): unknown;
+  /** Record a blocking refusal the moment a 401 status arrives; returns a refine token. */
+  refuseProvisionally(): unknown;
+  /** Replace the provisional refusal with the classified one. */
+  refine(token: unknown, refusal: Refusal, dispatched: number): void;
 }
 
 /**
@@ -602,11 +606,18 @@ export class Transport {
             // Custom fetch responses may lack a usable headers interface.
           }
           const classified = isClassifiedStatus(response.status);
+          // Every 401 refuses, whatever its body: block now, synchronously at the status, so a
+          // timeout or cancellation that beats a stalled body can never reach the outage posture.
+          const provisional =
+            response.status === 401 ? this.binding?.refuseProvisionally() : undefined;
           const refusal = classified
             ? await classifyHttpFailure(response, controller, deadline - monotonicNow())
             : undefined;
           // A classified refusal is recorded before anything else on this request's path.
-          if (refusal !== undefined) this.binding?.refuse(refusal, generation);
+          if (refusal !== undefined) {
+            if (response.status === 401) this.binding?.refine(provisional, refusal, generation);
+            else this.binding?.refuse(refusal, generation);
+          }
           const failure = new TransportHttpError(response.status, refusal, retryAfterMs);
           httpFailure = failure;
           // The outcome is decided at headers; disposal never delays or changes it.

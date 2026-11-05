@@ -1101,6 +1101,15 @@ function hasOwnEnumerableKey(record: object): boolean {
  */
 const PER_CALL_IDEMPOTENT_KEY = "solwynIdempotent";
 
+/** A class (constructing one is not a provider dispatch); unreadable sources count as callables. */
+function isClassValue(value: unknown): boolean {
+  try {
+    return /^class[\s{]/.test(Function.prototype.toString.call(value));
+  } catch {
+    return false;
+  }
+}
+
 /** Translate the camelCase public options to the snake_case `SolwynConfig` input. */
 function toConfigOptions(options: SolwynOptions): SolwynConfigOptions {
   const configOptions: SolwynConfigOptions = {};
@@ -1235,6 +1244,7 @@ export class SolwynCore {
   readonly #reporter: MetadataReporter;
   readonly #budget: BudgetEnforcer;
   readonly #binding: ProjectBinding;
+  readonly #refusalGuards = new WeakMap<object, object>();
   readonly #breakers: CircuitBreakerManager;
   readonly #controlPlaneBreaker: CircuitBreaker;
   readonly #sdkInstanceId: string;
@@ -1515,8 +1525,12 @@ export class SolwynCore {
     if (provider === null) {
       throw new SolwynError("surface provider attribution is unavailable");
     }
+    // A stored blocking key refusal outranks every surface posture and acknowledgment; it is
+    // enforced when a governed callable executes (reads also run inside background observation
+    // callbacks, where a throw would escape to the application).
+    const governed = decision.kind === "unknown" || decision.kind === "unmetered_spend";
     const shared = surfacePostureState();
-    return applySurfacePosture({
+    const value = applySurfacePosture({
       posture: this.#config.on_unmetered,
       decision,
       provider,
@@ -1529,6 +1543,35 @@ export class SolwynCore {
       guardAcknowledgedDescendant: (value) => this.#guardSurfaceValue(value, decision.surface),
       execute,
     });
+    return governed ? this.#refusalGuarded(value) : value;
+  }
+
+  /**
+   * Unmetered and unknown spend callables run outside the budget check, so each invocation
+   * re-checks the stored key refusal, including through a reference read before the refusal.
+   * Non-callables pass through; one guard per callable keeps reads identity-stable.
+   */
+  #refusalGuarded<T>(value: T): T {
+    if (typeof value !== "function" || isClassValue(value)) return value;
+    const target = value as unknown as (...args: unknown[]) => unknown;
+    const existing = this.#refusalGuards.get(target);
+    if (existing !== undefined) return existing as T;
+    const assertNotRefused = (): void => {
+      const refusal = this.#binding.blockingRefusal();
+      if (refusal !== null) throw refusal;
+    };
+    const guarded: object = new Proxy(target, {
+      apply(fn, thisArg, args): unknown {
+        assertNotRefused();
+        return Reflect.apply(fn, thisArg, args);
+      },
+      construct(fn, args, newTarget): object {
+        assertNotRefused();
+        return Reflect.construct(fn, args, newTarget);
+      },
+    });
+    this.#refusalGuards.set(target, guarded);
+    return guarded as T;
   }
 
   #guardSurfaceValue<T>(value: T, path: string): T {
@@ -1723,7 +1766,7 @@ export class SolwynCore {
     const value = this.#applySurfacePosture(decision, readOnce);
     // Static drift already entered unknown posture before evaluation. Finish by
     // guarding the evaluated value, not by recording the same drift a second time.
-    if (decision.kind === "unknown") return guardEvaluatedValue(rawValue);
+    if (decision.kind === "unknown") return this.#refusalGuarded(guardEvaluatedValue(rawValue));
     // Even data descriptors can differ from Proxy.get results. Every evaluated
     // value must satisfy the reviewed shape before an acknowledgment can allow it.
     const actual = evaluatedObservation();
@@ -1738,7 +1781,8 @@ export class SolwynCore {
       const method = rawValue as (...args: unknown[]) => unknown;
       return (...args: unknown[]) => this.#noOutputCapCall(surface, target, method, args);
     }
-    return exactRawResponse ? value : guardEvaluatedValue(rawValue);
+    const resolved = exactRawResponse ? value : guardEvaluatedValue(rawValue);
+    return decision.kind === "unmetered_spend" ? this.#refusalGuarded(resolved) : resolved;
   }
 
   /**
@@ -2780,6 +2824,13 @@ export class SolwynCore {
         attempted: [provider],
       });
     }
+    // A refusal recorded after the budget check (by a concurrent call or a background write)
+    // still stops this dispatch, and the call's funding is returned.
+    const refusedBeforeDispatch = this.#binding.blockingRefusal();
+    if (refusedBeforeDispatch !== null) {
+      this.#releaseFunding(callId, funding);
+      throw refusedBeforeDispatch;
+    }
     const started = nowMs();
     let region: string | null = null;
     try {
@@ -3049,6 +3100,14 @@ export class SolwynCore {
         // The provider read bound is immutable for the whole logical call. The total deadline
         // gates sleeps and BETWEEN-hop advancement but never shrinks an already-dispatched read.
         const hopReadTimeoutSeconds = ctx.tuning.hopReadTimeout;
+        // Before EVERY physical dispatch (first hop, failover hop, same-provider retry): a stored
+        // blocking refusal stops the call whatever funding admitted it, and the funding is closed.
+        const refusedBeforeDispatch = this.#binding.blockingRefusal();
+        if (refusedBeforeDispatch !== null) {
+          breaker.releaseProbe(admission);
+          this.#closeFunding(ctx);
+          throw refusedBeforeDispatch;
+        }
         const hopStarted = nowMs();
         try {
           const attempt = ctx.isStreaming

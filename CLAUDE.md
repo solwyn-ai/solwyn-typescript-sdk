@@ -99,7 +99,10 @@ Build before running distribution or package checks. Unit tests must remain offl
     allow cache, leases, the breaker and the outage posture, and `exitDecision()` on every return.
     Only an expired or revoked key on a project whose refusal posture is exactly `alert_only`, on a
     client that validated once, runs unmetered; every other refusal blocks. Responses are fenced
-    by the binding generation captured in `Transport.attempt`.
+    by the binding generation captured in `Transport.attempt`; a 401 refuses at its status. Every
+    physical provider dispatch (hops, retries, media, unmetered spend callables) re-checks
+    `blockingRefusal()`. Any authority change (refusal, new pin, recovery) drops cached allows
+    and leases, and the authority epoch keeps late grants and answers from being installed.
 
 ## Architecture
 

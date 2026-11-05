@@ -511,7 +511,10 @@ export interface BuildConfirmRequestOptions {
 export interface BudgetEnforcerOptions {
   apiUrl: string;
   apiKey: string;
-  /** Solwyn project: a project name or a `proj_` id (required unless `binding` is given). */
+  /**
+   * Solwyn project: a project name or a `proj_` id. Falls back to `SOLWYN_PROJECT`; required
+   * (one or the other) unless `binding` is given.
+   */
   project?: string;
   /** @internal The client's shared project binding; built from `project` when absent. */
   binding?: ProjectBinding;
@@ -569,6 +572,7 @@ interface RenewalOperation {
   readonly originLeaseId: string;
   readonly originGeneration: number;
   readonly closeEpoch: number;
+  readonly authorityEpoch: number;
   readonly declaredModels: readonly string[];
   /** Models a widening renewal adds to the lease; empty for an ordinary renewal. */
   readonly wideningModels: readonly string[];
@@ -771,6 +775,12 @@ export class BudgetEnforcer {
   private lastDeadlineWarnAt: number | null = null;
   private uncountedWarnScheduled = false;
   private closeEpoch = 0;
+  /**
+   * Incremented whenever retained authority stops being valid for this client: a recorded
+   * refusal, a newly pinned project id, or recovery from a refusal. Grants, renewals and check
+   * responses dispatched under an older epoch are never installed.
+   */
+  private authorityEpoch = 0;
   private closePromise: Promise<void> | null = null;
   /** Between close() and its single summary WARN, drops are reported only by that WARN. */
   private closeDraining = false;
@@ -812,7 +822,10 @@ export class BudgetEnforcer {
     this.binding =
       options.binding ??
       new ProjectBinding({
-        selector: resolveProjectSelector(options.project, getEnvSnapshot()),
+        selector: resolveProjectSelector(
+          options.project ?? getEnvSnapshot()["SOLWYN_PROJECT"],
+          getEnvSnapshot(),
+        ),
         apiUrl: options.apiUrl,
         apiKey: options.apiKey,
         fetch: options.fetch,
@@ -845,8 +858,9 @@ export class BudgetEnforcer {
     this.budgetMode = options.budgetMode ?? "alert_only";
     this.failOpen = options.failOpen ?? true;
     this.cacheTtl = cacheTtl;
-    // A refusal surrenders every held lease locally: none may fund a call past it.
-    this.binding.onRefuse(() => this.surrenderHeldLeases());
+    // Cached allows and held leases belong to the project and key state they were granted
+    // under. A refusal, a newly pinned project, or a recovery drops them all.
+    this.binding.onAuthorityChange(() => this.resetAuthority());
 
     try {
       const register = Reflect.get(globalThis, NODE_LEASE_REGISTRATION);
@@ -1133,7 +1147,12 @@ export class BudgetEnforcer {
       // Synchronous when no revalidation is due, so the check's dispatch prefix stays synchronous.
       const gate = this.binding.gateNow() ?? (await this.binding.gate());
       if (gate.kind === "unmetered") return this.unmeteredResult();
-      const result = await this.checkBudgetWithOwnership(options, deadlineMs);
+      // The re-run takes a per-call admission: the first pass's lease claim under this call id
+      // was released, and the ledger never re-admits a released call id.
+      const result = await this.checkBudgetWithOwnership(
+        pass === 0 ? options : { ...options, perCallOnly: true },
+        deadlineMs,
+      );
       const exit = this.binding.exitDecision(gate.generation);
       // A rerun means only that a successful revalidation moved the generation (no refusal is
       // stored). The re-run's own result stands even if the generation moved again; it never
@@ -1173,6 +1192,17 @@ export class BudgetEnforcer {
     });
     this.refusedPlaceholders.add(placeholder);
     return placeholder;
+  }
+
+  /**
+   * Drop all retained authority: cached allows and held leases (surrendered best effort; a
+   * refused key's surrender is ignored). In-flight grants, renewals and checks dispatched before
+   * this point are fenced by the epoch and never installed.
+   */
+  private resetAuthority(): void {
+    this.authorityEpoch += 1;
+    this.allowCache.clear();
+    this.surrenderHeldLeases();
   }
 
   /** Drop every held lease locally and send a best-effort surrender (ignored if refused). */
@@ -1354,6 +1384,7 @@ export class BudgetEnforcer {
         // Ordered response authority exists only for a real check POST. Capture and register
         // its dispatch after lease/cache/breaker decisions and immediately before the POST.
         const requestDispatch = this.captureAuthorityDispatch();
+        const authorityDispatchEpoch = this.authorityEpoch;
         this.registerPendingOrderedRequest(requestDispatch);
         try {
           let raw: Awaited<ReturnType<Transport["postJsonAndReadJson"]>>;
@@ -1399,6 +1430,11 @@ export class BudgetEnforcer {
           }
 
           this.controlPlaneBreaker?.recordSuccess(admission ?? undefined);
+          if (authorityDispatchEpoch !== this.authorityEpoch) {
+            // Answered under authority that has since been dropped: install nothing (no cache
+            // entry, no retained denial); the exit check re-decides the call.
+            return this.refusedPlaceholder(leaseClaimToken);
+          }
           const result = this.applyCheckResponse(
             response,
             stableOptions,
@@ -1607,6 +1643,7 @@ export class BudgetEnforcer {
       originLeaseId,
       originGeneration,
       closeEpoch: this.closeEpoch,
+      authorityEpoch: this.authorityEpoch,
       // An applied renewal covers exactly what the request declared, never the caller's chain.
       declaredModels: Object.freeze(
         leaseChainKeys(request.provider, request.model ?? null, fallbackProviders, fallbackModels),
@@ -1706,6 +1743,11 @@ export class BudgetEnforcer {
 
       if (operation.closeEpoch !== this.closeEpoch) {
         this.surrenderLateSuccessor(parsed.data, this.lateSpendFor(operation));
+        return;
+      }
+      if (operation.authorityEpoch !== this.authorityEpoch) {
+        // Granted under authority that has since been dropped: never install it.
+        this.surrenderLateGrantResponse(parsed.data);
         return;
       }
 
@@ -1847,6 +1889,7 @@ export class BudgetEnforcer {
     const runId = captured.agentRunId;
     if (runId === undefined) return { kind: "legacy" };
     const closeDispatchEpoch = this.closeEpoch;
+    const authorityDispatchEpoch = this.authorityEpoch;
     const remainingMs = captured.deadlineMs - this.monotonicNow();
     const admission: CircuitBreakerAdmission | null =
       remainingMs >= MIN_PREFLIGHT_REQUEST_MS ? (this.controlPlaneBreaker?.admit() ?? null) : null;
@@ -1927,6 +1970,12 @@ export class BudgetEnforcer {
       if (closeDispatchEpoch !== this.closeEpoch) {
         this.surrenderLateGrantResponse(parsed.data);
         return { kind: "legacy" };
+      }
+      if (authorityDispatchEpoch !== this.authorityEpoch) {
+        // The binding changed while this grant was in flight: surrender it, and let the exit
+        // check re-decide the call under the current authority.
+        this.surrenderLateGrantResponse(parsed.data);
+        return { kind: "refused" };
       }
 
       const runControl = this.applyGrantRunControl(parsed.data, runId);

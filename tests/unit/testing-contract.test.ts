@@ -12,6 +12,7 @@ import type { FetchLike } from "../../src/transport";
 const JSON_HEADERS = {
   Authorization: `Bearer ${`solwyn_sk_${"0".repeat(64)}`}`,
   "Content-Type": "application/json",
+  "Solwyn-Project": "test-project",
 };
 
 interface CapturedRequest {

@@ -349,6 +349,7 @@ describe("OpenTelemetry privacy firewall", () => {
       "budget.ts:launchRenewal",
       "client.ts:#ensureInit",
       "client.ts:close",
+      "project.ts:#request",
       "release-dispatcher.ts:#pump",
       "reporter.ts:close",
       "reporter.ts:close",

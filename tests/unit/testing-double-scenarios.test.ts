@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FakeControlPlane } from "../../src/testing/index";
+import { planeHeaders } from "../helpers/project-binding";
 
 const CHECK_PATH = "/api/v1/budgets/check";
 const INGEST_PATH = "/api/v1/metadata/ingest";
@@ -51,6 +52,7 @@ async function post(
   signal?: AbortSignal,
 ): Promise<Response> {
   return plane.fetch(`${plane.apiUrl}${path}`, {
+    headers: planeHeaders(plane),
     method: "POST",
     body: JSON.stringify(body),
     signal,
@@ -185,6 +187,7 @@ describe("FakeControlPlane scenario windows", () => {
     const plane = new FakeControlPlane();
     const refusal = plane.refuseChecks({ status: 503, requests: 1 });
     const malformedJson = await plane.fetch(`${plane.apiUrl}${CHECK_PATH}`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: '{"private_prompt":"secret"',
     });
@@ -240,6 +243,7 @@ describe("FakeControlPlane scenario windows", () => {
     expect(
       (
         await plane.fetch(`${plane.apiUrl}${CHECK_PATH}?ignored=query`, {
+          headers: planeHeaders(plane),
           method: "POST",
           body: JSON.stringify(checkBody()),
         })

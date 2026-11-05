@@ -526,7 +526,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     closers.push(() => budget.close());
     const outage = plane.outage({ path: AUTH_KEY_PATH });
     await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({ allowed: true });
-    expect(plane.projectHeaders.at(-1)).toBe("fake-project");
+    expect(plane.projectHeaders.at(-1)).toBe("test-project");
     expect(budget.binding.state).toBe("unvalidated");
     now += 10_000;
     await budget.checkBudget(checkOptions());
@@ -558,7 +558,7 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
     plane.refuseProject("project_not_found", { path: CHECK_PATH, requests: 1 });
     const error = await refusalOf(budget.checkBudget(checkOptions()));
     expect(error.message).toBe(
-      "Solwyn project 'fake-project' was not found for this API key. Check SOLWYN_PROJECT. A renamed project's old name stops working; its proj_ id always works.",
+      "Solwyn project 'test-project' was not found for this API key. Check SOLWYN_PROJECT. A renamed project's old name stops working; its proj_ id always works.",
     );
     expect(error.field).toBe("project");
     await refusalOf(budget.checkBudget(checkOptions()));
@@ -619,6 +619,35 @@ describe("F1 to F18: refusals never run a provider call unmetered by accident", 
       reservationId: null,
     });
     expect(budget.binding.refusal).toMatchObject({ effect: "allow_unmetered" });
+  });
+});
+
+describe("exit check rerun", () => {
+  it("re-runs a check once, with the pinned id, when a concurrent revalidation succeeds while it is in flight", async () => {
+    let now = 0;
+    const plane = scripted((path) => (path === AUTH_KEY_PATH ? authKeyResponse() : allow()));
+    const budget = enforcer(plane.fetch, { now: () => now });
+    const first = deferred<Response>();
+    plane.queue(AUTH_KEY_PATH, () => Promise.reject(new TypeError("fetch failed")));
+    plane.queue(CHECK_PATH, () => first.promise);
+    // A long budget so the injected clock's 30 s jump leaves the re-run inside its deadline.
+    const callA = budget.checkBudget(checkOptions({ timeout: 120 }));
+    await vi.waitFor(() => expect(plane.fetch).toHaveBeenCalledTimes(2));
+    expect(plane.headers[1]).toEqual({ path: CHECK_PATH, project: TEST_PROJECT });
+
+    now += 30_000;
+    await expect(budget.checkBudget(checkOptions())).resolves.toMatchObject({ allowed: true });
+    expect(budget.binding.state).toBe("valid");
+    first.resolve(allow());
+    await expect(callA).resolves.toMatchObject({ allowed: true });
+    expect(plane.headers.map((entry) => entry.path)).toEqual([
+      AUTH_KEY_PATH,
+      CHECK_PATH,
+      AUTH_KEY_PATH,
+      CHECK_PATH,
+      CHECK_PATH,
+    ]);
+    expect(plane.headers.at(-1)).toEqual({ path: CHECK_PATH, project: TEST_PROJECT_ID });
   });
 });
 

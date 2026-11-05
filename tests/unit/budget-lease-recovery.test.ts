@@ -5,6 +5,7 @@ import type { ReleaseDispatcher } from "../../src/release-dispatcher";
 import { FakeControlPlane } from "../../src/testing/index";
 import { createTokenDetails } from "../../src/token-details";
 import type { LeaseGrantResponse } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
@@ -129,7 +130,7 @@ function harness(handlers: Handlers, overrides: Partial<BudgetEnforcerOptions> =
   let grants = 0;
   let mark = 0;
   const budget = new BudgetEnforcer({
-    project: "test-project",
+    binding: testBinding(),
     apiUrl: API_URL,
     apiKey: API_KEY,
     leaseEnabled: true,
@@ -555,7 +556,7 @@ describe("lease recovery against FakeControlPlane", () => {
       return plane.fetch(input, init);
     };
     const budget = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: plane.apiUrl,
       apiKey: plane.apiKey,
       fetch,

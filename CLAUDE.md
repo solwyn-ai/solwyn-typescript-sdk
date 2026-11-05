@@ -44,8 +44,9 @@ Build before running distribution or package checks. Unit tests must remain offl
 
 - `tests/fixtures/openapi.snapshot.json` is the checked-in contract evidence. Approved contract
   refreshes replace the snapshot and its derived tables together.
-- The SDK uses eight endpoint shapes: budget check/confirm, lease grant/renew/surrender,
-  metadata ingest, untracked-surface reporting, and project provider-breaker reporting.
+- The SDK uses nine endpoint shapes: key validation (`GET /api/v1/auth/key`), budget
+  check/confirm, lease grant/renew/surrender, metadata ingest, untracked-surface reporting, and
+  project provider-breaker reporting. Every request carries `Solwyn-Project`.
 - Treat every wire-shape change as an API contract change. Strict response schemas must not use
   defaults or optional fields to hide drift. If runtime behavior and the approved wire contract
   conflict, stop and resolve the discrepancy explicitly.
@@ -94,6 +95,11 @@ Build before running distribution or package checks. Unit tests must remain offl
 12. **Tags are explicit, non-sensitive attribution only.** Never infer tags from prompts or
     responses. Remove per-call `solwyn_tags` only on intercepted provider requests, and keep
     tagged calls lease-ineligible so tag-scoped policy remains authoritative.
+13. **Key refusals never fail open.** Every budget check passes `ProjectBinding.gate()` before the
+    allow cache, leases, the breaker and the outage posture, and `exitDecision()` on every return.
+    Only an expired or revoked key on a project whose refusal posture is exactly `alert_only`, on a
+    client that validated once, runs unmetered; every other refusal blocks. Responses are fenced
+    by the binding generation captured in `Transport.attempt`.
 
 ## Architecture
 
@@ -159,7 +165,9 @@ src/
   testing/              # edge-safe fake control plane and contract probes
   config.ts  types.ts  errors.ts  validation.ts
   privacy.ts            # content-privileged estimation helpers
-  token-details.ts  tags.ts  read-only-key.ts
+  token-details.ts  tags.ts
+  project.ts            # ProjectBinding: Solwyn-Project header, /auth/key pinning, refusal gate
+  api-key-errors.ts     # classifies key and project refusals (every 401 refuses)
   budget.ts  lease.ts  circuit-breaker.ts  reporter.ts  receipt-fold.ts
   run-control.ts  velocity.ts
   routing.ts  registry.ts  client.ts  stream.ts  transport.ts

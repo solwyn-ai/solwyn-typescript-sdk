@@ -190,7 +190,7 @@ describe("FakeControlPlane.wrap wiring", () => {
   it("keeps direct config resolution environment-aware through an injected snapshot", () => {
     const apiKey = `solwyn_sk_${"a".repeat(64)}`;
     const direct = configModule.resolveConfigFromEnvSnapshot(
-      { api_key: apiKey },
+      { api_key: apiKey, project: "test-project" },
       {
         SOLWYN_API_URL: "https://ambient.invalid",
         SOLWYN_FAIL_OPEN: "false",

@@ -21,8 +21,8 @@ import { DEFAULT_OUTPUT_BOUND } from "../../src/lease";
 import { ProviderEntrySchema } from "../../src/validation";
 import { VELOCITY_HISTORY_LIMIT } from "../../src/velocity";
 
-// A well-formed project API key: `sk_proj_` + exactly 64 lowercase hex chars.
-const VALID_KEY = `sk_proj_${"a".repeat(64)}`;
+// A well-formed API key: `solwyn_sk_` + exactly 64 lowercase hex chars.
+const VALID_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 // A minimal, valid provider chain (non-empty) for tests that need a full config.
 function providers(): SolwynConfigOptions["providers"] {
@@ -44,7 +44,11 @@ afterEach(() => {
 
 describe("env-var population", () => {
   it("defaults the untracked-surface posture and advisory settings", () => {
-    const config = resolveConfig({ api_key: VALID_KEY, providers: providers() });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      providers: providers(),
+    });
 
     expect(config.on_unmetered).toBe("warn");
     expect(config.acknowledge_untracked).toEqual([]);
@@ -63,6 +67,7 @@ describe("env-var population", () => {
   it("exposes the exact injected-snapshot map without SOLWYN_PROJECT_ID", () => {
     expect(ENV_FIELD_MAP).toEqual({
       api_key: "SOLWYN_API_KEY",
+      project: "SOLWYN_PROJECT",
       api_url: "SOLWYN_API_URL",
       tags: "SOLWYN_TAGS",
       fail_open: "SOLWYN_FAIL_OPEN",
@@ -107,13 +112,18 @@ describe("env-var population", () => {
       SOLWYN_FAIL_OPEN: "false",
       SOLWYN_BUDGET_CHECK_CACHE_TTL: "23",
     } as const;
-    expect(loadConfigFromEnv({ api_key: VALID_KEY }, snapshot)).toMatchObject({
+    expect(
+      loadConfigFromEnv({ api_key: VALID_KEY, project: "test-project" }, snapshot),
+    ).toMatchObject({
       api_key: VALID_KEY,
+      project: "test-project",
       api_url: "https://snapshot.invalid",
       fail_open: false,
       budget_check_cache_ttl: "23",
     });
-    expect(resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, snapshot)).toMatchObject({
+    expect(
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, project: "test-project" }, snapshot),
+    ).toMatchObject({
       api_url: "https://snapshot.invalid",
       fail_open: false,
       budget_check_cache_ttl: 23,
@@ -134,7 +144,11 @@ describe("env-var population", () => {
   });
 
   it("defaults api_url to https://api.solwyn.ai when unset", () => {
-    const config = resolveConfig({ api_key: VALID_KEY, providers: providers() });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      providers: providers(),
+    });
     expect(config.api_url).toBe(DEFAULT_API_URL);
     expect(DEFAULT_API_URL).toBe("https://api.solwyn.ai");
   });
@@ -181,7 +195,10 @@ describe("env-var population", () => {
 
 describe("velocity configuration", () => {
   it("resolves all seven defaults and produces a defensive frozen snapshot", () => {
-    const resolved = resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, {});
+    const resolved = resolveConfigFromEnvSnapshot(
+      { api_key: VALID_KEY, project: "test-project" },
+      {},
+    );
     expect(resolved).toMatchObject({
       velocity_mode: "warn",
       velocity_repeat_count: 5,
@@ -219,6 +236,7 @@ describe("velocity configuration", () => {
     const resolved = resolveConfigFromEnvSnapshot(
       {
         api_key: VALID_KEY,
+        project: "test-project",
         velocity_mode: "deny",
         velocity_repeat_count: 7,
         velocity_growth_factor: 4,
@@ -248,6 +266,7 @@ describe("velocity configuration", () => {
     const resolved = resolveConfigFromEnvSnapshot(
       {
         api_key: VALID_KEY,
+        project: "test-project",
         velocity_repeat_window_s: Number.POSITIVE_INFINITY,
         velocity_growth_factor: Number.POSITIVE_INFINITY,
         velocity_accel_factor: Number.POSITIVE_INFINITY,
@@ -282,7 +301,10 @@ describe("velocity configuration", () => {
     ["SOLWYN_VELOCITY_GROWTH_FACTOR", "Infinity", "velocity_growth_factor"],
     ["SOLWYN_VELOCITY_ACCEL_FACTOR", "+inf", "velocity_accel_factor"],
   ] as const)("coerces the Pydantic infinity spelling %s=%s", (envName, raw, field) => {
-    const resolved = resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { [envName]: raw });
+    const resolved = resolveConfigFromEnvSnapshot(
+      { api_key: VALID_KEY, project: "test-project" },
+      { [envName]: raw },
+    );
 
     expect(resolved[field]).toBe(Number.POSITIVE_INFINITY);
   });
@@ -292,7 +314,10 @@ describe("velocity configuration", () => {
     ["SOLWYN_VELOCITY_GROWTH_FACTOR", "velocity_growth_factor"],
     ["SOLWYN_VELOCITY_ACCEL_FACTOR", "velocity_accel_factor"],
   ] as const)("accepts decimal overflow from %s", (envName, field) => {
-    const resolved = resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { [envName]: "1e9999" });
+    const resolved = resolveConfigFromEnvSnapshot(
+      { api_key: VALID_KEY, project: "test-project" },
+      { [envName]: "1e9999" },
+    );
 
     expect(resolved[field]).toBe(Number.POSITIVE_INFINITY);
   });
@@ -309,7 +334,10 @@ describe("velocity configuration", () => {
   ] as const)("rejects overflowing JavaScript-only %s env input", (_kind, envName, field, raw) => {
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { [envName]: raw });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { [envName]: raw },
+      );
     } catch (error) {
       caught = error;
     }
@@ -327,7 +355,10 @@ describe("velocity configuration", () => {
   ] as const)("rejects invalid velocity float env input %s=%s", (envName, raw, field) => {
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { [envName]: raw });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { [envName]: raw },
+      );
     } catch (error) {
       caught = error;
     }
@@ -351,7 +382,11 @@ describe("velocity configuration", () => {
     let caught: unknown;
     try {
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, [field]: value } as unknown as SolwynConfigOptions,
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          [field]: value,
+        } as unknown as SolwynConfigOptions,
         {},
       );
     } catch (error) {
@@ -372,7 +407,11 @@ describe("velocity configuration", () => {
     let caught: unknown;
     try {
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, [field]: value } as unknown as SolwynConfigOptions,
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          [field]: value,
+        } as unknown as SolwynConfigOptions,
         {},
       );
     } catch (error) {
@@ -390,7 +429,11 @@ describe("velocity configuration", () => {
     let caught: unknown;
     try {
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, [field]: value } as unknown as SolwynConfigOptions,
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          [field]: value,
+        } as unknown as SolwynConfigOptions,
         {},
       );
     } catch (error) {
@@ -408,7 +451,10 @@ describe("velocity configuration", () => {
     const envName = ENV_FIELD_MAP[field] as string;
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { [envName]: value });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { [envName]: value },
+      );
     } catch (error) {
       caught = error;
     }
@@ -420,7 +466,7 @@ describe("velocity configuration", () => {
     expect(VELOCITY_HISTORY_LIMIT).toBe(64);
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY },
+        { api_key: VALID_KEY, project: "test-project" },
         {
           SOLWYN_VELOCITY_REPEAT_COUNT: "64",
           SOLWYN_VELOCITY_GROWTH_STREAK: "64",
@@ -476,7 +522,7 @@ describe("untracked-surface environment settings", () => {
 
   it("parses, trims, and first-order deduplicates env acknowledgments", () => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY },
+      { api_key: VALID_KEY, project: "test-project" },
       {
         SOLWYN_ON_UNMETERED: "raise",
         SOLWYN_ACKNOWLEDGE_UNTRACKED: " responses.retrieve, future.operation ,responses.retrieve ",
@@ -502,7 +548,7 @@ describe("untracked-surface environment settings", () => {
     ["anything-else", false],
   ])("coerces SOLWYN_REPORT_UNTRACKED_SURFACES=%s to %s", (raw, expected) => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY },
+      { api_key: VALID_KEY, project: "test-project" },
       { SOLWYN_REPORT_UNTRACKED_SURFACES: raw },
     );
     expect(config.report_untracked_surfaces).toBe(expected);
@@ -511,7 +557,10 @@ describe("untracked-surface environment settings", () => {
   it("keeps posture exact and untrimmed", () => {
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_ON_UNMETERED: " warn" });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { SOLWYN_ON_UNMETERED: " warn" },
+      );
     } catch (error) {
       caught = error;
     }
@@ -523,6 +572,7 @@ describe("untracked-surface environment settings", () => {
     const config = resolveConfigFromEnvSnapshot(
       {
         api_key: VALID_KEY,
+        project: "test-project",
         on_unmetered: "allow",
         acknowledge_untracked: ["future.constructor"],
         report_untracked_surfaces: false,
@@ -560,6 +610,7 @@ describe("acknowledge_untracked validation", () => {
   ])("enforces the content-blind %s invariant in SolwynConfigSchema", (_label, value, message) => {
     const result = SolwynConfigSchema.safeParse({
       api_key: VALID_KEY,
+      project: "test-project",
       acknowledge_untracked: value,
     });
 
@@ -576,6 +627,7 @@ describe("acknowledge_untracked validation", () => {
     const input = ["responses.retrieve", "future.operation", "responses.retrieve"];
     const parsed = SolwynConfigSchema.parse({
       api_key: VALID_KEY,
+      project: "test-project",
       acknowledge_untracked: input,
     });
     input[0] = "mutated.after.parse";
@@ -599,7 +651,11 @@ describe("acknowledge_untracked validation", () => {
       },
     });
 
-    const config = resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: tokens });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      acknowledge_untracked: tokens,
+    });
 
     expect(traversals).toBe(1);
     expect(config.acknowledge_untracked).toEqual(["future.operation", "responses.retrieve"]);
@@ -644,7 +700,11 @@ describe("acknowledge_untracked validation", () => {
   ])("normalizes a %s failure to a data-free field error", (_label, buildTokens, message) => {
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: buildTokens() });
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        acknowledge_untracked: buildTokens(),
+      });
     } catch (error) {
       caught = error;
     }
@@ -660,6 +720,7 @@ describe("acknowledge_untracked validation", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         acknowledge_untracked: "responses.retrieve",
       } as unknown as SolwynConfigOptions);
     } catch (error) {
@@ -681,7 +742,10 @@ describe("acknowledge_untracked validation", () => {
   ])("rejects an empty env segment in %j with the exact error", (raw) => {
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_ACKNOWLEDGE_UNTRACKED: raw });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { SOLWYN_ACKNOWLEDGE_UNTRACKED: raw },
+      );
     } catch (error) {
       caught = error;
     }
@@ -695,7 +759,11 @@ describe("acknowledge_untracked validation", () => {
 
   it("copies, first-order deduplicates, and freezes constructor arrays", () => {
     const tokens = ["future.operation", "responses.retrieve", "future.operation"];
-    const config = resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: tokens });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      acknowledge_untracked: tokens,
+    });
     tokens[0] = "changed.after.resolution";
     tokens.push("later.mutation");
 
@@ -712,7 +780,11 @@ describe("acknowledge_untracked validation", () => {
   ])("rejects malformed constructor token %j without reflecting it", (token) => {
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: [token] });
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        acknowledge_untracked: [token],
+      });
     } catch (error) {
       caught = error;
     }
@@ -730,6 +802,7 @@ describe("acknowledge_untracked validation", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         acknowledge_untracked: [17],
       } as unknown as SolwynConfigOptions);
     } catch (error) {
@@ -753,7 +826,8 @@ describe("acknowledge_untracked validation", () => {
     "future.operation",
   ])("accepts acknowledgeable or provisional exact token %s", (token) => {
     expect(
-      resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: [token] }).acknowledge_untracked,
+      resolveConfig({ api_key: VALID_KEY, project: "test-project", acknowledge_untracked: [token] })
+        .acknowledge_untracked,
     ).toEqual([token]);
   });
 
@@ -770,7 +844,11 @@ describe("acknowledge_untracked validation", () => {
   ])("rejects known non-acknowledgeable token %s without reflecting it", (token, message) => {
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, acknowledge_untracked: [token] });
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        acknowledge_untracked: [token],
+      });
     } catch (error) {
       caught = error;
     }
@@ -892,7 +970,13 @@ describe("tags configuration", () => {
   it("accepts explicit tags, empty values, and Unicode code-point inclusive bounds", () => {
     const key = "🦊".repeat(64);
     const value = "🌲".repeat(256);
-    expect(resolveConfig({ api_key: VALID_KEY, tags: { [key]: value, empty: "" } }).tags).toEqual({
+    expect(
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        tags: { [key]: value, empty: "" },
+      }).tags,
+    ).toEqual({
       [key]: value,
       empty: "",
     });
@@ -900,7 +984,7 @@ describe("tags configuration", () => {
 
   it("parses SOLWYN_TAGS at the first equals and preserves whitespace and empty values", () => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY },
+      { api_key: VALID_KEY, project: "test-project" },
       { SOLWYN_TAGS: "a=b=c, spaced key = spaced value ,empty=" },
     );
     expect(config.tags).toEqual({
@@ -918,7 +1002,10 @@ describe("tags configuration", () => {
   ])("rejects malformed SOLWYN_TAGS %j with the exact parse message", (tags) => {
     let caught: unknown;
     try {
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_TAGS: tags });
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { SOLWYN_TAGS: tags },
+      );
     } catch (error) {
       caught = error;
     }
@@ -936,7 +1023,11 @@ describe("tags configuration", () => {
   ])("rejects %s as ConfigurationError(field=tags)", (_label, tags) => {
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, tags } as unknown as SolwynConfigOptions);
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        tags,
+      } as unknown as SolwynConfigOptions);
     } catch (error) {
       caught = error;
     }
@@ -947,7 +1038,7 @@ describe("tags configuration", () => {
   it("validates parsed environment tags with the SOLWYN_TAGS parameter label", () => {
     expect(() =>
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY },
+        { api_key: VALID_KEY, project: "test-project" },
         { SOLWYN_TAGS: `key=${"v".repeat(257)}` },
       ),
     ).toThrow(/SOLWYN_TAGS/);
@@ -955,7 +1046,7 @@ describe("tags configuration", () => {
 
   it("lets an explicit empty record beat the environment and normalize to undefined", () => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY, tags: {} },
+      { api_key: VALID_KEY, project: "test-project", tags: {} },
       { SOLWYN_TAGS: "ambient=poison" },
     );
     expect(config.tags).toBeUndefined();
@@ -963,7 +1054,7 @@ describe("tags configuration", () => {
 
   it("copies explicit constructor input into resolved config", () => {
     const caller = { team: "platform" };
-    const config = resolveConfig({ api_key: VALID_KEY, tags: caller });
+    const config = resolveConfig({ api_key: VALID_KEY, project: "test-project", tags: caller });
     caller.team = "mutated";
     expect(config.tags).toEqual({ team: "platform" });
   });
@@ -994,6 +1085,7 @@ describe("tags configuration", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         tags: makeTags() as Record<string, string>,
       });
     } catch (error) {
@@ -1016,7 +1108,7 @@ describe("tags configuration", () => {
     });
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, tags: { team: "platform" } });
+      resolveConfig({ api_key: VALID_KEY, project: "test-project", tags: { team: "platform" } });
     } catch (error) {
       caught = error;
     } finally {
@@ -1050,7 +1142,11 @@ describe("SOLWYN_FAIL_OPEN string coercion", () => {
   });
 
   it("defaults fail_open to true when unset", () => {
-    const config = resolveConfig({ api_key: VALID_KEY, providers: providers() });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      providers: providers(),
+    });
     expect(config.fail_open).toBe(true);
   });
 });
@@ -1106,7 +1202,7 @@ describe("D3 presence-check precedence (explicit falsy beats env)", () => {
     ["no", false],
   ])("coerces SOLWYN_LEASE_ENABLED=%s to %s", (raw, expected) => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY },
+      { api_key: VALID_KEY, project: "test-project" },
       { SOLWYN_LEASE_ENABLED: raw },
     );
     expect(config.lease_enabled).toBe(expected);
@@ -1115,7 +1211,7 @@ describe("D3 presence-check precedence (explicit falsy beats env)", () => {
   it("coerces the lease bound env value and lets explicit false/bound options win", () => {
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY },
+        { api_key: VALID_KEY, project: "test-project" },
         {
           SOLWYN_LEASE_ENABLED: "false",
           SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT: "8192",
@@ -1127,6 +1223,7 @@ describe("D3 presence-check precedence (explicit falsy beats env)", () => {
       resolveConfigFromEnvSnapshot(
         {
           api_key: VALID_KEY,
+          project: "test-project",
           lease_enabled: false,
           lease_output_bound_default: 2048,
         },
@@ -1143,6 +1240,7 @@ describe("D3 presence-check precedence (explicit falsy beats env)", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         lease_output_bound_default: value,
       } as SolwynConfigOptions);
     } catch (error) {
@@ -1156,6 +1254,7 @@ describe("D3 presence-check precedence (explicit falsy beats env)", () => {
     expect(() =>
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         lease_output_default: 123,
       } as unknown as SolwynConfigOptions),
     ).toThrow(ConfigurationError);
@@ -1183,7 +1282,11 @@ describe("project_id is absent from config", () => {
 
   it("a stray project_id key is rejected by the strict schema", () => {
     expect(() =>
-      resolveConfig({ api_key: VALID_KEY, project_id: "x" } as unknown as SolwynConfigOptions),
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        project_id: "x",
+      } as unknown as SolwynConfigOptions),
     ).toThrow(ConfigurationError);
   });
 });
@@ -1191,6 +1294,62 @@ describe("project_id is absent from config", () => {
 // ---------------------------------------------------------------------------
 // Missing or malformed api_key.
 // ---------------------------------------------------------------------------
+
+describe("project configuration", () => {
+  const NO_PROJECT =
+    "No Solwyn project configured. Set SOLWYN_PROJECT or pass the project option with a project name or proj_ id.";
+
+  function errorOf(run: () => unknown): ConfigurationError {
+    try {
+      run();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigurationError);
+      return error as ConfigurationError;
+    }
+    throw new Error("expected a ConfigurationError");
+  }
+
+  it("requires a project, with the exact message and field", () => {
+    const error = errorOf(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, {}));
+    expect(error.message).toBe(NO_PROJECT);
+    expect(error.field).toBe("project");
+  });
+
+  it("names SOLWYN_PROJECT_ID when only the retired variable is set, and never reads it", () => {
+    const error = errorOf(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY },
+        { SOLWYN_PROJECT_ID: `proj_${"a".repeat(24)}` },
+      ),
+    );
+    expect(error.message).toBe(
+      `${NO_PROJECT} SOLWYN_PROJECT_ID is no longer read; rename it to SOLWYN_PROJECT.`,
+    );
+  });
+
+  it("reads SOLWYN_PROJECT, lets the option win, and trims spaces and tabs", () => {
+    expect(
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_PROJECT: " checkout-bot\t" })
+        .project,
+    ).toBe("checkout-bot");
+    expect(
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: `proj_${"b".repeat(24)}` },
+        { SOLWYN_PROJECT: "checkout-bot" },
+      ).project,
+    ).toBe(`proj_${"b".repeat(24)}`);
+  });
+
+  it("rejects an invalid selector with the exact message", () => {
+    const error = errorOf(() =>
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, project: "bad/name" }, {}),
+    );
+    expect(error.message).toBe(
+      "Invalid project: use a project name (letters, digits, spaces, '.', '_' or '-', up to 100 characters) or a proj_ id.",
+    );
+    expect(error.field).toBe("project");
+  });
+});
 
 describe("api_key validation", () => {
   it("absent api_key (no kwarg, no env) raises ConfigurationError(field=api_key)", () => {
@@ -1208,13 +1367,13 @@ describe("api_key validation", () => {
   it.each([
     ["bad prefix", `sk_live_${"a".repeat(64)}`],
     ["legacy sk_solwyn_ prefix", `sk_solwyn_${"a".repeat(64)}`],
-    ["too short (63 hex)", `sk_proj_${"a".repeat(63)}`],
-    ["too long (65 hex)", `sk_proj_${"a".repeat(65)}`],
+    ["too short (63 hex)", `solwyn_sk_${"a".repeat(63)}`],
+    ["too long (65 hex)", `solwyn_sk_${"a".repeat(65)}`],
     ["empty string", ""],
-    ["unicode homograph", `sk_proj_${"а".repeat(64)}`],
-    ["path traversal ..", `sk_proj_..${"a".repeat(62)}`],
-    ["path traversal /", `sk_proj_/${"a".repeat(63)}`],
-    ["path traversal \\", `sk_proj_\\${"a".repeat(63)}`],
+    ["unicode homograph", `solwyn_sk_${"а".repeat(64)}`],
+    ["path traversal ..", `solwyn_sk_..${"a".repeat(62)}`],
+    ["path traversal /", `solwyn_sk_/${"a".repeat(63)}`],
+    ["path traversal \\", `solwyn_sk_\\${"a".repeat(63)}`],
   ])("rejects %s with ConfigurationError(field=api_key)", (_label, key) => {
     let caught: unknown;
     try {
@@ -1227,10 +1386,12 @@ describe("api_key validation", () => {
     expect((caught as ConfigurationError).message.length).toBeGreaterThan(0);
   });
 
-  it("legacy sk_solwyn_ key is rejected with a sk_proj_ message", () => {
+  it("an old sk_proj_ key is rejected with the exact old-key message", () => {
     expect(() =>
-      resolveConfig({ api_key: `sk_solwyn_${"a".repeat(64)}`, providers: providers() }),
-    ).toThrow(/sk_proj_/);
+      resolveConfig({ api_key: `sk_proj_${"a".repeat(64)}`, providers: providers() }),
+    ).toThrow(
+      "This is an old Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create.",
+    );
   });
 
   it("ConfigurationError is catchable as the SDK base SolwynError", () => {
@@ -1251,7 +1412,7 @@ describe("api_key validation", () => {
 
 describe("provider chain", () => {
   it("an empty providers chain raises ConfigurationError(field=providers)", () => {
-    const config = resolveConfig({ api_key: VALID_KEY, providers: [] });
+    const config = resolveConfig({ api_key: VALID_KEY, project: "test-project", providers: [] });
     let caught: unknown;
     try {
       validateProviderChain(config);
@@ -1267,6 +1428,7 @@ describe("provider chain", () => {
     const config = validateProviderChain(
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: [{ provider: "anthropic", model: "claude" }],
       }),
     );
@@ -1305,7 +1467,11 @@ describe("provider chain", () => {
 
 describe("failover / tuning knobs", () => {
   it("exposes the exact default values for every knob", () => {
-    const config = resolveConfig({ api_key: VALID_KEY, providers: providers() });
+    const config = resolveConfig({
+      api_key: VALID_KEY,
+      project: "test-project",
+      providers: providers(),
+    });
     expect(config.failover_total_timeout).toBe(30.0);
     expect(config.failover_hop_read_timeout).toBe(600);
     expect(config.failover_idempotency).toBe("safe");
@@ -1330,6 +1496,7 @@ describe("failover / tuning knobs", () => {
   it("holds every overridden knob value verbatim", () => {
     const config = resolveConfig({
       api_key: VALID_KEY,
+      project: "test-project",
       providers: providers(),
       failover_total_timeout: 12.5,
       failover_hop_read_timeout: 42,
@@ -1359,6 +1526,7 @@ describe("failover / tuning knobs", () => {
     const picked = pickFailoverTuning(
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         failover_total_timeout: 12.5,
         failover_hop_read_timeout: 42,
@@ -1393,6 +1561,7 @@ describe("failover / tuning knobs", () => {
       try {
         resolveConfig({
           api_key: VALID_KEY,
+          project: "test-project",
           providers: providers(),
           [field]: value,
         } as unknown as SolwynConfigOptions);
@@ -1423,6 +1592,7 @@ describe("failover / tuning knobs", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         [field]: value,
       } as unknown as SolwynConfigOptions);
@@ -1437,6 +1607,7 @@ describe("failover / tuning knobs", () => {
     expect(
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         failover_total_timeout: value,
       }).failover_total_timeout,
@@ -1447,6 +1618,7 @@ describe("failover / tuning knobs", () => {
     expect(
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         failover_hop_read_timeout: 0.001,
       }).failover_hop_read_timeout,
@@ -1456,7 +1628,7 @@ describe("failover / tuning knobs", () => {
   it("does not load failover_hop_read_timeout from an invented environment variable", () => {
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, providers: providers() },
+        { api_key: VALID_KEY, project: "test-project", providers: providers() },
         { SOLWYN_FAILOVER_HOP_READ_TIMEOUT: "42" },
       ).failover_hop_read_timeout,
     ).toBe(600);
@@ -1465,6 +1637,7 @@ describe("failover / tuning knobs", () => {
   it("per-entry default_params are preserved distinctly from the global default_params", () => {
     const config = resolveConfig({
       api_key: VALID_KEY,
+      project: "test-project",
       default_params: { temperature: 0.0 },
       providers: [{ provider: "openai", model: "gpt-4o", default_params: { temperature: 1.0 } }],
     });
@@ -1476,6 +1649,7 @@ describe("failover / tuning knobs", () => {
     expect(() =>
       SolwynConfigSchema.parse({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: [{ provider: "openai", model: "gpt-4o" }],
         same_provider_retries: -1,
       }),
@@ -1485,7 +1659,12 @@ describe("failover / tuning knobs", () => {
   it("same_provider_retries=-1 via resolveConfig surfaces ConfigurationError(field=same_provider_retries)", () => {
     let caught: unknown;
     try {
-      resolveConfig({ api_key: VALID_KEY, providers: providers(), same_provider_retries: -1 });
+      resolveConfig({
+        api_key: VALID_KEY,
+        project: "test-project",
+        providers: providers(),
+        same_provider_retries: -1,
+      });
     } catch (error) {
       caught = error;
     }
@@ -1519,7 +1698,12 @@ describe("reporter knob positivity (F21)", () => {
     it(`${field}=${value} surfaces ConfigurationError(field=${field})`, () => {
       let caught: unknown;
       try {
-        resolveConfig({ api_key: VALID_KEY, providers: providers(), [field]: value });
+        resolveConfig({
+          api_key: VALID_KEY,
+          project: "test-project",
+          providers: providers(),
+          [field]: value,
+        });
       } catch (error) {
         caught = error;
       }
@@ -1532,6 +1716,7 @@ describe("reporter knob positivity (F21)", () => {
   it("the minimum valid value (1, and a fractional flush interval) is accepted", () => {
     const config = resolveConfig({
       api_key: VALID_KEY,
+      project: "test-project",
       providers: providers(),
       reporter_batch_size: 1,
       reporter_flush_interval: 0.001,
@@ -1548,7 +1733,7 @@ describe("reporter knob positivity (F21)", () => {
 describe("reporter reliability knobs", () => {
   it("loads all five knobs from their exact environment variables", () => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY, providers: providers() },
+      { api_key: VALID_KEY, project: "test-project", providers: providers() },
       {
         SOLWYN_REPORTER_MAX_SEND_ATTEMPTS: "7",
         SOLWYN_REPORTER_RETRY_BACKOFF_BASE: "0.25",
@@ -1583,6 +1768,7 @@ describe("reporter reliability knobs", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         [field]: value,
       });
@@ -1604,6 +1790,7 @@ describe("strict schema", () => {
     try {
       resolveConfig({
         api_key: VALID_KEY,
+        project: "test-project",
         providers: providers(),
         bogus_field: 1,
       } as unknown as SolwynConfigOptions);
@@ -1641,12 +1828,16 @@ describe("numeric configuration safety bounds", () => {
 
   it("accepts the 100ms budget timeout boundary from options and environment", () => {
     expect(
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, budget_check_timeout: 0.1 }, {})
-        .budget_check_timeout,
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project", budget_check_timeout: 0.1 },
+        {},
+      ).budget_check_timeout,
     ).toBe(0.1);
     expect(
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_BUDGET_CHECK_TIMEOUT: "0.1" })
-        .budget_check_timeout,
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project" },
+        { SOLWYN_BUDGET_CHECK_TIMEOUT: "0.1" },
+      ).budget_check_timeout,
     ).toBe(0.1);
   });
 
@@ -1688,7 +1879,11 @@ describe("numeric configuration safety bounds", () => {
   )("rejects non-numeric or non-finite %s=%s with the exact field", (field, value) => {
     expect(() =>
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, [field]: value } as unknown as SolwynConfigOptions,
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          [field]: value,
+        } as unknown as SolwynConfigOptions,
         {},
       ),
     ).toThrow(expect.objectContaining({ name: "ConfigurationError", field }));
@@ -1699,9 +1894,12 @@ describe("numeric configuration safety bounds", () => {
       [-1, 1.5, Number.MAX_SAFE_INTEGER + 1].map((value) => [field, value] as const),
     ),
   )("rejects invalid integer %s=%s", (field, value) => {
-    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: value }, {})).toThrow(
-      expect.objectContaining({ field }),
-    );
+    expect(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project", [field]: value },
+        {},
+      ),
+    ).toThrow(expect.objectContaining({ field }));
   });
 
   it.each([
@@ -1709,9 +1907,9 @@ describe("numeric configuration safety bounds", () => {
     "circuit_breaker_success_threshold",
     "control_plane_failure_threshold",
   ] as const)("requires a positive %s", (field) => {
-    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: 0 }, {})).toThrow(
-      expect.objectContaining({ field }),
-    );
+    expect(() =>
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, project: "test-project", [field]: 0 }, {}),
+    ).toThrow(expect.objectContaining({ field }));
   });
 
   it.each(
@@ -1719,9 +1917,12 @@ describe("numeric configuration safety bounds", () => {
       [-1, maxTimerSeconds + 1].map((value) => [field, value] as const),
     ),
   )("rejects out-of-range timer %s=%s", (field, value) => {
-    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: value }, {})).toThrow(
-      expect.objectContaining({ field }),
-    );
+    expect(() =>
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project", [field]: value },
+        {},
+      ),
+    ).toThrow(expect.objectContaining({ field }));
   });
 
   it.each([
@@ -1732,15 +1933,19 @@ describe("numeric configuration safety bounds", () => {
     "reporter_retry_backoff_cap",
     "breaker_report_heartbeat",
   ] as const)("requires positive timer %s", (field) => {
-    expect(() => resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, [field]: 0 }, {})).toThrow(
-      expect.objectContaining({ field }),
-    );
+    expect(() =>
+      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, project: "test-project", [field]: 0 }, {}),
+    ).toThrow(expect.objectContaining({ field }));
   });
 
   it.each([-1, 1.001, 5])("rejects out-of-range breaker jitter %s", (value) => {
     expect(() =>
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, circuit_breaker_recovery_timeout_jitter: value },
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          circuit_breaker_recovery_timeout_jitter: value,
+        },
         {},
       ),
     ).toThrow(expect.objectContaining({ field: "circuit_breaker_recovery_timeout_jitter" }));
@@ -1748,14 +1953,25 @@ describe("numeric configuration safety bounds", () => {
 
   it("enforces the server batch limit and a heartbeat no greater than 60 seconds", () => {
     expect(() =>
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, reporter_batch_size: 1001 }, {}),
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project", reporter_batch_size: 1001 },
+        {},
+      ),
     ).toThrow(expect.objectContaining({ field: "reporter_batch_size" }));
     expect(() =>
-      resolveConfigFromEnvSnapshot({ api_key: VALID_KEY, breaker_report_heartbeat: 60.001 }, {}),
+      resolveConfigFromEnvSnapshot(
+        { api_key: VALID_KEY, project: "test-project", breaker_report_heartbeat: 60.001 },
+        {},
+      ),
     ).toThrow(expect.objectContaining({ field: "breaker_report_heartbeat" }));
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, reporter_batch_size: 1000, breaker_report_heartbeat: 60 },
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          reporter_batch_size: 1000,
+          breaker_report_heartbeat: 60,
+        },
         {},
       ),
     ).toMatchObject({ reporter_batch_size: 1000, breaker_report_heartbeat: 60 });
@@ -1764,7 +1980,10 @@ describe("numeric configuration safety bounds", () => {
   it("rejects empty and oversized timer environment values", () => {
     for (const raw of ["", " ", "3000000"]) {
       expect(() =>
-        resolveConfigFromEnvSnapshot({ api_key: VALID_KEY }, { SOLWYN_BUDGET_CHECK_TIMEOUT: raw }),
+        resolveConfigFromEnvSnapshot(
+          { api_key: VALID_KEY, project: "test-project" },
+          { SOLWYN_BUDGET_CHECK_TIMEOUT: raw },
+        ),
       ).toThrow(expect.objectContaining({ field: "budget_check_timeout" }));
     }
   });
@@ -1774,6 +1993,7 @@ describe("numeric configuration safety bounds", () => {
       resolveConfigFromEnvSnapshot(
         {
           api_key: VALID_KEY,
+          project: "test-project",
           failover_total_timeout: 0,
           budget_check_cache_ttl: 0,
           reporter_shutdown_deadline: 0,
@@ -1795,7 +2015,7 @@ describe("numeric configuration safety bounds", () => {
     });
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, circuit_breaker_recovery_timeout_jitter: 1 },
+        { api_key: VALID_KEY, project: "test-project", circuit_breaker_recovery_timeout_jitter: 1 },
         {},
       ).circuit_breaker_recovery_timeout_jitter,
     ).toBe(1);
@@ -1814,7 +2034,7 @@ describe("trace-correlation environment setting", () => {
     ["anything-else", false],
   ])("coerces SOLWYN_TRACE_CORRELATION=%s to %s", (raw, expected) => {
     const config = resolveConfigFromEnvSnapshot(
-      { api_key: VALID_KEY },
+      { api_key: VALID_KEY, project: "test-project" },
       { SOLWYN_TRACE_CORRELATION: raw },
     );
     expect(config.trace_correlation).toBe(expected);
@@ -1823,13 +2043,13 @@ describe("trace-correlation environment setting", () => {
   it("lets an explicit constructor value win over the environment in both directions", () => {
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, trace_correlation: true },
+        { api_key: VALID_KEY, project: "test-project", trace_correlation: true },
         { SOLWYN_TRACE_CORRELATION: "false" },
       ).trace_correlation,
     ).toBe(true);
     expect(
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, trace_correlation: false },
+        { api_key: VALID_KEY, project: "test-project", trace_correlation: false },
         { SOLWYN_TRACE_CORRELATION: "true" },
       ).trace_correlation,
     ).toBe(false);
@@ -1838,7 +2058,11 @@ describe("trace-correlation environment setting", () => {
   it("rejects a non-boolean constructor value", () => {
     expect(() =>
       resolveConfigFromEnvSnapshot(
-        { api_key: VALID_KEY, trace_correlation: "false" as unknown as boolean },
+        {
+          api_key: VALID_KEY,
+          project: "test-project",
+          trace_correlation: "false" as unknown as boolean,
+        },
         {},
       ),
     ).toThrow(ConfigurationError);

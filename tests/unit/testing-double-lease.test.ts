@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConfigurationError } from "../../src/errors";
 import { FakeControlPlane } from "../../src/testing/index";
+import { planeHeaders } from "../helpers/project-binding";
 
 const GRANT_PATH = "/api/v1/budgets/lease";
 const RENEW_PATH = "/api/v1/budgets/lease/renew";
@@ -40,6 +41,7 @@ function check(overrides: Record<string, unknown> = {}): Record<string, unknown>
 
 async function post(plane: FakeControlPlane, path: string, body: unknown, signal?: AbortSignal) {
   return plane.fetch(`${plane.apiUrl}${path}`, {
+    headers: planeHeaders(plane),
     method: "POST",
     body: JSON.stringify(body),
     signal,
@@ -253,7 +255,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
       currentUsage: 4,
       finalGrant: true,
       grantedTokens: 0,
-      projectId: "proj-test",
+      projectId: `proj_${"7".repeat(24)}`,
     });
 
     expect(plane.handle("POST", GRANT_PATH, grant({ fail_open: false }))).toEqual({
@@ -269,7 +271,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
         headroom_share_tokens: 0,
         posture: { mode: "alert_only", on_unreachable: "local_enforce" },
         final_grant: false,
-        project_id: "proj-test",
+        project_id: `proj_${"7".repeat(24)}`,
         mode: "alert_only",
         budget_limit: 50,
         current_usage: 4,
@@ -480,7 +482,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
         eligible: true,
         allowed: false,
         denied_by_period: "monthly",
-        project_id: "proj_fake",
+        project_id: "proj_000000000000000000000000",
         mode: "hard_deny",
         budget_limit: 100,
         current_usage: 0,
@@ -579,6 +581,7 @@ describe("FakeControlPlane lease grant and renewal", () => {
       headers: {},
     });
     const malformed = await plane.fetch(`${plane.apiUrl}${GRANT_PATH}`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: '{"private_prompt":"secret"',
     });

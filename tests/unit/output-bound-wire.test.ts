@@ -18,6 +18,7 @@ import { Solwyn } from "../../src/index";
 import { run } from "../../src/node";
 import type { FetchLike } from "../../src/transport";
 import type { BudgetMode } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
@@ -599,7 +600,7 @@ describe("hard_deny refuses a call whose output bound exceeds the remaining budg
 describe("BudgetEnforcer output bound", () => {
   it("defaults a missing or non-positive bound and omits it on media checks", () => {
     const enforcer = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseOutputBoundDefault: 512,
@@ -625,7 +626,7 @@ describe("BudgetEnforcer output bound", () => {
   it("does not let a cached allow for a small bound admit a larger one", async () => {
     const plane = allowPlane("alert_only");
     const enforcer = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: plane.fetchMock,

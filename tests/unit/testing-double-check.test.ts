@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ConfigurationError } from "../../src/errors";
 import { MAGIC_MODELS } from "../../src/testing/index";
+import { planeHeaders } from "../helpers/project-binding";
 
 async function makePlane(options: Record<string, unknown> = {}) {
   const { FakeControlPlane } = await import("../../src/testing/index");
@@ -110,7 +111,7 @@ describe("FakeControlPlane checks", () => {
         budget_limit: 100,
         current_usage: 0,
         denied_by_period: null,
-        project_id: "proj_fake",
+        project_id: "proj_000000000000000000000000",
         price_hints: null,
       },
       headers: {},
@@ -153,7 +154,7 @@ describe("FakeControlPlane checks", () => {
       budget_limit: 100,
       current_usage: 0,
       denied_by_period: null,
-      project_id: "proj_fake",
+      project_id: "proj_000000000000000000000000",
       price_hints: { openai: 0.25, future: 1.5 },
     });
 
@@ -169,12 +170,13 @@ describe("FakeControlPlane checks", () => {
       mode: "hard_deny",
       budget_limit: 100,
       current_usage: 0,
-      project_id: "proj_fake",
+      project_id: "proj_000000000000000000000000",
     });
     expect(plane.checks).toHaveLength(5);
 
     const bytesPlane = await makePlane();
     const legacyFetch = await bytesPlane.fetch(`${bytesPlane.apiUrl}/api/v1/budgets/check`, {
+      headers: planeHeaders(bytesPlane),
       method: "POST",
       body: JSON.stringify(checkBody()),
     });
@@ -187,7 +189,7 @@ describe("FakeControlPlane checks", () => {
         budget_limit: 100,
         current_usage: 0,
         denied_by_period: null,
-        project_id: "proj_fake",
+        project_id: "proj_000000000000000000000000",
         price_hints: null,
       }),
     );
@@ -402,6 +404,7 @@ describe("FakeControlPlane confirms and reservation state", () => {
     expect(plane.confirms).toHaveLength(1);
 
     const fetchReplay = await plane.fetch(`${plane.apiUrl}/api/v1/budgets/confirm`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: JSON.stringify(confirmBody()),
     });
@@ -543,6 +546,7 @@ describe("FakeControlPlane confirms and reservation state", () => {
     });
 
     const fetched = await plane.fetch(`${plane.apiUrl}/api/v1/budgets/check`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: JSON.stringify(invalid),
     });

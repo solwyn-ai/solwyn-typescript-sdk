@@ -21,6 +21,7 @@ import { createTokenDetails, type TokenDetails, zeroTokenDetails } from "../../s
 import type { FetchLike } from "../../src/transport";
 import type { MediaUsage, Modality } from "../../src/types";
 import { VelocityMonitor } from "../../src/velocity";
+import { testBinding } from "../helpers/project-binding";
 
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
@@ -1475,7 +1476,7 @@ describe("mediaCall lifecycle", () => {
 describe("media budget plumbing", () => {
   it("builds modality/media fields without changing text defaults", () => {
     const enforcer = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: "https://api.solwyn.test",
       apiKey: API_KEY,
     });

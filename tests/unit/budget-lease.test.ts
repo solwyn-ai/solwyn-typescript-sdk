@@ -13,6 +13,7 @@ import { createTokenDetails, zeroTokenDetails } from "../../src/token-details";
 import { TransportNetworkError } from "../../src/transport";
 import type { BudgetCheckResponse, LeaseGrantResponse } from "../../src/types";
 import { serializeBudgetConfirmRequest } from "../../src/validation";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
@@ -132,7 +133,7 @@ function enforcer(
   overrides: Partial<BudgetEnforcerOptions> = {},
 ): BudgetEnforcer {
   return new BudgetEnforcer({
-    project: "test-project",
+    binding: testBinding(),
     apiUrl: API_URL,
     apiKey: API_KEY,
     fetch,
@@ -230,7 +231,7 @@ describe("BudgetEnforcer lease grant and synchronous admission", () => {
   it("enables leases by default at the low-level constructor", async () => {
     const urls: string[] = [];
     const budget = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       holderId: "sdk-default-holder",

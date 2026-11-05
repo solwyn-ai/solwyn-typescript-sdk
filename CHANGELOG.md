@@ -31,7 +31,7 @@ names its project. **Breaking:** old `sk_proj_` keys and `SOLWYN_PROJECT_ID` no 
   with `ApiKeyRefusedError`; it no longer logs a diagnostic and carries on.
 - **Testing double.** `FakeControlPlane` requires the key and `Solwyn-Project` on every request,
   serves `GET /api/v1/auth/key`, and its `apiKey` is now a `solwyn_sk_` key. `projectId` must be a
-  `proj_` id (default `proj_000000000000000000000000`); `projectName` (default `fake-project`) and
+  `proj_` id (default `proj_000000000000000000000000`); `projectName` (default `test-project`) and
   `keyScope` are new options, and `project` is a reserved `wrap()` option. Every contract probe
   takes `project` in its options.
 

@@ -25,6 +25,8 @@ import {
 } from "./api-key-errors";
 import { ApiKeyRefusedError, SolwynError } from "./errors";
 import { bestEffortLogger, type Logger, noopLogger } from "./logging";
+import { runOutsideRun } from "./run-context";
+import { withoutTraceContext } from "./trace-context";
 import { type FetchLike, Transport, TransportHttpError } from "./transport";
 import { AuthKeyResponseSchema } from "./validation";
 
@@ -222,31 +224,35 @@ export class ProjectBinding {
   /** One single-flight `GET /api/v1/auth/key`. Never throws. */
   #request(): Promise<ValidationOutcome> {
     if (this.#inflight !== null) return this.#inflight;
-    const pending = (async (): Promise<ValidationOutcome> => {
-      try {
-        const { read, generation } = await this.#transport.getJson(AUTH_KEY_PATH, {
-          timeoutMs: this.#timeoutMs,
-        });
-        if (!read.parsed) return this.#outage();
-        const parsed = AuthKeyResponseSchema.safeParse(read.value);
-        if (!parsed.success) {
-          this.#logger.warn("solwyn.auth_key_response_unreadable");
+    // Shared by every concurrent caller, so it carries no one caller's run scope or trace
+    // context: a run-scoped start would keep that run reachable after it finishes.
+    const pending = runOutsideRun(() =>
+      withoutTraceContext(async (): Promise<ValidationOutcome> => {
+        try {
+          const { read, generation } = await this.#transport.getJson(AUTH_KEY_PATH, {
+            timeoutMs: this.#timeoutMs,
+          });
+          if (!read.parsed) return this.#outage();
+          const parsed = AuthKeyResponseSchema.safeParse(read.value);
+          if (!parsed.success) {
+            this.#logger.debug("solwyn.auth_key_response_unreadable");
+            return this.#outage();
+          }
+          if (parsed.data.scope !== "full") {
+            this.refuse({ code: "read_only_key", posture: "unknown", expiredOn: null }, generation);
+            return "refused";
+          }
+          return this.#succeed(generation, parsed.data.project_id) ? "success" : "ignored";
+        } catch (error) {
+          if (error instanceof TransportHttpError && error.refusal !== undefined) {
+            // Transport.attempt already recorded it with this request's dispatch generation.
+            this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
+            return "refused";
+          }
           return this.#outage();
         }
-        if (parsed.data.scope !== "full") {
-          this.refuse({ code: "read_only_key", posture: "unknown", expiredOn: null }, generation);
-          return "refused";
-        }
-        return this.#succeed(generation, parsed.data.project_id) ? "success" : "ignored";
-      } catch (error) {
-        if (error instanceof TransportHttpError && error.refusal !== undefined) {
-          // Transport.attempt already recorded it with this request's dispatch generation.
-          this.#nextValidateAt = this.#now() + REFUSED_RETRY_MS;
-          return "refused";
-        }
-        return this.#outage();
-      }
-    })();
+      }),
+    );
     const tracked = pending.finally(() => {
       if (this.#inflight === tracked) this.#inflight = null;
     });
@@ -303,9 +309,24 @@ export class ProjectBinding {
    * generation the exit check compares against.
    */
   async gate(): Promise<GateDecision> {
-    if (this.#state !== "valid" && this.#now() >= this.#nextValidateAt) {
-      await this.revalidate();
-    }
+    if (this.#revalidationDue()) await this.revalidate();
+    return this.#decide();
+  }
+
+  /**
+   * The gate without a suspension point: `undefined` when a revalidation is due (call
+   * {@link gate}); otherwise the same decision {@link gate} would make, synchronously, so a
+   * valid client's check keeps its synchronous dispatch prefix.
+   */
+  gateNow(): GateDecision | undefined {
+    return this.#revalidationDue() ? undefined : this.#decide();
+  }
+
+  #revalidationDue(): boolean {
+    return this.#state !== "valid" && this.#now() >= this.#nextValidateAt;
+  }
+
+  #decide(): GateDecision {
     const refusal = this.#state === "refused" ? this.#refusal : null;
     if (refusal !== null) return this.#apply(refusal);
     return { kind: "proceed", generation: this.#generation };

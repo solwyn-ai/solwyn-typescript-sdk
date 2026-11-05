@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ConfigurationError } from "../../src/errors";
 import { FakeControlPlane } from "../../src/testing/index";
+import { planeHeaders } from "../helpers/project-binding";
 
 const CHECK = "/api/v1/budgets/check";
 const LEASE = "/api/v1/budgets/lease";
@@ -242,6 +243,7 @@ describe("FakeControlPlane server behavior", () => {
   it("rejects untracked payloads larger than 256 KiB", async () => {
     const plane = new FakeControlPlane();
     const response = await plane.fetch(`${plane.apiUrl}/api/v1/untracked-surfaces`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: `${" ".repeat(256 * 1024)}${JSON.stringify([advisory()])}`,
     });
@@ -250,7 +252,7 @@ describe("FakeControlPlane server behavior", () => {
   });
 
   it("rejects breaker reports for a project outside the key's project", () => {
-    const plane = new FakeControlPlane({ projectId: "proj_synthetic" });
+    const plane = new FakeControlPlane({ projectId: `proj_${"5".repeat(24)}` });
     const response = plane.handle("POST", "/api/v1/projects/proj_other/providers/breaker-reports", {
       provider: "openai",
       state: "open",

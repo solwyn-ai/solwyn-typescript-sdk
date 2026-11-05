@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { planeHeaders } from "../helpers/project-binding";
 
 async function makePlane(options: Record<string, unknown> = {}) {
   const { FakeControlPlane } = await import("../../src/testing/index");
@@ -188,6 +189,7 @@ describe("FakeControlPlane metadata ingest", () => {
   it("sanitizes fetch JSON-decode and schema errors without recording rejected input", async () => {
     const plane = await makePlane();
     const jsonError = await plane.fetch(`${plane.apiUrl}/api/v1/metadata/ingest`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: '{"private_prompt":"secret-sentinel"',
     });
@@ -231,6 +233,7 @@ describe("FakeControlPlane advisory endpoints", () => {
     });
 
     const fetchOversized = await plane.fetch(`${plane.apiUrl}/api/v1/untracked-surfaces`, {
+      headers: planeHeaders(plane),
       method: "POST",
       body: JSON.stringify([{ private_prompt: "secret" }, ...oversized.slice(0, 100)]),
     });
@@ -267,21 +270,26 @@ describe("FakeControlPlane advisory endpoints", () => {
 
   it("emits the spec-authoritative breaker 202 accepted body and records the strict model", async () => {
     const plane = await makePlane();
-    const response = plane.handle("POST", "/api/v1/projects/proj_fake/providers/breaker-reports", {
-      provider: "openai",
-      state: "closed",
-      failure_count: 0,
-      success_count: 1,
-      reported_at: "2026-08-31T01:00:00Z",
-      sdk_instance_id: "sdk-1",
-    });
+    const response = plane.handle(
+      "POST",
+      "/api/v1/projects/proj_000000000000000000000000/providers/breaker-reports",
+      {
+        provider: "openai",
+        state: "closed",
+        failure_count: 0,
+        success_count: 1,
+        reported_at: "2026-08-31T01:00:00Z",
+        sdk_instance_id: "sdk-1",
+      },
+    );
     expect(response).toEqual({ status: 202, body: { accepted: true }, headers: {} });
     expect(plane.breakerReports).toHaveLength(1);
     expect(plane.breakerReports[0]).toMatchObject({ state: "closed", success_count: 1 });
 
     const fetchResponse = await plane.fetch(
-      `${plane.apiUrl}/api/v1/projects/proj_fake/providers/breaker-reports`,
+      `${plane.apiUrl}/api/v1/projects/proj_000000000000000000000000/providers/breaker-reports`,
       {
+        headers: planeHeaders(plane),
         method: "POST",
         body: JSON.stringify({
           provider: "openai",
@@ -297,15 +305,19 @@ describe("FakeControlPlane advisory endpoints", () => {
     expect(await fetchResponse.text()).toBe('{"accepted":true}');
 
     const sentinel = "private_breaker_key";
-    const invalid = plane.handle("POST", "/api/v1/projects/proj_fake/providers/breaker-reports", {
-      provider: "openai",
-      state: "closed",
-      failure_count: 0,
-      success_count: 0,
-      reported_at: "2026-08-31T01:00:02Z",
-      sdk_instance_id: "sdk-1",
-      [sentinel]: "secret",
-    });
+    const invalid = plane.handle(
+      "POST",
+      "/api/v1/projects/proj_000000000000000000000000/providers/breaker-reports",
+      {
+        provider: "openai",
+        state: "closed",
+        failure_count: 0,
+        success_count: 0,
+        reported_at: "2026-08-31T01:00:02Z",
+        sdk_instance_id: "sdk-1",
+        [sentinel]: "secret",
+      },
+    );
     expect(invalid.status).toBe(422);
     expect(JSON.stringify(invalid.body)).not.toContain(sentinel);
     expect(JSON.stringify(invalid.body)).not.toContain("secret");

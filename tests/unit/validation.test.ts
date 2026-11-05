@@ -58,9 +58,7 @@ describe("validateApiKeyFormat", () => {
 
   it("rejects a retired sk_proj_ key with the exact old-key message", () => {
     expect(() => validateApiKeyFormat(`sk_proj_${"a".repeat(64)}`)).toThrow(
-      new ConfigurationError(
-        "This is an old Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create.",
-      ),
+      "This is an old Solwyn project key (sk_proj_). Create a new key in the dashboard or with solwyn keys create.",
     );
   });
 

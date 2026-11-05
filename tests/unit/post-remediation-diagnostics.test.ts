@@ -17,7 +17,7 @@ import {
 const OPTIONS = {
   apiUrl: "https://control-plane.example",
   apiKey: `solwyn_sk_${"0".repeat(64)}`,
-  project: "fake-project",
+  project: "test-project",
 };
 const CHECK = { estimatedInputTokens: 1, model: "gpt-5.5", provider: "openai" as const };
 

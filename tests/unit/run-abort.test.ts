@@ -20,6 +20,7 @@ import type {
   BudgetConfirmRequest,
   MetadataEvent,
 } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 const API_URL = "https://api.solwyn.test";
@@ -91,7 +92,7 @@ function checkOptions(runId: string, index: number) {
 
 function enforcer(fetch: FetchLike): BudgetEnforcer {
   return new BudgetEnforcer({
-    project: "test-project",
+    binding: testBinding(),
     apiUrl: API_URL,
     apiKey: API_KEY,
     fetch,

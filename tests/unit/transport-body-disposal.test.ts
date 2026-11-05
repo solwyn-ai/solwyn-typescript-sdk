@@ -14,7 +14,7 @@ import {
 import type { BudgetConfirmRequest, LeaseGrantResponse } from "../../src/types";
 import { UntrackedSurfaceReporter } from "../../src/untracked-reporter";
 import { BudgetConfirmRequestSchema } from "../../src/validation";
-import { pinnedBinding } from "../helpers/project-binding";
+import { pinnedBinding, testBinding } from "../helpers/project-binding";
 
 // 2026-09-22 performance audit: Dispose unfinished HTTP response bodies the SDK discards.
 // Every body the SDK does not use is released off the result path: small complete
@@ -173,7 +173,6 @@ describe("Transport body disposal — outcomes are decided at headers", () => {
   });
 
   it.each([
-    [400, false],
     [429, true],
     [500, true],
     [503, true],
@@ -199,6 +198,32 @@ describe("Transport body disposal — outcomes are decided at headers", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each([
+    400, 401, 403, 404,
+  ])("reads a classified %i body for at most the drain bound, then cancels it", async (status) => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const { body, probe } = trackedBody({ complete: false });
+    const transport = transportFor(() => new Response(body, { status }), signals);
+
+    const outcome = transport
+      .postJson(BUDGET_CONFIRM_PATH, {}, { timeoutMs: 30_000 })
+      .catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(DRAIN_BOUND_MS - 1);
+    expect(probe.cancels).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(TransportHttpError);
+    expect((error as TransportHttpError).status).toBe(status);
+    // An unreadable body never classifies a project code; every 401 is still a refusal.
+    expect((error as TransportHttpError).refusal).toEqual(
+      status === 401 ? { code: "api_key_invalid", posture: "unknown", expiredOn: null } : undefined,
+    );
+    expect(probe.cancels).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("bounds the drain by the remaining attempt deadline when it is under one second", async () => {
     vi.useFakeTimers();
     const signals: AbortSignal[] = [];
@@ -215,10 +240,7 @@ describe("Transport body disposal — outcomes are decided at headers", () => {
 
   it("keeps retry counts unchanged when retried error bodies stall", async () => {
     vi.useFakeTimers();
-    for (const [status, expectedAttempts] of [
-      [503, 3],
-      [400, 1],
-    ] as const) {
+    for (const [status, expectedAttempts] of [[503, 3]] as const) {
       const signals: AbortSignal[] = [];
       const probes: BodyProbe[] = [];
       const transport = transportFor(
@@ -521,7 +543,7 @@ describe.each([
     const probes: BodyProbe[] = [];
     const signals: AbortSignal[] = [];
     const budget = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       leaseEnabled: true,

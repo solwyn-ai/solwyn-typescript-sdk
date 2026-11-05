@@ -21,6 +21,19 @@ async function releasesIdle(budget: BudgetEnforcer): Promise<void> {
 }
 const apiKey = `solwyn_sk_${"a".repeat(64)}`;
 const projectId = `proj_${"0".repeat(24)}`;
+const authKey = {
+  account_id: "00000000-0000-4000-8000-000000000001",
+  key_id: "00000000-0000-4000-8000-000000000002",
+  key_prefix: apiKey.slice(0, 26),
+  key_name: "retention-key",
+  scope: "full",
+  created_via: "dashboard",
+  expires_at: "2099-01-01T00:00:00Z",
+  rotation_grace_until: null,
+  project_id: projectId,
+  project_name: "test-project",
+  budget_mode: "hard_deny",
+};
 const results: Record<string, unknown> = {};
 const scenarios: Record<string, () => Promise<void>> = {};
 
@@ -66,6 +79,7 @@ function fixture(ineligible = false, tokens = 0) {
   });
   const fetch: FetchLike = async (url, init) => {
     const pathname = new URL(url).pathname;
+    if (pathname.endsWith("/auth/key")) return Response.json(authKey);
     if (pathname.endsWith("/budgets/lease")) {
       counters.grants++;
       return Response.json(grant());

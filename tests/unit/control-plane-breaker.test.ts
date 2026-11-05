@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { BudgetEnforcer, type BudgetEnforcerOptions } from "../../src/budget";
 import { CircuitBreaker } from "../../src/circuit-breaker";
+import { ApiKeyRefusedError } from "../../src/errors";
 import type { Logger } from "../../src/logging";
 import { MetadataReporter, type MetadataReporterOptions } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest } from "../../src/types";
 import { BudgetConfirmRequestSchema } from "../../src/validation";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
@@ -79,7 +81,7 @@ function budgetWithBreaker(
   const withBreaker = {
     apiUrl: API_URL,
     apiKey: API_KEY,
-    project: "test-project",
+    binding: testBinding(),
     ...options,
     controlPlaneBreaker: breaker,
   } as BudgetEnforcerOptions & { controlPlaneBreaker: CircuitBreaker | null };
@@ -352,14 +354,16 @@ describe("budget-check breaker admission and taxonomy", () => {
     expect(breaker.getState().state).toBe("closed");
   });
 
-  it("credits exact read-only 403 and keeps the breaker closed", async () => {
+  it("blocks on a read-only 403, credits the breaker, and keeps it closed", async () => {
     const breaker = new CircuitBreaker({ failureThreshold: 1, name: "control-plane" });
     const budget = budgetWithBreaker(breaker, {
       fetch: async () =>
         new Response(JSON.stringify({ detail: { code: "read_only_key" } }), { status: 403 }),
     });
 
-    await budget.checkBudget({ estimatedInputTokens: 1, model: "gpt-4o", provider: "openai" });
+    await expect(
+      budget.checkBudget({ estimatedInputTokens: 1, model: "gpt-4o", provider: "openai" }),
+    ).rejects.toBeInstanceOf(ApiKeyRefusedError);
 
     expect(breaker.getState()).toMatchObject({ state: "closed", failureCount: 0 });
   });

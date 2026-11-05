@@ -3,6 +3,7 @@ import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, LeaseGrantResponse, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
 import { installIngestContractGuard } from "../helpers/ingest-contract";
+import { testBinding } from "../helpers/project-binding";
 
 const API_URL = "https://api.solwyn.test";
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
@@ -288,7 +289,7 @@ describe("node beforeExit reporter drain", () => {
     const reporter = new MetadataReporter(API_URL, API_KEY, { fetch: reporterFetch });
     reporter.report(event(20));
     const budget = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: API_URL,
       apiKey: API_KEY,
       fetch: surrenderFetch,

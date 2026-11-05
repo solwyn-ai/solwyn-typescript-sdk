@@ -468,6 +468,24 @@ function copyCheckTags(
   return parsed.data === null || parsed.data === undefined ? parsed.data : { ...parsed.data };
 }
 
+/**
+ * Copy every caller-owned value a check reads, synchronously at entry. The entry gate may await a
+ * revalidation before the check builds its request; a caller mutating its tags or arrays in the
+ * meantime must not change what is sent.
+ */
+function snapshotCheckOptions<T extends CheckBudgetOptions>(options: T): T {
+  const snapshot: T = { ...options };
+  if (Object.hasOwn(options, "tags")) snapshot.tags = copyCheckTags(options.tags);
+  if (Array.isArray(options.fallbackProviders)) {
+    snapshot.fallbackProviders = [...options.fallbackProviders];
+  }
+  if (Array.isArray(options.fallbackModels)) snapshot.fallbackModels = [...options.fallbackModels];
+  if (options.estimatedMedia !== null && options.estimatedMedia !== undefined) {
+    snapshot.estimatedMedia = { ...options.estimatedMedia };
+  }
+  return snapshot;
+}
+
 /** Named, funding-aware input for the sans-I/O confirm builder. */
 export interface BuildConfirmRequestOptions {
   reservationId?: string | null;
@@ -1077,7 +1095,10 @@ export class BudgetEnforcer {
       );
     }
     try {
-      const result = await this.gatedCheck({ ...options, callId, signal }, deadlineMs);
+      const result = await this.gatedCheck(
+        snapshotCheckOptions({ ...options, callId, signal }),
+        deadlineMs,
+      );
       try {
         throwIfCheckAborted(signal);
       } catch (error) {
@@ -1109,11 +1130,15 @@ export class BudgetEnforcer {
     deadlineMs: number,
   ): Promise<BudgetCheckResult> {
     for (let pass = 0; ; pass++) {
-      const gate = await this.binding.gate();
+      // Synchronous when no revalidation is due, so the check's dispatch prefix stays synchronous.
+      const gate = this.binding.gateNow() ?? (await this.binding.gate());
       if (gate.kind === "unmetered") return this.unmeteredResult();
       const result = await this.checkBudgetWithOwnership(options, deadlineMs);
       const exit = this.binding.exitDecision(gate.generation);
-      if (exit.kind === "keep") return result;
+      // A rerun means only that a successful revalidation moved the generation (no refusal is
+      // stored). The re-run's own result stands even if the generation moved again; it never
+      // re-runs twice. (A refusal placeholder here is a denial, so this still fails closed.)
+      if (exit.kind === "keep" || (exit.kind === "rerun" && pass >= 1)) return result;
       // The result is discarded: return any local lease reservation it claimed.
       this.releaseReservation(options.callId, result.leaseClaimToken ?? null);
       if (exit.kind === "block") throw exit.error;
@@ -1124,7 +1149,6 @@ export class BudgetEnforcer {
           : { ...result, leaseClaimToken: null };
       }
       // A successful revalidation moved the generation: re-run once from the top.
-      if (pass >= 1) return this.checkBudgetWithOwnership(options, deadlineMs);
     }
   }
 

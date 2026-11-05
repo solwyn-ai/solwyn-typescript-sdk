@@ -111,7 +111,7 @@ Set `priceHints: null` to return an empty map on opted-in text checks; this does
 
 The fake authenticates every control-plane request the way Solwyn does. It requires
 `Authorization: Bearer <plane.apiKey>` and a `Solwyn-Project` header naming `plane.project` (the
-project name, `fake-project` by default) or its `proj_` id (`projectId`, default
+project name, `test-project` by default) or its `proj_` id (`projectId`, default
 `proj_000000000000000000000000`). A missing header returns `400 project_selector_required`; a
 header that matches neither returns `404 project_not_found`. `GET /api/v1/auth/key` returns the
 key and the resolved project, and every authenticated response carries `Solwyn-Project-Id`.

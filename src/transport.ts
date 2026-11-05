@@ -233,17 +233,76 @@ export function apiKeyRefusalOf(error: unknown): Refusal | undefined {
 }
 
 /**
- * Read a 400/401/403/404 body and keep only the classified refusal. An unreadable body still
- * classifies by status (every 401 is a refusal); the text itself is never retained.
+ * Read a 400/401/403/404 body, bounded like the discard drain (16 KiB and `boundMs`), and keep
+ * only the classified refusal. A body that is too large, stalls past the bound, or fails to read
+ * is cancelled (the request is aborted) and classifies as unreadable: every 401 is still a
+ * refusal. The text itself is never retained.
  */
-async function classifyHttpFailure(response: Response): Promise<Refusal | undefined> {
-  let text: string | null;
+async function classifyHttpFailure(
+  response: Response,
+  controller: AbortController,
+  boundMs: number,
+): Promise<Refusal | undefined> {
+  return classify(response.status, await readBoundedText(response, controller, boundMs));
+}
+
+async function readBoundedText(
+  response: Response,
+  controller: AbortController,
+  boundMs: number,
+): Promise<string | null> {
+  let body: ReadableStream<Uint8Array> | null | undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
   try {
-    text = await response.text();
+    body = response.body;
+    if (body === null || body === undefined) return "";
+    reader = body.getReader();
   } catch {
-    text = null;
+    controller.abort();
+    return null;
   }
-  return classify(response.status, text);
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.min(Math.max(0, boundMs), DISCARD_DRAIN_MAX_MS));
+    (timer as { unref?: () => void })?.unref?.();
+  });
+  const complete = (async (): Promise<boolean> => {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) return true;
+      const value: unknown = result.value;
+      if (!(value instanceof Uint8Array)) return false;
+      bytes += value.byteLength;
+      if (bytes > DISCARD_DRAIN_MAX_BYTES) return false;
+      chunks.push(value);
+    }
+  })().catch(() => false);
+  try {
+    if (!(await Promise.race([complete, expired]))) {
+      try {
+        reader.cancel().catch(() => {});
+      } catch {
+        // A synchronously throwing cancel still ends in the abort below.
+      }
+      controller.abort();
+      return null;
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(joined);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -543,7 +602,9 @@ export class Transport {
             // Custom fetch responses may lack a usable headers interface.
           }
           const classified = isClassifiedStatus(response.status);
-          const refusal = classified ? await classifyHttpFailure(response) : undefined;
+          const refusal = classified
+            ? await classifyHttpFailure(response, controller, deadline - monotonicNow())
+            : undefined;
           // A classified refusal is recorded before anything else on this request's path.
           if (refusal !== undefined) this.binding?.refuse(refusal, generation);
           const failure = new TransportHttpError(response.status, refusal, retryAfterMs);

@@ -9,6 +9,7 @@ import {
   withoutTraceContext,
 } from "../../src/trace-context";
 import type { MetadataEvent } from "../../src/types";
+import { testBinding } from "../helpers/project-binding";
 
 const REGISTRY_KEY = Symbol.for("opentelemetry.js.api.1");
 const SPAN_KEY = Symbol.for("OpenTelemetry Context Key SPAN");
@@ -384,6 +385,7 @@ describe("withoutTraceContext", () => {
     };
     const plane = new FakeControlPlane();
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: testBinding(),
       fetch: plane.fetch,
       sdkInstanceId: "manager-failure",
       logger: noopLogger,
@@ -445,6 +447,7 @@ describe("withoutTraceContext", () => {
     };
     const plane = new FakeControlPlane();
     const reporter = new MetadataReporter(plane.apiUrl, plane.apiKey, {
+      binding: testBinding(),
       fetch: plane.fetch,
       sdkInstanceId: "late-manager",
       logger: noopLogger,

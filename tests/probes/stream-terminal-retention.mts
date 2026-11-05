@@ -5,6 +5,7 @@ import { LeaseLedger, type LeaseState } from "../../src/lease";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { getCurrentRun } from "../../src/run-context";
 import type { FetchLike } from "../../src/transport";
+import { authKeyResponse } from "../helpers/project-binding";
 import { alive, collectUntil, settle } from "./gc.mjs";
 
 const states: WeakRef<LeaseState>[] = [];
@@ -26,6 +27,7 @@ LeaseLedger.prototype.applyGrantResponse = function (runId, response, options) {
 let grants = 0;
 let surrenders = 0;
 const fetch: FetchLike = async (url, init) => {
+  if (url.endsWith("/api/v1/auth/key")) return authKeyResponse();
   if (url.endsWith("/budgets/lease")) {
     grants++;
     return Response.json({

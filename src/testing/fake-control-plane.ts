@@ -162,7 +162,7 @@ export interface FakeControlPlaneOptions {
   remainingBudget?: number;
   /** Resolved project id (`proj_` + 24 lowercase hex). */
   projectId?: string;
-  /** Project name the key reaches (default `fake-project`). */
+  /** Project name the key reaches (default `test-project`). */
   projectName?: string;
   /** Scope `GET /api/v1/auth/key` reports (default `full`). */
   keyScope?: "full" | "read_only";
@@ -556,7 +556,7 @@ export class FakeControlPlane {
     this.currentUsage = value.currentUsage ?? 0;
     this.remainingBudget = value.remainingBudget ?? this.budgetLimit - this.currentUsage;
     this.projectId = value.projectId ?? `proj_${"0".repeat(24)}`;
-    this.projectName = value.projectName ?? "fake-project";
+    this.projectName = value.projectName ?? "test-project";
     this.keyScope = value.keyScope ?? "full";
     this.failoverTuningAllowed = value.failoverTuningAllowed ?? true;
     this.priceHints = value.priceHints;

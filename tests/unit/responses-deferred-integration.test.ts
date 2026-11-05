@@ -8,6 +8,7 @@ import { OpenAIAdapter } from "../../src/providers/openai";
 import { LatencyTracker } from "../../src/routing";
 import { markTerminated, resetRunControlForTest } from "../../src/run-control";
 import type { FetchLike } from "../../src/transport";
+import { authKeyResponse } from "../helpers/project-binding";
 
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
@@ -53,6 +54,7 @@ function fixture(baseURL = "https://api.openai.com/v1", options: SolwynOptions =
     });
   });
   const controlFetch: FetchLike = async (url, init) => {
+    if (url.endsWith("/api/v1/auth/key")) return authKeyResponse();
     if (url.includes("/breaker-reports")) {
       breakerReports.push(JSON.parse(init?.body as string));
       return new Response(null, { status: 204 });

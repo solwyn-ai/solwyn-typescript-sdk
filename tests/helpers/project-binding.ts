@@ -69,3 +69,11 @@ export async function pinnedBinding(projectId = TEST_PROJECT_ID): Promise<Projec
   await binding.validate();
   return binding;
 }
+
+/** Auth headers for a request sent straight to a FakeControlPlane's fetch. */
+export function planeHeaders(plane: {
+  readonly apiKey: string;
+  readonly project: string;
+}): Record<string, string> {
+  return { Authorization: `Bearer ${plane.apiKey}`, "Solwyn-Project": plane.project };
+}

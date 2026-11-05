@@ -4,13 +4,14 @@ import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
 import type { BudgetConfirmRequest, MetadataEvent } from "../../src/types";
 import { BudgetConfirmRequestSchema, MetadataEventSchema } from "../../src/validation";
+import { testBinding } from "../helpers/project-binding";
 
 const API_KEY = `solwyn_sk_${"a".repeat(64)}`;
 
 describe("settlement architecture parity", () => {
   it("keeps confirm construction sans-I/O and removes the blocking public send method", () => {
     const enforcer = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       apiUrl: "https://api.solwyn.test",
       apiKey: API_KEY,
     });

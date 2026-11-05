@@ -3,6 +3,7 @@ import { BudgetEnforcer } from "../../src/budget";
 import { CircuitBreaker } from "../../src/circuit-breaker";
 import { MetadataReporter } from "../../src/reporter";
 import { zeroTokenDetails } from "../../src/token-details";
+import { testBinding } from "../helpers/project-binding";
 
 for (const operation of ["check", "confirm"] as const) {
   it(`fences a stale ${operation} success away from a live control-plane recovery probe`, async () => {
@@ -48,7 +49,7 @@ for (const operation of ["check", "confirm"] as const) {
       },
     };
     const budget = new BudgetEnforcer({
-      project: "test-project",
+      binding: testBinding(),
       ...options,
       cacheTtl: 0,
       leaseEnabled: false,

@@ -8,6 +8,7 @@ import { createSolwynMiddleware } from "../../src/ai-sdk/index";
 import { noopLogger, run, Solwyn } from "../../src/node";
 import { MetadataReporter } from "../../src/reporter";
 import type { FetchLike } from "../../src/transport";
+import { authKeyResponse } from "../helpers/project-binding";
 import { alive, collectUntil } from "./gc.mjs";
 
 const forceGc = (globalThis as { gc?: () => void }).gc;
@@ -111,6 +112,7 @@ function controlPlane(count: Counters, options: PlaneOptions = {}): FetchLike {
   let ingestFailed = false;
   const confirmFailed = new Set<string>();
   return async (url, init) => {
+    if (url.endsWith("/api/v1/auth/key")) return authKeyResponse();
     if (url.endsWith("/budgets/check")) {
       count.checks++;
       if (options.reservations) count.reservations++;

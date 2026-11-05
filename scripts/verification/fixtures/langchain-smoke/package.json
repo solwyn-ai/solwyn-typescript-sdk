@@ -11,6 +11,6 @@
     "openai": "7.36.0",
     "typescript-current": "npm:typescript@6.0.3",
     "typescript-floor": "npm:typescript@5.8.3",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   }
 }
